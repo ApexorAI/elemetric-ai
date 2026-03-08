@@ -1,169 +1,189 @@
-const express = require("express");
-const cors = require("cors");
 require("dotenv").config();
 
+const express = require("express");
+const cors = require("cors");
 const OpenAI = require("openai");
 
 const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: "100mb" }));
-app.use(express.urlencoded({ extended: true, limit: "100mb" }));
+app.use(express.json({ limit: "50mb" }));
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+const client = new OpenAI({
+apiKey: process.env.OPENAI_API_KEY,
 });
 
 app.get("/", (_req, res) => {
-  res.send("Elemetric AI server running");
+res.json({
+ok: true,
+service: "Elemetric AI server",
+});
 });
 
 app.post("/review", async (req, res) => {
-  try {
-    const type = req.body?.type || "hotwater";
-    const images = req.body?.images;
+try {
+const { type, images } = req.body || {};
 
-    if (!Array.isArray(images) || images.length === 0) {
-      return res.status(400).json({ error: "No images provided" });
-    }
-
-    const first = images[0];
-    const base64 = first?.data || first?.base64;
-    const mime = first?.mime || "image/jpeg";
-
-    if (!base64) {
-      return res.status(400).json({ error: "Image base64 missing" });
-    }
-
-    // STEP 1: Ask AI if this is even a plumbing photo
-    const gateResponse = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0,
-      max_tokens: 120,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are strict. Decide if the photo is a plumbing installation photo. If unsure, say it is NOT relevant.",
-        },
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text:
-                'Reply ONLY as JSON like this: {"relevant": true/false, "reason": "short reason"}',
-            },
-            {
-              type: "image_url",
-              image_url: {
-                url: `data:${mime};base64,${base64}`,
-              },
-            },
-          ],
-        },
-      ],
-    });
-
-    const gateText = gateResponse.choices[0].message.content || "{}";
-    let gate;
-    try {
-      gate = JSON.parse(gateText);
-    } catch {
-      gate = { relevant: false, reason: "Could not understand image" };
-    }
-
-    if (!gate.relevant) {
-      return res.json({
-        relevant: false,
-        confidence: 5,
-        detected: [],
-        unclear: [],
-        missing: [],
-        action: "This does not look like a plumbing install photo. Take a clearer install photo.",
-      });
-    }
-
-    // STEP 2: Ask AI for structured plumbing result
-    const reviewResponse = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0,
-      max_tokens: 300,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a careful plumbing compliance assistant. Never guess. If you cannot clearly see something, put it in unclear.",
-        },
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text:
-                `Job type: ${type}. Look at this plumbing photo and reply ONLY as JSON with this exact shape:
-{
-  "relevant": true,
-  "confidence": 0-100,
-  "detected": ["short item", "short item"],
-  "unclear": ["short item"],
-  "missing": ["short item"],
-  "action": "short action"
+if (!type) {
+return res.status(400).json({
+error: "Missing job type",
+});
 }
 
-Rules:
-- Only list things actually visible or likely missing.
-- If not visible, put in unclear or missing.
-- Keep each item short.
-- Do not write extra words outside the JSON.`,
-            },
-            {
-              type: "image_url",
-              image_url: {
-                url: `data:${mime};base64,${base64}`,
-              },
-            },
-          ],
-        },
-      ],
-    });
+if (!images || !Array.isArray(images) || images.length === 0) {
+return res.status(400).json({
+error: "No images provided",
+});
+}
 
-    const reviewText = reviewResponse.choices[0].message.content || "{}";
+const inputContent = [
+{
+type: "text",
+text: `
+You are an AI plumbing documentation reviewer.
 
-    let result;
-    try {
-      result = JSON.parse(reviewText);
-    } catch {
-      result = {
-        relevant: true,
-        confidence: 0,
-        detected: [],
-        unclear: [],
-        missing: ["AI returned bad JSON"],
-        action: "Try again with a clearer photo",
-      };
-    }
+Job type: ${type}
 
-    return res.json({
-      relevant: true,
-      confidence: Number(result.confidence) || 0,
-      detected: Array.isArray(result.detected) ? result.detected : [],
-      unclear: Array.isArray(result.unclear) ? result.unclear : [],
-      missing: Array.isArray(result.missing) ? result.missing : [],
-      action: typeof result.action === "string" ? result.action : "",
-    });
-  } catch (err) {
-    console.error("AI ERROR:", err);
+Your task:
+1. Decide if the photos are relevant plumbing install photos.
+2. Estimate confidence from 0 to 100.
+3. List clearly visible plumbing items.
+4. List unclear items that cannot be confidently verified.
+5. List missing items that should be documented.
+6. Give one short recommended action.
 
-    return res.status(500).json({
-      error: "AI analysis failed",
-      details: err.message,
-    });
-  }
+IMPORTANT:
+- Be practical, short, and trade-focused.
+- For hot water installs, think about items like:
+- existing system
+- hot water unit
+- PTR valve
+- tempering valve
+- compliance plate / label
+- isolation valve
+- copper piping
+- insulation on pipes
+- Return STRICT JSON only.
+- Do not wrap in markdown.
+- Use this exact shape:
+
+{
+"relevant": true,
+"confidence": 85,
+"detected": ["hot water heater", "copper pipe"],
+"unclear": ["valve condition"],
+"missing": ["insulation on pipes"],
+"action": "inspect installation",
+"analysis": "short summary"
+}
+`.trim(),
+},
+...images.map((img) => ({
+type: "image_url",
+image_url: {
+url: `data:${img.mime};base64,${img.data}`,
+},
+})),
+];
+
+const response = await client.chat.completions.create({
+model: "gpt-4.1-mini",
+response_format: { type: "json_object" },
+messages: [
+{
+role: "user",
+content: inputContent,
+},
+],
+temperature: 0.2,
 });
 
-app.listen(8787, "0.0.0.0", () => {
-  console.log("Elemetric AI server running on port 8787");
+const raw = response.choices?.[0]?.message?.content || "{}";
+let parsed;
+
+try {
+parsed = JSON.parse(raw);
+} catch {
+return res.status(500).json({
+error: "AI returned invalid JSON",
+raw,
+});
+}
+
+const relevant = !!parsed.relevant;
+const confidence =
+typeof parsed.confidence === "number"
+? Math.max(0, Math.min(100, parsed.confidence))
+: 0;
+
+const detected = Array.isArray(parsed.detected) ? parsed.detected : [];
+const unclear = Array.isArray(parsed.unclear) ? parsed.unclear : [];
+const missing = Array.isArray(parsed.missing) ? parsed.missing : [];
+const action =
+typeof parsed.action === "string" ? parsed.action : "review installation";
+const analysis =
+typeof parsed.analysis === "string" ? parsed.analysis : "";
+
+// Simple documentation score logic
+// For hotwater installs we expect 5 required documentation photos
+const requiredPhotos = type === "hotwater" ? 5 : 5;
+
+// Verified photos = required photos that appear covered by AI
+// We estimate this from required documentation-related detections.
+const verificationKeywords = [
+"existing",
+"hot water",
+"heater",
+"ptr",
+"tempering",
+"compliance plate",
+"label",
+"isolation",
+"pipe",
+"copper",
+"tank",
+"valve",
+];
+
+const keywordHits = detected.filter((item) => {
+const lower = String(item).toLowerCase();
+return verificationKeywords.some((k) => lower.includes(k));
+}).length;
+
+const verifiedPhotos = Math.max(
+0,
+Math.min(requiredPhotos, keywordHits > 0 ? Math.min(requiredPhotos, keywordHits) : requiredPhotos - missing.length)
+);
+
+const documentationScore = Math.max(
+0,
+Math.min(100, Math.round((verifiedPhotos / requiredPhotos) * 100))
+);
+
+return res.json({
+relevant,
+confidence,
+documentationScore,
+requiredPhotos,
+verifiedPhotos,
+detected,
+unclear,
+missing,
+action,
+analysis,
+});
+} catch (error) {
+console.error("AI review error:", error);
+
+return res.status(500).json({
+error: "AI analysis failed",
+details: error.message || "Unknown server error",
+});
+}
+});
+
+const PORT = process.env.PORT || 8787;
+
+app.listen(PORT, "0.0.0.0", () => {
+console.log(`Elemetric AI server running on http://0.0.0.0:${PORT}`);
 });
