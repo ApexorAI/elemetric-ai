@@ -73,7 +73,7 @@ IMPORTANT:
 "detected": ["hot water heater", "copper pipe"],
 "unclear": ["valve condition"],
 "missing": ["insulation on pipes"],
-"action": "inspect installation",
+"action": "inspect connections",
 "analysis": "short summary"
 }
 `.trim(),
@@ -120,52 +120,13 @@ const detected = Array.isArray(parsed.detected) ? parsed.detected : [];
 const unclear = Array.isArray(parsed.unclear) ? parsed.unclear : [];
 const missing = Array.isArray(parsed.missing) ? parsed.missing : [];
 const action =
-typeof parsed.action === "string" ? parsed.action : "review installation";
+typeof parsed.action === "string" ? parsed.action : "inspect connections";
 const analysis =
 typeof parsed.analysis === "string" ? parsed.analysis : "";
-
-// Simple documentation score logic
-// For hotwater installs we expect 5 required documentation photos
-const requiredPhotos = type === "hotwater" ? 5 : 5;
-
-// Verified photos = required photos that appear covered by AI
-// We estimate this from required documentation-related detections.
-const verificationKeywords = [
-"existing",
-"hot water",
-"heater",
-"ptr",
-"tempering",
-"compliance plate",
-"label",
-"isolation",
-"pipe",
-"copper",
-"tank",
-"valve",
-];
-
-const keywordHits = detected.filter((item) => {
-const lower = String(item).toLowerCase();
-return verificationKeywords.some((k) => lower.includes(k));
-}).length;
-
-const verifiedPhotos = Math.max(
-0,
-Math.min(requiredPhotos, keywordHits > 0 ? Math.min(requiredPhotos, keywordHits) : requiredPhotos - missing.length)
-);
-
-const documentationScore = Math.max(
-0,
-Math.min(100, Math.round((verifiedPhotos / requiredPhotos) * 100))
-);
 
 return res.json({
 relevant,
 confidence,
-documentationScore,
-requiredPhotos,
-verifiedPhotos,
 detected,
 unclear,
 missing,
