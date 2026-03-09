@@ -36,33 +36,45 @@ error: "No images provided",
 });
 }
 
-const inputContent = [
-{
-type: "text",
-text: `
+const promptText = `
 You are an AI plumbing documentation reviewer.
 
 Job type: ${type}
 
-Your task:
-1. Decide if the photos are relevant plumbing install photos.
-2. Estimate confidence from 0 to 100.
-3. List clearly visible plumbing items.
-4. List unclear items that cannot be confidently verified.
-5. List missing items that should be documented.
-6. Give one short recommended action.
+You are reviewing a SET of job photos for a plumbing installation.
 
-IMPORTANT:
-- Be practical, short, and trade-focused.
-- For hot water installs, think about items like:
+VERY IMPORTANT LOGIC:
+- Judge the FULL SET of images, not just one image.
+- If most images are clearly relevant to plumbing or hot water installation work, set "relevant" to true.
+- If one image is random, blurry, unrelated, or non-plumbing, DO NOT automatically set "relevant" to false.
+- Only set "relevant" to false if the overall set is mostly unrelated to plumbing work.
+- If at least some clear plumbing installation evidence is visible across the set, that strongly supports "relevant": true.
+
+For hot water installs, look for things like:
+- hot water unit / heater / tank
 - existing system
-- hot water unit
 - PTR valve
 - tempering valve
 - compliance plate / label
 - isolation valve
 - copper piping
 - insulation on pipes
+- plumbing connections
+- drainage or discharge pipework
+
+Your task:
+1. Decide if the overall photo set is relevant plumbing documentation.
+2. Estimate confidence from 0 to 100.
+3. List clearly visible plumbing items across the set.
+4. List unclear items that cannot be confidently verified.
+5. List missing items that should still be documented.
+6. Give one short recommended action.
+7. Give one short analysis summary.
+
+Rules:
+- Be practical, short, and trade-focused.
+- Do not be overly harsh.
+- Base missing items on what is not yet clearly documented across the set.
 - Return STRICT JSON only.
 - Do not wrap in markdown.
 - Use this exact shape:
@@ -73,10 +85,15 @@ IMPORTANT:
 "detected": ["hot water heater", "copper pipe"],
 "unclear": ["valve condition"],
 "missing": ["insulation on pipes"],
-"action": "inspect connections",
-"analysis": "short summary"
+"action": "capture compliance plate",
+"analysis": "Most images show a relevant hot water installation with visible unit and copper piping. Some required documentation items are still not clearly shown."
 }
-`.trim(),
+`.trim();
+
+const inputContent = [
+{
+type: "text",
+text: promptText,
 },
 ...images.map((img) => ({
 type: "image_url",
@@ -95,12 +112,12 @@ role: "user",
 content: inputContent,
 },
 ],
-temperature: 0.2,
+temperature: 0.1,
 });
 
 const raw = response.choices?.[0]?.message?.content || "{}";
-let parsed;
 
+let parsed;
 try {
 parsed = JSON.parse(raw);
 } catch {
@@ -120,9 +137,11 @@ const detected = Array.isArray(parsed.detected) ? parsed.detected : [];
 const unclear = Array.isArray(parsed.unclear) ? parsed.unclear : [];
 const missing = Array.isArray(parsed.missing) ? parsed.missing : [];
 const action =
-typeof parsed.action === "string" ? parsed.action : "inspect connections";
+typeof parsed.action === "string" ? parsed.action : "review installation";
 const analysis =
-typeof parsed.analysis === "string" ? parsed.analysis : "";
+typeof parsed.analysis === "string"
+? parsed.analysis
+: "AI review completed.";
 
 return res.json({
 relevant,
@@ -143,7 +162,7 @@ details: error.message || "Unknown server error",
 }
 });
 
-const PORT = process.env.PORT || 8787;
+const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, "0.0.0.0", () => {
 console.log(`Elemetric AI server running on http://0.0.0.0:${PORT}`);
