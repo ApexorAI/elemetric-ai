@@ -37,56 +37,50 @@ error: "No images provided",
 }
 
 const promptText = `
-You are an AI plumbing documentation reviewer.
+You are a strict plumbing compliance photo validator for Victorian plumbing regulations.
 
 Job type: ${type}
 
-You are reviewing a SET of job photos for a plumbing installation.
+Each photo below has been submitted with a label describing what it is SUPPOSED to show. Your job is to validate each photo individually and determine whether it actually contains the required plumbing component.
 
-VERY IMPORTANT LOGIC:
-- Judge the FULL SET of images, not just one image.
-- If most images are clearly relevant to plumbing or hot water installation work, set "relevant" to true.
-- If one image is random, blurry, unrelated, or non-plumbing, DO NOT automatically set "relevant" to false.
-- Only set "relevant" to false if the overall set is mostly unrelated to plumbing work.
-- If at least some clear plumbing installation evidence is visible across the set, that strongly supports "relevant": true.
+VALIDATION RULES — apply these without exception:
+- Validate each photo against its label independently.
+- A photo PASSES only if it clearly and unambiguously shows the specific plumbing component named in its label.
+- A photo FAILS if it shows a person, animal, pet, room interior, outdoor scene, food, furniture, vehicle, sky, or any object that is not a plumbing component.
+- A photo FAILS if it is blurry, too dark, or ambiguous — if you cannot clearly identify the named component, it fails.
+- A photo FAILS if it shows plumbing in general but not the specific component named in its label.
+- Never give benefit of the doubt. When in doubt, the photo fails.
 
-For hot water installs, look for things like:
-- hot water unit / heater / tank
-- existing system
-- PTR valve
-- tempering valve
-- compliance plate / label
-- isolation valve
-- copper piping
-- insulation on pipes
-- plumbing connections
-- drainage or discharge pipework
+REQUIRED COMPONENTS for a ${type} installation and what must be visible for a PASS:
+- "Existing system (before)": must show the old hot water unit, tank, or existing pipework before replacement
+- "PTR valve installed": must clearly show a PTR (pressure and temperature relief) valve with discharge pipe
+- "Tempering valve": must clearly show a tempering valve body with markings or connections
+- "Compliance plate / label": must show the compliance plate or regulatory rating label physically attached to the unit
+- "Isolation valve": must clearly show an isolation valve on the supply or return pipework
 
-Your task:
-1. Decide if the overall photo set is relevant plumbing documentation.
-2. Estimate confidence from 0 to 100.
-3. List clearly visible plumbing items across the set.
-4. List unclear items that cannot be confidently verified.
-5. List missing items that should still be documented.
-6. Give one short recommended action.
-7. Give one short analysis summary.
+SCORING:
+- Count how many photos PASS their individual validation.
+- confidence = round((passing photos / total photos submitted) * 100)
+- If zero photos pass: confidence = 0, relevant = false.
+- relevant = true only if at least one photo passes and the passing photos are genuine plumbing components.
 
-Rules:
-- Be practical, short, and trade-focused.
-- Do not be overly harsh.
-- Base missing items on what is not yet clearly documented across the set.
-- Return STRICT JSON only.
-- Do not wrap in markdown.
-- Use this exact shape:
+OUTPUT FIELDS:
+- detected: labels of photos that clearly PASS
+- unclear: labels of photos that show something plumbing-related but cannot be confidently verified as the named component
+- missing: labels of photos that FAIL — wrong subject, animal, person, unrelated object, or component not visible
+- action: one short sentence on what to retake or fix
+- analysis: one short sentence summarising how many photos passed and why others failed
+
+Return STRICT JSON only. No markdown. No explanation outside the JSON.
 
 {
 "relevant": true,
-"confidence": 85,
-"detected": ["hot water heater", "copper pipe"],
-"unclear": ["valve condition"],
-"missing": ["insulation on pipes"],
-"action": "capture compliance plate",
-"analysis": "Most images show a relevant hot water installation with visible unit and copper piping. Some required documentation items are still not clearly shown."
+"confidence": 60,
+"detected": ["PTR valve installed", "Isolation valve"],
+"unclear": ["Compliance plate / label"],
+"missing": ["Existing system (before)", "Tempering valve"],
+"action": "Retake the before photo and tempering valve — current photos do not show these components.",
+"analysis": "2 of 5 photos pass validation. 1 photo is unclear. 2 photos do not show the required component."
 }
 `.trim();
 
@@ -95,12 +89,18 @@ const inputContent = [
 type: "text",
 text: promptText,
 },
-...images.map((img) => ({
+...images.flatMap((img) => [
+{
+type: "text",
+text: `Photo label: "${img.label}"`,
+},
+{
 type: "image_url",
 image_url: {
 url: `data:${img.mime};base64,${img.data}`,
 },
-})),
+},
+]),
 ];
 
 const response = await client.chat.completions.create({
