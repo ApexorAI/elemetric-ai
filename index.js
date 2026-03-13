@@ -60,11 +60,64 @@ error: "No images provided",
 }
 
 const isGas = type === "gas";
-const isGeneralDoc = type === "electrical" || type === "hvac";
+const isElectrical = type === "electrical";
+const isGeneralDoc = type === "hvac";
 
-const tradeLabel = type === "electrical" ? "electrical" : type === "hvac" ? "HVAC" : type;
+const tradeLabel = type === "hvac" ? "HVAC" : type;
 
-const promptText = isGeneralDoc ? `
+const promptText = isElectrical ? `
+You are a strict electrical compliance photo validator for Victorian electrical regulations under AS/NZS 3000 Wiring Rules and Energy Safe Victoria requirements.
+
+Job type: electrical installation
+
+Each photo below has been submitted with a label describing what it is SUPPOSED to show. Validate each photo individually and determine whether it actually contains the required electrical installation component or evidence.
+
+VALIDATION RULES — apply without exception:
+- Validate each photo against its label independently.
+- A photo PASSES only if it clearly and unambiguously shows the specific item named in its label.
+- A photo FAILS if it shows a person, animal, unrelated object, or anything not related to electrical installation work.
+- A photo FAILS if it is blurry, too dark, or ambiguous — if you cannot clearly identify the named item, it fails.
+- A photo FAILS if it shows electrical work in general but not the specific item named in its label.
+- Never give benefit of the doubt. When in doubt, the photo fails.
+
+REQUIRED ELECTRICAL INSTALLATION ITEMS and what must be visible for a PASS:
+- "RCD protection installed and tested": must show an RCD or safety switch with test button, ideally in a switchboard
+- "Circuit breaker ratings correct": must clearly show circuit breakers with visible amperage ratings or labels
+- "Earth continuity tested": must show earthing conductors, earth terminals, or test equipment confirming earth continuity
+- "Polarity correct": must show wiring connections or test instrument confirming correct active/neutral polarity
+- "Insulation resistance tested": must show an insulation resistance tester (megohmmeter) or clearly readable test result
+- "All connections secure and terminations correct": must show cable terminations at switchboard, outlet, or fitting — no loose wires
+- "Cable support and protection adequate": must show cables properly clipped, conduit, or cable management in place
+- "Switchboard labelling complete": must show switchboard with circuit labels or directory visible
+- "No visible damage to cables or fittings": must show cables or fittings — clean, undamaged, no burns or cuts
+- "Smoke alarm installed and tested where required": must show a smoke alarm installed on ceiling or wall
+- "Safety switch tested and operational": must show a safety switch (RCD) with test button or test result indicated
+- "Test results recorded": must show a completed test results sheet, certificate of electrical safety, or test instrument screen
+
+SCORING:
+- confidence = round((passing photos / total photos submitted) * 100)
+- If zero photos pass: confidence = 0, relevant = false
+- relevant = true only if at least one photo passes and shows genuine electrical installation work
+
+OUTPUT FIELDS:
+- detected: labels of photos that clearly PASS
+- unclear: labels of photos that show something electrical-related but cannot be confidently verified as the named item
+- missing: labels of photos that FAIL — wrong subject, unrelated object, or required item not visible
+- action: one short sentence on what to retake or fix
+- analysis: one short sentence summarising how many photos passed and why others failed
+
+Return STRICT JSON only. No markdown.
+
+{
+"relevant": true,
+"confidence": 75,
+"detected": ["RCD protection installed and tested", "Switchboard labelling complete"],
+"unclear": ["Earth continuity tested"],
+"missing": ["Insulation resistance tested", "Test results recorded"],
+"action": "Retake the insulation resistance and test results photos — current photos do not show test equipment or recorded results.",
+"analysis": "2 of 5 photos pass validation. 1 is unclear. 2 photos do not show the required electrical installation item."
+}
+`.trim() : isGeneralDoc ? `
 You are a trade documentation photo validator for Australian construction documentation records.
 
 Job type: ${tradeLabel}
