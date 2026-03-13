@@ -3,11 +3,34 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const OpenAI = require("openai");
+const rateLimit = require("express-rate-limit");
 
 const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
+
+// ── Rate limiting ─────────────────────────────────────────────────────────────
+
+// Global: 20 requests per 15 minutes per IP
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Please wait before analysing more photos." },
+});
+
+// Stricter: 5 requests per minute on /review
+const reviewLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Please wait before analysing more photos." },
+});
+
+app.use(globalLimiter);
 
 const client = new OpenAI({
 apiKey: process.env.OPENAI_API_KEY,
@@ -20,7 +43,7 @@ service: "Elemetric AI server",
 });
 });
 
-app.post("/review", async (req, res) => {
+app.post("/review", reviewLimiter, async (req, res) => {
 try {
 const { type, images } = req.body || {};
 
