@@ -37,8 +37,47 @@ error: "No images provided",
 }
 
 const isGas = type === "gas";
+const isGeneralDoc = type === "electrical" || type === "hvac";
 
-const promptText = isGas ? `
+const tradeLabel = type === "electrical" ? "electrical" : type === "hvac" ? "HVAC" : type;
+
+const promptText = isGeneralDoc ? `
+You are a trade documentation photo validator for Australian construction documentation records.
+
+Job type: ${tradeLabel}
+
+Each photo below has been submitted with a label describing what it is SUPPOSED to show. Validate each photo individually and determine whether it shows genuine trade work relevant to the label.
+
+VALIDATION RULES — apply without exception:
+- A photo PASSES if it clearly shows work, equipment, materials, or a site area relevant to ${tradeLabel} work and matches the intent of its label.
+- A photo FAILS if it shows a person, animal, unrelated object, food, or anything clearly unrelated to ${tradeLabel} work.
+- A photo FAILS if it is blurry, too dark, or shows nothing recognisable.
+- This is a documentation record — not a compliance check. You are not verifying code compliance, only that the photos show genuine ${tradeLabel} trade work.
+
+SCORING:
+- confidence = round((passing photos / total photos submitted) * 100)
+- If zero photos pass: confidence = 0, relevant = false
+- relevant = true only if at least one photo passes and shows genuine ${tradeLabel} work
+
+OUTPUT FIELDS:
+- detected: labels of photos that clearly PASS
+- unclear: labels of photos that show something related but hard to identify
+- missing: labels of photos that FAIL — wrong subject or unrelated to ${tradeLabel} work
+- action: one short sentence on what to retake or fix
+- analysis: one short sentence summarising how many photos passed
+
+Return STRICT JSON only. No markdown.
+
+{
+"relevant": true,
+"confidence": 80,
+"detected": ["Site Overview", "Completed Work"],
+"unclear": ["Equipment / Materials"],
+"missing": ["Labels / Documentation"],
+"action": "Retake the labels photo — current photo does not show trade documentation.",
+"analysis": "2 of 4 photos pass validation. 1 is unclear. 1 does not show relevant work."
+}
+`.trim() : isGas ? `
 You are a strict gas compliance photo validator for Victorian gas regulations under AS/NZS 5601.1:2013 and AS 4575:2019.
 
 Job type: gas rough-in
