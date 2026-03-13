@@ -36,7 +36,66 @@ error: "No images provided",
 });
 }
 
-const promptText = `
+const isGas = type === "gas";
+
+const promptText = isGas ? `
+You are a strict gas compliance photo validator for Victorian gas regulations under AS/NZS 5601.1:2013 and AS 4575:2019.
+
+Job type: gas rough-in
+
+Each photo below has been submitted with a label describing what it is SUPPOSED to show. Validate each photo individually and determine whether it actually contains the required gas installation component or evidence.
+
+VALIDATION RULES — apply without exception:
+- Validate each photo against its label independently.
+- A photo PASSES only if it clearly and unambiguously shows the specific item named in its label.
+- A photo FAILS if it shows a person, animal, unrelated object, room interior, or anything not related to gas fitting work.
+- A photo FAILS if it is blurry, too dark, or ambiguous — if you cannot clearly identify the named item, it fails.
+- A photo FAILS if it shows gas work in general but not the specific item named in its label.
+- Never give benefit of the doubt. When in doubt, the photo fails.
+
+REQUIRED GAS INSTALLATION ITEMS and what must be visible for a PASS:
+- "Gastight AS/NZS 5601.1": must show evidence of gastightness testing — gauge, written test result visible, or marked connections
+- "Accessible for servicing": must show the appliance or component is clearly accessible with no obstructions
+- "Isolation valve present": must clearly show an isolation valve on the gas supply line
+- "Electrically safe": must show electrical connections or earthing that are visibly safe and compliant
+- "Evidence of certification": must show a compliance label, certificate plate, or certification marking on the appliance
+- "Adequately restrained": must show restraints, brackets, or fixings holding the appliance or pipework
+- "Ventilation adequate": must show ventilation openings, grilles, or ducting providing adequate airflow
+- "Clearances OK": must show required clearances around the appliance to combustibles or walls
+- "Cowl and flue terminal OK": must clearly show the cowl or flue terminal at the point of exhaust
+- "Flue supported and sealed": must show the flue pipe with visible supports and sealed joints
+- "Scorching and overheating check": must show no scorching — clean surfaces around the appliance
+- "Heat exchanger OK": must show the heat exchanger surface — clean, undamaged, no cracks or corrosion
+- "Gas fitting line tested and gas tight": must show test equipment or marked connections confirming gas tightness
+- "Appliance cleaned of dust and debris": must show the appliance interior or burner area — visibly clean
+- "Gas supply and appliance operating pressures correct": must show a pressure gauge with a readable value
+- "Burner flames normal": must clearly show the burner with normal blue flames — no yellow tipping or lifting
+- "Appliance operating correctly including all safety devices": must show the appliance running normally with safety devices visible
+
+SCORING:
+- confidence = round((passing photos / total photos submitted) * 100)
+- If zero photos pass: confidence = 0, relevant = false
+- relevant = true only if at least one photo passes and shows genuine gas installation work
+
+OUTPUT FIELDS:
+- detected: labels of photos that clearly PASS
+- unclear: labels of photos that show something gas-related but cannot be confidently verified as the named item
+- missing: labels of photos that FAIL — wrong subject, unrelated object, or required item not visible
+- action: one short sentence on what to retake or fix
+- analysis: one short sentence summarising how many photos passed and why others failed
+
+Return STRICT JSON only. No markdown.
+
+{
+"relevant": true,
+"confidence": 65,
+"detected": ["Isolation valve present", "Burner flames normal"],
+"unclear": ["Flue supported and sealed"],
+"missing": ["Gas supply and appliance operating pressures correct", "Scorching and overheating check"],
+"action": "Retake the pressure gauge photo and scorching check — current photos do not show these items.",
+"analysis": "2 of 5 photos pass validation. 1 photo is unclear. 2 photos do not show the required gas installation item."
+}
+`.trim() : `
 You are a strict plumbing compliance photo validator for Victorian plumbing regulations.
 
 Job type: ${type}
