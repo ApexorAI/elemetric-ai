@@ -4,8 +4,134 @@ const express = require("express");
 const cors = require("cors");
 const OpenAI = require("openai");
 const rateLimit = require("express-rate-limit");
+const Stripe = require("stripe");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
+
+// ── Stripe webhook — raw body MUST come before express.json() ─────────────────
+
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-12-18.acacia" })
+  : null;
+
+const supabaseAdmin = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+  : null;
+
+// Map Stripe price IDs → app role names
+function roleFromSubscription(subscription) {
+  const priceId = subscription.items?.data?.[0]?.price?.id;
+  const amount  = subscription.items?.data?.[0]?.price?.unit_amount ?? 0;
+
+  const priceMap = {
+    [process.env.STRIPE_PRICE_CORE]:          "core",
+    [process.env.STRIPE_PRICE_PRO]:           "pro",
+    [process.env.STRIPE_PRICE_EMPLOYER]:      "employer",
+    [process.env.STRIPE_PRICE_EMPLOYER_PLUS]: "employer_plus",
+  };
+
+  if (priceId && priceMap[priceId]) return priceMap[priceId];
+
+  // Amount-based fallback (AUD cents)
+  if (amount <= 2499) return "core";
+  if (amount <= 3999) return "pro";
+  if (amount <= 9900) return "employer";
+  return "employer_plus";
+}
+
+app.post(
+  "/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    if (!stripe || !supabaseAdmin) {
+      console.warn("Webhook: Stripe or Supabase not configured.");
+      return res.sendStatus(200); // don't fail Stripe
+    }
+
+    const sig = req.headers["stripe-signature"];
+    const secret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    if (!secret) {
+      console.warn("Webhook: STRIPE_WEBHOOK_SECRET not set.");
+      return res.sendStatus(200);
+    }
+
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, secret);
+    } catch (err) {
+      console.error("Webhook signature verification failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    try {
+      if (event.type === "customer.subscription.created" || event.type === "customer.subscription.updated") {
+        const subscription = event.data.object;
+
+        // Retrieve the Stripe customer to get their email
+        const customer = await stripe.customers.retrieve(subscription.customer);
+        const email = customer.email;
+        if (!email) {
+          console.warn("Webhook: No customer email found.");
+          return res.sendStatus(200);
+        }
+
+        const role = roleFromSubscription(subscription);
+
+        // Look up the Supabase user by email
+        const { data: users, error: listErr } = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 });
+        if (listErr) throw listErr;
+
+        const user = users?.users?.find((u) => u.email === email);
+        if (!user) {
+          console.warn(`Webhook: No Supabase user found for email ${email}`);
+          return res.sendStatus(200);
+        }
+
+        await supabaseAdmin.from("profiles").upsert(
+          {
+            user_id: user.id,
+            role,
+            stripe_customer_id: subscription.customer,
+            subscription_status: subscription.status,
+          },
+          { onConflict: "user_id" }
+        );
+
+        console.log(`Webhook: Updated ${email} → role=${role}`);
+      }
+
+      if (event.type === "customer.subscription.deleted") {
+        const subscription = event.data.object;
+
+        const customer = await stripe.customers.retrieve(subscription.customer);
+        const email = customer.email;
+        if (!email) return res.sendStatus(200);
+
+        const { data: users } = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 });
+        const user = users?.users?.find((u) => u.email === email);
+        if (!user) return res.sendStatus(200);
+
+        await supabaseAdmin.from("profiles").upsert(
+          {
+            user_id: user.id,
+            role: "free",
+            subscription_status: "canceled",
+          },
+          { onConflict: "user_id" }
+        );
+
+        console.log(`Webhook: Downgraded ${email} → free`);
+      }
+    } catch (err) {
+      console.error("Webhook handler error:", err);
+      // Still return 200 so Stripe doesn't retry
+    }
+
+    res.sendStatus(200);
+  }
+);
 
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
@@ -35,8 +161,8 @@ app.use(globalLimiter);
 // ── API key auth ───────────────────────────────────────────────────────────────
 
 app.use((req, res, next) => {
-  // Allow unauthenticated health check
-  if (req.path === "/") return next();
+  // Allow unauthenticated health check and Stripe webhook
+  if (req.path === "/" || req.path === "/webhook") return next();
 
   const key = req.headers["x-elemetric-key"];
   const expected = process.env.ELEMETRIC_API_KEY;
