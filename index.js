@@ -32,6 +32,27 @@ const reviewLimiter = rateLimit({
 
 app.use(globalLimiter);
 
+// ── API key auth ───────────────────────────────────────────────────────────────
+
+app.use((req, res, next) => {
+  // Allow unauthenticated health check
+  if (req.path === "/") return next();
+
+  const key = req.headers["x-elemetric-key"];
+  const expected = process.env.ELEMETRIC_API_KEY;
+
+  if (!expected) {
+    // Key not configured — skip enforcement in development
+    return next();
+  }
+
+  if (!key || key !== expected) {
+    return res.status(401).json({ error: "Unauthorised." });
+  }
+
+  next();
+});
+
 const client = new OpenAI({
 apiKey: process.env.OPENAI_API_KEY,
 });
