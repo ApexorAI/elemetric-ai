@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const OpenAI = require("openai");
+const Replicate = require("replicate");
 const rateLimit = require("express-rate-limit");
 const Stripe = require("stripe");
 const { createClient } = require("@supabase/supabase-js");
@@ -158,89 +159,11 @@ const reviewLimiter = rateLimit({
 
 app.use(globalLimiter);
 
-// ── In-memory stores for async Nano Banana visualiser ─────────────────────────
-
-// Temp images: keyed by id, served publicly so Nano Banana can fetch them
-const tempImages = new Map(); // id → { base64, mime, expires }
-
-// Task results: keyed by taskId from Nano Banana
-const taskResults = new Map(); // taskId → { status, imageUrl?, error? }
-
-const TEMP_IMAGE_TTL_MS = 30 * 60 * 1000; // 30 minutes
-
-// Serve temp images without auth (Nano Banana fetches these from outside)
-app.get("/temp-image/:id", (req, res) => {
-  const entry = tempImages.get(req.params.id);
-  if (!entry) return res.status(404).json({ error: "Image not found or expired." });
-  if (Date.now() > entry.expires) {
-    tempImages.delete(req.params.id);
-    return res.status(404).json({ error: "Image expired." });
-  }
-  const buf = Buffer.from(entry.base64, "base64");
-  res.set("Content-Type", entry.mime);
-  res.set("Cache-Control", "public, max-age=1800");
-  res.send(buf);
-});
-
-// Callback endpoint — Nano Banana POSTs the result here (no auth required)
-app.post("/visualise-callback", express.json({ limit: "10mb" }), (req, res) => {
-  const body = req.body || {};
-
-  // Nano Banana callback payload (handle multiple possible formats)
-  const taskId =
-    body.taskId ??
-    body.task_id ??
-    body.data?.taskId ??
-    body.data?.task_id;
-
-  if (!taskId) {
-    console.warn("Visualise callback: no taskId in body", JSON.stringify(body).slice(0, 200));
-    return res.sendStatus(200);
-  }
-
-  const status = (body.status ?? body.data?.status ?? "").toUpperCase();
-  const isSuccess = status === "SUCCESS" || status === "COMPLETED" || status === "DONE" || body.code === 200;
-
-  // Extract image URL from common response shapes
-  const imageUrl =
-    body.imageUrl ??
-    body.image_url ??
-    body.data?.imageUrl ??
-    body.data?.image_url ??
-    body.data?.output?.[0] ??
-    body.data?.images?.[0] ??
-    body.output?.[0] ??
-    body.images?.[0];
-
-  if (isSuccess && imageUrl) {
-    taskResults.set(taskId, { status: "done", imageUrl });
-    console.log(`Visualise callback: task ${taskId} done → ${imageUrl}`);
-  } else {
-    const error = body.error ?? body.message ?? body.data?.error ?? "Generation failed";
-    taskResults.set(taskId, { status: "failed", error });
-    console.warn(`Visualise callback: task ${taskId} failed →`, error);
-  }
-
-  // Clean up temp images associated with this task
-  // (we stored taskId → imageId mapping in taskResults meta)
-  const meta = taskResults.get(taskId);
-  if (meta?.tempImageId) {
-    tempImages.delete(meta.tempImageId);
-  }
-
-  res.sendStatus(200);
-});
-
 // ── API key auth ───────────────────────────────────────────────────────────────
 
 app.use((req, res, next) => {
-  // Allow unauthenticated: health check, Stripe webhook, temp image serving, Nano Banana callback
-  if (
-    req.path === "/" ||
-    req.path === "/webhook" ||
-    req.path.startsWith("/temp-image/") ||
-    req.path === "/visualise-callback"
-  ) return next();
+  // Allow unauthenticated health check and Stripe webhook
+  if (req.path === "/" || req.path === "/webhook") return next();
 
   const key = req.headers["x-elemetric-key"];
   const expected = process.env.ELEMETRIC_API_KEY;
@@ -579,11 +502,9 @@ const visualiserLimiter = rateLimit({
   message: { error: "Too many visualisation requests. Please wait before generating another." },
 });
 
-const RAILWAY_URL = process.env.RAILWAY_PUBLIC_DOMAIN
-  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
-  : "https://elemetric-ai-production.up.railway.app";
-
-const NANO_BANANA_API = "https://api.nanobananaapi.ai/api/v1/nanobanana/generate";
+const replicate = new Replicate({
+  auth: process.env.REPLICATE_API_TOKEN,
+});
 
 app.post("/visualise", visualiserLimiter, async (req, res) => {
   try {
@@ -595,13 +516,11 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
     if (!modelNumber) {
       return res.status(400).json({ error: "Missing product model number." });
     }
-
-    const nanoBananaKey = process.env.NANO_BANANA_API_KEY;
-    if (!nanoBananaKey) {
+    if (!process.env.REPLICATE_API_TOKEN) {
       return res.status(503).json({ error: "Visualiser not configured on server." });
     }
 
-    // Step 1: Describe the room using GPT-4o mini vision
+    // Step 1: Describe the room using GPT-4o mini vision for a better prompt
     let roomDescription = "a modern Australian home interior";
     try {
       const visionResponse = await client.chat.completions.create({
@@ -612,7 +531,7 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
             content: [
               {
                 type: "text",
-                text: "Describe this room or wall space in 2-3 concise sentences. Focus on: wall colour, room style, lighting, and approximate size. Do not mention any existing appliances or fixtures.",
+                text: "Describe this room or wall space in one sentence. Include: wall colour, room style, and lighting conditions only.",
               },
               {
                 type: "image_url",
@@ -621,75 +540,52 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
             ],
           },
         ],
-        max_tokens: 120,
-        temperature: 0.3,
+        max_tokens: 80,
+        temperature: 0.2,
       });
       roomDescription = visionResponse.choices?.[0]?.message?.content?.trim() || roomDescription;
     } catch (visionErr) {
-      console.warn("Vision step failed, using default description:", visionErr.message);
+      console.warn("Vision step skipped:", visionErr.message);
     }
 
-    // Step 2: Store the image temporarily so Nano Banana can fetch it via public URL
-    const imageId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-    tempImages.set(imageId, {
-      base64: wallImage,
-      mime,
-      expires: Date.now() + TEMP_IMAGE_TTL_MS,
-    });
-    // Auto-clean after TTL
-    setTimeout(() => tempImages.delete(imageId), TEMP_IMAGE_TTL_MS);
+    // Step 2: Run Stable Diffusion img2img via Replicate
+    // replicate.run() polls internally and returns when the prediction is complete
+    const prompt =
+      `Add a ${modelNumber} mounted on the wall, photorealistic, same room, same lighting, ` +
+      `${roomDescription}, product clearly visible and naturally installed, high quality photograph`;
 
-    const publicImageUrl = `${RAILWAY_URL}/temp-image/${imageId}`;
-    const callBackUrl = `${RAILWAY_URL}/visualise-callback`;
+    const output = await replicate.run(
+      "stability-ai/stable-diffusion-img2img:15a3689ee13b0d2616e98820eca31d4af4b51b09e1ef83b7bd29abe2c99e8ff6",
+      {
+        input: {
+          image:            `data:${mime};base64,${wallImage}`,
+          prompt,
+          negative_prompt:  "blurry, low quality, distorted, unrealistic, cartoon, sketch, watermark",
+          strength:         0.4,
+          guidance_scale:   7.5,
+          num_inference_steps: 30,
+          num_outputs:      1,
+        },
+      }
+    );
 
-    // Step 3: Build a composite prompt
-    const prompt = [
-      `Photorealistic image edit: place a ${modelNumber} into this space.`,
-      `Room context: ${roomDescription}`,
-      "Preserve the original room structure, wall colours, flooring, and natural lighting exactly.",
-      "The product should appear naturally installed — correct perspective, matching shadows.",
-      "Result should look like a real photograph, not a render. Australian home aesthetic.",
-    ].join(" ");
+    // output is an array of ReadableStream or URL strings depending on SDK version
+    let imageUrl = Array.isArray(output) ? output[0] : output;
 
-    // Step 4: Call Nano Banana API (async — returns taskId, result delivered via callback)
-    const nbRes = await fetch(NANO_BANANA_API, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${nanoBananaKey}`,
-      },
-      body: JSON.stringify({
-        type: "IMAGETOIAMGE",   // Nano Banana API enum (as documented)
-        prompt,
-        imageUrls: [publicImageUrl],
-        callBackUrl,
-        numImages: 1,
-        image_size: "1:1",
-      }),
-    });
-
-    if (!nbRes.ok) {
-      const errText = await nbRes.text();
-      console.error("Nano Banana error:", nbRes.status, errText);
-      return res.status(502).json({ error: "Visualisation service error.", details: errText.slice(0, 200) });
+    // Replicate SDK ≥ 1.0 returns FileOutput objects with a .url() method
+    if (imageUrl && typeof imageUrl === "object" && typeof imageUrl.url === "function") {
+      imageUrl = imageUrl.url();
+    }
+    if (imageUrl && typeof imageUrl === "object" && imageUrl.href) {
+      imageUrl = imageUrl.href;
     }
 
-    const nbJson = await nbRes.json();
-    const taskId = nbJson?.data?.taskId ?? nbJson?.taskId;
-
-    if (!taskId) {
-      console.error("Nano Banana: no taskId in response", JSON.stringify(nbJson));
-      return res.status(502).json({ error: "Visualisation service did not return a task ID." });
+    if (!imageUrl) {
+      return res.status(500).json({ error: "No image returned from Replicate." });
     }
 
-    // Register pending task (store tempImageId for cleanup on callback)
-    taskResults.set(taskId, { status: "pending", tempImageId: imageId });
-
-    // Auto-clean task result after 1 hour
-    setTimeout(() => taskResults.delete(taskId), 60 * 60 * 1000);
-
-    console.log(`Visualise: task ${taskId} submitted for model "${modelNumber}"`);
-    return res.json({ taskId, status: "pending" });
+    console.log(`Visualise: completed for model "${modelNumber}" → ${imageUrl}`);
+    return res.json({ imageUrl });
 
   } catch (error) {
     console.error("Visualiser error:", error);
@@ -698,19 +594,6 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
       details: error.message || "Unknown server error",
     });
   }
-});
-
-// ── Visualiser status polling ──────────────────────────────────────────────────
-
-app.get("/visualise-status/:taskId", (req, res) => {
-  const { taskId } = req.params;
-  const result = taskResults.get(taskId);
-
-  if (!result) {
-    return res.status(404).json({ status: "not_found", error: "Task not found or expired." });
-  }
-
-  return res.json(result);
 });
 
 const PORT = process.env.PORT || 8080;
