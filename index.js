@@ -90,7 +90,7 @@ error: "No images provided",
 
 const isGas = type === "gas";
 const isElectrical = type === "electrical";
-const isGeneralDoc = type === "hvac";
+const isGeneralDoc = type === "hvac" || type === "carpentry";
 
 const tradeLabel = type === "hvac" ? "HVAC" : type;
 
@@ -363,6 +363,76 @@ error: "AI analysis failed",
 details: error.message || "Unknown server error",
 });
 }
+});
+
+// ── Visualiser: 3 per 10 minutes ──────────────────────────────────────────────
+
+const visualiserLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 3,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many visualisation requests. Please wait before generating another." },
+});
+
+app.post("/visualise", visualiserLimiter, async (req, res) => {
+  try {
+    const { wallImage, mime, modelNumber } = req.body || {};
+
+    if (!wallImage || !mime) {
+      return res.status(400).json({ error: "Missing wall image." });
+    }
+    if (!modelNumber) {
+      return res.status(400).json({ error: "Missing product model number." });
+    }
+
+    // Step 1: Describe the room using GPT-4o vision
+    const visionResponse = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "Describe this room or wall space in 2-3 concise sentences for use as a context in an interior design rendering prompt. Focus on: wall colour, room style, lighting, and approximate size. Do not mention any existing appliances or fixtures.",
+            },
+            {
+              type: "image_url",
+              image_url: { url: `data:${mime};base64,${wallImage}` },
+            },
+          ],
+        },
+      ],
+      max_tokens: 150,
+      temperature: 0.3,
+    });
+
+    const roomDescription = visionResponse.choices?.[0]?.message?.content?.trim() || "a modern Australian home interior";
+
+    // Step 2: Generate visualisation with DALL-E 3
+    const dalleResponse = await client.images.generate({
+      model: "dall-e-3",
+      prompt: `Photorealistic interior design render of a ${modelNumber} installed in the following space: ${roomDescription}. The product is clearly visible, professionally installed, and the image looks like a real photograph. Australian home, high quality, natural lighting.`,
+      n: 1,
+      size: "1024x1024",
+      quality: "standard",
+      response_format: "b64_json",
+    });
+
+    const imageBase64 = dalleResponse.data?.[0]?.b64_json;
+    if (!imageBase64) {
+      return res.status(500).json({ error: "No image generated." });
+    }
+
+    return res.json({ imageBase64, roomDescription });
+  } catch (error) {
+    console.error("Visualiser error:", error);
+    return res.status(500).json({
+      error: "Visualisation failed",
+      details: error.message || "Unknown server error",
+    });
+  }
 });
 
 const PORT = process.env.PORT || 8080;
