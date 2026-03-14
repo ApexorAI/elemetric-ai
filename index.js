@@ -43,6 +43,14 @@ service: "Elemetric AI server",
 });
 });
 
+app.get("/timestamp", (_req, res) => {
+  const now = new Date();
+  res.json({
+    timestamp: now.toISOString(),
+    formatted: now.toLocaleString("en-AU", { timeZone: "Australia/Melbourne" }),
+  });
+});
+
 app.post("/review", reviewLimiter, async (req, res) => {
 try {
 const { type, images } = req.body || {};
