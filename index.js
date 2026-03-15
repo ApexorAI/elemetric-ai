@@ -37490,6 +37490,223 @@ Return JSON with:
   }
 });
 
+// POST /ladder-register — Register portable access equipment (ladders, scaffolding tags)
+app.post("/ladder-register", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, assetType = "LADDER", make, model, serialNumber,
+    purchaseDate, lastInspectionDate, nextInspectionDue,
+    maxLoadKg, heightRatingM, inspectionResult = "PASS",
+    tagColour, assignedTo, location, notes,
+  } = req.body;
+  if (!assetType || !serialNumber) {
+    return res.status(400).json({ error: "assetType and serialNumber are required." });
+  }
+  const validTypes = ["LADDER", "STEP_LADDER", "EXTENSION_LADDER", "PODIUM_STEP", "TRESTLE", "MOBILE_SCAFFOLD"];
+  if (!validTypes.includes(assetType)) {
+    return res.status(400).json({ error: `assetType must be one of: ${validTypes.join(", ")}` });
+  }
+  const assetRef = `LAD-${Date.now().toString(36).toUpperCase()}`;
+  const daysUntilInspection = nextInspectionDue
+    ? Math.ceil((new Date(nextInspectionDue) - new Date()) / (1000 * 60 * 60 * 24))
+    : null;
+  const inspectionStatus = daysUntilInspection === null ? "UNKNOWN"
+    : daysUntilInspection < 0 ? "OVERDUE"
+    : daysUntilInspection <= 7 ? "DUE_SOON"
+    : "CURRENT";
+  const status = inspectionResult === "FAIL" || inspectionStatus === "OVERDUE" ? "OUT_OF_SERVICE" : "IN_SERVICE";
+  const record = {
+    asset_ref: assetRef,
+    project_id: projectId || null,
+    asset_type: assetType,
+    make: sanitiseInput(make || ""),
+    model: sanitiseInput(model || ""),
+    serial_number: sanitiseInput(serialNumber),
+    purchase_date: purchaseDate || null,
+    last_inspection_date: lastInspectionDate || null,
+    next_inspection_due: nextInspectionDue || null,
+    max_load_kg: Number(maxLoadKg) || null,
+    height_rating_m: Number(heightRatingM) || null,
+    inspection_result: inspectionResult,
+    inspection_status: inspectionStatus,
+    tag_colour: sanitiseInput(tagColour || ""),
+    assigned_to: sanitiseInput(assignedTo || ""),
+    location: sanitiseInput(location || ""),
+    status,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("ladder_register").insert(record);
+    if (error) console.error("ladder-register DB error:", error.message);
+  }
+  res.json({ assetRef, assetType, serialNumber, status, inspectionStatus, daysUntilInspection, saved: !!supabaseAdmin });
+});
+
+// GET /ladder-register — List portable access equipment for a project
+app.get("/ladder-register", apiKeyAuth, async (req, res) => {
+  const { projectId, status, assetType } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("ladder_register").select("*").order("next_inspection_due", { ascending: true });
+  if (projectId) query = query.eq("project_id", projectId);
+  if (status) query = query.eq("status", status);
+  if (assetType) query = query.eq("asset_type", assetType);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({
+    count: data.length,
+    outOfService: data.filter(a => a.status === "OUT_OF_SERVICE").length,
+    overdueInspections: data.filter(a => a.inspection_status === "OVERDUE").length,
+    assets: data,
+  });
+});
+
+// POST /height-safety-inspection — Record a height safety equipment inspection
+app.post("/height-safety-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, equipmentType, serialNumber, inspectorName, inspectionDate,
+    inspectionItems = [], overallResult, defectsFound = [], correctiveActions = [],
+    withheldFromService = false, nextInspectionDate, notes,
+  } = req.body;
+  if (!equipmentType || !serialNumber || !inspectorName || !inspectionDate || !overallResult) {
+    return res.status(400).json({ error: "equipmentType, serialNumber, inspectorName, inspectionDate, and overallResult are required." });
+  }
+  const validResults = ["PASS", "FAIL", "CONDITIONAL_PASS"];
+  if (!validResults.includes(overallResult)) {
+    return res.status(400).json({ error: `overallResult must be one of: ${validResults.join(", ")}` });
+  }
+  const inspectionRef = `HSI-${Date.now().toString(36).toUpperCase()}`;
+  const failedItems = inspectionItems.filter(i => i.result === "FAIL").length;
+  const record = {
+    inspection_ref: inspectionRef,
+    project_id: projectId || null,
+    equipment_type: sanitiseInput(equipmentType),
+    serial_number: sanitiseInput(serialNumber),
+    inspector_name: sanitiseInput(inspectorName),
+    inspection_date: inspectionDate,
+    inspection_items: Array.isArray(inspectionItems) ? inspectionItems : [],
+    overall_result: overallResult,
+    failed_items: failedItems,
+    defects_found: Array.isArray(defectsFound) ? defectsFound.map(d => sanitiseInput(d)) : [],
+    corrective_actions: Array.isArray(correctiveActions) ? correctiveActions.map(a => sanitiseInput(a)) : [],
+    withheld_from_service: overallResult === "FAIL" || Boolean(withheldFromService),
+    next_inspection_date: nextInspectionDate || null,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("height_safety_inspections").insert(record);
+    if (error) console.error("height-safety-inspection DB error:", error.message);
+  }
+  res.json({
+    inspectionRef, equipmentType, serialNumber, overallResult,
+    failedItems, withheldFromService: record.withheld_from_service,
+    nextInspectionDate, saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-swms-generator — AI generates a Safe Work Method Statement
+app.post("/ai-swms-generator", apiKeyAuth, async (req, res) => {
+  const {
+    trade, highRiskActivity, workDescription, workLocation,
+    principalContractor, siteAddress, state = "VIC",
+    involvedTrades = [], expectedDurationDays = 1,
+  } = req.body;
+  if (!trade || !highRiskActivity || !workDescription) {
+    return res.status(400).json({ error: "trade, highRiskActivity, and workDescription are required." });
+  }
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedActivity = sanitiseInput(highRiskActivity);
+  const sanitisedDesc = sanitiseInput(workDescription);
+  const sanitisedState = sanitiseInput(state);
+  const validActivities = [
+    "WORKING_AT_HEIGHT", "EXCAVATION", "DEMOLITION", "CONFINED_SPACE", "ELECTRICAL_WORK",
+    "LIFTING_OPERATIONS", "ASBESTOS_REMOVAL", "STRUCTURAL_ALTERATIONS", "PREFABRICATED_STEEL",
+    "PRESSURISED_PIPES", "EXPLOSIVE_TOOLS", "DIVING_WORK",
+  ];
+  if (!validActivities.includes(highRiskActivity)) {
+    return res.status(400).json({ error: `highRiskActivity must be one of: ${validActivities.join(", ")}` });
+  }
+  const systemPrompt = `You are an Australian WHS consultant specialising in high-risk construction work (HRCW) Safe Work Method Statements.`;
+  const userPrompt = `Generate a SWMS for HRCW under Australian WHS Regulations:
+Trade: ${sanitisedTrade}
+High-risk activity: ${sanitisedActivity}
+Work description: ${sanitisedDesc}
+State: ${sanitisedState}
+Principal contractor: ${sanitiseInput(principalContractor || "")}
+Site: ${sanitiseInput(siteAddress || "")}
+Other trades: ${involvedTrades.map(t => sanitiseInput(t)).join(", ")}
+Expected duration: ${expectedDurationDays} days
+
+Return JSON with:
+{
+  "swmsTitle": "...",
+  "hrcwDescription": "...",
+  "legislativeRequirements": ["...", "..."],
+  "workSequence": [
+    {
+      "step": 1,
+      "activity": "...",
+      "hazards": ["...", "..."],
+      "initialRisk": {"likelihood": "POSSIBLE", "consequence": "MAJOR", "rating": "HIGH"},
+      "controlMeasures": [{"hierarchy": "ELIMINATION|SUBSTITUTION|ENGINEERING|ADMIN|PPE", "measure": "..."}],
+      "residualRisk": {"likelihood": "RARE", "consequence": "MODERATE", "rating": "LOW"},
+      "responsiblePerson": "..."
+    }
+  ],
+  "plantAndEquipment": ["...", "..."],
+  "ppeRequired": ["...", "..."],
+  "trainingRequired": ["...", "..."],
+  "emergencyProcedures": "...",
+  "consultationRecord": "...",
+  "reviewTriggers": ["...", "..."]
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 4000,
+    });
+    usageStats.openaiCalls++;
+    const swms = JSON.parse(aiRes.choices[0].message.content);
+    const swmsRef = `SWMS-${Date.now().toString(36).toUpperCase()}`;
+    res.json({ swmsRef, trade: sanitisedTrade, highRiskActivity: sanitisedActivity, state: sanitisedState, swms });
+  } catch (err) {
+    console.error("ai-swms-generator error:", err.message);
+    const swmsRef = `SWMS-FALLBACK`;
+    res.json({
+      swmsRef, trade: sanitisedTrade, highRiskActivity: sanitisedActivity, state: sanitisedState,
+      swms: {
+        swmsTitle: `SWMS — ${sanitisedTrade}: ${sanitisedActivity}`,
+        hrcwDescription: sanitisedDesc,
+        legislativeRequirements: [`Work Health and Safety Regulation 2017 — ${sanitisedState}`, "WHS Act 2011 s.299 — HRCW SWMS requirement"],
+        workSequence: [
+          {
+            step: 1, activity: "Pre-work planning and site assessment",
+            hazards: ["Unidentified site hazards", "Inadequate planning"],
+            initialRisk: { likelihood: "POSSIBLE", consequence: "MAJOR", rating: "HIGH" },
+            controlMeasures: [
+              { hierarchy: "ADMIN", measure: "Complete site inspection and hazard identification before work commences" },
+              { hierarchy: "ADMIN", measure: "Brief all workers on hazards and controls" },
+            ],
+            residualRisk: { likelihood: "RARE", consequence: "MODERATE", rating: "LOW" },
+            responsiblePerson: "Site supervisor",
+          },
+        ],
+        plantAndEquipment: ["As required for the specific activity"],
+        ppeRequired: ["Hard hat", "Safety boots", "Hi-vis vest", "Safety glasses", "Gloves"],
+        trainingRequired: ["Site induction", `High-risk work licence for ${sanitisedActivity}`],
+        emergencyProcedures: "Call 000 immediately. Administer first aid if trained. Do not move injured person unless in danger.",
+        consultationRecord: "Workers and HSRs must be consulted in development of this SWMS.",
+        reviewTriggers: ["Change in work scope", "Near-miss or incident", "Request from HSR", "Regularly as scheduled"],
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
