@@ -72020,6 +72020,368 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 261 ─────────────────────────────────────────────────────────────────
+
+// POST /waste-management-record — Track construction waste quantities and disposal compliance
+app.post("/waste-management-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, recordDate, recordedBy, wasteStreams,
+      totalWasteGeneratedKg, totalWasteRecycledKg, totalWasteLandfillKg,
+      totalWasteHazardousKg, disposalContractor, disposalLicenceNumber,
+      wasteTrackingNumbers, epaNotificationRequired, epaNotificationSent,
+      contaminated, contaminationDetails, notes
+    } = req.body;
+
+    if (!projectId || !recordDate || !recordedBy) {
+      return res.status(400).json({ error: "projectId, recordDate, recordedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeRecordedBy = sanitiseInput(String(recordedBy));
+    const safeContractor = disposalContractor ? sanitiseInput(String(disposalContractor)) : null;
+    const safeLicence = disposalLicenceNumber ? sanitiseInput(String(disposalLicenceNumber)) : null;
+
+    const streams = Array.isArray(wasteStreams) ? wasteStreams : [];
+    const trackingNums = Array.isArray(wasteTrackingNumbers) ? wasteTrackingNumbers : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const totalKg = parseFloat(totalWasteGeneratedKg) || 0;
+    const recycledKg = parseFloat(totalWasteRecycledKg) || 0;
+    const landfillKg = parseFloat(totalWasteLandfillKg) || 0;
+    const hazardousKg = parseFloat(totalWasteHazardousKg) || 0;
+
+    // Environment Protection Act 2017 (Vic) — waste tracking obligations
+    if (hazardousKg > 0 && !safeLicence) {
+      criticalIssues.push("Hazardous waste disposal contractor licence number not recorded — required under Environment Protection Act 2017 (Vic) s.169.");
+    }
+    if (hazardousKg > 0 && trackingNums.length === 0) {
+      criticalIssues.push("No waste tracking numbers for hazardous waste — required per Environment Protection Act 2017 (Vic) and Waste Management Policy (Vic).");
+    }
+
+    // EPA notification thresholds
+    if (epaNotificationRequired && !epaNotificationSent) {
+      criticalIssues.push("EPA notification required but not confirmed sent — notify EPA Victoria before commencing scheduled waste transport.");
+    }
+
+    if (contaminated === true || contaminated === "true") {
+      if (!contaminationDetails) {
+        warnings.push("Contaminated waste flagged but contamination details not recorded — document contaminant type and concentration.");
+      } else {
+        warnings.push(`Contaminated waste: ${sanitiseInput(String(contaminationDetails))}. Ensure licensed contractor and waste tracking.`);
+      }
+      if (trackingNums.length === 0) {
+        criticalIssues.push("Contaminated waste must have waste tracking numbers — required for EPA audit trail.");
+      }
+    }
+
+    // Diversion rate
+    let diversionRate = null;
+    if (totalKg > 0 && recycledKg > 0) {
+      diversionRate = Math.round((recycledKg / totalKg) * 100);
+      if (diversionRate < 50) {
+        warnings.push(`Waste diversion rate ${diversionRate}% — consider increasing recycling/reuse to meet sustainability targets.`);
+      }
+    }
+
+    if (totalKg > 0 && recycledKg + landfillKg + hazardousKg > totalKg * 1.02) {
+      warnings.push("Waste stream totals exceed total generated — verify quantities.");
+    }
+
+    const complianceStatus = criticalIssues.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "REVIEW_REQUIRED" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("waste_management_records")
+        .insert({
+          project_id: safeProject,
+          record_date: recordDate,
+          recorded_by: safeRecordedBy,
+          waste_streams: streams,
+          total_waste_generated_kg: totalKg || null,
+          total_waste_recycled_kg: recycledKg || null,
+          total_waste_landfill_kg: landfillKg || null,
+          total_waste_hazardous_kg: hazardousKg || null,
+          diversion_rate_percent: diversionRate,
+          disposal_contractor: safeContractor,
+          disposal_licence_number: safeLicence,
+          waste_tracking_numbers: trackingNums,
+          epa_notification_required: epaNotificationRequired || false,
+          epa_notification_sent: epaNotificationSent || false,
+          contaminated: contaminated || false,
+          contamination_details: contaminationDetails ? sanitiseInput(String(contaminationDetails)) : null,
+          compliance_status: complianceStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        complianceStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Waste management non-compliant — rectify before disposal proceeds.",
+        standards: ["Environment Protection Act 2017 (Vic)", "Waste Management Policy (Vic)", "SEPP (Waste to Resources)"],
+      });
+    }
+
+    res.json({
+      complianceStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      totalWasteKg: totalKg,
+      diversionRatePercent: diversionRate,
+      standards: ["Environment Protection Act 2017 (Vic)", "Waste Management Policy (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /waste-management-record error:", err.message);
+    res.status(500).json({ error: "Failed to record waste management data." });
+  }
+});
+
+// POST /stormwater-management-record — Record stormwater quality monitoring on construction sites
+app.post("/stormwater-management-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, siteAddress, recordDate, recordedBy,
+      rainfallEventMm, turbidityNTU, phLevel, oilSheenPresent,
+      sedimentBasinsInstalled, sedimentBasinDesludged,
+      siltFencesIntact, erosionControlsWorking, catchmentDrains,
+      dischargeSampledNTU, dischargeSampledPH, dischargeToReceivingWater,
+      receivingWaterType, nonCompliantDischargeOccurred, correctiveActionsTaken,
+      epaSppWatersCompliant, notes
+    } = req.body;
+
+    if (!projectId || !siteAddress || !recordDate || !recordedBy) {
+      return res.status(400).json({ error: "projectId, siteAddress, recordDate, recordedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeSite = sanitiseInput(String(siteAddress));
+    const safeRecordedBy = sanitiseInput(String(recordedBy));
+
+    const turbidity = parseFloat(turbidityNTU) || null;
+    const dischargeTurbidity = parseFloat(dischargeSampledNTU) || null;
+    const ph = parseFloat(phLevel) || null;
+    const dischargePH = parseFloat(dischargeSampledPH) || null;
+
+    const criticalIssues = [];
+    const warnings = [];
+
+    // SEPP Waters 2018 (Vic) — discharge limits for construction sites
+    // Turbidity limit: 50 NTU for discharges to waterways (typical SEPP standard)
+    if (dischargeTurbidity !== null && dischargeTurbidity > 50) {
+      criticalIssues.push(`Discharge turbidity ${dischargeTurbidity} NTU exceeds 50 NTU limit — non-compliant discharge. Notify EPA (SEPP Waters 2018 Vic).`);
+    } else if (dischargeTurbidity !== null && dischargeTurbidity > 30) {
+      warnings.push(`Discharge turbidity ${dischargeTurbidity} NTU approaching limit — tighten erosion controls.`);
+    }
+
+    if (dischargePH !== null && (dischargePH < 6.5 || dischargePH > 8.5)) {
+      criticalIssues.push(`Discharge pH ${dischargePH} outside 6.5–8.5 range — non-compliant with SEPP Waters 2018 (Vic).`);
+    }
+
+    if (oilSheenPresent === true || oilSheenPresent === "true") {
+      criticalIssues.push("Oil sheen detected — hydrocarbon spill or machine leak. Contain and report to EPA (Environment Protection Act 2017 Vic s.254).");
+    }
+
+    if (nonCompliantDischargeOccurred === true || nonCompliantDischargeOccurred === "true") {
+      criticalIssues.push("Non-compliant discharge reported — mandatory EPA notification required (Environment Protection Act 2017 Vic s.254).");
+      if (!correctiveActionsTaken) {
+        criticalIssues.push("Non-compliant discharge occurred but corrective actions not documented.");
+      }
+    }
+
+    if (!sedimentBasinsInstalled) {
+      warnings.push("Sediment basins not confirmed installed — required for catchment area >5000m² (EPA Construction Runoff Guidelines).");
+    }
+    if (!siltFencesIntact) {
+      warnings.push("Silt fences not intact — repair or replace to prevent sediment runoff.");
+    }
+    if (!erosionControlsWorking) {
+      warnings.push("Erosion controls not confirmed operational — inspect and repair before next rainfall event.");
+    }
+
+    if (sedimentBasinsInstalled && !sedimentBasinDesludged) {
+      if (turbidity !== null && turbidity > 200) {
+        warnings.push("High-turbidity rainfall — check sediment basin and desludge if >50% capacity.");
+      }
+    }
+
+    const complianceStatus = criticalIssues.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "ATTENTION_REQUIRED" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("stormwater_management_records")
+        .insert({
+          project_id: safeProject,
+          site_address: safeSite,
+          record_date: recordDate,
+          recorded_by: safeRecordedBy,
+          rainfall_event_mm: rainfallEventMm || null,
+          turbidity_ntu: turbidity,
+          ph_level: ph,
+          oil_sheen_present: oilSheenPresent || false,
+          sediment_basins_installed: sedimentBasinsInstalled || false,
+          sediment_basin_desludged: sedimentBasinDesludged || false,
+          silt_fences_intact: siltFencesIntact || false,
+          erosion_controls_working: erosionControlsWorking || false,
+          discharge_sampled_ntu: dischargeTurbidity,
+          discharge_sampled_ph: dischargePH,
+          discharge_to_receiving_water: dischargeToReceivingWater || false,
+          receiving_water_type: receivingWaterType ? sanitiseInput(String(receivingWaterType)) : null,
+          non_compliant_discharge: nonCompliantDischargeOccurred || false,
+          corrective_actions: correctiveActionsTaken ? sanitiseInput(String(correctiveActionsTaken)) : null,
+          compliance_status: complianceStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        complianceStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Stormwater non-compliance — stop discharge and notify EPA Victoria.",
+        standards: ["SEPP Waters 2018 (Vic)", "Environment Protection Act 2017 (Vic)", "EPA Construction Runoff Guidelines"],
+      });
+    }
+
+    res.json({
+      complianceStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      dischargeTurbidityNTU: dischargeTurbidity,
+      dischargePH,
+      standards: ["SEPP Waters 2018 (Vic)", "Environment Protection Act 2017 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /stormwater-management-record error:", err.message);
+    res.status(500).json({ error: "Failed to record stormwater management data." });
+  }
+});
+
+// POST /ai-environmental-risk-assessment — AI assesses construction environmental risk profile
+app.post("/ai-environmental-risk-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectType, siteArea, proximityToWaterway, proximityToHeritageSite,
+      soilContaminationKnown, vegetationClearing, endangeredSpeciesPresent,
+      noiseSensitiveReceivers, dustSensitiveReceivers,
+      wasteTypes, constructionDurationMonths, siteContext
+    } = req.body;
+
+    if (!projectType) {
+      return res.status(400).json({ error: "projectType is required." });
+    }
+
+    const safeProjectType = sanitiseInput(String(projectType));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const wastes = Array.isArray(wasteTypes) ? wasteTypes.map(w => sanitiseInput(String(w))) : [];
+
+    const prompt = `You are an environmental consultant assessing the risk profile for a Victorian construction project.
+
+Project type: ${safeProjectType}
+Site area: ${siteArea ? siteArea + " m²" : "Unknown"}
+Proximity to waterway: ${proximityToWaterway || "Unknown"}
+Proximity to heritage site: ${proximityToHeritageSite || "Unknown"}
+Soil contamination known: ${soilContaminationKnown ? "Yes" : "No"}
+Vegetation clearing required: ${vegetationClearing ? "Yes" : "No"}
+Endangered species present: ${endangeredSpeciesPresent ? "Yes" : "No"}
+Noise-sensitive receivers: ${noiseSensitiveReceivers || "Unknown"}
+Dust-sensitive receivers: ${dustSensitiveReceivers || "Unknown"}
+Waste types: ${wastes.length > 0 ? wastes.join(", ") : "Not specified"}
+Project duration: ${constructionDurationMonths ? constructionDurationMonths + " months" : "Unknown"}
+Location: ${safeSite}
+
+Assess environmental risks under:
+- Environment Protection Act 2017 (Vic)
+- SEPP Waters 2018 (Vic)
+- Flora and Fauna Guarantee Act 1988 (Vic)
+- Heritage Act 2017 (Vic)
+- Planning and Environment Act 1987 (Vic)
+- NCC 2022
+
+Provide:
+1. Overall environmental risk rating
+2. Highest-risk environmental aspects
+3. Required environmental approvals / referrals
+4. Mandatory management plans
+5. Monitoring requirements
+6. Regulatory notifications required
+
+Respond ONLY in JSON:
+{
+  "overallRisk": "LOW|MODERATE|HIGH|EXTREME",
+  "highestRiskAspects": ["string"],
+  "approvalsRequired": ["string"],
+  "managementPlansRequired": ["string"],
+  "monitoringRequirements": ["string"],
+  "regulatoryNotifications": ["string"],
+  "potentialOffences": ["string"],
+  "applicableStandards": ["string"],
+  "eppRequired": true|false,
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallRisk: "MODERATE",
+        highestRiskAspects: ["Stormwater runoff", "Dust generation", "Waste management"],
+        approvalsRequired: ["Planning permit (if applicable)", "EPA works approval (if triggering)"],
+        managementPlansRequired: [
+          "Construction Environmental Management Plan (CEMP)",
+          "Stormwater Management Plan",
+          "Dust Management Plan",
+        ],
+        monitoringRequirements: ["Weekly stormwater inspection", "Dust monitoring during dry/windy conditions"],
+        regulatoryNotifications: ["Notify EPA if non-compliant discharge occurs"],
+        potentialOffences: ["Unlawful discharge to waterway (Environment Protection Act 2017 Vic)"],
+        applicableStandards: ["Environment Protection Act 2017 (Vic)", "SEPP Waters 2018 (Vic)"],
+        eppRequired: false,
+        summary: "AI assessment unavailable. Engage environmental consultant to develop site-specific CEMP.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      projectType: safeProjectType,
+      standards: ["Environment Protection Act 2017 (Vic)", "SEPP Waters 2018 (Vic)", "Flora and Fauna Guarantee Act 1988 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /ai-environmental-risk-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess environmental risk." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
