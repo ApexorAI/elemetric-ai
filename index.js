@@ -85785,6 +85785,472 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 295 ─────────────────────────────────────────────────────────────────
+
+// POST /bridge-inspection — Record bridge/overpass structural inspection per AS 5100.1 / AUSTROADS
+app.post("/bridge-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, bridgeId, bridgeName, location, inspectionDate, inspectedBy,
+      inspectorLicence, inspectionLevel, bridgeType, constructionMaterial,
+      spanCountM, totalLengthM, deckWidthM, yearConstructed, designLoadKn,
+      generalConditionRating, superstructureCondition, substructureCondition, deckCondition,
+      bearingsCondition, jointsCondition, drainageCondition,
+      scourEvidenced, scourDepthMm, foundationExposure,
+      crackingObserved, crackingLocation, crackWidth,
+      corrosionObserved, corrosionLocation, corrosionSeverity,
+      spalling, delaminationOfConcrete,
+      overloadEvidence, vehicleImpactDamage,
+      loadRatingCompleted, currentLoadLimitT, signageInstalled,
+      safetyBarriersOk, approachSignageOk, pavementApproachOk,
+      dueForLoadTest, remedialActionsRequired, remediationPriority,
+      nextInspectionDue, certRef, notes
+    } = req.body;
+
+    if (!bridgeId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "bridgeId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeBridgeId = sanitiseInput(String(bridgeId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const criticalIssues = [];
+    const warnings = [];
+
+    const crackW = parseFloat(crackWidth) || null;
+    const scourD = parseFloat(scourDepthMm) || null;
+    const genRating = parseInt(generalConditionRating) || null;
+    const yearBuilt = parseInt(yearConstructed) || null;
+
+    // AS 5100.1 — Bridge design — Scope and general principles
+    // AUSTROADS Bridge Inspection Manual
+    // Road Management Act 2004 (Vic)
+    if (genRating !== null && genRating <= 2) {
+      criticalIssues.push(`Bridge general condition rating ${genRating}/10 — CRITICAL structural condition. Restrict load or close bridge immediately. Engage structural engineer (AS 5100.1 / AUSTROADS Bridge Management).`);
+    } else if (genRating !== null && genRating <= 4) {
+      criticalIssues.push(`Bridge general condition rating ${genRating}/10 — POOR structural condition. Detailed structural inspection and load review required (AUSTROADS Bridge Inspection Manual).`);
+    }
+
+    if (scourEvidenced === true || scourEvidenced === "true") {
+      if (scourD !== null && scourD > 300) {
+        criticalIssues.push(`Scour depth ${scourD} mm detected at bridge foundations — significant scour threatens foundation integrity. Close bridge and engage structural/hydraulic engineer immediately (AUSTROADS).`);
+      } else {
+        criticalIssues.push(`Scour evidence detected at bridge substructure — scour is a leading cause of bridge failure. Engineer assessment required before next flood event (AUSTROADS).`);
+      }
+    }
+
+    if (foundationExposure === true || foundationExposure === "true") {
+      criticalIssues.push("Foundation exposure detected — exposed foundation elements may indicate loss of bearing support. Load restrict and engage geotechnical engineer immediately.");
+    }
+
+    if (vehicleImpactDamage === true || vehicleImpactDamage === "true") {
+      criticalIssues.push("Vehicle impact damage detected — structural assessment required to determine capacity reduction before unrestricted use can continue.");
+    }
+
+    if (crackW !== null && crackW > 0.5) {
+      criticalIssues.push(`Crack width ${crackW} mm exceeds 0.5 mm threshold — active cracking or significant structural crack. Detailed investigation required (AS 5100 / ACI 318).`);
+    }
+
+    const corrSev = String(corrosionSeverity || "").toUpperCase();
+    if (corrosionObserved && (corrSev === "SEVERE" || corrSev === "HEAVY")) {
+      criticalIssues.push(`Severe corrosion at ${corrosionLocation || "bridge element"} — loss of section may compromise structural capacity. Structural assessment required (AS 5100.1).`);
+    }
+
+    if ((delaminationOfConcrete === true || delaminationOfConcrete === "true") || spalling) {
+      warnings.push("Concrete delamination/spalling detected — risk of falling debris to road users. Install netting or close below structure until repaired.");
+    }
+
+    if (!safetyBarriersOk) {
+      warnings.push("Safety barrier deficiency — bridge safety barriers must meet AUSTROADS design requirements. Repair or replace barriers before opening to traffic.");
+    }
+
+    if (!loadRatingCompleted || !currentLoadLimitT) {
+      warnings.push("Load rating not current — all bridges should have a current load rating to ensure safe load limits (AS 5100 / AUSTROADS Bridge Management).");
+    }
+
+    if (yearBuilt && yearBuilt < 1970) {
+      warnings.push(`Bridge constructed ${yearBuilt} — bridges pre-dating modern design standards may not meet current load requirements. Review load rating and consider structural assessment.`);
+    }
+
+    if (remedialActionsRequired === true || remedialActionsRequired === "true") {
+      const priority = String(remediationPriority || "").toUpperCase();
+      if (priority === "HIGH" || priority === "URGENT" || priority === "CRITICAL") {
+        criticalIssues.push(`Remediation priority ${remediationPriority} — schedule repairs and confirm bridge safety before unrestricted use.`);
+      }
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "LOAD_RESTRICT_OR_CLOSE" : warnings.length > 0 ? "MONITOR" : "SERVICEABLE";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("bridge_inspections")
+        .insert({
+          project_id: safeProject,
+          bridge_id: safeBridgeId,
+          bridge_name: bridgeName ? sanitiseInput(String(bridgeName)) : null,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          inspector_licence: inspectorLicence ? sanitiseInput(String(inspectorLicence)) : null,
+          inspection_level: inspectionLevel ? sanitiseInput(String(inspectionLevel)) : null,
+          bridge_type: bridgeType ? sanitiseInput(String(bridgeType)) : null,
+          construction_material: constructionMaterial ? sanitiseInput(String(constructionMaterial)) : null,
+          total_length_m: parseFloat(totalLengthM) || null,
+          deck_width_m: parseFloat(deckWidthM) || null,
+          year_constructed: yearBuilt,
+          design_load_kn: parseFloat(designLoadKn) || null,
+          general_condition_rating: genRating,
+          superstructure_condition: superstructureCondition ? sanitiseInput(String(superstructureCondition)) : null,
+          substructure_condition: substructureCondition ? sanitiseInput(String(substructureCondition)) : null,
+          deck_condition: deckCondition ? sanitiseInput(String(deckCondition)) : null,
+          scour_evidenced: scourEvidenced || false,
+          scour_depth_mm: scourD,
+          foundation_exposure: foundationExposure || false,
+          cracking_observed: crackingObserved || false,
+          crack_width_mm: crackW,
+          corrosion_observed: corrosionObserved || false,
+          corrosion_severity: corrosionSeverity ? sanitiseInput(String(corrosionSeverity)) : null,
+          vehicle_impact_damage: vehicleImpactDamage || false,
+          load_rating_completed: loadRatingCompleted !== false && loadRatingCompleted !== "false",
+          current_load_limit_t: parseFloat(currentLoadLimitT) || null,
+          safety_barriers_ok: safetyBarriersOk !== false && safetyBarriersOk !== "false",
+          remedial_required: remedialActionsRequired || false,
+          remediation_priority: remediationPriority ? sanitiseInput(String(remediationPriority)) : null,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          next_inspection_due: nextInspectionDue || null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Bridge structural concerns — load restriction or closure may be required. Engage structural engineer immediately.",
+        standards: ["AS 5100.1", "AUSTROADS Bridge Inspection Manual", "Road Management Act 2004 (Vic)"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      bridgeId: safeBridgeId,
+      nextInspectionDue: nextInspectionDue || null,
+      standards: ["AS 5100.1", "AUSTROADS Bridge Inspection Manual"],
+    });
+  } catch (err) {
+    console.error("POST /bridge-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record bridge inspection." });
+  }
+});
+
+// POST /road-pavement-assessment — Record road pavement condition assessment
+app.post("/road-pavement-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, assessmentId, roadName, location, assessmentDate, assessedBy,
+      pavementType, constructionYear, aadtVehicles, hcvPercent,
+      roughnessIri, roughnessLimit,
+      ruttingMaxMm, ruttingLimit,
+      crackingPercent, crackingType, crackSeverity,
+      pavementConditionIndex, pciThreshold,
+      drainageCondition, kerbGutterOk, pitInspected,
+      lineMarkingOk, signageOk, guardRailOk,
+      slipperySection, skidResistance, skidResistanceLimit,
+      potholesCount, potholeSeverity,
+      pavementStrengthDeflection, designBearing,
+      urgentRepairsRequired, repairPriority,
+      nextAssessmentDue, certRef, notes
+    } = req.body;
+
+    if (!assessmentId || !roadName || !assessmentDate || !assessedBy) {
+      return res.status(400).json({ error: "assessmentId, roadName, assessmentDate, assessedBy are required." });
+    }
+
+    const safeAssId = sanitiseInput(String(assessmentId));
+    const safeRoadName = sanitiseInput(String(roadName));
+    const safeAssessor = sanitiseInput(String(assessedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const criticalIssues = [];
+    const warnings = [];
+
+    const roughness = parseFloat(roughnessIri) || null;
+    const roughnessLim = parseFloat(roughnessLimit) || null;
+    const rutting = parseFloat(ruttingMaxMm) || null;
+    const ruttingLim = parseFloat(ruttingLimit) || null;
+    const pci = parseFloat(pavementConditionIndex) || null;
+    const pciThresh = parseFloat(pciThreshold) || 40; // below 40 generally requires intervention
+    const skidRes = parseFloat(skidResistance) || null;
+    const skidLim = parseFloat(skidResistanceLimit) || null;
+
+    // Road Management Act 2004 (Vic) / VicRoads Technical Specifications
+    // AUSTROADS Pavement Design / AGPT Guide to Pavement Technology
+    if (pci !== null && pci < 25) {
+      criticalIssues.push(`Pavement Condition Index ${pci} — FAILED (below 25). Immediate intervention required. Road may need to be closed or load restricted (Road Management Act 2004 (Vic) s.40).`);
+    } else if (pci !== null && pci < pciThresh) {
+      criticalIssues.push(`Pavement Condition Index ${pci} below threshold ${pciThresh} — urgent pavement rehabilitation required.`);
+    }
+
+    if (skidRes !== null && skidLim !== null && skidRes < skidLim) {
+      criticalIssues.push(`Skid resistance ${skidRes} below minimum ${skidLim} — road surface is unsafe in wet conditions. High crash risk. Apply surface treatment or close section (Road Management Act 2004 (Vic)).`);
+    }
+
+    if (slipperySection === true || slipperySection === "true") {
+      criticalIssues.push("Slippery surface section identified — install warning signage and apply anti-skid treatment immediately. High crash risk.");
+    }
+
+    if (rutting !== null && ruttingLim !== null && rutting > ruttingLim) {
+      criticalIssues.push(`Maximum rutting depth ${rutting} mm exceeds limit ${ruttingLim} mm — water ponding and vehicle instability risk. Schedule urgent rehabilitation (AUSTROADS Pavement Design).`);
+    } else if (rutting !== null && rutting > 30) {
+      criticalIssues.push(`Severe rutting ${rutting} mm — water ponding in ruts is a crash risk. Schedule urgent repairs.`);
+    }
+
+    const potCount = parseInt(potholesCount) || 0;
+    const potSev = String(potholeSeverity || "").toUpperCase();
+    if (potCount > 0 && (potSev === "SEVERE" || potSev === "HIGH")) {
+      criticalIssues.push(`${potCount} severe pothole(s) detected — high road damage and vehicle safety risk. Repair within 24 hours for high-traffic roads (Road Management Act 2004 (Vic) — road authority duty of care).`);
+    } else if (potCount > 5) {
+      warnings.push(`${potCount} potholes detected — schedule urgent patching repairs to prevent damage and liability.`);
+    }
+
+    if (roughness !== null && roughnessLim !== null && roughness > roughnessLim) {
+      warnings.push(`International Roughness Index ${roughness} IRI exceeds limit ${roughnessLim} IRI — rough road surface increases vehicle wear, user discomfort, and road authority liability.`);
+    }
+
+    if (!lineMarkingOk) {
+      warnings.push("Line marking deficiency — worn or missing line marking is a road safety risk. Schedule re-marking (AUSTROADS Guide to Road Design Part 6A).");
+    }
+
+    if (!drainageCondition || String(drainageCondition).toUpperCase() === "POOR") {
+      warnings.push("Poor drainage condition — standing water on pavement accelerates deterioration and creates crash risk. Clear drainage pits and pipes.");
+    }
+
+    const urgentPriority = String(repairPriority || "").toUpperCase();
+    if ((urgentRepairsRequired === true || urgentRepairsRequired === "true") && (urgentPriority === "HIGH" || urgentPriority === "URGENT")) {
+      criticalIssues.push(`Urgent repairs identified (priority: ${repairPriority}) — road authority has duty of care to maintain safe road surface under Road Management Act 2004 (Vic).`);
+    }
+
+    const assessmentStatus = criticalIssues.length > 0 ? "INTERVENTION_REQUIRED" : warnings.length > 0 ? "MONITOR" : "ACCEPTABLE";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("road_pavement_assessments")
+        .insert({
+          project_id: safeProject,
+          assessment_id: safeAssId,
+          road_name: safeRoadName,
+          location: location ? sanitiseInput(String(location)) : null,
+          assessment_date: assessmentDate,
+          assessed_by: safeAssessor,
+          pavement_type: pavementType ? sanitiseInput(String(pavementType)) : null,
+          construction_year: parseInt(constructionYear) || null,
+          aadt: parseInt(aadtVehicles) || null,
+          hcv_percent: parseFloat(hcvPercent) || null,
+          roughness_iri: roughness,
+          roughness_limit: roughnessLim,
+          rutting_max_mm: rutting,
+          rutting_limit: ruttingLim,
+          cracking_percent: parseFloat(crackingPercent) || null,
+          cracking_type: crackingType ? sanitiseInput(String(crackingType)) : null,
+          pci: pci,
+          pci_threshold: pciThresh,
+          skid_resistance: skidRes,
+          slippery_section: slipperySection || false,
+          potholes_count: potCount,
+          pothole_severity: potholeSeverity ? sanitiseInput(String(potholeSeverity)) : null,
+          line_marking_ok: lineMarkingOk !== false && lineMarkingOk !== "false",
+          drainage_condition: drainageCondition ? sanitiseInput(String(drainageCondition)) : null,
+          urgent_repairs: urgentRepairsRequired || false,
+          repair_priority: repairPriority ? sanitiseInput(String(repairPriority)) : null,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          next_assessment_due: nextAssessmentDue || null,
+          assessment_status: assessmentStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        assessmentStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Road pavement requires urgent intervention — road authority liability risk. Schedule repairs promptly.",
+        standards: ["Road Management Act 2004 (Vic)", "AUSTROADS Pavement Design Guide", "VicRoads Technical Specifications"],
+      });
+    }
+
+    res.json({
+      assessmentStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      assessmentId: safeAssId,
+      nextAssessmentDue: nextAssessmentDue || null,
+      standards: ["Road Management Act 2004 (Vic)", "AUSTROADS Pavement Design Guide"],
+    });
+  } catch (err) {
+    console.error("POST /road-pavement-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to record road pavement assessment." });
+  }
+});
+
+// POST /ai-transport-infrastructure-assessment — AI assesses transport infrastructure condition and compliance
+app.post("/ai-transport-infrastructure-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      networkId, networkAuthority, totalBridgeCount, bridgesInPoorCondition,
+      totalRoadLengthKm, roadsRequiringRehab,
+      averagePCI, percentBelowThreshold,
+      majorMaintenanceBacklogM, budgetAllocatedM,
+      inspectionProgramCurrent, nextInspectionCycle,
+      failureModes, incidentHistory,
+      climateRiskAssessed, floodProneAssets, seismicZone,
+      safetyAuditsConducted, crashHistory,
+      roadManagementPlanCurrent, assetManagementSystemInPlace,
+      austroadsCompliancePercent, deficienciesNoted, notes
+    } = req.body;
+
+    if (!networkId) {
+      return res.status(400).json({ error: "networkId is required." });
+    }
+
+    const safeNetworkId = sanitiseInput(String(networkId));
+    const deficiencies = Array.isArray(deficienciesNoted) ? deficienciesNoted : [];
+    const failures = Array.isArray(failureModes) ? failureModes : [];
+    const floodProne = Array.isArray(floodProneAssets) ? floodProneAssets : [];
+
+    const prompt = `You are an expert transport infrastructure engineer specialising in asset management and compliance. Assess this transport network's infrastructure condition and management compliance.
+
+Network ID: ${safeNetworkId}
+Network authority: ${networkAuthority || "Unknown"}
+
+BRIDGES:
+- Total bridges: ${totalBridgeCount || 0}
+- Bridges in poor condition: ${bridgesInPoorCondition || 0}
+
+ROADS:
+- Total road length: ${totalRoadLengthKm || 0} km
+- Roads requiring rehabilitation: ${roadsRequiringRehab || 0} km
+- Average PCI: ${averagePCI || "Unknown"}
+- % below threshold: ${percentBelowThreshold || 0}%
+
+MAINTENANCE:
+- Major maintenance backlog: $${majorMaintenanceBacklogM || 0}M
+- Budget allocated: $${budgetAllocatedM || 0}M
+- Inspection program current: ${inspectionProgramCurrent ? "Yes" : "No"}
+- Next inspection cycle: ${nextInspectionCycle || "Unknown"}
+
+RISK:
+- Known failure modes: ${failures.join(", ") || "None"}
+- Climate risk assessed: ${climateRiskAssessed ? "Yes" : "No"}
+- Flood-prone assets: ${floodProne.length > 0 ? floodProne.join(", ") : "None identified"}
+- Seismic zone: ${seismicZone || "Unknown"}
+
+SAFETY:
+- Safety audits conducted: ${safetyAuditsConducted ? "Yes" : "No"}
+- Crash history: ${incidentHistory || "None recorded"}
+
+MANAGEMENT:
+- Road management plan: ${roadManagementPlanCurrent ? "Yes" : "No"}
+- Asset management system: ${assetManagementSystemInPlace ? "Yes" : "No"}
+- AUSTROADS compliance: ${austroadsCompliancePercent || "Unknown"}%
+
+Deficiencies: ${deficiencies.join("; ") || "None"}
+
+Assess under:
+- Road Management Act 2004 (Vic) — road authority inspection obligations
+- AS 5100.1 (bridge design)
+- AUSTROADS Bridge Inspection Manual
+- AUSTROADS Guide to Pavement Technology (Parts 1–8)
+- Road Safety Act 1986 (Vic)
+- Emergency Management Act 2013 (Vic)
+- ISO 55001 (asset management)
+
+Provide:
+1. Overall network condition risk rating
+2. Bridge inventory risk
+3. Pavement condition risk
+4. Maintenance funding adequacy
+5. Climate resilience assessment
+6. Priority recommendations
+
+Respond ONLY in JSON:
+{
+  "overallNetworkRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "bridgeInventoryRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "pavementConditionRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "maintenanceFundingRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "climateResilienceRisk": "LOW|MODERATE|HIGH",
+  "legalLiabilityRisk": "LOW|MODERATE|HIGH|VERY_HIGH",
+  "bridgeFindings": ["string"],
+  "pavementFindings": ["string"],
+  "maintenanceFindings": ["string"],
+  "climateFindings": ["string"],
+  "priorityRecommendations": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 900,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallNetworkRisk: "MODERATE",
+        bridgeInventoryRisk: "MODERATE",
+        pavementConditionRisk: "MODERATE",
+        maintenanceFundingRisk: "MODERATE",
+        climateResilienceRisk: "MODERATE",
+        legalLiabilityRisk: "MODERATE",
+        bridgeFindings: ["AI assessment unavailable — prioritise inspection of oldest bridges per AUSTROADS Bridge Inspection Manual"],
+        pavementFindings: ["AI assessment unavailable — review pavement condition index for all segments against intervention thresholds"],
+        maintenanceFindings: ["Review maintenance backlog and prioritise life-safety critical assets under Road Management Act 2004 (Vic)"],
+        climateFindings: ["Assess flood vulnerability of low-lying bridges and road segments under climate projections"],
+        priorityRecommendations: ["Implement ISO 55001-aligned asset management system", "Prioritise bridge inspection program per AUSTROADS manual"],
+        applicableStandards: ["Road Management Act 2004 (Vic)", "AS 5100.1", "AUSTROADS Bridge Inspection Manual", "AUSTROADS AGPT", "ISO 55001"],
+        summary: "AI transport infrastructure assessment unavailable. Engage accredited road and bridge engineers for formal network condition assessment.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      networkId: safeNetworkId,
+      standards: ["Road Management Act 2004 (Vic)", "AS 5100.1", "AUSTROADS", "ISO 55001"],
+    });
+  } catch (err) {
+    console.error("POST /ai-transport-infrastructure-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess transport infrastructure." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
