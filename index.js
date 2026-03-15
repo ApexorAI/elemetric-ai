@@ -28815,6 +28815,228 @@ Return a JSON object with:
   }
 });
 
+// ── Round 100: Drawing register, AI drawing review, shop drawing approval ─────
+
+// POST /drawing-register — Register a project drawing or document
+app.post("/drawing-register", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, drawingNumber, revision, title,
+    discipline, drawingType, issuedBy, issuedDate,
+    scale, fileUrl, supersedes,
+  } = req.body;
+
+  if (!projectId || !drawingNumber || !title)
+    return res.status(400).json({ error: "projectId, drawingNumber, title required." });
+
+  const validDisciplines = ["ARCHITECTURAL", "STRUCTURAL", "CIVIL", "MECHANICAL", "ELECTRICAL", "PLUMBING", "FIRE", "HYDRAULIC", "LANDSCAPE", "OTHER"];
+  const validTypes = ["FOR_CONSTRUCTION", "FOR_INFORMATION", "FOR_APPROVAL", "AS_BUILT", "PRELIMINARY", "SHOP_DRAWING", "COORDINATION"];
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    drawing_number: sanitiseInput(drawingNumber),
+    revision: sanitiseInput(revision || "A"),
+    title: sanitiseInput(title),
+    discipline: validDisciplines.includes((discipline || "").toUpperCase()) ? discipline.toUpperCase() : "OTHER",
+    drawing_type: validTypes.includes((drawingType || "").toUpperCase()) ? drawingType.toUpperCase() : "FOR_CONSTRUCTION",
+    issued_by: sanitiseInput(issuedBy || ""),
+    issued_date: issuedDate || new Date().toISOString().split("T")[0],
+    scale: sanitiseInput(scale || ""),
+    file_url: fileUrl && isSafeUrl(fileUrl) ? fileUrl : null,
+    supersedes: sanitiseInput(supersedes || ""),
+    status: "CURRENT",
+    registered_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("drawing_register")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, drawingId: data.id, ...record });
+  }
+
+  res.json({ success: true, drawingId: null, ...record, saved: false });
+});
+
+// GET /drawings/:projectId — List drawings for a project
+app.get("/drawings/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { discipline, drawingType } = req.query;
+
+  if (supabaseAdmin) {
+    let query = supabaseAdmin
+      .from("drawing_register")
+      .select("*")
+      .eq("project_id", projectId)
+      .eq("status", "CURRENT")
+      .order("drawing_number", { ascending: true });
+
+    if (discipline) query = query.eq("discipline", discipline.toUpperCase());
+    if (drawingType) query = query.eq("drawing_type", drawingType.toUpperCase());
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "DB error." });
+    return res.json({ projectId, drawings: data || [], count: (data || []).length });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /shop-drawing-approval — Submit or respond to a shop drawing approval request
+app.post("/shop-drawing-approval", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, submissionNumber, submittedBy, drawingTitle,
+    drawingNumber, revision, trade, reviewedBy,
+    status, comments, resubmitRequired = false,
+  } = req.body;
+
+  if (!projectId || !submissionNumber || !drawingTitle)
+    return res.status(400).json({ error: "projectId, submissionNumber, drawingTitle required." });
+
+  const validStatuses = ["SUBMITTED", "APPROVED", "APPROVED_WITH_COMMENTS", "REJECTED", "REVISE_RESUBMIT"];
+  const sub = (status || "SUBMITTED").toUpperCase();
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    submission_number: sanitiseInput(String(submissionNumber)),
+    submitted_by: sanitiseInput(submittedBy || ""),
+    drawing_title: sanitiseInput(drawingTitle),
+    drawing_number: sanitiseInput(drawingNumber || ""),
+    revision: sanitiseInput(revision || "A"),
+    trade: sanitiseInput(trade || ""),
+    reviewed_by: sanitiseInput(reviewedBy || ""),
+    status: validStatuses.includes(sub) ? sub : "SUBMITTED",
+    comments: sanitiseInput(comments || ""),
+    resubmit_required: Boolean(resubmitRequired) || sub === "REVISE_RESUBMIT" || sub === "REJECTED",
+    submitted_at: new Date().toISOString(),
+    reviewed_at: reviewedBy ? new Date().toISOString() : null,
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("shop_drawing_approvals")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, approvalId: data.id, ...record });
+  }
+
+  res.json({ success: true, approvalId: null, ...record, saved: false });
+});
+
+// POST /ai-drawing-review — AI reviews a drawing description and flags potential issues
+app.post("/ai-drawing-review", apiKeyAuth, async (req, res) => {
+  const {
+    drawingType, discipline, trade, drawingDescription,
+    buildingClass, nccVersion = "2022", state = "VIC",
+  } = req.body;
+
+  if (!drawingDescription || !discipline) return res.status(400).json({ error: "drawingDescription and discipline required." });
+
+  const sanitisedDesc = sanitiseInput(drawingDescription);
+
+  const prompt = `You are a senior construction document controller and compliance expert in Australia. Review the following drawing description and identify potential compliance issues, missing information, and coordination concerns.
+
+Drawing type: ${sanitiseInput(drawingType || "Construction Drawing")}
+Discipline: ${sanitiseInput(discipline)}
+Trade: ${sanitiseInput(trade || "Not specified")}
+NCC version: ${sanitiseInput(nccVersion)}
+State: ${sanitiseInput(state)}
+Building class: ${sanitiseInput(buildingClass || "Not specified")}
+
+DRAWING DESCRIPTION:
+${sanitisedDesc}
+
+Return a JSON object with:
+- "complianceStatus": "COMPLIANT"|"MINOR_ISSUES"|"MAJOR_ISSUES"|"NON_COMPLIANT"
+- "issues": array of { "severity": "LOW"|"MEDIUM"|"HIGH", "category": string, "description": string, "recommendation": string }
+- "missingInformation": array of items that should be shown on the drawing
+- "coordinationChecks": array of items to coordinate with other disciplines
+- "applicableStandards": array of relevant codes/standards to verify
+- "overallComment": string
+- "approvalRecommendation": "APPROVE"|"APPROVE_WITH_COMMENTS"|"REVISE_RESUBMIT"|"REJECT"`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1800,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, discipline, drawingType, state, reviewedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      complianceStatus: "MINOR_ISSUES",
+      issues: [{ severity: "LOW", category: "Review", description: "Automated review unavailable.", recommendation: "Perform manual review by qualified person." }],
+      missingInformation: [],
+      coordinationChecks: [],
+      applicableStandards: [],
+      overallComment: "Automated drawing review temporarily unavailable. Manual review required.",
+      approvalRecommendation: "APPROVE_WITH_COMMENTS",
+      discipline, drawingType, state, reviewedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /transmittal — Issue a formal document transmittal
+app.post("/transmittal", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, transmittalNumber, from, to,
+    documents = [], purposeCode, message, requiredResponse,
+  } = req.body;
+
+  if (!projectId || !transmittalNumber || !documents.length)
+    return res.status(400).json({ error: "projectId, transmittalNumber, documents required." });
+
+  const purposeCodes = {
+    "A": "For Approval", "B": "For Construction", "C": "For Information",
+    "D": "For Review and Comment", "E": "For Record", "F": "Returned for Correction",
+    "G": "As Requested",
+  };
+
+  const code = (purposeCode || "C").toUpperCase();
+
+  const processedDocs = documents.map(d => ({
+    drawingNumber: sanitiseInput(d.drawingNumber || ""),
+    revision: sanitiseInput(d.revision || ""),
+    title: sanitiseInput(d.title || ""),
+    copies: Number(d.copies) || 1,
+    format: sanitiseInput(d.format || "PDF"),
+  }));
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    transmittal_number: sanitiseInput(String(transmittalNumber)),
+    from: sanitiseInput(from || ""),
+    to: sanitiseInput(to || ""),
+    documents: processedDocs,
+    document_count: processedDocs.length,
+    purpose_code: purposeCodes[code] ? code : "C",
+    purpose_description: purposeCodes[code] || purposeCodes["C"],
+    message: sanitiseInput(message || ""),
+    required_response: sanitiseInput(requiredResponse || ""),
+    status: "SENT",
+    transmitted_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("transmittals")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, transmittalId: data.id, ...record });
+  }
+
+  res.json({ success: true, transmittalId: null, ...record, saved: false });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
