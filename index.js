@@ -15239,6 +15239,259 @@ app.post("/job-archive", apiKeyAuth, async (req, res) => {
   return res.status(201).json({ ...archiveRecord, saved });
 });
 
+// ── Round 31 ──────────────────────────────────────────────────────────────────
+
+// POST /trade-conversion  — Convert units commonly used in trade work (e.g. flow rates, pressures)
+app.post("/trade-conversion", apiKeyAuth, (req, res) => {
+  const { from, to, value } = req.body;
+  if (!from || !to || value === undefined) {
+    return res.status(400).json({ error: "from, to, and value are required." });
+  }
+  const safeFrom  = sanitiseInput(String(from)).toLowerCase().replace(/\s/g, "");
+  const safeTo    = sanitiseInput(String(to)).toLowerCase().replace(/\s/g, "");
+  const numValue  = parseFloat(value);
+  if (isNaN(numValue)) return res.status(400).json({ error: "value must be a number." });
+
+  // Conversion map: key = "from:to", value = multiplier or function
+  const CONVERSIONS = {
+    // Pressure
+    "kpa:psi":       v => v * 0.145038,
+    "psi:kpa":       v => v / 0.145038,
+    "kpa:bar":       v => v / 100,
+    "bar:kpa":       v => v * 100,
+    "kpa:mwc":       v => v * 0.101972, // metres water column
+    "mwc:kpa":       v => v / 0.101972,
+    // Flow
+    "l/s:l/min":     v => v * 60,
+    "l/min:l/s":     v => v / 60,
+    "l/s:m3/h":      v => v * 3.6,
+    "m3/h:l/s":      v => v / 3.6,
+    "l/min:m3/h":    v => v / 16.667,
+    "m3/h:l/min":    v => v * 16.667,
+    // Temperature
+    "c:f":           v => (v * 9/5) + 32,
+    "f:c":           v => (v - 32) * 5/9,
+    "c:k":           v => v + 273.15,
+    "k:c":           v => v - 273.15,
+    // Length
+    "mm:in":         v => v / 25.4,
+    "in:mm":         v => v * 25.4,
+    "m:ft":          v => v * 3.28084,
+    "ft:m":          v => v / 3.28084,
+    "mm:m":          v => v / 1000,
+    "m:mm":          v => v * 1000,
+    // Power
+    "kw:btu/h":      v => v * 3412.14,
+    "btu/h:kw":      v => v / 3412.14,
+    "kw:hp":         v => v * 1.34102,
+    "hp:kw":         v => v / 1.34102,
+    // Electrical
+    "w:kw":          v => v / 1000,
+    "kw:w":          v => v * 1000,
+    "kva:kw":        v => v * 0.8,   // assuming 0.8 pf
+    "kw:kva":        v => v / 0.8,
+  };
+
+  const key = `${safeFrom}:${safeTo}`;
+  const converter = CONVERSIONS[key];
+
+  if (!converter) {
+    return res.status(404).json({
+      error: `No conversion available from '${from}' to '${to}'.`,
+      availableConversions: Object.keys(CONVERSIONS).map(k => k.replace(":", " → ")),
+    });
+  }
+
+  const result = Math.round(converter(numValue) * 1000000) / 1000000;
+
+  return res.json({
+    input:  { value: numValue, unit: safeFrom },
+    output: { value: result,   unit: safeTo },
+    formula: `${numValue} ${safeFrom} = ${result} ${safeTo}`,
+  });
+});
+
+// POST /permit-status  — Track the status of a building/plumbing permit
+app.post("/permit-status", apiKeyAuth, async (req, res) => {
+  const { permitNumber, jobType, permitType, issueDate, expiryDate, status,
+          address, contractorId, notes } = req.body;
+
+  if (!permitNumber || !jobType) {
+    return res.status(400).json({ error: "permitNumber and jobType are required." });
+  }
+
+  const safePermit    = sanitiseInput(String(permitNumber));
+  const safeJobType   = sanitiseInput(String(jobType)).toLowerCase();
+  const safeAddress   = sanitiseInput(String(address || "Not specified"));
+  const safePermitType= sanitiseInput(String(permitType || "Building permit"));
+
+  const issueDateObj  = issueDate  ? new Date(issueDate)  : null;
+  const expiryDateObj = expiryDate ? new Date(expiryDate) : null;
+  const now           = new Date();
+
+  let derivedStatus = sanitiseInput(String(status || "ACTIVE")).toUpperCase();
+  let daysRemaining = null;
+  let isOverdue     = false;
+
+  if (expiryDateObj && !isNaN(expiryDateObj.getTime())) {
+    daysRemaining = Math.round((expiryDateObj - now) / (1000 * 60 * 60 * 24));
+    if (daysRemaining < 0) {
+      derivedStatus = "EXPIRED";
+      isOverdue     = true;
+    } else if (daysRemaining <= 30) {
+      derivedStatus = "EXPIRING_SOON";
+    }
+  }
+
+  const record = {
+    permitNumber:  safePermit,
+    permitType:    safePermitType,
+    jobType:       safeJobType,
+    address:       safeAddress,
+    issueDate:     issueDateObj  ? issueDateObj.toISOString().slice(0, 10)  : null,
+    expiryDate:    expiryDateObj ? expiryDateObj.toISOString().slice(0, 10) : null,
+    daysRemaining,
+    status:        derivedStatus,
+    isOverdue,
+    notes:         sanitiseInput(String(notes || "")),
+    actions:       [
+      isOverdue         ? "URGENT: Permit has expired — contact VBA to renew or obtain a new permit" : null,
+      daysRemaining !== null && daysRemaining <= 30 && !isOverdue ? "Permit expiring soon — apply for extension before expiry" : null,
+      derivedStatus === "ACTIVE" ? "Permit is current — ensure all work is completed before expiry" : null,
+    ].filter(Boolean),
+    checkedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin && contractorId) {
+    await supabaseAdmin.from("permit_tracker").upsert({
+      permit_number:  safePermit,
+      job_type:       safeJobType,
+      address:        safeAddress,
+      contractor_id:  sanitiseInput(String(contractorId)),
+      status:         derivedStatus,
+      expiry_date:    expiryDateObj ? expiryDateObj.toISOString() : null,
+      updated_at:     now.toISOString(),
+    }, { onConflict: "permit_number" }).then(() => {}).catch(() => {});
+  }
+
+  return res.json(record);
+});
+
+// POST /job-feedback  — Submit client feedback on a completed job
+app.post("/job-feedback", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, contractorId, contractorName, clientName,
+          rating, comment, wouldRecommend, categories } = req.body;
+
+  if (!jobId || rating === undefined) {
+    return res.status(400).json({ error: "jobId and rating are required." });
+  }
+
+  const numRating = parseFloat(rating);
+  if (isNaN(numRating) || numRating < 1 || numRating > 5) {
+    return res.status(400).json({ error: "rating must be a number between 1 and 5." });
+  }
+
+  const safeJobId      = sanitiseInput(String(jobId));
+  const safeContractor = sanitiseInput(String(contractorName || "Unknown"));
+  const safeClient     = sanitiseInput(String(clientName || "Anonymous"));
+  const safeComment    = sanitiseInput(String(comment || "")).slice(0, 1000);
+  const safeJobType    = sanitiseInput(String(jobType || "general")).toLowerCase();
+
+  const validCategories = ["punctuality", "cleanliness", "communication", "quality", "value", "compliance"];
+  const safeCategories  = Array.isArray(categories)
+    ? categories.filter(c => validCategories.includes(sanitiseInput(String(c)).toLowerCase()))
+    : [];
+
+  const feedbackId = `FB-${Date.now().toString(36).toUpperCase()}`;
+
+  let sentiment = "neutral";
+  if (numRating >= 4.5)      sentiment = "very_positive";
+  else if (numRating >= 3.5) sentiment = "positive";
+  else if (numRating < 2)    sentiment = "negative";
+  else if (numRating < 3)    sentiment = "mixed";
+
+  const feedbackRecord = {
+    feedbackId,
+    jobId:          safeJobId,
+    jobType:        safeJobType,
+    contractorName: safeContractor,
+    clientName:     safeClient,
+    rating:         numRating,
+    ratingLabel:    ["", "Very Poor", "Poor", "Average", "Good", "Excellent"][Math.round(numRating)],
+    sentiment,
+    wouldRecommend: wouldRecommend === true || wouldRecommend === "true",
+    categories:     safeCategories,
+    comment:        safeComment || null,
+    submittedAt:    new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("job_feedback").insert({
+      feedback_id:      feedbackId,
+      job_id:           safeJobId,
+      contractor_id:    contractorId ? sanitiseInput(String(contractorId)) : null,
+      job_type:         safeJobType,
+      rating:           numRating,
+      sentiment,
+      would_recommend:  feedbackRecord.wouldRecommend,
+      categories:       safeCategories,
+      comment:          safeComment || null,
+      created_at:       new Date().toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...feedbackRecord, saved });
+});
+
+// GET /feedback-summary/:contractorId  — Aggregate feedback scores for a contractor
+app.get("/feedback-summary/:contractorId", apiKeyAuth, async (req, res) => {
+  const contractorId = sanitiseInput(String(req.params.contractorId || ""));
+  if (!contractorId) return res.status(400).json({ error: "contractorId is required." });
+
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: "Database not configured." });
+  }
+
+  const { data, error } = await supabaseAdmin
+    .from("job_feedback")
+    .select("rating, sentiment, would_recommend, categories, created_at, job_type")
+    .eq("contractor_id", contractorId)
+    .order("created_at", { ascending: false })
+    .limit(200);
+
+  if (error) return res.status(500).json({ error: "Failed to retrieve feedback." });
+  if (!data || data.length === 0) return res.status(404).json({ error: "No feedback found for this contractor." });
+
+  const count       = data.length;
+  const avgRating   = Math.round((data.reduce((s, r) => s + r.rating, 0) / count) * 10) / 10;
+  const recommend   = data.filter(r => r.would_recommend).length;
+  const sentiments  = { very_positive: 0, positive: 0, neutral: 0, mixed: 0, negative: 0 };
+  for (const r of data) sentiments[r.sentiment] = (sentiments[r.sentiment] || 0) + 1;
+
+  const tradeBreakdown = {};
+  for (const r of data) {
+    if (!tradeBreakdown[r.job_type]) tradeBreakdown[r.job_type] = { count: 0, ratingSum: 0 };
+    tradeBreakdown[r.job_type].count++;
+    tradeBreakdown[r.job_type].ratingSum += r.rating;
+  }
+  for (const t of Object.keys(tradeBreakdown)) {
+    tradeBreakdown[t].avgRating = Math.round((tradeBreakdown[t].ratingSum / tradeBreakdown[t].count) * 10) / 10;
+  }
+
+  return res.json({
+    contractorId,
+    totalFeedback:    count,
+    averageRating:    avgRating,
+    recommendationRate: `${Math.round((recommend / count) * 100)}%`,
+    sentimentBreakdown: sentiments,
+    tradeBreakdown,
+    recentFeedback:   data.slice(0, 5).map(r => ({ rating: r.rating, sentiment: r.sentiment, jobType: r.job_type, date: r.created_at })),
+    retrievedAt:      new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
