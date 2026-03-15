@@ -39773,6 +39773,207 @@ Return JSON with:
   }
 });
 
+// POST /roof-inspection-record — Record a roof inspection
+app.post("/roof-inspection-record", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, projectId, roofType, inspectionDate, inspectorName,
+    inspectorLicence, roofAgeYears, roofMaterial,
+    condition = "FAIR", defectsFound = [],
+    flashing_condition, gutterCondition, downpipeCondition,
+    penetrationSeals, ridgeCapping, valleys, skylights = 0,
+    waterIngressReported = false, immediateActionRequired = false,
+    nextInspectionDate, estimatedRemainingLifeYears, notes,
+  } = req.body;
+  if (!propertyAddress || !inspectionDate || !inspectorName) {
+    return res.status(400).json({ error: "propertyAddress, inspectionDate, and inspectorName are required." });
+  }
+  const validConditions = ["EXCELLENT", "GOOD", "FAIR", "POOR", "CRITICAL"];
+  if (!validConditions.includes(condition)) {
+    return res.status(400).json({ error: `condition must be one of: ${validConditions.join(", ")}` });
+  }
+  const inspectionRef = `ROOF-${Date.now().toString(36).toUpperCase()}`;
+  const overallRisk = condition === "CRITICAL" || waterIngressReported ? "HIGH"
+    : condition === "POOR" ? "MEDIUM"
+    : "LOW";
+  const record = {
+    inspection_ref: inspectionRef,
+    property_address: sanitiseInput(propertyAddress),
+    project_id: projectId || null,
+    roof_type: sanitiseInput(roofType || ""),
+    inspection_date: inspectionDate,
+    inspector_name: sanitiseInput(inspectorName),
+    inspector_licence: sanitiseInput(inspectorLicence || ""),
+    roof_age_years: Number(roofAgeYears) || null,
+    roof_material: sanitiseInput(roofMaterial || ""),
+    condition,
+    defects_found: Array.isArray(defectsFound) ? defectsFound.map(d => sanitiseInput(d)) : [],
+    flashing_condition: sanitiseInput(flashing_condition || ""),
+    gutter_condition: sanitiseInput(gutterCondition || ""),
+    downpipe_condition: sanitiseInput(downpipeCondition || ""),
+    penetration_seals: sanitiseInput(penetrationSeals || ""),
+    ridge_capping: sanitiseInput(ridgeCapping || ""),
+    valleys: sanitiseInput(valleys || ""),
+    skylights: Number(skylights),
+    water_ingress_reported: Boolean(waterIngressReported),
+    immediate_action_required: Boolean(immediateActionRequired),
+    next_inspection_date: nextInspectionDate || null,
+    estimated_remaining_life_years: Number(estimatedRemainingLifeYears) || null,
+    overall_risk: overallRisk,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("roof_inspections").insert(record);
+    if (error) console.error("roof-inspection-record DB error:", error.message);
+  }
+  res.json({
+    inspectionRef, propertyAddress, condition, overallRisk,
+    defectCount: record.defects_found.length, waterIngressReported,
+    immediateActionRequired, saved: !!supabaseAdmin,
+  });
+});
+
+// POST /waterproofing-inspection — Record a waterproofing inspection
+app.post("/waterproofing-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, projectId, location, membraneType, applicationDate,
+    inspectionDate, inspectorName, inspectorLicence,
+    stage = "PRE_CONCRETE", ponding_test = false, pondingTestHours,
+    pondingTestPassed, membraneThicknessMm, jointsSealed, flashingsInstalled,
+    drainageProvided, result = "PASS", defects = [], holdPointReleased = false,
+    applicatorName, applicatorLicence, notes,
+  } = req.body;
+  if (!propertyAddress || !inspectionDate || !inspectorName || !location) {
+    return res.status(400).json({ error: "propertyAddress, inspectionDate, inspectorName, and location are required." });
+  }
+  const validStages = ["PRE_MEMBRANE", "DURING_APPLICATION", "POST_APPLICATION", "PRE_CONCRETE", "FINAL"];
+  if (!validStages.includes(stage)) {
+    return res.status(400).json({ error: `stage must be one of: ${validStages.join(", ")}` });
+  }
+  const inspectionRef = `WP-${Date.now().toString(36).toUpperCase()}`;
+  const finalResult = (ponding_test && pondingTestPassed === false) ? "FAIL" : result;
+  const record = {
+    inspection_ref: inspectionRef,
+    property_address: sanitiseInput(propertyAddress),
+    project_id: projectId || null,
+    location: sanitiseInput(location),
+    membrane_type: sanitiseInput(membraneType || ""),
+    application_date: applicationDate || null,
+    inspection_date: inspectionDate,
+    inspector_name: sanitiseInput(inspectorName),
+    inspector_licence: sanitiseInput(inspectorLicence || ""),
+    stage,
+    ponding_test: Boolean(ponding_test),
+    ponding_test_hours: Number(pondingTestHours) || null,
+    ponding_test_passed: ponding_test ? Boolean(pondingTestPassed) : null,
+    membrane_thickness_mm: Number(membraneThicknessMm) || null,
+    joints_sealed: Boolean(jointsSealed),
+    flashings_installed: Boolean(flashingsInstalled),
+    drainage_provided: Boolean(drainageProvided),
+    result: finalResult,
+    defects: Array.isArray(defects) ? defects.map(d => sanitiseInput(d)) : [],
+    hold_point_released: finalResult === "PASS" ? Boolean(holdPointReleased) : false,
+    applicator_name: sanitiseInput(applicatorName || ""),
+    applicator_licence: sanitiseInput(applicatorLicence || ""),
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("waterproofing_inspections").insert(record);
+    if (error) console.error("waterproofing-inspection DB error:", error.message);
+  }
+  res.json({
+    inspectionRef, location, stage, result: finalResult,
+    pondingTestPassed: record.ponding_test_passed, holdPointReleased: record.hold_point_released,
+    defectCount: record.defects.length, saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-building-envelope-assessment — AI assesses building envelope compliance
+app.post("/ai-building-envelope-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, propertyType = "residential", state = "VIC",
+    buildYear, buildingClass, constructionType,
+    roofCondition = "UNKNOWN", wallCondition = "UNKNOWN",
+    waterproofingAreas = [], knownLeaks = [], knownCracks = [],
+    thermalPerformanceRating, condensationRisk = false,
+    nccComplianceYear, recentWorks = [], certifications = [],
+  } = req.body;
+  if (!propertyAddress) {
+    return res.status(400).json({ error: "propertyAddress is required." });
+  }
+  const sanitisedAddress = sanitiseInput(propertyAddress);
+  const sanitisedType = sanitiseInput(propertyType);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian building envelope specialist with expertise in roofing, waterproofing, thermal performance, and NCC compliance.`;
+  const userPrompt = `Assess the building envelope for:
+Address: ${sanitisedAddress}
+Property type: ${sanitisedType}
+State: ${sanitisedState}
+Build year: ${buildYear || "Unknown"}
+Building class: ${sanitiseInput(buildingClass || "Unknown")}
+Construction type: ${sanitiseInput(constructionType || "Unknown")}
+Roof condition: ${roofCondition}
+Wall condition: ${wallCondition}
+Waterproofed areas: ${waterproofingAreas.map(a => sanitiseInput(a)).join(", ") || "None specified"}
+Known leaks: ${knownLeaks.map(l => sanitiseInput(l)).join("; ") || "None"}
+Known cracks: ${knownCracks.map(c => sanitiseInput(c)).join("; ") || "None"}
+Thermal rating: ${sanitiseInput(thermalPerformanceRating || "Unknown")}
+Condensation risk: ${condensationRisk}
+NCC version applied: ${sanitiseInput(nccComplianceYear || "Unknown")}
+Recent works: ${recentWorks.map(w => sanitiseInput(w)).join("; ") || "None"}
+Certifications: ${certifications.map(c => sanitiseInput(c)).join("; ") || "None"}
+
+Return JSON with:
+{
+  "overallCondition": "GOOD|FAIR|POOR|CRITICAL",
+  "complianceScore": 70,
+  "waterIngressRisk": "HIGH|MEDIUM|LOW",
+  "thermalPerformanceRisk": "HIGH|MEDIUM|LOW",
+  "immediateActions": ["...", "..."],
+  "scheduledWorks": [{"work": "...", "timeframe": "...", "priority": "HIGH"}],
+  "nccComplianceNotes": "...",
+  "applicableStandards": ["...", "..."],
+  "recommendedInspections": ["...", "..."],
+  "estimatedMaintenanceCost": "...",
+  "estimatedRemainingServiceLife": "...",
+  "summaryStatement": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ propertyAddress: sanitisedAddress, propertyType: sanitisedType, state: sanitisedState, assessment });
+  } catch (err) {
+    console.error("ai-building-envelope-assessment error:", err.message);
+    res.json({
+      propertyAddress: sanitisedAddress, propertyType: sanitisedType, state: sanitisedState,
+      assessment: {
+        overallCondition: knownLeaks.length > 0 ? "POOR" : "UNKNOWN",
+        complianceScore: 0,
+        waterIngressRisk: knownLeaks.length > 0 ? "HIGH" : "UNKNOWN",
+        thermalPerformanceRisk: "UNKNOWN",
+        immediateActions: knownLeaks.length > 0 ? ["Investigate and repair water ingress immediately"] : ["Commission building envelope inspection"],
+        scheduledWorks: [{ work: "Comprehensive building envelope inspection", timeframe: "Within 3 months", priority: "HIGH" }],
+        nccComplianceNotes: "NCC compliance assessment requires review of original building approvals and current standards.",
+        applicableStandards: ["NCC 2022", "AS 4654.2 (Waterproofing)", "AS 4200.1 (Pliable building membranes)"],
+        recommendedInspections: ["Thermal imaging scan", "Moisture meter assessment", "Visual inspection by qualified building inspector"],
+        estimatedMaintenanceCost: "TBD — requires on-site inspection",
+        estimatedRemainingServiceLife: "TBD — requires inspection",
+        summaryStatement: "Building envelope condition cannot be fully assessed without on-site inspection.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
