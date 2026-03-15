@@ -86251,6 +86251,447 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 296 ─────────────────────────────────────────────────────────────────
+
+// POST /stormwater-asset-inspection — Record stormwater drain/culvert/pit inspection
+app.post("/stormwater-asset-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, assetId, assetType, location, inspectionDate, inspectedBy,
+      constructionMaterial, diameterOrSizeMm, yearInstalled, ownerAuthority,
+      cctvInspected, cctvJobRef,
+      structuralConditionRating, structuralDefects, structuralDefectDetails,
+      sedimentDepthMm, debrisPresent, rootIntrusion,
+      jointCondition, jointLeaks, crackingObserved, crackSeverity,
+      pitLidSecure, pitLidDamaged, grateConditionOk, grateInlet,
+      flowCapacityIssue, overflowEvidence,
+      waterQualityMonitored, grossPollutantTrapPresent, gptMaintenanceCurrent,
+      catchmentPollutantRisk, sewerCrossConnection,
+      urgentRepairsRequired, repairPriority,
+      nextInspectionDue, certRef, notes
+    } = req.body;
+
+    if (!assetId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "assetId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeAssetId = sanitiseInput(String(assetId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const criticalIssues = [];
+    const warnings = [];
+
+    const sedDepth = parseFloat(sedimentDepthMm) || null;
+    const condRating = parseInt(structuralConditionRating) || null;
+
+    // Road Management Act 2004 (Vic) — drainage assets
+    // Environment Protection Act 2017 (Vic) — stormwater discharge
+    // SEPP Waters 2018 (Vic)
+    if (condRating !== null && condRating <= 2) {
+      criticalIssues.push(`Stormwater asset structural condition rating ${condRating}/5 — FAILED. Structural failure risk. Engage civil engineer for emergency assessment and repair (Road Management Act 2004 (Vic)).`);
+    }
+
+    if (sewerCrossConnection === true || sewerCrossConnection === "true") {
+      criticalIssues.push("Sewer cross-connection detected — sewage entering stormwater system is a Category A environmental offence. Notify EPA Victoria and water authority immediately (Environment Protection Act 2017 (Vic) s.27).");
+    }
+
+    if (!pitLidSecure || pitLidDamaged) {
+      criticalIssues.push("Pit lid unsecured or damaged — public safety hazard (fall risk). Secure or replace lid immediately.");
+    }
+
+    if (!grateConditionOk || !grateInlet) {
+      criticalIssues.push("Grate inlet deficiency — damaged or missing grate creates public safety risk and reduces flow capacity. Replace immediately.");
+    }
+
+    if (rootIntrusion === true || rootIntrusion === "true") {
+      warnings.push("Root intrusion detected — structural damage may be progressive. Schedule CCTV inspection and pipe lining or replacement.");
+    }
+
+    if (sedDepth !== null && sedDepth > 200) {
+      warnings.push(`Sediment depth ${sedDepth} mm — significant sedimentation reduces flow capacity and may carry pollutants to waterways. Schedule cleaning (SEPP Waters 2018 (Vic)).`);
+    }
+
+    if (jointLeaks === true || jointLeaks === "true") {
+      warnings.push("Joint leaks detected — groundwater ingress or exfiltration may cause subsidence and pollution. Schedule repair.");
+    }
+
+    if (overflowEvidence === true || overflowEvidence === "true") {
+      warnings.push("Evidence of overflow detected — system may be undersized for current catchment. Review hydraulic capacity and consider upgrade.");
+    }
+
+    if (!gptMaintenanceCurrent && grossPollutantTrapPresent) {
+      warnings.push("Gross pollutant trap (GPT) maintenance not current — GPTs must be cleaned regularly to maintain effectiveness and prevent pollution (SEPP Waters 2018 (Vic)).");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "ACTION_REQUIRED" : warnings.length > 0 ? "MONITOR" : "ACCEPTABLE";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("stormwater_asset_inspections")
+        .insert({
+          project_id: safeProject,
+          asset_id: safeAssetId,
+          asset_type: assetType ? sanitiseInput(String(assetType)) : null,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          construction_material: constructionMaterial ? sanitiseInput(String(constructionMaterial)) : null,
+          diameter_mm: parseFloat(diameterOrSizeMm) || null,
+          year_installed: parseInt(yearInstalled) || null,
+          owner_authority: ownerAuthority ? sanitiseInput(String(ownerAuthority)) : null,
+          structural_condition_rating: condRating,
+          structural_defects: structuralDefects || false,
+          sediment_depth_mm: sedDepth,
+          debris_present: debrisPresent !== false && debrisPresent !== "false",
+          root_intrusion: rootIntrusion || false,
+          joint_leaks: jointLeaks || false,
+          cracking_observed: crackingObserved || false,
+          pit_lid_secure: pitLidSecure !== false && pitLidSecure !== "false",
+          grate_ok: grateConditionOk !== false && grateConditionOk !== "false",
+          flow_capacity_issue: flowCapacityIssue || false,
+          overflow_evidence: overflowEvidence || false,
+          gpt_present: grossPollutantTrapPresent !== false && grossPollutantTrapPresent !== "false",
+          gpt_maintenance_current: gptMaintenanceCurrent !== false && gptMaintenanceCurrent !== "false",
+          sewer_cross_connection: sewerCrossConnection || false,
+          urgent_repairs: urgentRepairsRequired || false,
+          repair_priority: repairPriority ? sanitiseInput(String(repairPriority)) : null,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          next_inspection_due: nextInspectionDue || null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          structural_defect_details: structuralDefectDetails ? sanitiseInput(String(structuralDefectDetails)) : null,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Stormwater asset defects require urgent action — public safety and environmental protection at risk.",
+        standards: ["Road Management Act 2004 (Vic)", "Environment Protection Act 2017 (Vic)", "SEPP Waters 2018 (Vic)"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      assetId: safeAssetId,
+      nextInspectionDue: nextInspectionDue || null,
+      standards: ["Road Management Act 2004 (Vic)", "SEPP Waters 2018 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /stormwater-asset-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record stormwater asset inspection." });
+  }
+});
+
+// POST /water-main-condition-assessment — Record water main/pipe condition assessment
+app.post("/water-main-condition-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, assetId, pipelineSegment, location, assessmentDate, assessedBy,
+      pipelineMaterial, nominalDiameterMm, pipelineLength, yearInstalled,
+      waterPressureKpa, workingPressureKpa, testPressureKpa,
+      leakageRateL, leakageLimit, leakTestMethod,
+      externalCorrosionPresent, internalCorrosionPresent, corrosionSeverity,
+      cctvInspectedMain, cctvDefects,
+      wallThicknessMm, minimumAllowableThicknessMm,
+      breakHistory, breaksLast5Years,
+      cathodicProtectionInstalled, cathodicProtectionReading,
+      valveConditionOk, hydrantCondition,
+      pressureZoneCompliant, waterQualityCompliant,
+      urgentRepairsRequired, repairPriority, rehabRecommended,
+      nextAssessmentDue, certRef, notes
+    } = req.body;
+
+    if (!assetId || !location || !assessmentDate || !assessedBy) {
+      return res.status(400).json({ error: "assetId, location, assessmentDate, assessedBy are required." });
+    }
+
+    const safeAssetId = sanitiseInput(String(assetId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeAssessor = sanitiseInput(String(assessedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const criticalIssues = [];
+    const warnings = [];
+
+    const leakRate = parseFloat(leakageRateL) || null;
+    const leakLimit = parseFloat(leakageLimit) || null;
+    const workingPressure = parseFloat(workingPressureKpa) || null;
+    const wallThick = parseFloat(wallThicknessMm) || null;
+    const minWallThick = parseFloat(minimumAllowableThicknessMm) || null;
+    const cpReading = parseFloat(cathodicProtectionReading) || null;
+    const breaksCount = parseInt(breaksLast5Years) || 0;
+
+    // Safe Drinking Water Act 2003 (Vic) / Water Act 1989 (Vic)
+    // AS/NZS 3500.1 — Plumbing and drainage — Water services
+    // AS 4041 — Pressure piping
+    if (leakRate !== null && leakLimit !== null && leakRate > leakLimit) {
+      criticalIssues.push(`Leakage rate ${leakRate} L exceeds limit ${leakLimit} L — excessive water loss. Investigate and repair leaks. Water authorities have duty under Water Act 1989 (Vic) to minimise leakage.`);
+    }
+
+    if (!pressureZoneCompliant) {
+      criticalIssues.push("Pressure zone non-compliant — water pressure outside acceptable range can cause pipe bursts or insufficient supply pressure. Investigate pressure regulating valves.");
+    }
+
+    if (!waterQualityCompliant) {
+      criticalIssues.push("Water quality non-compliant — safe drinking water supply obligation under Safe Drinking Water Act 2003 (Vic). Notify water authority and DHHS Victoria immediately.");
+    }
+
+    if (wallThick !== null && minWallThick !== null && wallThick < minWallThick) {
+      criticalIssues.push(`Wall thickness ${wallThick} mm below minimum allowable ${minWallThick} mm — pipe structural integrity compromised. Remove from service or reduce operating pressure (AS 4041).`);
+    }
+
+    const corrSev = String(corrosionSeverity || "").toUpperCase();
+    if ((externalCorrosionPresent || internalCorrosionPresent) && (corrSev === "SEVERE" || corrSev === "HEAVY")) {
+      criticalIssues.push(`Severe corrosion detected — wall loss may be significant. Engage pipeline engineer for assessment and pipeline condition assessment (AS 4041).`);
+    }
+
+    if (breaksCount > 3) {
+      criticalIssues.push(`${breaksCount} breaks in last 5 years — repeated failure indicates end-of-life or structural weakness. Schedule detailed condition assessment and rehabilitation.`);
+    }
+
+    if (cathodicProtectionInstalled === true || cathodicProtectionInstalled === "true") {
+      if (cpReading !== null && cpReading > -850) {
+        warnings.push(`Cathodic protection potential ${cpReading} mV — below -850 mV (vs Cu/CuSO₄) recommended. Verify cathodic protection system is functional.`);
+      }
+    }
+
+    if (!valveConditionOk) {
+      warnings.push("Valve condition issues — isolation valves must be operational for burst response. Schedule valve maintenance.");
+    }
+
+    if (rehabRecommended === true || rehabRecommended === "true") {
+      warnings.push("Rehabilitation recommended — consider pipe relining, replacement, or pressure class upgrade based on condition assessment results.");
+    }
+
+    const assessmentStatus = criticalIssues.length > 0 ? "ACTION_REQUIRED" : warnings.length > 0 ? "MONITOR" : "ACCEPTABLE";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("water_main_assessments")
+        .insert({
+          project_id: safeProject,
+          asset_id: safeAssetId,
+          pipeline_segment: pipelineSegment ? sanitiseInput(String(pipelineSegment)) : null,
+          location: safeLocation,
+          assessment_date: assessmentDate,
+          assessed_by: safeAssessor,
+          pipeline_material: pipelineMaterial ? sanitiseInput(String(pipelineMaterial)) : null,
+          nominal_diameter_mm: parseFloat(nominalDiameterMm) || null,
+          pipeline_length: parseFloat(pipelineLength) || null,
+          year_installed: parseInt(yearInstalled) || null,
+          working_pressure_kpa: workingPressure,
+          leakage_rate_l: leakRate,
+          leakage_limit: leakLimit,
+          leak_test_method: leakTestMethod ? sanitiseInput(String(leakTestMethod)) : null,
+          external_corrosion: externalCorrosionPresent || false,
+          internal_corrosion: internalCorrosionPresent || false,
+          corrosion_severity: corrosionSeverity ? sanitiseInput(String(corrosionSeverity)) : null,
+          wall_thickness_mm: wallThick,
+          min_wall_thickness_mm: minWallThick,
+          breaks_last_5_years: breaksCount,
+          cathodic_protection_installed: cathodicProtectionInstalled !== false && cathodicProtectionInstalled !== "false",
+          cathodic_protection_mv: cpReading,
+          valve_condition_ok: valveConditionOk !== false && valveConditionOk !== "false",
+          pressure_zone_compliant: pressureZoneCompliant !== false && pressureZoneCompliant !== "false",
+          water_quality_compliant: waterQualityCompliant !== false && waterQualityCompliant !== "false",
+          urgent_repairs: urgentRepairsRequired || false,
+          repair_priority: repairPriority ? sanitiseInput(String(repairPriority)) : null,
+          rehab_recommended: rehabRecommended || false,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          next_assessment_due: nextAssessmentDue || null,
+          assessment_status: assessmentStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        assessmentStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Water main condition issues — action required to maintain safe drinking water supply and infrastructure integrity.",
+        standards: ["Safe Drinking Water Act 2003 (Vic)", "Water Act 1989 (Vic)", "AS 4041", "AS/NZS 3500.1"],
+      });
+    }
+
+    res.json({
+      assessmentStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      assetId: safeAssetId,
+      nextAssessmentDue: nextAssessmentDue || null,
+      standards: ["Safe Drinking Water Act 2003 (Vic)", "Water Act 1989 (Vic)", "AS 4041"],
+    });
+  } catch (err) {
+    console.error("POST /water-main-condition-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to record water main condition assessment." });
+  }
+});
+
+// POST /ai-water-infrastructure-assessment — AI assesses water/wastewater infrastructure condition and compliance
+app.post("/ai-water-infrastructure-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      utilityId, utilityName, serviceArea,
+      totalWaterMainsKm, mainsBelowConditionThreshold, averageMainAge,
+      totalSewerMainsKm, sewerBelowConditionThreshold,
+      totalStormwaterKm, stormwaterBelowConditionThreshold,
+      leakagePercent, targetLeakagePercent,
+      waterTreatmentCompliant, wastewaterTreatmentCompliant,
+      sdwaCertificationCurrent, epaCertificationCurrent,
+      annualCapitalWorksM, maintenanceBacklogM,
+      waterQualityIncidents, sewerOverflows12Months,
+      assetManagementPlanCurrent, customerServiceStandardsMet,
+      climateAdaptationPlanInPlace, floodResilienceAssessed,
+      deficienciesNoted, notes
+    } = req.body;
+
+    if (!utilityId) {
+      return res.status(400).json({ error: "utilityId is required." });
+    }
+
+    const safeUtilityId = sanitiseInput(String(utilityId));
+    const deficiencies = Array.isArray(deficienciesNoted) ? deficienciesNoted : [];
+
+    const prompt = `You are an expert water industry engineer and regulator. Assess this water utility's infrastructure condition and compliance under Victorian and Australian water regulations.
+
+Utility ID: ${safeUtilityId}
+Utility name: ${utilityName || "Unknown"}
+Service area: ${serviceArea || "Unknown"}
+
+WATER MAINS:
+- Total length: ${totalWaterMainsKm || 0} km
+- Below condition threshold: ${mainsBelowConditionThreshold || 0} km
+- Average age: ${averageMainAge ? averageMainAge + " years" : "Unknown"}
+
+SEWER MAINS:
+- Total length: ${totalSewerMainsKm || 0} km
+- Below condition threshold: ${sewerBelowConditionThreshold || 0} km
+
+STORMWATER:
+- Total length: ${totalStormwaterKm || 0} km
+- Below condition threshold: ${stormwaterBelowConditionThreshold || 0} km
+
+PERFORMANCE:
+- Leakage: ${leakagePercent || "Unknown"}% (target: ${targetLeakagePercent || "Unknown"}%)
+- Water treatment compliant: ${waterTreatmentCompliant ? "Yes" : "No"}
+- Wastewater treatment compliant: ${wastewaterTreatmentCompliant ? "Yes" : "No"}
+- SDWA certification current: ${sdwaCertificationCurrent ? "Yes" : "No"}
+- EPA certification current: ${epaCertificationCurrent ? "Yes" : "No/NA"}
+
+INVESTMENT:
+- Annual capital works: $${annualCapitalWorksM || 0}M
+- Maintenance backlog: $${maintenanceBacklogM || 0}M
+
+INCIDENTS:
+- Water quality incidents: ${waterQualityIncidents || 0}
+- Sewer overflows (12 months): ${sewerOverflows12Months || 0}
+
+MANAGEMENT:
+- Asset management plan current: ${assetManagementPlanCurrent ? "Yes" : "No"}
+- Customer service standards met: ${customerServiceStandardsMet ? "Yes" : "No/Unknown"}
+- Climate adaptation plan: ${climateAdaptationPlanInPlace ? "Yes" : "No"}
+
+Deficiencies: ${deficiencies.join("; ") || "None"}
+
+Assess under:
+- Safe Drinking Water Act 2003 (Vic)
+- Water Industry Act 1994 (Vic)
+- Water Act 1989 (Vic)
+- Environment Protection Act 2017 (Vic)
+- SEPP Waters 2018 (Vic)
+- Essential Services Commission (ESC) Water Performance Reporting
+- National Water Initiative (NWI)
+- AS/NZS 3500.1 (water services)
+- AGSC (Australian Groundwater and Soil Contamination) guidelines
+
+Provide:
+1. Overall water infrastructure risk rating
+2. Drinking water safety compliance
+3. Wastewater/sewer compliance
+4. Asset condition risk
+5. Regulatory compliance risk
+6. Investment and maintenance adequacy
+
+Respond ONLY in JSON:
+{
+  "overallRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "drinkingWaterRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "wastewaterRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "assetConditionRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "regulatoryRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "investmentAdequacy": "ADEQUATE|MARGINAL|INADEQUATE|CRITICAL",
+  "drinkingWaterFindings": ["string"],
+  "wastewaterFindings": ["string"],
+  "assetFindings": ["string"],
+  "regulatoryFindings": ["string"],
+  "priorityRecommendations": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 900,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallRisk: "MODERATE",
+        drinkingWaterRisk: "MODERATE",
+        wastewaterRisk: "MODERATE",
+        assetConditionRisk: "MODERATE",
+        regulatoryRisk: "LOW",
+        investmentAdequacy: "MARGINAL",
+        drinkingWaterFindings: ["AI assessment unavailable — verify SDWA certification is current and water quality monitoring program is compliant"],
+        wastewaterFindings: ["AI assessment unavailable — review sewer overflow data and EPA licence conditions"],
+        assetFindings: ["Prioritise water main renewal for highest-risk segments based on age, material, and break history"],
+        regulatoryFindings: ["Maintain current ESC Water Performance Reporting and compliance with customer service standards"],
+        priorityRecommendations: ["Develop/update Asset Management Plan per ISO 55001", "Review capital works program against maintenance backlog"],
+        applicableStandards: ["Safe Drinking Water Act 2003 (Vic)", "Water Industry Act 1994 (Vic)", "Environment Protection Act 2017 (Vic)", "AS/NZS 3500.1"],
+        summary: "AI water infrastructure assessment unavailable. Engage water industry engineers for formal asset condition and compliance review.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      utilityId: safeUtilityId,
+      standards: ["Safe Drinking Water Act 2003 (Vic)", "Water Industry Act 1994 (Vic)", "Environment Protection Act 2017 (Vic)", "SEPP Waters 2018 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /ai-water-infrastructure-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess water infrastructure." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
