@@ -13397,6 +13397,323 @@ app.post("/property-inspection-checklist", (req, res) => {
   });
 });
 
+// ── Round 25 ──────────────────────────────────────────────────────────────────
+
+// POST /job-sign-off  — Generate a formal job sign-off record with signatures
+app.post("/job-sign-off", apiKeyAuth, async (req, res) => {
+  const { jobType, jobId, contractorName, contractorLicence, clientName, clientAddress,
+          workDescription, completionDate, complianceScore, itemsDetected, itemsMissing,
+          certificateFiled, signatureObtained, gpsRecorded, notes } = req.body;
+
+  if (!jobType || !contractorName || !workDescription) {
+    return res.status(400).json({ error: "jobType, contractorName, and workDescription are required." });
+  }
+  const safeJobType = sanitiseInput(String(jobType)).toLowerCase();
+  const safeContractor = sanitiseInput(String(contractorName));
+  const safeClient = sanitiseInput(String(clientName || "Not specified"));
+  const safeWork = sanitiseInput(String(workDescription));
+  const safeNotes = sanitiseInput(String(notes || ""));
+
+  const tradeLabel = { plumbing: "Plumbing", gas: "Gas Fitting", electrical: "Electrical",
+    drainage: "Drainage", carpentry: "Carpentry", hvac: "HVAC/Refrigeration" }[safeJobType] || safeJobType;
+
+  const signOffDate = completionDate || new Date().toISOString().slice(0, 10);
+  const liabilityPeriod = LIABILITY_PERIODS[safeJobType] || "6 years (default)";
+
+  const readinessChecks = [
+    { check: "Certificate filed with regulator", passed: !!certificateFiled },
+    { check: "Client signature obtained", passed: !!signatureObtained },
+    { check: "GPS/location recorded", passed: !!gpsRecorded },
+    { check: "Compliance score >= 70", passed: (complianceScore || 0) >= 70 },
+    { check: "No critical missing items", passed: !itemsMissing || itemsMissing.length === 0 },
+  ];
+  const allPassed = readinessChecks.every(c => c.passed);
+
+  const signOffRecord = {
+    signOffId: `SO-${Date.now()}`,
+    status: allPassed ? "COMPLETE" : "INCOMPLETE",
+    jobType: tradeLabel,
+    jobId: jobId || null,
+    contractor: {
+      name: safeContractor,
+      licence: contractorLicence || "Not provided",
+    },
+    client: { name: safeClient, address: clientAddress || "Not provided" },
+    workDescription: safeWork,
+    completionDate: signOffDate,
+    complianceScore: complianceScore || null,
+    liabilityPeriod,
+    readinessChecks,
+    incompleteItems: readinessChecks.filter(c => !c.passed).map(c => c.check),
+    itemsDetected: itemsDetected || [],
+    itemsMissing: itemsMissing || [],
+    notes: safeNotes || null,
+    declarations: [
+      `I, ${safeContractor}, declare that the ${tradeLabel.toLowerCase()} work described above was completed in accordance with all applicable Victorian regulations and Australian Standards.`,
+      `The work was carried out under licence number ${contractorLicence || "[LICENCE NOT PROVIDED]"} and is subject to a ${liabilityPeriod} liability period under the Domestic Building Contracts Act 1995.`,
+    ],
+    generatedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin && jobId) {
+    await supabaseAdmin.from("sign_offs").insert({
+      job_id: String(jobId),
+      contractor_name: safeContractor,
+      client_name: safeClient,
+      status: signOffRecord.status,
+      compliance_score: complianceScore || null,
+      sign_off_data: signOffRecord,
+      created_at: new Date().toISOString(),
+    }).then(() => {}).catch(() => {});
+  }
+
+  return res.json(signOffRecord);
+});
+
+// POST /defect-log  — Log and categorise a defect found during inspection
+app.post("/defect-log", apiKeyAuth, async (req, res) => {
+  const { jobType, jobId, defects, severity, location, reportedBy, notes } = req.body;
+
+  if (!defects || !Array.isArray(defects) || defects.length === 0) {
+    return res.status(400).json({ error: "defects array is required and must not be empty." });
+  }
+
+  const DEFECT_CATEGORIES = {
+    plumbing:   ["pipe leak", "incorrect fall", "no backflow preventer", "wrong material", "inadequate pressure", "missing inspection point"],
+    gas:        ["gas leak", "incorrect regulator", "no isolation valve", "inadequate ventilation", "wrong pipe material", "missing test certificate"],
+    electrical: ["exposed conductors", "incorrect circuit protection", "no earth", "overloaded circuit", "wrong cable size", "missing RCD"],
+    drainage:   ["blocked drain", "incorrect gradient", "cracked pipe", "root intrusion", "insufficient inspection access", "no vent"],
+    carpentry:  ["undersized member", "incorrect fixing", "no bracing", "moisture damage", "wrong species", "inadequate bearing"],
+    hvac:       ["refrigerant leak", "incorrect sizing", "no condensate drain", "duct leakage", "wrong thermostat wiring", "filter not installed"],
+  };
+
+  const safeJobType = sanitiseInput(String(jobType || "general")).toLowerCase();
+  const safeLocation = sanitiseInput(String(location || "Not specified"));
+  const safeReporter = sanitiseInput(String(reportedBy || "Anonymous"));
+  const tradeCategories = DEFECT_CATEGORIES[safeJobType] || [];
+
+  const SEVERITY_MATRIX = {
+    critical: { label: "Critical", rectificationDays: 1, notifyRegulator: true, stopWork: true },
+    major:    { label: "Major",    rectificationDays: 7, notifyRegulator: false, stopWork: false },
+    minor:    { label: "Minor",    rectificationDays: 30, notifyRegulator: false, stopWork: false },
+    cosmetic: { label: "Cosmetic", rectificationDays: 90, notifyRegulator: false, stopWork: false },
+  };
+
+  const resolvedSeverity = (severity || "minor").toLowerCase();
+  const severityInfo = SEVERITY_MATRIX[resolvedSeverity] || SEVERITY_MATRIX.minor;
+
+  const categorisedDefects = defects.slice(0, 20).map((d, i) => {
+    const text = sanitiseInput(String(d));
+    const matchedCategory = tradeCategories.find(cat => text.toLowerCase().includes(cat.split(" ")[0])) || "general";
+    return {
+      defectNumber: i + 1,
+      description: text,
+      category: matchedCategory,
+      severity: severityInfo.label,
+      location: safeLocation,
+      rectifyWithin: `${severityInfo.rectificationDays} day${severityInfo.rectificationDays !== 1 ? "s" : ""}`,
+      requiresRegulatorNotification: severityInfo.notifyRegulator,
+    };
+  });
+
+  const dueDate = new Date();
+  dueDate.setDate(dueDate.getDate() + severityInfo.rectificationDays);
+
+  const logEntry = {
+    defectLogId: `DL-${Date.now()}`,
+    jobType: safeJobType,
+    jobId: jobId || null,
+    location: safeLocation,
+    reportedBy: safeReporter,
+    reportedAt: new Date().toISOString(),
+    severity: severityInfo.label,
+    stopWorkRequired: severityInfo.stopWork,
+    notifyRegulator: severityInfo.notifyRegulator,
+    totalDefects: categorisedDefects.length,
+    defects: categorisedDefects,
+    rectificationDeadline: dueDate.toISOString().slice(0, 10),
+    notes: sanitiseInput(String(notes || "")),
+    status: "OPEN",
+  };
+
+  if (supabaseAdmin && jobId) {
+    await supabaseAdmin.from("defect_logs").insert({
+      job_id: String(jobId),
+      severity: resolvedSeverity,
+      defect_count: categorisedDefects.length,
+      log_data: logEntry,
+      created_at: new Date().toISOString(),
+    }).then(() => {}).catch(() => {});
+  }
+
+  return res.json(logEntry);
+});
+
+// GET /licence-types  — Return all known Victorian trade licence types and categories
+app.get("/licence-types", apiKeyAuth, (req, res) => {
+  const { trade } = req.query;
+  const LICENCE_TYPES = {
+    plumbing: [
+      { code: "MP",  name: "Plumber (General)",          scope: "All plumbing work",                    authority: "VBA" },
+      { code: "GF",  name: "Gasfitter",                  scope: "Type A and Type B gas appliances",     authority: "VBA" },
+      { code: "DR",  name: "Drainer",                    scope: "Sanitary drainage work",               authority: "VBA" },
+      { code: "RGF", name: "Restricted Gasfitter",       scope: "Type A domestic gas only",             authority: "VBA" },
+      { code: "SF",  name: "Sprinklerfitter",            scope: "Fire sprinkler systems",               authority: "VBA" },
+    ],
+    electrical: [
+      { code: "EE",  name: "Electrician (General)",      scope: "All electrical work",                  authority: "Energy Safe Victoria" },
+      { code: "EM",  name: "Electrical Mechanic",        scope: "Installation and maintenance",         authority: "Energy Safe Victoria" },
+      { code: "EL",  name: "Electrical Inspector",       scope: "Inspection of electrical work",        authority: "Energy Safe Victoria" },
+      { code: "RE",  name: "Restricted Electrical",      scope: "Specific limited scope only",          authority: "Energy Safe Victoria" },
+    ],
+    gas: [
+      { code: "GF",  name: "Gasfitter",                  scope: "Type A and B appliances",              authority: "VBA" },
+      { code: "RGF", name: "Restricted Gasfitter",       scope: "Type A domestic only",                 authority: "VBA" },
+      { code: "GAL", name: "Gas Appliance Licencee",     scope: "Appliance installation only",          authority: "VBA" },
+    ],
+    drainage: [
+      { code: "DR",  name: "Drainer",                    scope: "Sanitary and stormwater drainage",     authority: "VBA" },
+      { code: "SDR", name: "Stormwater Drainer",         scope: "Stormwater systems only",              authority: "VBA" },
+    ],
+    carpentry: [
+      { code: "DB",  name: "Domestic Builder (Unlimited)", scope: "All domestic building work",         authority: "VBA" },
+      { code: "DBL", name: "Domestic Builder (Limited)",   scope: "Building work up to $10,000",        authority: "VBA" },
+      { code: "DBM", name: "Domestic Builder (Manager)",   scope: "Project management only",            authority: "VBA" },
+      { code: "CBU", name: "Commercial Builder (Unlimited)", scope: "All commercial building work",     authority: "VBA" },
+    ],
+    hvac: [
+      { code: "RAC", name: "Refrigeration and Air Conditioning", scope: "All RAC systems",              authority: "ARC (ARCtick)" },
+      { code: "RAC-L", name: "RAC (Low GWP)",             scope: "Systems using low GWP refrigerants",  authority: "ARC (ARCtick)" },
+      { code: "EE",  name: "Electrician (General)",       scope: "Electrical wiring of HVAC systems",   authority: "Energy Safe Victoria" },
+    ],
+  };
+
+  if (trade) {
+    const key = sanitiseInput(String(trade)).toLowerCase();
+    const types = LICENCE_TYPES[key];
+    if (!types) return res.status(404).json({ error: `No licence types found for trade: ${key}` });
+    return res.json({ trade: key, licenceTypes: types, count: types.length });
+  }
+
+  return res.json({
+    trades: Object.keys(LICENCE_TYPES),
+    licenceTypes: LICENCE_TYPES,
+    totalTypes: Object.values(LICENCE_TYPES).reduce((n, a) => n + a.length, 0),
+    issuingAuthorities: ["VBA (Victorian Building Authority)", "Energy Safe Victoria", "ARC (Australian Refrigeration Council)"],
+    note: "All Victorian trade licences must be renewed annually. Check vba.vic.gov.au for current requirements.",
+  });
+});
+
+// POST /job-readiness  — Pre-job readiness check before starting work on site
+app.post("/job-readiness", apiKeyAuth, (req, res) => {
+  const { jobType, hasLicence, hasInsurance, hasPermit, siteAccessConfirmed,
+          materialsOnSite, toolsInspected, swmsCompleted, inductionComplete,
+          weatherSuitable, clientNotified, emergencyContactsLogged } = req.body;
+
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+  const safeJobType = sanitiseInput(String(jobType)).toLowerCase();
+
+  const checks = [
+    { check: "Valid trade licence held",         passed: !!hasLicence,              critical: true  },
+    { check: "Public liability insurance current", passed: !!hasInsurance,          critical: true  },
+    { check: "Permit obtained (if required)",    passed: !!hasPermit,               critical: true  },
+    { check: "Site access confirmed with client",passed: !!siteAccessConfirmed,     critical: true  },
+    { check: "All materials on site",            passed: !!materialsOnSite,         critical: false },
+    { check: "Tools inspected for safety",       passed: !!toolsInspected,          critical: true  },
+    { check: "SWMS completed and signed",        passed: !!swmsCompleted,           critical: true  },
+    { check: "Site induction complete",          passed: !!inductionComplete,       critical: false },
+    { check: "Weather conditions suitable",      passed: !!weatherSuitable,         critical: false },
+    { check: "Client notified of start time",    passed: !!clientNotified,          critical: false },
+    { check: "Emergency contacts logged",        passed: !!emergencyContactsLogged, critical: true  },
+  ];
+
+  const criticalFailed = checks.filter(c => c.critical && !c.passed);
+  const minorFailed    = checks.filter(c => !c.critical && !c.passed);
+  const passed         = checks.filter(c => c.passed);
+  const readyToStart   = criticalFailed.length === 0;
+
+  const tradeSpecificReminders = {
+    plumbing:   ["Confirm water supply can be isolated before starting", "Have TPR valve test report ready"],
+    gas:        ["Check gas isolation valve location before any work", "Ensure combustion analyser is calibrated"],
+    electrical: ["Confirm supply isolation at switchboard", "Test dead before touching any conductors"],
+    drainage:   ["Confirm drainage flow direction before excavation", "Have traffic management plan if near roadway"],
+    carpentry:  ["Check for asbestos before cutting or drilling", "Confirm structural engineer sign-off if load-bearing"],
+    hvac:       ["Confirm ARCtick licence for refrigerant handling", "Check condensate drain path before commissioning"],
+  };
+
+  return res.json({
+    jobType: safeJobType,
+    readyToStart,
+    verdict: readyToStart ? "PROCEED" : "DO NOT START — resolve critical items first",
+    totalChecks:    checks.length,
+    passed:         passed.length,
+    criticalFailed: criticalFailed.map(c => c.check),
+    minorFailed:    minorFailed.map(c => c.check),
+    completionRate: Math.round((passed.length / checks.length) * 100),
+    tradeReminders: tradeSpecificReminders[safeJobType] || [],
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+// POST /cost-estimate-breakdown  — Detailed labour + material cost breakdown
+app.post("/cost-estimate-breakdown", apiKeyAuth, (req, res) => {
+  const { jobType, complexity, hours, materialsCost, calloutFee, gstIncluded, state } = req.body;
+
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+  const safeJobType = sanitiseInput(String(jobType)).toLowerCase();
+  const resolvedComplexity = sanitiseInput(String(complexity || "medium")).toLowerCase();
+
+  const rateTable = AWARD_RATES[safeJobType] || AWARD_RATES.plumbing;
+  const baseRate = (rateTable && rateTable.ordinary) ? rateTable.ordinary : 45;
+
+  const MULTIPLIERS = { simple: 1.0, medium: 1.2, complex: 1.5, "very complex": 1.8 };
+  const complexityMultiplier = MULTIPLIERS[resolvedComplexity] || 1.2;
+
+  const resolvedHours = parseFloat(hours) || 2;
+  const resolvedMaterials = parseFloat(materialsCost) || 0;
+  const resolvedCallout = parseFloat(calloutFee) || 0;
+
+  const labourRate       = Math.round(baseRate * complexityMultiplier * 100) / 100;
+  const labourCost       = Math.round(resolvedHours * labourRate * 100) / 100;
+  const subTotal         = Math.round((labourCost + resolvedMaterials + resolvedCallout) * 100) / 100;
+  const gstAmount        = Math.round(subTotal * 0.1 * 100) / 100;
+  const totalWithGst     = Math.round((subTotal + gstAmount) * 100) / 100;
+  const totalWithoutGst  = subTotal;
+
+  const MARKUP_RATES = { simple: 0.15, medium: 0.20, complex: 0.25, "very complex": 0.30 };
+  const markupRate   = MARKUP_RATES[resolvedComplexity] || 0.20;
+  const materialsWithMarkup = Math.round(resolvedMaterials * (1 + markupRate) * 100) / 100;
+
+  return res.json({
+    jobType: safeJobType,
+    complexity: resolvedComplexity,
+    state: sanitiseInput(String(state || "VIC")),
+    breakdown: {
+      labour: {
+        hours:        resolvedHours,
+        ratePerHour:  labourRate,
+        total:        labourCost,
+        note:         `Based on ${safeJobType} award rate with ${resolvedComplexity} complexity multiplier (×${complexityMultiplier})`,
+      },
+      materials: {
+        supplierCost: resolvedMaterials,
+        withMarkup:   materialsWithMarkup,
+        markupRate:   `${Math.round(markupRate * 100)}%`,
+      },
+      calloutFee: resolvedCallout,
+    },
+    summary: {
+      subTotal:        totalWithoutGst,
+      gst:             gstAmount,
+      totalIncGst:     totalWithGst,
+      gstIncluded:     !!gstIncluded,
+      displayTotal:    gstIncluded ? totalWithGst : totalWithoutGst,
+    },
+    disclaimer: "Estimate only. Actual costs may vary based on site conditions, material availability, and scope changes. All prices in AUD.",
+    generatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
