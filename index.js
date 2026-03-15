@@ -83921,6 +83921,469 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 291 ─────────────────────────────────────────────────────────────────
+
+// POST /telecom-tower-inspection — Record telecommunications tower/antenna structure inspection per AS/NZS 4296
+app.post("/telecom-tower-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, towerId, location, inspectionDate, inspectedBy,
+      towerType, towerHeightM, towerAge, towerOwner,
+      structuralInspectionType, lastFullInspectionDate,
+      foundationCondition, anchorBoltsOk, baseFrameOk,
+      memberCorrosion, memberCorrosionSeverity, memberBuckledOrBent,
+      connectionBoltsOk, climbingPegLadderOk,
+      safetyClimbSystemOk, platformsGratingOk,
+      lightningProtectionOk, earthResistanceOhm,
+      antennaMountingOk, cableManagementOk, coaxCablesOk,
+      aviationLightingRequired, aviationLightingFunctional,
+      exclusionZoneSignage, rfEmissionSignageOk,
+      accessControlOk, siteSecured,
+      windLoadAssessed, loadCertificateCurrent,
+      defectsFound, defectDetails, nextInspectionDue, certRef, notes
+    } = req.body;
+
+    if (!towerId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "towerId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeTowerId = sanitiseInput(String(towerId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const defects = Array.isArray(defectDetails) ? defectDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const earthResistance = parseFloat(earthResistanceOhm) || null;
+    const towerH = parseFloat(towerHeightM) || null;
+    const towerAgeYrs = parseInt(towerAge) || null;
+
+    // AS/NZS 4296 — Telecommunications network (customer access) infrastructure
+    // AS 3995 — Design of steel lattice towers and masts
+    // OHS Regulations 2017 (Vic) — working at height
+    if (memberBuckledOrBent === true || memberBuckledOrBent === "true") {
+      criticalIssues.push("Structural member buckled or bent — immediate out-of-service assessment required. Tower structural integrity is compromised. Do not climb (AS 3995).");
+    }
+
+    const corrosionSev = String(memberCorrosionSeverity || "").toUpperCase();
+    if (memberCorrosion === true || memberCorrosion === "true") {
+      if (corrosionSev === "SEVERE" || corrosionSev === "HEAVY") {
+        criticalIssues.push(`Severe member corrosion detected — structural capacity reduced. Do not climb tower without structural engineer assessment (AS 3995 / AS/NZS 2312).`);
+      } else if (corrosionSev === "MODERATE") {
+        warnings.push("Moderate corrosion on tower members — schedule full structural inspection with corrosion treatment within 3 months.");
+      }
+    }
+
+    if (!connectionBoltsOk) {
+      criticalIssues.push("Connection bolt deficiencies found — loose or missing bolts compromise structural integrity. Do not climb until repaired (AS 3995).");
+    }
+
+    if (!foundationCondition || String(foundationCondition).toUpperCase() === "POOR") {
+      criticalIssues.push("Tower foundation in poor condition — cracking, settlement, or exposed reinforcement threatens overall tower stability. Engage structural engineer.");
+    }
+
+    if (!safetyClimbSystemOk) {
+      criticalIssues.push("Safety climb system (fall arrest) not serviceable — personnel must not climb tower without functional fall protection (OHS Regulations 2017 (Vic) / AS/NZS 1891.4).");
+    }
+
+    if (aviationLightingRequired === true || aviationLightingRequired === "true") {
+      if (!aviationLightingFunctional) {
+        criticalIssues.push("Aviation warning lighting required but not functional — immediate rectification required and notify CASA (Civil Aviation Safety Regulations 1998 (Cth)).");
+      }
+    }
+
+    if (!lightningProtectionOk) {
+      criticalIssues.push("Lightning protection system defective — telecommunications towers are high-risk lightning strike targets. Repair earth/bonding system immediately (AS 1768).");
+    } else if (earthResistance !== null && earthResistance > 10) {
+      warnings.push(`Earth resistance ${earthResistance} Ω exceeds maximum 10 Ω — improve earthing system to ensure adequate lightning protection (AS 1768).`);
+    }
+
+    if (!loadCertificateCurrent) {
+      warnings.push("Tower load certificate not current — any antenna additions require structural assessment against current load certificate (AS 3995).");
+    }
+
+    if (!climbingPegLadderOk) {
+      warnings.push("Climbing pegs/ladder defects — repair before next personnel climb.");
+    }
+
+    if (!platformsGratingOk) {
+      warnings.push("Platform/grating defects detected — repair before next personnel access.");
+    }
+
+    if (towerAgeYrs !== null && towerAgeYrs > 20 && !lastFullInspectionDate) {
+      warnings.push(`Tower is ${towerAgeYrs} years old with no recent full structural inspection on record — schedule comprehensive Level 3 inspection (AS/NZS 4296).`);
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "OUT_OF_SERVICE" : warnings.length > 0 ? "CONDITIONAL" : "SERVICEABLE";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("telecom_tower_inspections")
+        .insert({
+          project_id: safeProject,
+          tower_id: safeTowerId,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          tower_type: towerType ? sanitiseInput(String(towerType)) : null,
+          tower_height_m: towerH,
+          tower_age: towerAgeYrs,
+          tower_owner: towerOwner ? sanitiseInput(String(towerOwner)) : null,
+          inspection_type: inspectionType ? sanitiseInput(String(inspectionType)) : null,
+          foundation_condition: foundationCondition ? sanitiseInput(String(foundationCondition)) : null,
+          anchor_bolts_ok: anchorBoltsOk !== false && anchorBoltsOk !== "false",
+          member_corrosion: memberCorrosion || false,
+          corrosion_severity: memberCorrosionSeverity ? sanitiseInput(String(memberCorrosionSeverity)) : null,
+          member_buckled: memberBuckledOrBent || false,
+          connection_bolts_ok: connectionBoltsOk !== false && connectionBoltsOk !== "false",
+          safety_climb_ok: safetyClimbSystemOk !== false && safetyClimbSystemOk !== "false",
+          aviation_lighting_required: aviationLightingRequired || false,
+          aviation_lighting_ok: aviationLightingFunctional !== false && aviationLightingFunctional !== "false",
+          lightning_protection_ok: lightningProtectionOk !== false && lightningProtectionOk !== "false",
+          earth_resistance_ohm: earthResistance,
+          load_cert_current: loadCertificateCurrent !== false && loadCertificateCurrent !== "false",
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          next_inspection_due: nextInspectionDue || null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          defect_details: defects,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Telecommunications tower out of service — do not climb or load until structural defects are rectified.",
+        standards: ["AS/NZS 4296", "AS 3995", "AS 1768", "OHS Regulations 2017 (Vic)"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      towerId: safeTowerId,
+      nextInspectionDue: nextInspectionDue || null,
+      standards: ["AS/NZS 4296", "AS 3995"],
+    });
+  } catch (err) {
+    console.error("POST /telecom-tower-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record telecom tower inspection." });
+  }
+});
+
+// POST /data-centre-inspection — Record data centre power and cooling infrastructure inspection
+app.post("/data-centre-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, facilityId, facilityName, location, inspectionDate, inspectedBy,
+      tierRating, totalItkW, designItkW,
+      ups1StatusOk, ups2StatusOk, upsRuntimeMin, upsBatteryAge,
+      generatorCount, generatorsTestedMonthly, lastGeneratorTest, generatorTestPassed,
+      ahuCount, ahuOperational, cracCoolAisleSetPointC, hotAisleTempC,
+      coldAisleTempC, pueRatio,
+      waterCoolingInstalled, coolingTowerOk, chillerOk,
+      mainSwitchboardOk, stsOk, pduOk,
+      earthingOk, lightningProtectionOk,
+      fireSuppresionSystemOk, smokeDetectionOk, vesda,
+      accessControlOk, cctv, intrusionDetection,
+      waterLeakDetectionInstalled, waterLeakAlarmsOk,
+      bmsMonitoringOk, remoteMonitoringOk,
+      defectsFound, defectDetails, notes
+    } = req.body;
+
+    if (!facilityId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "facilityId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeFacilityId = sanitiseInput(String(facilityId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const defects = Array.isArray(defectDetails) ? defectDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const upsRuntime = parseFloat(upsRuntimeMin) || null;
+    const upsBattAge = parseInt(upsBatteryAge) || null;
+    const hotAisleT = parseFloat(hotAisleTempC) || null;
+    const coldAisleT = parseFloat(coldAisleTempC) || null;
+    const pue = parseFloat(pueRatio) || null;
+    const totalIT = parseFloat(totalItkW) || null;
+    const designIT = parseFloat(designItkW) || null;
+
+    // AS/NZS ISO/IEC 24764 — Generic cabling for data centres
+    // BICSI 002 — Data Centre Design and Implementation Best Practices
+    // Uptime Institute Tier Standards
+    if (!ups1StatusOk) {
+      criticalIssues.push("UPS-1 fault — primary uninterruptible power supply not operational. Data centre has no primary power protection. Engage UPS engineer immediately.");
+    }
+
+    if (!fireSuppresionSystemOk) {
+      criticalIssues.push("Fire suppression system fault — data centre cannot be occupied until fire suppression system is restored. Notify AS 1851 registered contractor (AS 1851).");
+    }
+
+    if (!smokeDetectionOk) {
+      criticalIssues.push("Smoke detection system fault — data centre may not be occupied without functioning smoke detection (Building Regulations 2018 (Vic)).");
+    }
+
+    if (hotAisleT !== null && hotAisleT > 45) {
+      criticalIssues.push(`Hot aisle temperature ${hotAisleT}°C dangerously high — risk of server/equipment thermal shutdown. Investigate cooling failure immediately.`);
+    }
+
+    if (coldAisleT !== null && coldAisleT > 27) {
+      criticalIssues.push(`Cold aisle supply temperature ${coldAisleT}°C above ASHRAE recommended maximum 27°C — servers operating outside thermal envelope. Investigate cooling.`);
+    }
+
+    if (!generatorTestPassed && generatorCount > 0) {
+      criticalIssues.push("Generator test failed — standby power cannot be relied on during extended mains outage. Repair generator before next UPS battery depletion.");
+    }
+
+    if (upsRuntime !== null && upsRuntime < 10) {
+      warnings.push(`UPS runtime ${upsRuntime} min is below 10-minute minimum — insufficient time for orderly shutdown during extended outage. Review UPS sizing or battery capacity.`);
+    }
+
+    if (upsBattAge !== null && upsBattAge > 4) {
+      warnings.push(`UPS batteries ${upsBattAge} years old — most VRLA batteries should be replaced at 4–5 years. Schedule battery replacement.`);
+    }
+
+    if (pue !== null && pue > 1.8) {
+      warnings.push(`PUE ratio ${pue} above 1.8 — energy efficiency below industry best practice. Consider cooling optimisation (hot/cold aisle containment, airflow management).`);
+    }
+
+    if (totalIT !== null && designIT !== null && totalIT > designIT * 0.85) {
+      warnings.push(`IT load ${totalIT} kW approaching design capacity ${designIT} kW (${Math.round((totalIT / designIT) * 100)}%) — plan capacity expansion or review load distribution.`);
+    }
+
+    if (!waterLeakDetectionInstalled) {
+      warnings.push("Water leak detection not installed — water ingress under raised floor or near cooling equipment can cause catastrophic equipment failure. Install leak detection.");
+    }
+
+    if (!accessControlOk) {
+      warnings.push("Physical access control deficiency — data centre access must be restricted to authorised personnel (ISO/IEC 27001).");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "CRITICAL" : warnings.length > 0 ? "ATTENTION_REQUIRED" : "OPERATIONAL";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("data_centre_inspections")
+        .insert({
+          project_id: safeProject,
+          facility_id: safeFacilityId,
+          facility_name: facilityName ? sanitiseInput(String(facilityName)) : null,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          tier_rating: tierRating ? sanitiseInput(String(tierRating)) : null,
+          total_it_kw: totalIT,
+          design_it_kw: designIT,
+          ups_1_ok: ups1StatusOk !== false && ups1StatusOk !== "false",
+          ups_2_ok: ups2StatusOk !== false && ups2StatusOk !== "false",
+          ups_runtime_min: upsRuntime,
+          ups_battery_age: upsBattAge,
+          generator_count: parseInt(generatorCount) || 0,
+          generators_tested: generatorsTestedMonthly !== false && generatorsTestedMonthly !== "false",
+          last_gen_test: lastGeneratorTest || null,
+          gen_test_passed: generatorTestPassed !== false && generatorTestPassed !== "false",
+          hot_aisle_temp_c: hotAisleT,
+          cold_aisle_temp_c: coldAisleT,
+          pue_ratio: pue,
+          fire_suppression_ok: fireSuppresionSystemOk !== false && fireSuppresionSystemOk !== "false",
+          smoke_detection_ok: smokeDetectionOk !== false && smokeDetectionOk !== "false",
+          vesda_installed: vesda !== false && vesda !== "false",
+          access_control_ok: accessControlOk !== false && accessControlOk !== "false",
+          cctv_ok: cctv !== false && cctv !== "false",
+          water_leak_detection: waterLeakDetectionInstalled !== false && waterLeakDetectionInstalled !== "false",
+          bms_monitoring: bmsMonitoringOk !== false && bmsMonitoringOk !== "false",
+          earthing_ok: earthingOk !== false && earthingOk !== "false",
+          defects_found: defectsFound || false,
+          defect_details: defects,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Data centre critical infrastructure fault — immediate action required to prevent service outage.",
+        standards: ["AS/NZS ISO/IEC 24764", "AS 1851", "Uptime Institute Tier Standards", "ISO/IEC 27001"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      facilityId: safeFacilityId,
+      standards: ["AS/NZS ISO/IEC 24764", "Uptime Institute Tier Standards"],
+    });
+  } catch (err) {
+    console.error("POST /data-centre-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record data centre inspection." });
+  }
+});
+
+// POST /ai-ict-infrastructure-assessment — AI assesses ICT infrastructure resilience and compliance
+app.post("/ai-ict-infrastructure-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      organisationId, facilityType, criticalityLevel,
+      dataCentresCount, dataCentresTierRating, averagePue,
+      telecomTowersCount, towersInspectedLast12Months,
+      networkRedundancy, wanRedundancy, internetRedundancy,
+      powerRedundancyLevel, generatorBackup, generatorRuntimeHr,
+      disasterRecoveryPlanInPlace, drpLastTested, rpoHours, rtoHours,
+      cyberSecurityFramework, lastPenTestDate, incidentResponsePlanInPlace,
+      iso27001Certified, uptimeMonitored,
+      maintenanceContractsInPlace, preventiveMaintenanceScheduled,
+      slaCompliancePercent, outagesLast12Months, outageImpactHours,
+      deficienciesNoted, notes
+    } = req.body;
+
+    if (!organisationId) {
+      return res.status(400).json({ error: "organisationId is required." });
+    }
+
+    const safeOrgId = sanitiseInput(String(organisationId));
+    const deficiencies = Array.isArray(deficienciesNoted) ? deficienciesNoted : [];
+
+    const prompt = `You are an ICT infrastructure and data centre resilience expert. Assess this organisation's ICT infrastructure compliance and resilience risk.
+
+Organisation ID: ${safeOrgId}
+Facility type: ${facilityType || "Unknown"}
+Criticality level: ${criticalityLevel || "Unknown"}
+
+FACILITIES:
+- Data centres: ${dataCentresCount || 0}, Tier rating: ${dataCentresTierRating || "Unknown"}
+- Average PUE: ${averagePue || "Unknown"}
+- Telecom towers: ${telecomTowersCount || 0}, inspected last 12 months: ${towersInspectedLast12Months || 0}
+
+RESILIENCE:
+- Network redundancy: ${networkRedundancy || "Unknown"}
+- WAN redundancy: ${wanRedundancy || "Unknown"}
+- Internet redundancy: ${internetRedundancy || "Unknown"}
+- Power redundancy: ${powerRedundancyLevel || "Unknown"}
+- Generator backup: ${generatorBackup ? "Yes — " + (generatorRuntimeHr || "unknown") + " hr runtime" : "No"}
+
+CONTINUITY:
+- DRP in place: ${disasterRecoveryPlanInPlace ? "Yes (last tested: " + (drpLastTested || "unknown") + ")" : "No"}
+- RPO: ${rpoHours ? rpoHours + " hours" : "Unknown"}
+- RTO: ${rtoHours ? rtoHours + " hours" : "Unknown"}
+
+SECURITY AND COMPLIANCE:
+- Cyber security framework: ${cyberSecurityFramework || "None"}
+- Last pen test: ${lastPenTestDate || "Unknown"}
+- Incident response plan: ${incidentResponsePlanInPlace ? "Yes" : "No"}
+- ISO 27001 certified: ${iso27001Certified ? "Yes" : "No"}
+- Uptime monitoring: ${uptimeMonitored ? "Yes" : "No"}
+
+OPERATIONS:
+- Maintenance contracts: ${maintenanceContractsInPlace ? "Yes" : "No"}
+- Preventive maintenance scheduled: ${preventiveMaintenanceScheduled ? "Yes" : "No"}
+- SLA compliance: ${slaCompliancePercent ? slaCompliancePercent + "%" : "Unknown"}
+- Outages (12 months): ${outagesLast12Months || 0}, impact: ${outageImpactHours || 0} hours
+
+Deficiencies: ${deficiencies.join("; ") || "None"}
+
+Assess under:
+- Uptime Institute Tier Standards (I–IV)
+- ASHRAE Thermal Guidelines for Data Processing Environments
+- ISO/IEC 27001 (information security)
+- ISO/IEC 22301 (business continuity)
+- Essential Eight Maturity Model (ACSC)
+- AS/NZS ISO/IEC 24764 (data centre cabling)
+- AS 1851 (fire protection maintenance)
+- Critical Infrastructure Resilience Strategy (Vic)
+
+Provide:
+1. Overall ICT infrastructure resilience rating
+2. Data centre tier compliance assessment
+3. Power and cooling resilience
+4. Disaster recovery preparedness
+5. Security posture assessment
+6. Priority improvement actions
+
+Respond ONLY in JSON:
+{
+  "overallResilienceRating": "HIGH|MODERATE|LOW|INADEQUATE",
+  "dataCentreTierCompliance": "COMPLIANT|PARTIALLY_COMPLIANT|NON_COMPLIANT|UNKNOWN",
+  "powerResilienceRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "coolingResilienceRisk": "LOW|MODERATE|HIGH",
+  "drpReadiness": "STRONG|ADEQUATE|INADEQUATE|NONE",
+  "securityPosture": "STRONG|MODERATE|WEAK|CRITICAL",
+  "priorityActions": ["string"],
+  "powerFindings": ["string"],
+  "drpFindings": ["string"],
+  "securityFindings": ["string"],
+  "energyEfficiencyFindings": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 900,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallResilienceRating: "MODERATE",
+        dataCentreTierCompliance: "UNKNOWN",
+        powerResilienceRisk: "MODERATE",
+        coolingResilienceRisk: "MODERATE",
+        drpReadiness: "INADEQUATE",
+        securityPosture: "MODERATE",
+        priorityActions: ["Test DRP annually and update to meet RTO/RPO requirements", "Ensure all data centre generators are tested monthly under load"],
+        powerFindings: ["AI assessment unavailable — engage data centre specialist for formal Tier compliance audit"],
+        drpFindings: ["Disaster recovery plan should be tested at minimum annually per ISO/IEC 22301"],
+        securityFindings: ["Consider aligning with Essential Eight Maturity Model (ACSC) for baseline cybersecurity"],
+        energyEfficiencyFindings: ["Benchmark PUE against ASHRAE guidelines and target PUE < 1.5"],
+        applicableStandards: ["Uptime Institute Tier Standards", "ISO/IEC 27001", "ISO/IEC 22301", "AS 1851"],
+        summary: "AI ICT infrastructure assessment unavailable. Engage data centre specialist and cybersecurity consultant for formal compliance review.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      organisationId: safeOrgId,
+      standards: ["Uptime Institute Tier Standards", "ISO/IEC 27001", "ISO/IEC 22301", "ASHRAE Thermal Guidelines", "AS/NZS ISO/IEC 24764"],
+    });
+  } catch (err) {
+    console.error("POST /ai-ict-infrastructure-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess ICT infrastructure." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
