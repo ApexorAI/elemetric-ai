@@ -32618,6 +32618,158 @@ app.get("/compliance-health/:contractorId", apiKeyAuth, async (req, res) => {
   });
 });
 
+// ── Round 120: Payroll run, superannuation register, payslip summary ──────────
+
+// POST /payroll-run — Process a payroll run for a period
+app.post("/payroll-run", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, payPeriodStart, payPeriodEnd, paymentDate,
+    hoursRegular = 0, hoursOvertime = 0, hoursSaturday = 0, hoursSunday = 0, hoursPublicHoliday = 0,
+    rateOrdinary = 0, allowances = [], deductions = [],
+    awardCode, employmentType = "FULL_TIME", state = "VIC",
+  } = req.body;
+
+  if (!contractorId || !payPeriodStart || !payPeriodEnd)
+    return res.status(400).json({ error: "contractorId, payPeriodStart, payPeriodEnd required." });
+
+  const rate = Number(rateOrdinary);
+  // Award penalty rates (simplified — always consult Fair Work for actual rates)
+  const penaltyRates = { overtime: 1.5, saturday: 1.5, sunday: 2.0, publicHoliday: 2.5 };
+
+  const grossRegular = Number(hoursRegular) * rate;
+  const grossOvertime = Number(hoursOvertime) * rate * penaltyRates.overtime;
+  const grossSaturday = Number(hoursSaturday) * rate * penaltyRates.saturday;
+  const grossSunday = Number(hoursSunday) * rate * penaltyRates.sunday;
+  const grossPublicHoliday = Number(hoursPublicHoliday) * rate * penaltyRates.publicHoliday;
+  const grossHourly = grossRegular + grossOvertime + grossSaturday + grossSunday + grossPublicHoliday;
+
+  const totalAllowances = allowances.reduce((s, a) => s + (Number(a.amount) || 0), 0);
+  const grossPay = grossHourly + totalAllowances;
+
+  // Super (11.5% SG rate for 2024-25)
+  const superRate = 0.115;
+  const superAmount = Math.round(grossPay * superRate * 100) / 100;
+
+  const totalDeductions = deductions.reduce((s, d) => s + (Number(d.amount) || 0), 0);
+
+  // Simplified tax (no PAYG withholding calc — indicative only)
+  const totalHours = Number(hoursRegular) + Number(hoursOvertime) + Number(hoursSaturday) + Number(hoursSunday) + Number(hoursPublicHoliday);
+
+  const record = {
+    contractor_id: sanitiseInput(contractorId),
+    pay_period_start: payPeriodStart,
+    pay_period_end: payPeriodEnd,
+    payment_date: paymentDate || null,
+    hours: { regular: Number(hoursRegular), overtime: Number(hoursOvertime), saturday: Number(hoursSaturday), sunday: Number(hoursSunday), publicHoliday: Number(hoursPublicHoliday), total: totalHours },
+    rate_ordinary: rate,
+    penalty_rates_used: penaltyRates,
+    gross_hourly: Math.round(grossHourly * 100) / 100,
+    allowances: allowances.map(a => ({ description: sanitiseInput(a.description || ""), amount: Number(a.amount) || 0 })),
+    total_allowances: Math.round(totalAllowances * 100) / 100,
+    gross_pay: Math.round(grossPay * 100) / 100,
+    superannuation: superAmount,
+    super_rate_percent: superRate * 100,
+    deductions: deductions.map(d => ({ description: sanitiseInput(d.description || ""), amount: Number(d.amount) || 0 })),
+    total_deductions: Math.round(totalDeductions * 100) / 100,
+    net_pay: Math.round((grossPay - totalDeductions) * 100) / 100,
+    award_code: sanitiseInput(awardCode || ""),
+    employment_type: sanitiseInput(employmentType),
+    state: sanitiseInput(state),
+    disclaimer: "Payroll calculated as indicative only. Always verify with payroll software and qualified payroll provider.",
+    processed_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("payroll_runs")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, payrollId: data.id, ...record });
+  }
+
+  res.json({ success: true, payrollId: null, ...record, saved: false });
+});
+
+// POST /superannuation-record — Record a superannuation contribution
+app.post("/superannuation-record", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, fundName, memberNumber, contributionAmount,
+    contributionType = "EMPLOYER_SG", payPeriodEnd, paymentDate, financialYear,
+  } = req.body;
+
+  if (!contractorId || !contributionAmount) return res.status(400).json({ error: "contractorId and contributionAmount required." });
+
+  const validTypes = ["EMPLOYER_SG", "EMPLOYEE_VOLUNTARY", "SALARY_SACRIFICE", "CO_CONTRIBUTION", "SPOUSE"];
+  const type = (contributionType || "EMPLOYER_SG").toUpperCase();
+  const fy = financialYear || (() => {
+    const now = new Date();
+    const year = now.getMonth() >= 6 ? now.getFullYear() + 1 : now.getFullYear();
+    return `${year - 1}-${year}`;
+  })();
+
+  const record = {
+    contractor_id: sanitiseInput(contractorId),
+    fund_name: sanitiseInput(fundName || ""),
+    member_number: sanitiseInput(memberNumber || ""),
+    contribution_amount: Number(contributionAmount),
+    contribution_type: validTypes.includes(type) ? type : "EMPLOYER_SG",
+    pay_period_end: payPeriodEnd || null,
+    payment_date: paymentDate || null,
+    financial_year: sanitiseInput(fy),
+    status: paymentDate ? "PAID" : "PENDING",
+    recorded_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("superannuation_records")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, recordId: data.id, ...record });
+  }
+
+  res.json({ success: true, recordId: null, ...record, saved: false });
+});
+
+// GET /payroll-summary/:contractorId — Summarise payroll totals for a contractor
+app.get("/payroll-summary/:contractorId", apiKeyAuth, async (req, res) => {
+  const { contractorId } = req.params;
+  const { financialYear } = req.query;
+
+  if (supabaseAdmin) {
+    let query = supabaseAdmin
+      .from("payroll_runs")
+      .select("pay_period_start, pay_period_end, gross_pay, net_pay, superannuation, total_hours, processed_at")
+      .eq("contractor_id", contractorId)
+      .order("pay_period_end", { ascending: false });
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "DB error." });
+
+    const runs = data || [];
+    const totalGross = runs.reduce((s, r) => s + (r.gross_pay || 0), 0);
+    const totalNet = runs.reduce((s, r) => s + (r.net_pay || 0), 0);
+    const totalSuper = runs.reduce((s, r) => s + (r.superannuation || 0), 0);
+    const totalHours = runs.reduce((s, r) => s + (r.total_hours?.total || 0), 0);
+
+    return res.json({
+      contractorId,
+      payRunCount: runs.length,
+      totalGrossPay: Math.round(totalGross * 100) / 100,
+      totalNetPay: Math.round(totalNet * 100) / 100,
+      totalSuper: Math.round(totalSuper * 100) / 100,
+      totalHours: Math.round(totalHours * 10) / 10,
+      recentRuns: runs.slice(0, 10),
+    });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
