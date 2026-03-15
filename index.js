@@ -15739,6 +15739,252 @@ app.post("/subcontractor-register", apiKeyAuth, async (req, res) => {
   return res.status(201).json({ ...record, saved });
 });
 
+// ── Round 33 ──────────────────────────────────────────────────────────────────
+
+// POST /safety-observation  — Log a safety observation or near-miss on site
+app.post("/safety-observation", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, observationType, description, location, severity,
+          reportedBy, immediateAction, correctiveAction, photoAttached } = req.body;
+
+  if (!description || !observationType) {
+    return res.status(400).json({ error: "description and observationType are required." });
+  }
+
+  const OBSERVATION_TYPES = ["near_miss", "unsafe_condition", "unsafe_act", "positive_observation", "first_aid", "incident"];
+  const safeObsType   = sanitiseInput(String(observationType)).toLowerCase().replace(/\s/g, "_");
+
+  if (!OBSERVATION_TYPES.includes(safeObsType)) {
+    return res.status(400).json({ error: `observationType must be one of: ${OBSERVATION_TYPES.join(", ")}` });
+  }
+
+  const safeDesc       = sanitiseInput(String(description));
+  const safeLocation   = sanitiseInput(String(location || "Not specified"));
+  const safeSeverity   = sanitiseInput(String(severity || "low")).toLowerCase();
+  const safeReporter   = sanitiseInput(String(reportedBy || "Anonymous"));
+  const safeImmediate  = sanitiseInput(String(immediateAction || ""));
+  const safeCorrective = sanitiseInput(String(correctiveAction || ""));
+  const safeJobType    = sanitiseInput(String(jobType || "general")).toLowerCase();
+
+  const SEVERITY_ACTIONS = {
+    critical: { notifyWorksafe: true,  escalate: true,  stopWork: true  },
+    high:     { notifyWorksafe: false, escalate: true,  stopWork: false },
+    medium:   { notifyWorksafe: false, escalate: false, stopWork: false },
+    low:      { notifyWorksafe: false, escalate: false, stopWork: false },
+  };
+
+  const severityActions = SEVERITY_ACTIONS[safeSeverity] || SEVERITY_ACTIONS.low;
+  const obsId = `OBS-${Date.now().toString(36).toUpperCase()}`;
+
+  const requiredFollowUp = [
+    severityActions.stopWork        ? "Stop work on affected area immediately" : null,
+    severityActions.notifyWorksafe  ? "Notify WorkSafe Victoria within 1 hour (1800 136 089)" : null,
+    severityActions.escalate        ? "Escalate to site supervisor and project manager" : null,
+    safeCorrective                  ? `Complete corrective action: ${safeCorrective}` : "Document corrective action before resuming work",
+    !photoAttached                  ? "Attach photo evidence of the observation" : null,
+  ].filter(Boolean);
+
+  const observation = {
+    observationId:    obsId,
+    jobId:            jobId ? sanitiseInput(String(jobId)) : null,
+    jobType:          safeJobType,
+    observationType:  safeObsType,
+    description:      safeDesc,
+    location:         safeLocation,
+    severity:         safeSeverity.toUpperCase(),
+    reportedBy:       safeReporter,
+    immediateAction:  safeImmediate || null,
+    correctiveAction: safeCorrective || null,
+    photoAttached:    !!photoAttached,
+    notifyWorksafe:   severityActions.notifyWorksafe,
+    stopWorkRequired: severityActions.stopWork,
+    requiredFollowUp,
+    status:           "OPEN",
+    reportedAt:       new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    await supabaseAdmin.from("safety_observations").insert({
+      observation_id:   obsId,
+      job_id:           observation.jobId,
+      job_type:         safeJobType,
+      observation_type: safeObsType,
+      severity:         safeSeverity,
+      description:      safeDesc,
+      stop_work:        severityActions.stopWork,
+      status:           "OPEN",
+      created_at:       new Date().toISOString(),
+    }).then(() => {}).catch(() => {});
+  }
+
+  return res.status(201).json(observation);
+});
+
+// POST /commissioning-record  — Log a formal commissioning record for newly installed equipment
+app.post("/commissioning-record", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, equipmentDescription, manufacturer, model, serialNumber,
+          installDate, commissionedBy, testResults, passedCommissioning, clientSignoff,
+          warrantyYears, nextServiceDate, notes } = req.body;
+
+  if (!equipmentDescription || !jobType) {
+    return res.status(400).json({ error: "equipmentDescription and jobType are required." });
+  }
+
+  const safeJobType  = sanitiseInput(String(jobType)).toLowerCase();
+  const safeEquip    = sanitiseInput(String(equipmentDescription));
+  const safeMfg      = sanitiseInput(String(manufacturer || "Not specified"));
+  const safeModel    = sanitiseInput(String(model || "Not specified"));
+  const safeSerial   = sanitiseInput(String(serialNumber || "Not recorded"));
+  const safeComBy    = sanitiseInput(String(commissionedBy || "Technician"));
+  const safeNotes    = sanitiseInput(String(notes || ""));
+
+  const commId = `COM-${Date.now().toString(36).toUpperCase()}`;
+
+  const COMMISSIONING_CHECKS = {
+    plumbing:   ["Pressure test performed", "Flow rates verified", "All isolation valves tested", "TPR valve functional"],
+    gas:        ["Pressure test performed", "Combustion analysis completed", "All appliances lit and operating", "Flue draught verified"],
+    electrical: ["Insulation resistance tested", "RCD tested and tripped", "All circuits labelled", "Load test performed"],
+    drainage:   ["Water test performed", "All inspection openings accessible", "Gradient confirmed", "No blockages"],
+    carpentry:  ["All connections torqued", "No movement under test load", "Moisture content verified", "Visual inspection complete"],
+    hvac:       ["Refrigerant charge verified", "Air flow balanced", "Thermostat calibrated", "Condensate drain tested"],
+  };
+
+  const checks = (COMMISSIONING_CHECKS[safeJobType] || []).map(check => ({
+    check,
+    status: passedCommissioning ? "PASS" : "PENDING",
+  }));
+
+  const record = {
+    commissioningId:      commId,
+    status:               passedCommissioning ? "COMMISSIONED" : "PENDING_COMMISSIONING",
+    jobId:                jobId ? sanitiseInput(String(jobId)) : null,
+    jobType:              safeJobType,
+    equipment: {
+      description: safeEquip,
+      manufacturer: safeMfg,
+      model:        safeModel,
+      serialNumber: safeSerial,
+    },
+    installDate:          installDate || null,
+    commissionedBy:       safeComBy,
+    commissioningChecks:  checks,
+    testResults:          testResults || null,
+    passedCommissioning:  !!passedCommissioning,
+    clientSignoff:        !!clientSignoff,
+    warrantyYears:        parseInt(warrantyYears) || null,
+    nextServiceDate:      nextServiceDate || null,
+    notes:                safeNotes || null,
+    commissionedAt:       new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin && jobId) {
+    const { error } = await supabaseAdmin.from("commissioning_records").insert({
+      commissioning_id:  commId,
+      job_id:            String(jobId),
+      job_type:          safeJobType,
+      equipment:         safeEquip,
+      manufacturer:      safeMfg,
+      model:             safeModel,
+      passed:            !!passedCommissioning,
+      warranty_years:    parseInt(warrantyYears) || null,
+      next_service_date: nextServiceDate || null,
+      created_at:        new Date().toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...record, saved });
+});
+
+// GET /weather-risk/:state  — Return current weather-related risk flags for a state
+app.get("/weather-risk/:state", apiKeyAuth, (req, res) => {
+  const state = sanitiseInput(String(req.params.state || "VIC")).toUpperCase();
+  const month = new Date().getMonth() + 1; // 1-12
+
+  const SEASONAL_RISKS = {
+    VIC: {
+      summer:  { months: [12, 1, 2],  risks: ["Bushfire — BAL-zone sites may have access restrictions", "Extreme heat — restrict outdoor work above 35°C", "Electrical storm — cease elevated work during thunderstorms", "UV exposure — mandatory sun protection for outdoor workers"] },
+      autumn:  { months: [3, 4, 5],   risks: ["Heavy rainfall — trench flooding risk, check drainage", "Strong winds — scaffolding and elevated work risk", "Temperature drop — check gas appliance operation after summer"] },
+      winter:  { months: [6, 7, 8],   risks: ["Frost — slippery surfaces on roofs and scaffolding", "Poor light — finish daylight outdoor work by 5pm", "Increased gas/HVAC load — inspect and service before winter"] },
+      spring:  { months: [9, 10, 11], risks: ["Sudden storms — electrical and height risks", "Bushfire season starts October — check ember protection", "High UV — restart sun protection protocols"] },
+    },
+    NSW: {
+      summer:  { months: [12, 1, 2],  risks: ["Extreme heat events", "Bushfire risk in western areas", "Coastal storm surge — protect site drainage"] },
+      autumn:  { months: [3, 4, 5],   risks: ["La Niña rainfall — site flooding", "Strong southerly changes"] },
+      winter:  { months: [6, 7, 8],   risks: ["Alpine frost risk in highlands", "Heating system demand peaks"] },
+      spring:  { months: [9, 10, 11], risks: ["Bushfire season commences", "Severe storm risk — NE coast"] },
+    },
+    QLD: {
+      summer:  { months: [12, 1, 2],  risks: ["Cyclone season — follow BOM advisories", "Monsoonal rain — site flooding", "Extreme heat and humidity"] },
+      autumn:  { months: [3, 4, 5],   risks: ["Residual wet season", "Cyclone risk continues to April"] },
+      winter:  { months: [6, 7, 8],   risks: ["Dry season — dust and low humidity"] },
+      spring:  { months: [9, 10, 11], risks: ["Severe thunderstorm season commences", "Early wet season — north QLD from November"] },
+    },
+  };
+
+  const stateRisks = SEASONAL_RISKS[state] || SEASONAL_RISKS.VIC;
+  const season = Object.entries(stateRisks).find(([, v]) => v.months.includes(month));
+  const currentSeason = season ? season[0] : "unknown";
+  const risks = season ? season[1].risks : ["No specific weather risks on record for this month"];
+
+  return res.json({
+    state,
+    month,
+    season: currentSeason,
+    weatherRisks: risks,
+    worksafeContact: "1800 136 089",
+    bomAlert: "Always check bom.gov.au for current warnings before commencing outdoor work.",
+  });
+});
+
+// POST /ai-compliance-advice  — AI-generated plain-language compliance advice for a specific question
+app.post("/ai-compliance-advice", apiKeyAuth, async (req, res) => {
+  const { question, jobType, context } = req.body;
+
+  if (!question) return res.status(400).json({ error: "question is required." });
+
+  const safeQuestion = sanitiseInput(String(question)).slice(0, 500);
+  const safeJobType  = sanitiseInput(String(jobType || "general")).toLowerCase();
+  const safeContext  = context ? sanitiseInput(String(context)).slice(0, 300) : null;
+
+  const systemPrompt = `You are a Victorian trade compliance expert assistant. Answer questions about Australian Standards, Victorian regulations (VBA, ESV, WorkSafe, Consumer Affairs Victoria), and trade compliance best practices. Give clear, practical, plain-English answers. Always recommend consulting the relevant authority for definitive advice. Keep responses under 200 words. Format as JSON with: "answer" (string), "keyPoints" (array of strings, max 4), "authority" (the main regulatory body), "disclaimer" (string).`;
+
+  const userMessage = `Job type: ${safeJobType}\nQuestion: ${safeQuestion}${safeContext ? `\nContext: ${safeContext}` : ""}`;
+
+  let answer, keyPoints, authority, disclaimer;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: userMessage },
+      ],
+      max_tokens: 400,
+      response_format: { type: "json_object" },
+    });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    answer     = sanitiseInput(String(parsed.answer     || ""));
+    keyPoints  = Array.isArray(parsed.keyPoints) ? parsed.keyPoints.slice(0, 4).map(p => sanitiseInput(String(p))) : [];
+    authority  = sanitiseInput(String(parsed.authority  || "Relevant Victorian authority"));
+    disclaimer = sanitiseInput(String(parsed.disclaimer || "This is general guidance only. Always verify with the relevant authority."));
+  } catch {
+    answer    = "Unable to generate compliance advice at this time. Please consult vba.vic.gov.au or esv.vic.gov.au for authoritative guidance.";
+    keyPoints = [];
+    authority = "VBA / ESV";
+    disclaimer = "This is general guidance only.";
+  }
+
+  return res.json({
+    question:  safeQuestion,
+    jobType:   safeJobType,
+    answer,
+    keyPoints,
+    authority,
+    disclaimer,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
