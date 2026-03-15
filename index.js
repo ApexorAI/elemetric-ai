@@ -23581,6 +23581,176 @@ app.post("/noise-complaint", apiKeyAuth, async (req, res) => {
   return res.status(201).json({ ...complaint, saved: !!supabaseAdmin });
 });
 
+// POST /job-checklist-template  — Create a custom checklist template
+app.post("/job-checklist-template", apiKeyAuth, async (req, res) => {
+  const { contractorId, jobType, templateName, items = [], isDefault } = req.body || {};
+  if (!contractorId || !templateName || !Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: "contractorId, templateName, and items array required." });
+  }
+
+  const safeCId    = sanitiseInput(String(contractorId)).slice(0, 80);
+  const safeType   = jobType ? sanitiseInput(String(jobType)).toLowerCase().slice(0, 40) : "general";
+  const safeName   = sanitiseInput(String(templateName)).slice(0, 100);
+  const safeItems  = items.slice(0, 100).map((item, idx) => ({
+    order:    idx + 1,
+    text:     sanitiseInput(String(item.text || item || "")).slice(0, 200),
+    required: item.required !== false,
+    category: item.category ? sanitiseInput(String(item.category)).slice(0, 40) : "general",
+  }));
+
+  const template = {
+    templateId: `TPL-${safeCId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    contractorId: safeCId, jobType: safeType, templateName: safeName,
+    itemCount: safeItems.length, items: safeItems,
+    isDefault: isDefault === true,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      if (isDefault) {
+        await supabaseAdmin.from("checklist_templates").update({ is_default: false }).eq("contractor_id", safeCId).eq("job_type", safeType);
+      }
+      await supabaseAdmin.from("checklist_templates").insert({
+        template_id: template.templateId, contractor_id: safeCId, job_type: safeType,
+        template_name: safeName, items: safeItems, is_default: template.isDefault,
+        created_at: template.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...template, saved: !!supabaseAdmin });
+});
+
+// GET /job-checklist-template/:jobType  — Get checklist templates for a job type
+app.get("/job-checklist-template/:jobType", apiKeyAuth, async (req, res) => {
+  const jobType      = sanitiseInput(String(req.params.jobType || "")).toLowerCase().slice(0, 40);
+  const contractorId = req.query.contractorId ? sanitiseInput(String(req.query.contractorId)).slice(0, 80) : null;
+  if (!jobType) return res.status(400).json({ error: "jobType required." });
+
+  let templates = [];
+  if (supabaseAdmin) {
+    try {
+      let q = supabaseAdmin.from("checklist_templates").select("*").eq("job_type", jobType).order("is_default", { ascending: false }).limit(20);
+      if (contractorId) q = q.eq("contractor_id", contractorId);
+      const { data } = await q;
+      templates = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  return res.json({ jobType, contractorId: contractorId || "all", templateCount: templates.length, templates, generatedAt: new Date().toISOString() });
+});
+
+// POST /soil-report  — Log a geotechnical/soil classification report for a site
+app.post("/soil-report", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, address, soilClass, reportDate, testedBy, reportRef, findings, notes } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+
+  const VALID_SOIL_CLASSES = ["A", "S", "M", "H1", "H2", "E", "P"];
+  const SOIL_CLASS_DESC = {
+    A:  "Stable/rock — very little ground movement",
+    S:  "Slightly reactive clay — small ground movement",
+    M:  "Moderately reactive clay/silt",
+    H1: "Highly reactive clay — high ground movement",
+    H2: "Highly reactive clay — very high ground movement",
+    E:  "Extremely reactive clay — severe ground movement",
+    P:  "Problem site — requires investigation",
+  };
+
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeClass  = VALID_SOIL_CLASSES.includes(String(soilClass || "").toUpperCase()) ? String(soilClass).toUpperCase() : null;
+  const safeRef    = reportRef ? sanitiseInput(String(reportRef)).slice(0, 80) : null;
+  const safeFinds  = findings ? sanitiseInput(String(findings)).slice(0, 1000) : null;
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const record = {
+    reportId: `SOIL-${(safeSiteId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId, jobId: safeJobId,
+    address: address ? sanitiseInput(String(address)).slice(0, 200) : null,
+    soilClass: safeClass, soilClassDescription: safeClass ? SOIL_CLASS_DESC[safeClass] : null,
+    reportDate: reportDate ? sanitiseInput(String(reportDate)).slice(0, 20) : new Date().toISOString().split("T")[0],
+    testedBy: testedBy ? sanitiseInput(String(testedBy)).slice(0, 100) : null,
+    reportRef: safeRef, findings: safeFinds, notes: safeNotes,
+    requiresEngineering: safeClass && ["H2", "E", "P"].includes(safeClass),
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("soil_reports").insert({
+        report_id: record.reportId, site_id: safeSiteId, job_id: safeJobId,
+        address: record.address, soil_class: safeClass, report_date: record.reportDate,
+        tested_by: record.testedBy, report_ref: safeRef, findings: safeFinds, notes: safeNotes,
+        requires_engineering: record.requiresEngineering, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// POST /ai-compliance-summary  — AI summarises the overall compliance status of a job
+app.post("/ai-compliance-summary", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, complianceScore, missingItems = [], detectedItems = [], riskLevel, certFiled, permitObtained, photoCount, inspectionResults } = req.body || {};
+  if (!jobId || !jobType) return res.status(400).json({ error: "jobId and jobType required." });
+
+  const safeJobId  = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeType   = sanitiseInput(String(jobType)).slice(0, 40);
+  const safeScore  = typeof complianceScore === "number" ? Math.min(100, Math.max(0, complianceScore)) : null;
+  const safeMissing = Array.isArray(missingItems) ? missingItems.slice(0, 20).map(i => sanitiseInput(String(i)).slice(0, 100)) : [];
+  const safeDetected = Array.isArray(detectedItems) ? detectedItems.slice(0, 20).map(i => sanitiseInput(String(i)).slice(0, 100)) : [];
+  const safeInspection = inspectionResults ? sanitiseInput(String(inspectionResults)).slice(0, 200) : null;
+
+  const prompt = `You are a compliance expert for ${safeType} work in Victoria, Australia.
+
+Summarise the compliance status of job ${safeJobId}:
+- Compliance score: ${safeScore !== null ? safeScore + "/100" : "Not provided"}
+- Missing items: ${safeMissing.length > 0 ? safeMissing.join(", ") : "None"}
+- Detected items: ${safeDetected.length > 0 ? safeDetected.join(", ") : "None"}
+- Risk level: ${riskLevel || "Not provided"}
+- Certificate filed: ${certFiled === true ? "Yes" : certFiled === false ? "No" : "Unknown"}
+- Permit obtained: ${permitObtained === true ? "Yes" : permitObtained === false ? "No" : "Unknown"}
+- Photos taken: ${typeof photoCount === "number" ? photoCount : "Unknown"}
+${safeInspection ? `- Inspection results: ${safeInspection}` : ""}
+
+Provide a compliance summary in JSON:
+{
+  "overallStatus": "COMPLIANT|MOSTLY_COMPLIANT|NON_COMPLIANT|AT_RISK",
+  "executiveSummary": "2-3 sentence executive summary",
+  "keyStrengths": ["strength"],
+  "criticalActions": ["action required immediately"],
+  "recommendedActions": ["action recommended"],
+  "readyForHandover": true|false,
+  "readyForSignOff": true|false
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 600 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      jobId: safeJobId, jobType: safeType, complianceScore: safeScore,
+      overallStatus:      parsed.overallStatus || "AT_RISK",
+      executiveSummary:   parsed.executiveSummary || "",
+      keyStrengths:       Array.isArray(parsed.keyStrengths) ? parsed.keyStrengths : [],
+      criticalActions:    Array.isArray(parsed.criticalActions) ? parsed.criticalActions : [],
+      recommendedActions: Array.isArray(parsed.recommendedActions) ? parsed.recommendedActions : [],
+      readyForHandover:   parsed.readyForHandover === true,
+      readyForSignOff:    parsed.readyForSignOff === true,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      jobId: safeJobId, jobType: safeType, complianceScore: safeScore,
+      overallStatus: "AT_RISK", executiveSummary: "Compliance summary temporarily unavailable.",
+      keyStrengths: [], criticalActions: safeMissing.length > 0 ? [`Resolve ${safeMissing.length} missing item(s)`] : [],
+      recommendedActions: [], readyForHandover: false, readyForSignOff: false,
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
