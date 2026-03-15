@@ -6551,6 +6551,400 @@ app.post("/incident-report", (req, res) => {
   return res.json(report);
 });
 
+// ── GET /compliance-tips/:jobType ─────────────────────────────────────────────
+// Returns a curated, prioritised list of compliance tips specific to a trade.
+// Tips are grouped by category and weighted by how often they appear as missing
+// items in Victorian compliance audits.
+app.get("/compliance-tips/:jobType", (req, res) => {
+  const jobType = req.params.jobType?.toLowerCase();
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+  if (!SUPPORTED.includes(jobType)) {
+    return res.status(400).json({ error: `Unsupported jobType. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+
+  const TIPS = {
+    plumbing: [
+      { category: "Documentation", priority: "critical", tip: "Always file your Certificate of Compliance (CoC) with the VBA within 2 business days of job completion.", regulatoryRef: "Plumbing Regulations 2018 (Vic) r.50" },
+      { category: "Backflow Prevention", priority: "critical", tip: "Install a testable backflow prevention device on all high-hazard cross-connections and record the test result.", regulatoryRef: "AS/NZS 3500.1" },
+      { category: "PTR Valve", priority: "critical", tip: "Every hot water system must have a pressure-temperature relief (PTR) valve with a compliant discharge line to a safe location.", regulatoryRef: "AS/NZS 3500.4" },
+      { category: "Photos", priority: "high", tip: "Photograph all concealed pipe work before covering — inspectors cannot verify what they cannot see.", regulatoryRef: "Best practice" },
+      { category: "Water Pressure", priority: "high", tip: "Test inlet pressure before and after any pressure-limiting valve (PLV). Target 500 kPa or less at the outlet.", regulatoryRef: "AS/NZS 3500.1 cl.3.5" },
+      { category: "Pipe Support", priority: "medium", tip: "Use manufacturer-specified clip spacings and protect metallic pipes from electrolytic corrosion at supports.", regulatoryRef: "AS/NZS 3500.1" },
+      { category: "Solar/Heat Pump", priority: "medium", tip: "Include expansion relief valve test records and proof of AGA or WaterMark product certification in the photo set.", regulatoryRef: "AS/NZS 2712" },
+      { category: "GPS", priority: "medium", tip: "Capture GPS-tagged photos at job site arrival — this timestamps your on-site presence for insurance purposes.", regulatoryRef: "Best practice" },
+    ],
+    gas: [
+      { category: "Pressure Test", priority: "critical", tip: "Conduct a working pressure test AND a tightness test. Both results must appear on the Gas Compliance Certificate.", regulatoryRef: "AS/NZS 5601.1 cl.9" },
+      { category: "Ventilation", priority: "critical", tip: "Verify that all gas appliances have compliant ventilation openings — size, location, and free area all matter.", regulatoryRef: "AS/NZS 5601.1 cl.6" },
+      { category: "Flue Clearance", priority: "critical", tip: "Maintain minimum clearances from flue terminals to openings (windows, doors, eaves). Photograph each clearance with a tape measure in frame.", regulatoryRef: "AS/NZS 5601.1 cl.7" },
+      { category: "Certificate", priority: "critical", tip: "Gas Compliance Certificate must be signed and lodged with Energy Safe Victoria (ESV) within 48 hours.", regulatoryRef: "Gas Safety Act 1997 (Vic)" },
+      { category: "Appliance Certification", priority: "high", tip: "Every gas appliance must have an in-date AGA or SAA certification mark. Photograph the badge or data plate.", regulatoryRef: "AS 3814" },
+      { category: "Leak Detection", priority: "high", tip: "Use calibrated electronic gas detector or approved leak detection fluid — document the result with a photo.", regulatoryRef: "Best practice" },
+      { category: "Isolation Valve", priority: "medium", tip: "Fit an accessible isolating valve within 1 m of each appliance and label it clearly.", regulatoryRef: "AS/NZS 5601.1 cl.5" },
+      { category: "LPG Cylinder", priority: "medium", tip: "Photograph cylinder restraint, regulator type, and hose connections as evidence of compliant LPG installation.", regulatoryRef: "AS/NZS 1596" },
+    ],
+    electrical: [
+      { category: "Certificate", priority: "critical", tip: "Lodge Certificate of Electrical Safety (CoES) with Energy Safe Victoria (ESV) within 5 days for residential, 2 days for commercial.", regulatoryRef: "Electricity Safety Act 1998 (Vic)" },
+      { category: "RCD Protection", priority: "critical", tip: "All final sub-circuits serving power outlets and lighting in new installations must have RCD protection (≤30 mA trip).", regulatoryRef: "AS/NZS 3000 cl.2.6.3" },
+      { category: "Earth Continuity", priority: "critical", tip: "Record earth continuity test results for every circuit and include the instrument calibration certificate in your documentation.", regulatoryRef: "AS/NZS 3017" },
+      { category: "Circuit Labelling", priority: "high", tip: "Every circuit breaker must be clearly labelled at the switchboard. Photograph the complete, labelled board.", regulatoryRef: "AS/NZS 3000 cl.2.10.3" },
+      { category: "Insulation Test", priority: "high", tip: "Perform insulation resistance tests at 500 V DC before energising. Record results > 1 MΩ per circuit.", regulatoryRef: "AS/NZS 3017 cl.3.2" },
+      { category: "Clearances", priority: "high", tip: "Document minimum clearances from switchboards to combustible materials and access restrictions.", regulatoryRef: "AS/NZS 3000 cl.2.10" },
+      { category: "Solar / Battery", priority: "medium", tip: "For PV systems photograph inverter data plate, main switch labelling, string fusing, and earthing connections.", regulatoryRef: "AS/NZS 5033" },
+      { category: "GPS", priority: "medium", tip: "GPS metadata on switchboard photos helps verify the certificate address matches the installation address.", regulatoryRef: "Best practice" },
+    ],
+    drainage: [
+      { category: "Fall Compliance", priority: "critical", tip: "Use a digital level to verify 1:40 fall on all grade drains. Photograph the level tool on each run.", regulatoryRef: "AS/NZS 3500.2" },
+      { category: "Certificate", priority: "critical", tip: "Lodge CoC with VBA within 2 business days. Include permit number if a building permit was required.", regulatoryRef: "Plumbing Regulations 2018 (Vic)" },
+      { category: "Inspection Opening", priority: "critical", tip: "Every drain change of direction >45° requires an inspection opening. Photograph each IO before backfilling.", regulatoryRef: "AS/NZS 3500.2 cl.6.3" },
+      { category: "Backwater Valve", priority: "high", tip: "Properties in flood-prone areas require a backwater valve on the house drain. Photograph installation depth and access cover.", regulatoryRef: "AS/NZS 3500.2 cl.9" },
+      { category: "Pipe Bedding", priority: "high", tip: "Photograph bedding material and depth before backfilling. Rigid PVC requires 100 mm sand surround.", regulatoryRef: "AS/NZS 3500.2 cl.11" },
+      { category: "Hydraulic Test", priority: "high", tip: "Perform a hydraulic (water) or air test before covering. Record test pressure and duration in photos.", regulatoryRef: "AS/NZS 3500.2 cl.13" },
+      { category: "Trap Seal", priority: "medium", tip: "Each fixture drain must connect to a trap with a minimum 25 mm water seal. Photograph trap installation.", regulatoryRef: "AS/NZS 3500.2 cl.4" },
+    ],
+    carpentry: [
+      { category: "Structural Members", priority: "critical", tip: "Photograph every structural member size (span tables must be satisfied). Include a tape measure in frame.", regulatoryRef: "NCC 2022 Vol 2, AS 1684" },
+      { category: "Bracing", priority: "critical", tip: "Record bracing type, length, and fixing details before lining. Under-bracing is a top VBA non-conformance.", regulatoryRef: "AS 1684.2" },
+      { category: "Tie-Down", priority: "critical", tip: "Photograph hurricane straps / tie-down rod installations at each rafter / truss position.", regulatoryRef: "AS 1684.2 cl.9" },
+      { category: "Permit", priority: "high", tip: "Confirm building permit number is cited on all inspection requests and site signage is visible.", regulatoryRef: "Building Act 1993 (Vic)" },
+      { category: "Fire Separation", priority: "high", tip: "BAL-rated wall/roof assemblies require photographic evidence of each layer before concealment.", regulatoryRef: "NCC 2022 Spec C1.9" },
+      { category: "Waterproofing", priority: "high", tip: "Photograph all wet area waterproofing membrane applications including lap details and cove junctions.", regulatoryRef: "AS 3740" },
+      { category: "Lintel Bearings", priority: "medium", tip: "Verify minimum 100 mm bearing at each end of steel/LVL lintels. Include steel stamping in photo.", regulatoryRef: "AS 4100" },
+    ],
+    hvac: [
+      { category: "ARC Licence", priority: "critical", tip: "Only ARC-licensed technicians may handle refrigerants. Include ARC licence number on job documentation.", regulatoryRef: "Ozone Protection and Synthetic Greenhouse Gas Act 1989" },
+      { category: "Refrigerant Recovery", priority: "critical", tip: "Photograph refrigerant recovery cylinder weight before and after recovery. Record net kg recovered.", regulatoryRef: "AREP requirements" },
+      { category: "Electrical Isolation", priority: "critical", tip: "Lock-out / tag-out the dedicated circuit before any refrigerant work. Photograph LOTO in place.", regulatoryRef: "AS/NZS 3000" },
+      { category: "Condensate Drainage", priority: "high", tip: "Condensate drain must gravity-flow to a compliant drain. Photograph tray, drain connection, and overflow.", regulatoryRef: "AIRAH DA09" },
+      { category: "Filter Access", priority: "high", tip: "Confirm filter is accessible for maintenance without tools. Photograph access panel and filter condition.", regulatoryRef: "AS 1668.2" },
+      { category: "Commissioning", priority: "high", tip: "Record suction and discharge pressures, delta-T, and airflow at commissioning. These are your proof of performance.", regulatoryRef: "AIRAH DA09" },
+      { category: "Ductwork Insulation", priority: "medium", tip: "All supply air ductwork in unconditioned spaces must be insulated to R1.5 minimum. Photograph insulation thickness.", regulatoryRef: "NCC 2022 J-provisions" },
+      { category: "Clearances", priority: "medium", tip: "Document clearances from outdoor unit to fences, walls, and overhangs as per manufacturer specifications.", regulatoryRef: "Manufacturer specs" },
+    ],
+  };
+
+  const tips = TIPS[jobType] || [];
+  const critical = tips.filter(t => t.priority === "critical");
+  const high     = tips.filter(t => t.priority === "high");
+  const medium   = tips.filter(t => t.priority === "medium");
+
+  return res.json({
+    jobType,
+    totalTips:     tips.length,
+    criticalCount: critical.length,
+    highCount:     high.length,
+    mediumCount:   medium.length,
+    tips: { critical, high, medium },
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /auto-classify ───────────────────────────────────────────────────────
+// Uses GPT to classify a free-text job description into a supported trade type.
+// Useful for intake forms where users describe work in plain language.
+app.post("/auto-classify", async (req, res) => {
+  const { description } = req.body || {};
+  if (!description || typeof description !== "string" || description.trim().length < 5) {
+    return res.status(400).json({ error: "description is required (minimum 5 characters)." });
+  }
+
+  if (!client) {
+    return res.status(503).json({ error: "AI service not configured." });
+  }
+
+  const sanitised = sanitiseInput(description).substring(0, 500);
+
+  try {
+    const response = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        {
+          role: "system",
+          content: `You classify construction and trade job descriptions into one of six Victorian trade types.
+Respond with ONLY valid JSON in this format:
+{"jobType":"<type>","confidence":<0-100>,"reasoning":"<one sentence>","alternativeType":"<type or null>"}
+
+Valid types: plumbing, gas, electrical, drainage, carpentry, hvac
+If the description clearly matches none, use the closest match and set confidence below 40.`,
+        },
+        {
+          role: "user",
+          content: `Classify this job: "${sanitised}"`,
+        },
+      ],
+      max_tokens: 150,
+      temperature: 0,
+    });
+
+    const raw = response.choices[0]?.message?.content?.trim() || "";
+    let parsed;
+    try {
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      parsed = JSON.parse(jsonMatch ? jsonMatch[0] : raw);
+    } catch {
+      return res.status(502).json({ error: "AI returned unparseable response.", raw });
+    }
+
+    const VALID_TYPES = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+    if (!VALID_TYPES.includes(parsed.jobType)) {
+      parsed.jobType = "plumbing"; // fallback
+      parsed.confidence = 20;
+    }
+
+    usageStats.openaiCalls++;
+    return res.json({
+      input:           sanitised,
+      jobType:         parsed.jobType,
+      confidence:      Math.min(100, Math.max(0, Number(parsed.confidence) || 50)),
+      reasoning:       parsed.reasoning || null,
+      alternativeType: VALID_TYPES.includes(parsed.alternativeType) ? parsed.alternativeType : null,
+      classifiedAt:    new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("auto-classify error:", err);
+    return res.status(500).json({ error: "Classification failed." });
+  }
+});
+
+// ── POST /site-safety-check ───────────────────────────────────────────────────
+// Generates a WorkSafe Victoria-aligned site safety checklist based on the
+// job type and optional scope descriptors.
+app.post("/site-safety-check", (req, res) => {
+  const { jobType, scope = [], siteName } = req.body || {};
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+
+  if (!jobType || !SUPPORTED.includes(jobType.toLowerCase())) {
+    return res.status(400).json({ error: `jobType required. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+
+  const UNIVERSAL_CHECKS = [
+    { item: "Site induction completed for all workers", category: "Site Management", mandatory: true },
+    { item: "SWMS (Safe Work Method Statement) prepared and signed", category: "Documentation", mandatory: true },
+    { item: "Personal Protective Equipment (PPE) in use — boots, hi-vis, glasses", category: "PPE", mandatory: true },
+    { item: "Emergency evacuation plan communicated to all workers", category: "Emergency", mandatory: true },
+    { item: "First aid kit accessible on site", category: "Emergency", mandatory: true },
+    { item: "Site supervisor contact details posted", category: "Site Management", mandatory: true },
+  ];
+
+  const TRADE_SPECIFIC_CHECKS = {
+    plumbing: [
+      { item: "Water isolation point identified and labelled", category: "Isolation", mandatory: true },
+      { item: "Hot water burn hazard assessment completed", category: "Hazard", mandatory: true },
+      { item: "Confined space permit obtained if entering cistern or pit", category: "Confined Space", mandatory: false },
+      { item: "Pressure test equipment calibrated and in date", category: "Equipment", mandatory: true },
+      { item: "Lead-free solder used for all potable water connections", category: "Materials", mandatory: true },
+    ],
+    gas: [
+      { item: "Gas supply isolated and locked out before any work", category: "Isolation", mandatory: true },
+      { item: "Electronic gas detector available and calibrated", category: "Equipment", mandatory: true },
+      { item: "No ignition sources within 3 m of any open gas fitting", category: "Hazard", mandatory: true },
+      { item: "Ventilation confirmed adequate before lighting pilot", category: "Hazard", mandatory: true },
+      { item: "Emergency gas shut-off location communicated to occupant", category: "Emergency", mandatory: true },
+    ],
+    electrical: [
+      { item: "Electrical isolation (LOTO) completed and tested with multimeter", category: "Isolation", mandatory: true },
+      { item: "Residual Current Device (RCD) in use on all leads and tools", category: "PPE", mandatory: true },
+      { item: "Working on or near live parts — permit and second person required", category: "Live Work", mandatory: true },
+      { item: "Test and tag completed on all portable equipment", category: "Equipment", mandatory: true },
+      { item: "EWP or ladder correctly rated and secured if working at height", category: "Working at Height", mandatory: false },
+    ],
+    drainage: [
+      { item: "Excavation safety: shoring or batter slopes per AS 2870", category: "Excavation", mandatory: true },
+      { item: "Underground services located (Dial Before You Dig)", category: "Services", mandatory: true },
+      { item: "Confined space entry procedure for any sewer access", category: "Confined Space", mandatory: true },
+      { item: "Wheel stops and barriers around open excavations", category: "Site Management", mandatory: true },
+      { item: "Sewage exposure PPE — gloves, eye protection, face mask", category: "PPE", mandatory: true },
+    ],
+    carpentry: [
+      { item: "Temporary propping plan reviewed before any load-bearing removal", category: "Structural", mandatory: true },
+      { item: "Chainsaw and power tool guarding in place", category: "Equipment", mandatory: true },
+      { item: "Fall protection — harness or edge protection above 2 m", category: "Working at Height", mandatory: true },
+      { item: "Nail gun anti-sequential trigger checked and understood", category: "Equipment", mandatory: true },
+      { item: "Dust suppression for silica-containing products (cement sheet, tile)", category: "Hazardous Substances", mandatory: true },
+    ],
+    hvac: [
+      { item: "Refrigerant gas class identified — A1, A2L, or A3 — and SWMS tailored accordingly", category: "Hazardous Substances", mandatory: true },
+      { item: "ARC licence sighted and current for any refrigerant handling", category: "Licensing", mandatory: true },
+      { item: "Electrical isolation confirmed before opening refrigerant circuit", category: "Isolation", mandatory: true },
+      { item: "Lift plan in place for rooftop equipment (>20 kg)", category: "Manual Handling", mandatory: false },
+      { item: "Combustible A2L/A3 refrigerants — no ignition sources within 5 m", category: "Hazard", mandatory: false },
+    ],
+  };
+
+  const scopeLower = scope.map(s => String(s).toLowerCase());
+  const tradeChecks = TRADE_SPECIFIC_CHECKS[jobType.toLowerCase()] || [];
+
+  // Add scope-triggered extras
+  const scopeChecks = [];
+  if (scopeLower.some(s => s.includes("roof") || s.includes("height") || s.includes("scaffold"))) {
+    scopeChecks.push({ item: "Working at height risk assessment — fall prevention plan documented", category: "Working at Height", mandatory: true });
+  }
+  if (scopeLower.some(s => s.includes("asbestos") || s.includes("fibro") || s.includes("pre-1990"))) {
+    scopeChecks.push({ item: "Asbestos assessment by licensed assessor before any disturbance", category: "Hazardous Substances", mandatory: true });
+  }
+  if (scopeLower.some(s => s.includes("confined") || s.includes("pit") || s.includes("tank") || s.includes("sewer"))) {
+    scopeChecks.push({ item: "Confined space entry permit, atmospheric testing, and standby person in place", category: "Confined Space", mandatory: true });
+  }
+
+  const allChecks = [...UNIVERSAL_CHECKS, ...tradeChecks, ...scopeChecks];
+  const mandatoryCount = allChecks.filter(c => c.mandatory).length;
+
+  return res.json({
+    siteName:       siteName || null,
+    jobType,
+    totalChecks:    allChecks.length,
+    mandatoryCount,
+    scopeAdjustments: scopeChecks.length,
+    checklist:      allChecks,
+    regulatoryRef:  "Occupational Health and Safety Act 2004 (Vic), OHS Regulations 2017",
+    note:           "This checklist is a guide only. SWMS must be prepared by a competent person familiar with the specific site hazards.",
+    generatedAt:    new Date().toISOString(),
+  });
+});
+
+// ── POST /work-order ──────────────────────────────────────────────────────────
+// Generates a structured work order document from job details. Returns JSON
+// suitable for rendering as PDF or emailing to a customer.
+app.post("/work-order", (req, res) => {
+  const {
+    jobType,
+    customerName,
+    customerEmail,
+    siteAddress,
+    scope,
+    scheduledDate,
+    estimatedDuration,
+    traderName,
+    traderLicence,
+    traderPhone,
+    traderEmail,
+    materials = [],
+    specialInstructions,
+    quoteRef,
+  } = req.body || {};
+
+  if (!jobType || !customerName || !siteAddress || !scope) {
+    return res.status(400).json({ error: "jobType, customerName, siteAddress, and scope are required." });
+  }
+
+  const workOrderId = `WO-${Date.now().toString(36).toUpperCase()}`;
+
+  const COMPLIANCE_NOTES = {
+    plumbing:   "Work will be performed by a VBA-licensed plumber. A Certificate of Compliance (CoC) will be provided on completion.",
+    gas:        "Work will be performed by an ESV-licensed gas fitter. A Gas Compliance Certificate will be provided on completion.",
+    electrical: "Work will be performed by an ESV-licensed electrician. A Certificate of Electrical Safety (CoES) will be lodged on completion.",
+    drainage:   "Work will be performed by a VBA-licensed drainer. A Certificate of Compliance (CoC) will be provided on completion.",
+    carpentry:  "Work is subject to a current VBA building permit. Mandatory inspections will be arranged with the appointed Building Surveyor.",
+    hvac:       "Refrigerant handling performed by ARC-licensed technician. All work complies with AIRAH guidelines and AS 1668.",
+  };
+
+  const tradeLabel = {
+    plumbing: "Plumbing", gas: "Gas Fitting", electrical: "Electrical",
+    drainage: "Drainage", carpentry: "Carpentry / Building", hvac: "HVAC / Refrigeration",
+  }[jobType?.toLowerCase()] || jobType;
+
+  const workOrder = {
+    workOrderId,
+    documentType:   "Work Order",
+    status:         "pending",
+    createdAt:      new Date().toISOString(),
+
+    customer: {
+      name:    customerName,
+      email:   customerEmail  || null,
+      address: siteAddress,
+    },
+
+    job: {
+      type:              tradeLabel,
+      scope:             scope,
+      scheduledDate:     scheduledDate  || null,
+      estimatedDuration: estimatedDuration || null,
+      quoteReference:    quoteRef || null,
+      specialInstructions: specialInstructions || null,
+    },
+
+    trader: {
+      name:    traderName    || null,
+      licence: traderLicence || null,
+      phone:   traderPhone   || null,
+      email:   traderEmail   || null,
+    },
+
+    materials: materials.map((m, i) => ({
+      lineItem:    i + 1,
+      description: m.description || String(m),
+      quantity:    m.quantity    || null,
+      unit:        m.unit        || null,
+    })),
+
+    complianceNote: COMPLIANCE_NOTES[jobType?.toLowerCase()] || "Applicable compliance certificates will be provided on completion.",
+    jurisdiction:   "Victoria, Australia",
+    platform:       "Elemetric AI Compliance Platform",
+  };
+
+  return res.json(workOrder);
+});
+
+// ── POST /geofence-check ──────────────────────────────────────────────────────
+// Verifies that a lat/lng point is within Victoria, Australia. Optionally
+// checks if it falls within a known Melbourne metropolitan suburb bounding box.
+app.post("/geofence-check", (req, res) => {
+  const { lat, lng, label } = req.body || {};
+  const latitude  = parseFloat(lat);
+  const longitude = parseFloat(lng);
+
+  if (isNaN(latitude) || isNaN(longitude)) {
+    return res.status(400).json({ error: "lat and lng are required numeric values." });
+  }
+
+  // Rough bounding box for the state of Victoria
+  const VICTORIA_BOUNDS = { minLat: -39.2, maxLat: -33.98, minLng: 140.96, maxLng: 149.98 };
+  // Melbourne metropolitan area (approx)
+  const MELBOURNE_METRO = { minLat: -38.25, maxLat: -37.45, minLng: 144.44, maxLng: 145.53 };
+  // Regional city bounding boxes
+  const REGIONAL_CITIES = [
+    { name: "Geelong",    minLat: -38.22, maxLat: -38.06, minLng: 144.26, maxLng: 144.50 },
+    { name: "Ballarat",   minLat: -37.62, maxLat: -37.52, minLng: 143.75, maxLng: 143.96 },
+    { name: "Bendigo",    minLat: -36.82, maxLat: -36.70, minLng: 144.24, maxLng: 144.44 },
+    { name: "Shepparton", minLat: -36.45, maxLat: -36.32, minLng: 145.35, maxLng: 145.47 },
+    { name: "Wodonga",    minLat: -36.17, maxLat: -36.08, minLng: 146.83, maxLng: 146.96 },
+    { name: "Warrnambool",minLat: -38.45, maxLat: -38.35, minLng: 142.44, maxLng: 142.57 },
+  ];
+
+  const inVictoria = latitude  >= VICTORIA_BOUNDS.minLat && latitude  <= VICTORIA_BOUNDS.maxLat &&
+                     longitude >= VICTORIA_BOUNDS.minLng && longitude <= VICTORIA_BOUNDS.maxLng;
+
+  const inMelbourne = latitude  >= MELBOURNE_METRO.minLat && latitude  <= MELBOURNE_METRO.maxLat &&
+                      longitude >= MELBOURNE_METRO.minLng && longitude <= MELBOURNE_METRO.maxLng;
+
+  const matchedCity = inVictoria && !inMelbourne
+    ? REGIONAL_CITIES.find(c =>
+        latitude  >= c.minLat && latitude  <= c.maxLat &&
+        longitude >= c.minLng && longitude <= c.maxLng
+      )
+    : null;
+
+  let region = "outside Victoria";
+  if (inMelbourne)       region = "Melbourne Metropolitan Area";
+  else if (matchedCity)  region = `Regional Victoria — ${matchedCity.name}`;
+  else if (inVictoria)   region = "Regional Victoria";
+
+  return res.json({
+    label:      label || null,
+    lat:        latitude,
+    lng:        longitude,
+    inVictoria,
+    inMelbourne,
+    region,
+    jurisdiction: inVictoria ? "Victorian Building Authority (VBA)" : "Outside VBA jurisdiction",
+    warning: !inVictoria
+      ? "These coordinates are outside Victoria. Elemetric is designed for Victorian trade compliance only."
+      : null,
+    checkedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
