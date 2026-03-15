@@ -17443,6 +17443,204 @@ app.post("/compliance-gap-report", apiKeyAuth, (req, res) => {
   });
 });
 
+// ── Round 40 ──────────────────────────────────────────────────────────────────
+
+// POST /ai-risk-narrative  — AI-generated risk narrative for a job
+app.post("/ai-risk-narrative", apiKeyAuth, async (req, res) => {
+  const { jobType, riskFactors, overallRisk, complianceScore, missingItems,
+          liabilityYears, address } = req.body;
+
+  if (!jobType || !overallRisk) {
+    return res.status(400).json({ error: "jobType and overallRisk are required." });
+  }
+
+  const safeJobType = sanitiseInput(String(jobType)).toLowerCase();
+  const safeRisk    = sanitiseInput(String(overallRisk)).toUpperCase();
+  const safeMissing = Array.isArray(missingItems) ? missingItems.slice(0, 8).map(i => sanitiseInput(String(i))) : [];
+  const safeFactors = Array.isArray(riskFactors)  ? riskFactors.slice(0, 6).map(i => sanitiseInput(String(i)))  : [];
+  const safeAddress = address ? sanitiseInput(String(address)).slice(0, 100) : null;
+
+  const systemPrompt = `You are a Victorian trade compliance risk analyst. Write a professional, concise risk narrative (2-3 paragraphs) for a job record. Use plain English suitable for an insurance or legal review. Return JSON with: "narrative" (string), "keyRisks" (array of strings, max 4), "insuranceNote" (string).`;
+
+  const userMsg = `Trade: ${safeJobType}\nRisk Level: ${safeRisk}\nCompliance Score: ${complianceScore || "Not provided"}\nLiability Period: ${liabilityYears || "Standard"} years\nRisk Factors: ${safeFactors.join("; ") || "None listed"}\nMissing Items: ${safeMissing.join("; ") || "None"}\n${safeAddress ? `Address: ${safeAddress}` : ""}`;
+
+  let narrative, keyRisks, insuranceNote;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: userMsg },
+      ],
+      max_tokens: 400,
+      response_format: { type: "json_object" },
+    });
+    const parsed  = JSON.parse(aiRes.choices[0].message.content);
+    narrative     = sanitiseInput(String(parsed.narrative    || "")).slice(0, 2000);
+    keyRisks      = Array.isArray(parsed.keyRisks) ? parsed.keyRisks.slice(0, 4).map(r => sanitiseInput(String(r))) : [];
+    insuranceNote = sanitiseInput(String(parsed.insuranceNote || "")).slice(0, 500);
+  } catch {
+    narrative     = `This ${safeJobType} job carries a ${safeRisk.toLowerCase()} risk rating based on the compliance data provided. ${safeMissing.length > 0 ? `Outstanding items include: ${safeMissing.join(", ")}.` : ""} The contractor should ensure all documentation is completed before the job is archived.`;
+    keyRisks      = safeFactors.slice(0, 4);
+    insuranceNote = "Ensure all documentation is retained for the full statutory liability period.";
+  }
+
+  return res.json({
+    jobType:      safeJobType,
+    overallRisk:  safeRisk,
+    complianceScore: complianceScore || null,
+    liabilityYears: liabilityYears  || null,
+    narrative,
+    keyRisks,
+    insuranceNote,
+    generatedAt:  new Date().toISOString(),
+  });
+});
+
+// POST /site-access-log  — Log site entry/exit for contractor personnel
+app.post("/site-access-log", apiKeyAuth, async (req, res) => {
+  const { projectId, personName, licenceNumber, role, action, timestamp, vehicleRego, notes } = req.body;
+
+  if (!personName || !action || !projectId) {
+    return res.status(400).json({ error: "projectId, personName, and action (entry|exit) are required." });
+  }
+
+  const safeAction  = sanitiseInput(String(action)).toLowerCase();
+  if (!["entry", "exit"].includes(safeAction)) {
+    return res.status(400).json({ error: "action must be 'entry' or 'exit'." });
+  }
+
+  const safeName    = sanitiseInput(String(personName));
+  const safeLicence = sanitiseInput(String(licenceNumber || "Not provided"));
+  const safeRole    = sanitiseInput(String(role || "Worker"));
+  const safeProject = sanitiseInput(String(projectId));
+  const safeVehicle = sanitiseInput(String(vehicleRego || ""));
+  const safeNotes   = sanitiseInput(String(notes || ""));
+  const logTime     = timestamp ? new Date(sanitiseInput(String(timestamp))) : new Date();
+
+  const logId = `AL-${Date.now().toString(36).toUpperCase()}`;
+
+  const logEntry = {
+    logId,
+    projectId:     safeProject,
+    personName:    safeName,
+    licenceNumber: safeLicence,
+    role:          safeRole,
+    action:        safeAction.toUpperCase(),
+    vehicleRego:   safeVehicle || null,
+    notes:         safeNotes   || null,
+    timestamp:     !isNaN(logTime.getTime()) ? logTime.toISOString() : new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("site_access_logs").insert({
+      log_id:        logId,
+      project_id:    safeProject,
+      person_name:   safeName,
+      licence_number: safeLicence,
+      role:          safeRole,
+      action:        safeAction,
+      vehicle_rego:  safeVehicle || null,
+      log_timestamp: logEntry.timestamp,
+      created_at:    new Date().toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...logEntry, saved });
+});
+
+// GET /site-access-log/:projectId  — Retrieve access log entries for a project
+app.get("/site-access-log/:projectId", apiKeyAuth, async (req, res) => {
+  const projectId = sanitiseInput(String(req.params.projectId || ""));
+  if (!projectId) return res.status(400).json({ error: "projectId is required." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  const { limit: qLimit, date } = req.query;
+  const rowLimit = Math.min(parseInt(qLimit) || 100, 500);
+
+  let query = supabaseAdmin
+    .from("site_access_logs")
+    .select("*")
+    .eq("project_id", projectId)
+    .order("log_timestamp", { ascending: false })
+    .limit(rowLimit);
+
+  if (date) {
+    const d = sanitiseInput(String(date)).slice(0, 10);
+    query = query.gte("log_timestamp", `${d}T00:00:00`).lte("log_timestamp", `${d}T23:59:59`);
+  }
+
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: "Failed to retrieve access log." });
+
+  const entries   = data || [];
+  const persons   = [...new Set(entries.map(e => e.person_name))];
+  const entries_  = entries.filter(e => e.action === "entry").length;
+  const exits     = entries.filter(e => e.action === "exit").length;
+
+  return res.json({
+    projectId,
+    totalEntries:  entries.length,
+    uniquePersons: persons.length,
+    entryCount:    entries_,
+    exitCount:     exits,
+    persons,
+    log:           entries,
+    retrievedAt:   new Date().toISOString(),
+  });
+});
+
+// POST /contract-summary  — Parse and summarise a domestic building contract
+app.post("/contract-summary", apiKeyAuth, async (req, res) => {
+  const { contractText, contractType, contractorName, clientName, projectAddress, contractValue } = req.body;
+
+  if (!contractText) return res.status(400).json({ error: "contractText is required." });
+
+  const safeText      = sanitiseInput(String(contractText)).slice(0, 4000);
+  const safeType      = sanitiseInput(String(contractType     || "Domestic Building Contract"));
+  const safeContractor= sanitiseInput(String(contractorName   || "Contractor"));
+  const safeClient    = sanitiseInput(String(clientName       || "Client"));
+  const safeAddress   = sanitiseInput(String(projectAddress   || "Not specified"));
+
+  const systemPrompt = `You are a Victorian domestic building contracts specialist. Summarise a building contract excerpt. Return JSON with: "keyTerms" (object: startDate, completionDate, contractValue, depositAmount, progressPayments), "warranties" (array of strings), "contractorObligations" (array of strings, max 6), "clientObligations" (array of strings, max 4), "disputeResolution" (string), "summary" (string, 2-3 sentences).`;
+
+  let parsed;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: `Contract type: ${safeType}\nContractor: ${safeContractor}\nClient: ${safeClient}\nAddress: ${safeAddress}\nContract value: ${contractValue || "Not specified"}\n\nContract text:\n${safeText}` },
+      ],
+      max_tokens: 600,
+      response_format: { type: "json_object" },
+    });
+    parsed = JSON.parse(aiRes.choices[0].message.content);
+  } catch {
+    parsed = {
+      keyTerms: { startDate: null, completionDate: null, contractValue: contractValue || null, depositAmount: null, progressPayments: null },
+      warranties: ["Statutory warranties apply under DBCA 1995"],
+      contractorObligations: ["Complete works as specified", "Comply with all applicable codes and standards"],
+      clientObligations: ["Pay on time as agreed", "Provide site access"],
+      disputeResolution: "Disputes to be referred to VCAT under the Domestic Building Contracts Act 1995",
+      summary: "Contract summary unavailable. Please review the full contract document.",
+    };
+  }
+
+  return res.json({
+    contractType:  safeType,
+    contractor:    safeContractor,
+    client:        safeClient,
+    address:       safeAddress,
+    contractValue: contractValue || null,
+    ...parsed,
+    dbcaNote: "Domestic building contracts in Victoria are governed by the Domestic Building Contracts Act 1995. Mandatory warranties run for 6–12 years depending on defect type.",
+    analysedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
