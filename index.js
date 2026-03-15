@@ -41022,6 +41022,207 @@ Return JSON with:
   }
 });
 
+// POST /photo-album — Create a named photo album for a project stage
+app.post("/photo-album", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, albumName, stage, description,
+    photoUrls = [], coverPhotoUrl, tags = [],
+    visibility = "PRIVATE", notes,
+  } = req.body;
+  if (!projectId || !albumName) {
+    return res.status(400).json({ error: "projectId and albumName are required." });
+  }
+  const validVisibilities = ["PRIVATE", "TEAM", "CLIENT", "PUBLIC"];
+  if (!validVisibilities.includes(visibility)) {
+    return res.status(400).json({ error: `visibility must be one of: ${validVisibilities.join(", ")}` });
+  }
+  if (coverPhotoUrl && !isSafeUrl(coverPhotoUrl)) return res.status(400).json({ error: "Invalid coverPhotoUrl." });
+  const validatedUrls = Array.isArray(photoUrls) ? photoUrls.filter(u => isSafeUrl(u)) : [];
+  const albumRef = `ALB-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    album_ref: albumRef,
+    project_id: projectId,
+    album_name: sanitiseInput(albumName),
+    stage: sanitiseInput(stage || ""),
+    description: sanitiseInput(description || ""),
+    photo_urls: validatedUrls,
+    photo_count: validatedUrls.length,
+    cover_photo_url: coverPhotoUrl || (validatedUrls[0] || null),
+    tags: Array.isArray(tags) ? tags.map(t => sanitiseInput(t)) : [],
+    visibility,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("photo_albums").insert(record);
+    if (error) console.error("photo-album DB error:", error.message);
+  }
+  res.json({ albumRef, albumName, stage, photoCount: validatedUrls.length, visibility, saved: !!supabaseAdmin });
+});
+
+// PATCH /photo-album/:albumRef/add-photos — Add photos to an existing album
+app.patch("/photo-album/:albumRef/add-photos", apiKeyAuth, async (req, res) => {
+  const { albumRef } = req.params;
+  const { photoUrls = [] } = req.body;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  const validUrls = Array.isArray(photoUrls) ? photoUrls.filter(u => isSafeUrl(u)) : [];
+  if (!validUrls.length) return res.status(400).json({ error: "At least one valid photoUrl is required." });
+  const { data: existing, error: fetchErr } = await supabaseAdmin.from("photo_albums").select("photo_urls").eq("album_ref", albumRef).single();
+  if (fetchErr) return res.status(404).json({ error: "Album not found." });
+  const merged = [...(existing.photo_urls || []), ...validUrls];
+  const { error } = await supabaseAdmin.from("photo_albums").update({ photo_urls: merged, photo_count: merged.length, updated_at: new Date().toISOString() }).eq("album_ref", albumRef);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ albumRef, addedCount: validUrls.length, totalPhotoCount: merged.length });
+});
+
+// POST /ai-onsite-photo-tagger — AI tags and categorises construction site photos
+app.post("/ai-onsite-photo-tagger", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, trade, photos = [],
+    stage, knownActivities = [],
+  } = req.body;
+  if (!photos.length) {
+    return res.status(400).json({ error: "At least one photo is required." });
+  }
+  const validatedPhotos = photos.filter(p => p.url && isSafeUrl(p.url)).slice(0, 10);
+  if (!validatedPhotos.length) return res.status(400).json({ error: "No valid photo URLs provided." });
+  const sanitisedTrade = sanitiseInput(trade || "general");
+  const systemPrompt = `You are a construction documentation specialist. Analyse and tag construction site photos.`;
+  const imageContent = validatedPhotos.map(p => ({
+    type: "image_url",
+    image_url: { url: p.url, detail: "low" },
+  }));
+  const userMessage = {
+    type: "text",
+    text: `Analyse these ${validatedPhotos.length} construction site photo(s) for a ${sanitisedTrade} project.
+Stage: ${sanitiseInput(stage || "general")}
+Known activities: ${knownActivities.map(a => sanitiseInput(a)).join(", ")}
+
+For each photo return a JSON object in the array with:
+{
+  "index": 0,
+  "primaryCategory": "SAFETY|QUALITY|PROGRESS|DEFECT|MATERIAL|PLANT|GENERAL",
+  "subCategory": "...",
+  "description": "...",
+  "suggestedTags": ["...", "..."],
+  "qualityScore": 85,
+  "usableAsEvidence": true,
+  "safetyIssueVisible": false,
+  "defectVisible": false,
+  "completionPercent": null,
+  "notes": "..."
+}
+Return as JSON: {"photos": [...array of objects...]}`
+  };
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: [...imageContent, userMessage] }],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(aiRes.choices[0].message.content);
+    const tagged = Array.isArray(result.photos) ? result.photos : [];
+    const safetyIssues = tagged.filter(p => p.safetyIssueVisible).length;
+    const defects = tagged.filter(p => p.defectVisible).length;
+    res.json({
+      projectId, trade: sanitisedTrade, stage, photoCount: validatedPhotos.length,
+      safetyIssuesFound: safetyIssues, defectsFound: defects,
+      photos: tagged,
+    });
+  } catch (err) {
+    console.error("ai-onsite-photo-tagger error:", err.message);
+    res.json({
+      projectId, trade: sanitisedTrade, stage, photoCount: validatedPhotos.length,
+      safetyIssuesFound: 0, defectsFound: 0,
+      photos: validatedPhotos.map((p, i) => ({
+        index: i,
+        primaryCategory: "GENERAL",
+        subCategory: "Unclassified",
+        description: "Photo analysis unavailable",
+        suggestedTags: [sanitisedTrade, stage || "site"],
+        qualityScore: null,
+        usableAsEvidence: true,
+        safetyIssueVisible: false,
+        defectVisible: false,
+        completionPercent: null,
+        notes: "AI tagging unavailable — manual review required",
+      })),
+    });
+  }
+});
+
+// POST /ai-progress-photo-analysis — AI analyses progress photos for completion assessment
+app.post("/ai-progress-photo-analysis", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, trade, stage, photos = [],
+    expectedCompletionItems = [], previousCompletionPercent = 0,
+  } = req.body;
+  if (!photos.length || !trade) {
+    return res.status(400).json({ error: "trade and at least one photo are required." });
+  }
+  const validatedPhotos = photos.filter(p => p.url && isSafeUrl(p.url)).slice(0, 8);
+  if (!validatedPhotos.length) return res.status(400).json({ error: "No valid photo URLs provided." });
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedStage = sanitiseInput(stage || "");
+  const systemPrompt = `You are a construction progress assessor. Estimate completion percentages from site photos.`;
+  const imageContent = validatedPhotos.map(p => ({
+    type: "image_url",
+    image_url: { url: p.url, detail: "low" },
+  }));
+  const userMessage = {
+    type: "text",
+    text: `Assess construction progress from these photos:
+Trade: ${sanitisedTrade}
+Stage: ${sanitisedStage || "general progress"}
+Previous completion: ${previousCompletionPercent}%
+Expected items: ${expectedCompletionItems.map(i => sanitiseInput(i)).join(", ")}
+
+Return JSON with:
+{
+  "estimatedCompletionPercent": 65,
+  "progressSinceLastAssessment": "+12%",
+  "itemsObservedComplete": ["...", "..."],
+  "itemsObservedInProgress": ["...", "..."],
+  "itemsNotYetStarted": ["...", "..."],
+  "qualityObservations": ["...", "..."],
+  "safetyObservations": ["...", "..."],
+  "photoCoverage": "ADEQUATE|LIMITED|INSUFFICIENT",
+  "assessmentConfidence": "HIGH|MEDIUM|LOW",
+  "notes": "..."
+}`
+  };
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: [...imageContent, userMessage] }],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const analysis = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ projectId, trade: sanitisedTrade, stage: sanitisedStage, photoCount: validatedPhotos.length, previousCompletionPercent, analysis });
+  } catch (err) {
+    console.error("ai-progress-photo-analysis error:", err.message);
+    res.json({
+      projectId, trade: sanitisedTrade, stage: sanitisedStage, photoCount: validatedPhotos.length, previousCompletionPercent,
+      analysis: {
+        estimatedCompletionPercent: null,
+        progressSinceLastAssessment: "Unable to assess",
+        itemsObservedComplete: [],
+        itemsObservedInProgress: [],
+        itemsNotYetStarted: [],
+        qualityObservations: [],
+        safetyObservations: [],
+        photoCoverage: "INSUFFICIENT",
+        assessmentConfidence: "LOW",
+        notes: "AI analysis unavailable — manual progress assessment required",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
