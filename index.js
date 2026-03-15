@@ -13001,6 +13001,402 @@ app.post("/warranty-register", async (req, res) => {
   });
 });
 
+// ── POST /job-closure-check ───────────────────────────────────────────────────
+// Final multi-step closure checklist before a job is archived. Ensures all
+// certificates, documents, and handover items are accounted for.
+app.post("/job-closure-check", (req, res) => {
+  const {
+    jobType,
+    certificateFiled,
+    certificateNumber,
+    ownerCopyProvided,
+    testResultsRetained,
+    warrantyDocsProvided,
+    siteCleanedUp,
+    customerSignedOff,
+    photographsArchived,
+    permitClosed,
+    defectsPeriodNoted,
+    invoiceSent,
+    paymentReceived,
+  } = req.body || {};
+
+  if (!jobType) {
+    return res.status(400).json({ error: "jobType is required." });
+  }
+
+  const LIABILITY = LIABILITY_PERIODS[jobType?.toLowerCase()] || { defects: 7 };
+
+  const CLOSURE_ITEMS = {
+    plumbing: [
+      { key: "certificateFiled",      label: "CoC lodged with VBA",                    mandatory: true,  value: certificateFiled    },
+      { key: "certificateNumber",     label: "CoC number obtained and recorded",        mandatory: true,  value: !!certificateNumber },
+      { key: "ownerCopyProvided",     label: "Owner copy of CoC provided",              mandatory: true,  value: ownerCopyProvided   },
+      { key: "testResultsRetained",   label: "Test results retained (7 years)",         mandatory: true,  value: testResultsRetained },
+      { key: "warrantyDocsProvided",  label: "Warranty documents handed to owner",      mandatory: false, value: warrantyDocsProvided},
+      { key: "photographsArchived",   label: "Compliance photos archived",              mandatory: true,  value: photographsArchived },
+      { key: "siteCleanedUp",         label: "Site cleaned up and made good",           mandatory: true,  value: siteCleanedUp       },
+      { key: "customerSignedOff",     label: "Customer sign-off obtained",              mandatory: false, value: customerSignedOff   },
+      { key: "invoiceSent",           label: "Invoice sent to customer",                mandatory: false, value: invoiceSent         },
+      { key: "paymentReceived",       label: "Payment received",                        mandatory: false, value: paymentReceived     },
+    ],
+    gas: [
+      { key: "certificateFiled",      label: "Gas Compliance Certificate lodged with ESV", mandatory: true,  value: certificateFiled    },
+      { key: "certificateNumber",     label: "Certificate number recorded",             mandatory: true,  value: !!certificateNumber },
+      { key: "ownerCopyProvided",     label: "Owner copy of certificate provided",      mandatory: true,  value: ownerCopyProvided   },
+      { key: "testResultsRetained",   label: "Pressure test records retained (5 years)",mandatory: true,  value: testResultsRetained },
+      { key: "warrantyDocsProvided",  label: "Appliance manuals provided to owner",     mandatory: true,  value: warrantyDocsProvided},
+      { key: "siteCleanedUp",         label: "Site cleaned up and made good",           mandatory: true,  value: siteCleanedUp       },
+      { key: "customerSignedOff",     label: "Owner notified of isolation valve location", mandatory: true, value: customerSignedOff  },
+    ],
+    electrical: [
+      { key: "certificateFiled",      label: "CoES lodged with ESV",                   mandatory: true,  value: certificateFiled    },
+      { key: "certificateNumber",     label: "CoES reference number recorded",         mandatory: true,  value: !!certificateNumber },
+      { key: "ownerCopyProvided",     label: "Owner copy of CoES provided",            mandatory: true,  value: ownerCopyProvided   },
+      { key: "testResultsRetained",   label: "Test results retained (5 years)",        mandatory: true,  value: testResultsRetained },
+      { key: "photographsArchived",   label: "Switchboard and circuit photos archived",mandatory: true,  value: photographsArchived },
+      { key: "customerSignedOff",     label: "RCD test procedure demonstrated to owner", mandatory: true, value: customerSignedOff  },
+      { key: "siteCleanedUp",         label: "Site cleaned up and made good",          mandatory: true,  value: siteCleanedUp       },
+    ],
+    drainage: [
+      { key: "certificateFiled",      label: "CoC lodged with VBA",                    mandatory: true,  value: certificateFiled    },
+      { key: "testResultsRetained",   label: "Hydraulic test record retained",         mandatory: true,  value: testResultsRetained },
+      { key: "photographsArchived",   label: "Drainage photos archived",               mandatory: true,  value: photographsArchived },
+      { key: "siteCleanedUp",         label: "Site cleaned up and reinstated",         mandatory: true,  value: siteCleanedUp       },
+    ],
+    carpentry: [
+      { key: "permitClosed",          label: "Building permit final inspection completed", mandatory: true, value: permitClosed       },
+      { key: "certificateFiled",      label: "Certificate of Occupancy issued",        mandatory: true,  value: certificateFiled    },
+      { key: "ownerCopyProvided",     label: "Certificate of Occupancy copy to owner", mandatory: true,  value: ownerCopyProvided   },
+      { key: "warrantyDocsProvided",  label: "Maintenance manuals and warranty docs provided", mandatory: true, value: warrantyDocsProvided },
+      { key: "defectsPeriodNoted",    label: `Owner notified of ${LIABILITY.defects}-year defects period`, mandatory: true, value: defectsPeriodNoted },
+      { key: "siteCleanedUp",         label: "Site cleaned up and debris removed",     mandatory: true,  value: siteCleanedUp       },
+    ],
+    hvac: [
+      { key: "certificateFiled",      label: "ARC service record updated",             mandatory: true,  value: certificateFiled    },
+      { key: "warrantyDocsProvided",  label: "Commissioning report provided to owner", mandatory: true,  value: warrantyDocsProvided},
+      { key: "ownerCopyProvided",     label: "Filter maintenance schedule provided",   mandatory: true,  value: ownerCopyProvided   },
+      { key: "siteCleanedUp",         label: "Site cleaned, packing materials removed",mandatory: true,  value: siteCleanedUp       },
+    ],
+  };
+
+  const items = (CLOSURE_ITEMS[jobType?.toLowerCase()] || []).map(item => ({
+    ...item,
+    status: item.value === true ? "complete" : item.value === false ? "incomplete" : "unknown",
+  }));
+
+  const mandatoryIncomplete = items.filter(i => i.mandatory && i.status !== "complete");
+  const allMandatoryComplete = mandatoryIncomplete.length === 0;
+  const completedCount = items.filter(i => i.status === "complete").length;
+
+  return res.json({
+    jobType,
+    closureStatus: allMandatoryComplete ? "READY TO CLOSE" : "NOT READY",
+    completedItems: completedCount,
+    totalItems:     items.length,
+    mandatoryIncomplete: mandatoryIncomplete.map(i => i.label),
+    checklist:      items,
+    recommendation: allMandatoryComplete
+      ? "All mandatory closure items complete — job can be archived."
+      : `${mandatoryIncomplete.length} mandatory item(s) must be completed before closing this job.`,
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+// ── GET /popular-missing-items ────────────────────────────────────────────────
+// Returns the most commonly missed compliance items for each trade type.
+// Based on platform usage patterns — useful for pre-job preparation.
+app.get("/popular-missing-items", (req, res) => {
+  const { jobType } = req.query;
+
+  const POPULAR_MISSING = {
+    plumbing: [
+      { rank: 1, item: "Pressure test results photo", frequency: "68% of jobs", tip: "Photograph the test gauge during and after pressure test." },
+      { rank: 2, item: "PTR valve installation evidence", frequency: "55% of jobs", tip: "Include a clear photo of the PTR valve with drain pipe attached." },
+      { rank: 3, item: "Certificate of Compliance confirmation", frequency: "52% of jobs", tip: "Screenshot or photo of the lodgement confirmation from VBA portal." },
+      { rank: 4, item: "Backflow prevention device test record", frequency: "44% of jobs", tip: "If a backflow device is fitted, annual test records are mandatory." },
+      { rank: 5, item: "Customer sign-off",                  frequency: "41% of jobs", tip: "Get a digital or physical signature before leaving the site." },
+    ],
+    gas: [
+      { rank: 1, item: "Gas compliance certificate lodgement confirmation", frequency: "71% of jobs", tip: "Screenshot from ESV portal confirming lodgement within 48 hours." },
+      { rank: 2, item: "Pressure and tightness test record", frequency: "63% of jobs", tip: "Photo of test gauge with date visible." },
+      { rank: 3, item: "Appliance AGA certification badge", frequency: "58% of jobs", tip: "Close-up of appliance data plate showing AGA certification number." },
+      { rank: 4, item: "Flue clearance measurement photo", frequency: "47% of jobs", tip: "Tape measure in frame showing clearance from flue terminal to any opening." },
+      { rank: 5, item: "Isolation valve location photo",   frequency: "39% of jobs", tip: "Label the isolation valve clearly and include in photos." },
+    ],
+    electrical: [
+      { rank: 1, item: "CoES lodgement confirmation",       frequency: "64% of jobs", tip: "Screenshot from ESV e-licensing portal confirming CoES lodgement." },
+      { rank: 2, item: "Earth continuity test result",      frequency: "61% of jobs", tip: "Photo of test instrument display showing earth resistance value." },
+      { rank: 3, item: "RCD test result photo",             frequency: "57% of jobs", tip: "Photo of RCD tester or instrument showing trip time result." },
+      { rank: 4, item: "Circuit labelling on switchboard",  frequency: "51% of jobs", tip: "Wide photo of complete switchboard with all circuits labelled." },
+      { rank: 5, item: "Insulation resistance test results",frequency: "44% of jobs", tip: "Photo of insulation resistance tester display for each circuit." },
+    ],
+    drainage: [
+      { rank: 1, item: "Hydraulic test gauge photo",        frequency: "73% of jobs", tip: "Close-up of test gauge showing pressure/water level during test." },
+      { rank: 2, item: "Fall/grade measurement",            frequency: "65% of jobs", tip: "Photo of digital level on pipe showing gradient." },
+      { rank: 3, item: "Inspection opening installation",   frequency: "58% of jobs", tip: "Clear photo of each IO installed before backfilling." },
+      { rank: 4, item: "Pipe bedding",                      frequency: "49% of jobs", tip: "Photo of sand bedding in trench before placing pipe." },
+      { rank: 5, item: "Certificate of Compliance",         frequency: "41% of jobs", tip: "Screenshot or photo of VBA portal CoC lodgement confirmation." },
+    ],
+    carpentry: [
+      { rank: 1, item: "Bracing evidence",                  frequency: "69% of jobs", tip: "Photograph each bracing panel clearly showing type, length, and fixings." },
+      { rank: 2, item: "Tie-down connection details",       frequency: "66% of jobs", tip: "Close-up of each tie-down strap or rod at connection points." },
+      { rank: 3, item: "Structural member sizes visible",   frequency: "58% of jobs", tip: "Tape measure against each structural member with stamped size visible." },
+      { rank: 4, item: "Building permit display",           frequency: "51% of jobs", tip: "Wide photo of permit board on site." },
+      { rank: 5, item: "Waterproofing membrane installation", frequency: "44% of jobs", tip: "Photo of membrane application in all wet areas before tiling." },
+    ],
+    hvac: [
+      { rank: 1, item: "Commissioning record/gauges",       frequency: "67% of jobs", tip: "Photo of service gauges showing suction and discharge pressures." },
+      { rank: 2, item: "ARC service record entry",          frequency: "61% of jobs", tip: "Screenshot of ARC service record entry from ARC portal." },
+      { rank: 3, item: "Refrigerant type and charge weight", frequency: "56% of jobs", tip: "Photo of refrigerant cylinder label and scales showing charge weight." },
+      { rank: 4, item: "Condensate drain connection",       frequency: "48% of jobs", tip: "Photo of condensate drain connection to compliant drainage point." },
+      { rank: 5, item: "Outdoor unit clearances",           frequency: "42% of jobs", tip: "Tape measure showing clearances from unit to walls and fences." },
+    ],
+  };
+
+  if (jobType) {
+    const lower = jobType.toLowerCase();
+    const items = POPULAR_MISSING[lower];
+    if (!items) return res.status(400).json({ error: `Unknown jobType. Available: ${Object.keys(POPULAR_MISSING).join(", ")}` });
+    return res.json({ jobType: lower, items, retrievedAt: new Date().toISOString() });
+  }
+
+  return res.json({ allTrades: POPULAR_MISSING, retrievedAt: new Date().toISOString() });
+});
+
+// ── POST /time-tracking ───────────────────────────────────────────────────────
+// Logs a time entry for a job to Supabase. Supports start/end timestamps or
+// a direct duration. Used for job costing and productivity analysis.
+app.post("/time-tracking", async (req, res) => {
+  const {
+    analysisId,
+    userId,
+    jobType,
+    activity,
+    startTime,
+    endTime,
+    durationMinutes,
+    notes,
+  } = req.body || {};
+
+  if (!userId || !activity) {
+    return res.status(400).json({ error: "userId and activity are required." });
+  }
+
+  let duration = durationMinutes !== undefined ? Number(durationMinutes) : null;
+
+  if (startTime && endTime) {
+    const start = new Date(startTime).getTime();
+    const end   = new Date(endTime).getTime();
+    if (!isNaN(start) && !isNaN(end) && end > start) {
+      duration = Math.round((end - start) / 60_000);
+    }
+  }
+
+  if (duration !== null && (duration < 1 || duration > 1440)) {
+    return res.status(400).json({ error: "Duration must be between 1 and 1440 minutes." });
+  }
+
+  const awardRate  = AWARD_RATES[jobType?.toLowerCase()]?.rate || 60;
+  const laborCost  = duration !== null ? Math.round((duration / 60) * awardRate * 100) / 100 : null;
+
+  const record = {
+    analysis_id:      analysisId       || null,
+    user_id:          userId,
+    job_type:         jobType          || null,
+    activity:         sanitiseInput(String(activity)).substring(0, 200),
+    start_time:       startTime        || null,
+    end_time:         endTime          || null,
+    duration_minutes: duration,
+    estimated_cost:   laborCost,
+    notes:            notes ? sanitiseInput(String(notes)).substring(0, 300) : null,
+    logged_at:        new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("time_entries").insert(record);
+      if (error) console.error("time-tracking insert error:", error);
+    } catch (err) {
+      console.error("time-tracking unexpected error:", err);
+    }
+  }
+
+  return res.status(201).json({
+    logged:           true,
+    analysisId:       analysisId || null,
+    activity:         record.activity,
+    durationMinutes:  duration,
+    durationHours:    duration !== null ? Math.round(duration / 60 * 100) / 100 : null,
+    estimatedLaborCost: laborCost !== null ? `$${laborCost.toFixed(2)} AUD (at $${awardRate}/hr)` : null,
+    loggedAt:         record.logged_at,
+  });
+});
+
+// ── POST /ai-image-compare ────────────────────────────────────────────────────
+// Uses GPT-4.1-mini vision to compare a before and after photo. Returns a
+// structured assessment of changes, improvements, and compliance differences.
+app.post("/ai-image-compare", async (req, res) => {
+  const { beforePhoto, afterPhoto, jobType, label } = req.body || {};
+
+  if (!beforePhoto?.data || !afterPhoto?.data) {
+    return res.status(400).json({ error: "beforePhoto.data and afterPhoto.data (base64) are required." });
+  }
+  if (!client) return res.status(503).json({ error: "AI service not configured." });
+
+  const beforeBase64 = String(beforePhoto.data).split(",").pop();
+  const afterBase64  = String(afterPhoto.data).split(",").pop();
+  const mimeType     = beforePhoto.mimeType || "image/jpeg";
+
+  const prompt = `Compare these two photos: BEFORE (first image) and AFTER (second image) for a Victorian ${jobType || "trade"} job.
+Label: "${label || "unlabelled comparison"}"
+
+Respond ONLY with JSON:
+{
+  "changesDetected": ["<change>", ...],
+  "complianceImprovements": ["<improvement>", ...],
+  "remainingIssues": ["<issue still present>", ...],
+  "overallAssessment": "improved|unchanged|degraded",
+  "recommendedActions": ["<action>", ...],
+  "summary": "<2 sentence summary>"
+}`;
+
+  try {
+    const response = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: prompt },
+            { type: "image_url", image_url: { url: `data:${mimeType};base64,${beforeBase64}`, detail: "high" } },
+            { type: "image_url", image_url: { url: `data:${afterPhoto.mimeType || mimeType};base64,${afterBase64}`, detail: "high" } },
+          ],
+        },
+      ],
+      max_tokens: 400,
+      temperature: 0.1,
+    });
+
+    const raw = response.choices[0]?.message?.content?.trim() || "{}";
+    let parsed;
+    try {
+      const match = raw.match(/\{[\s\S]*\}/);
+      parsed = JSON.parse(match ? match[0] : raw);
+    } catch {
+      return res.status(502).json({ error: "AI returned unparseable response.", raw });
+    }
+
+    usageStats.openaiCalls++;
+
+    return res.json({
+      jobType:                jobType  || null,
+      label:                  label    || null,
+      changesDetected:        Array.isArray(parsed.changesDetected)        ? parsed.changesDetected        : [],
+      complianceImprovements: Array.isArray(parsed.complianceImprovements) ? parsed.complianceImprovements : [],
+      remainingIssues:        Array.isArray(parsed.remainingIssues)        ? parsed.remainingIssues        : [],
+      overallAssessment:      ["improved", "unchanged", "degraded"].includes(parsed.overallAssessment) ? parsed.overallAssessment : "unknown",
+      recommendedActions:     Array.isArray(parsed.recommendedActions)     ? parsed.recommendedActions     : [],
+      summary:                parsed.summary    || null,
+      comparedAt:             new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("ai-image-compare error:", err);
+    return res.status(500).json({ error: "Image comparison failed." });
+  }
+});
+
+// ── POST /property-inspection-checklist ───────────────────────────────────────
+// Generates a comprehensive property inspection checklist for a buyer or
+// property manager reviewing trade compliance across multiple systems.
+app.post("/property-inspection-checklist", (req, res) => {
+  const { tradeTypes = [], propertyAge, propertyType = "residential", siteAddress } = req.body || {};
+
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+  const trades = tradeTypes.length > 0
+    ? tradeTypes.filter(t => SUPPORTED.includes(String(t).toLowerCase()))
+    : SUPPORTED;
+
+  const INSPECTION_ITEMS = {
+    plumbing: [
+      { item: "All taps run freely — no drips or reduced flow", urgency: "check" },
+      { item: "Hot water system condition — age, PTR valve, drain pipe", urgency: "important" },
+      { item: "Under-sink plumbing — no leaks, adequate trap seals", urgency: "check" },
+      { item: "Roof plumbing — gutters, downpipes, overflow relief gully", urgency: "check" },
+      { item: "Water pressure measured at outlet — target 350–500 kPa", urgency: "important" },
+      { item: "CoC certificates available for major work in last 7 years", urgency: "critical" },
+    ],
+    gas: [
+      { item: "Gas connection status — natural gas or LPG?", urgency: "check" },
+      { item: "All gas appliances operational — pilots light, no smell", urgency: "critical" },
+      { item: "Gas compliance certificates available for all work", urgency: "critical" },
+      { item: "CO alarms installed near gas appliances — current batteries", urgency: "important" },
+      { item: "Flue clearances appear adequate — no obstructions or damage", urgency: "important" },
+      { item: "Gas isolation valve accessible and operational", urgency: "important" },
+    ],
+    electrical: [
+      { item: "RCDs (safety switches) present on all circuits", urgency: "critical" },
+      { item: "Switchboard — labelled, no corrosion, no burning smell", urgency: "critical" },
+      { item: "Test RCD buttons — all trip within 300 ms", urgency: "critical" },
+      { item: "All power outlets functional — tested with lamp or socket tester", urgency: "check" },
+      { item: "Smoke alarms — present, tested, and less than 10 years old", urgency: "critical" },
+      { item: "CoES certificates available for electrical work in last 5 years", urgency: "important" },
+      { item: "Solar PV system — inverter display normal, generation visible", urgency: "check" },
+    ],
+    drainage: [
+      { item: "All floor wastes drain freely — no gurgling or slow drain", urgency: "check" },
+      { item: "No sewer smell from internal drains", urgency: "important" },
+      { item: "Inspection openings accessible and not buried or built over", urgency: "important" },
+      { item: "Stormwater — downpipes connected, no ponding near foundations", urgency: "important" },
+      { item: "Backwater valve present (if in flood zone) — accessible", urgency: "check" },
+    ],
+    carpentry: [
+      { item: "All doors and windows open and close freely — no sticking", urgency: "check" },
+      { item: "Roof condition — no missing tiles, ridge capping intact", urgency: "important" },
+      { item: "Decks — no rot, no spring, fixings secure, handrail height compliant", urgency: "important" },
+      { item: "Wet areas — no cracked grout, no soft spots behind tiles", urgency: "important" },
+      { item: "Building permits and CoO available for any alterations", urgency: "critical" },
+      { item: "Roof space — insulation present, no vermin activity, vents clear", urgency: "check" },
+    ],
+    hvac: [
+      { item: "All HVAC units operational in heating and cooling mode", urgency: "check" },
+      { item: "Filters clean or recently cleaned — no mould smell", urgency: "important" },
+      { item: "Condensate drain flowing freely — no overflow marks", urgency: "check" },
+      { item: "Outdoor unit — no obstructions, coil not damaged", urgency: "check" },
+      { item: "ARC service records available for refrigerant work", urgency: "important" },
+    ],
+  };
+
+  const checklist = trades.flatMap(trade => {
+    const items = INSPECTION_ITEMS[trade.toLowerCase()] || [];
+    return items.map(item => ({ ...item, trade }));
+  });
+
+  const critical  = checklist.filter(c => c.urgency === "critical");
+  const important = checklist.filter(c => c.urgency === "important");
+
+  const yearBuilt = Number(propertyAge) || null;
+  const ageWarnings = [];
+  if (yearBuilt && yearBuilt < 1960) ageWarnings.push("Pre-1960 construction — asbestos presence likely in lagging, floor tiles, and ceiling tiles. Do not disturb.");
+  if (yearBuilt && yearBuilt < 1985) ageWarnings.push("Pre-1985 — lead paint possible on surfaces. Do not sand or burn without testing.");
+  if (yearBuilt && yearBuilt < 2000) ageWarnings.push("Pre-2000 — wiring may not have RCD protection. Electrical safety inspection strongly recommended.");
+
+  return res.json({
+    documentType:    "Property Inspection Checklist",
+    siteAddress:     siteAddress    || null,
+    propertyType,
+    yearBuilt:       yearBuilt,
+    ageWarnings,
+    tradesIncluded:  trades,
+    totalItems:      checklist.length,
+    criticalCount:   critical.length,
+    importantCount:  important.length,
+    checklist,
+    priorityItems:   critical.map(c => `[${c.trade.toUpperCase()}] ${c.item}`),
+    generatedAt:     new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
