@@ -65614,6 +65614,414 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /scaffold-inspection — Scaffold inspection per AS/NZS 1576 / OHS Regulations 2017 (Vic) Part 3.4
+app.post("/scaffold-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    scaffoldId,
+    location,
+    inspectionDate,
+    inspectionType,       // initial-handover | routine | post-modification | post-incident | post-adverse-weather
+    inspector,
+    scaffoldLicence,      // required for scaffolding >4 m OHS Regs 2017 (Vic)
+    scaffoldType,         // tube-and-coupler | system | mobile | suspended | modular
+    scaffoldHeight_m,
+    bays,
+    lifts,
+    designLoadKPa,        // kPa per platform — light duty 0.75 | general purpose 2.25 | special duty 4.5
+    planksCondition,      // good | damaged | missing | incorrect-overlap
+    guardRailsPresent,    // top rail, mid rail, toe board
+    topRailHeight_mm,     // min 900 mm per AS/NZS 1576.1
+    midRailPresent,
+    toeBoardPresent,
+    toeBoardHeight_mm,    // min 150 mm per AS/NZS 1576.1
+    tiesInstalled,        // horizontal ties to structure
+    tieSpacing_m,
+    designTieSpacing_m,
+    bracing_adequate,
+    baseJacks_level,
+    base_plates_present,
+    soleboards_on_soft_ground,
+    accessLadderSecured,
+    accessHatchPresent,   // trap-door access through platforms
+    platformGapMax_mm,    // max 25 mm for light work, none for over-edge work
+    overloadingRisk,
+    criticalDefects,      // array of strings
+    overallResult,        // FIT-FOR-USE | TAKE-OUT-OF-SERVICE | MODIFIED-USE-ONLY
+    photos,
+    notes,
+  } = req.body;
+
+  const failures = [];
+
+  // Licence check for >4 m
+  const height = parseFloat(scaffoldHeight_m) || 0;
+  if (height > 4 && (!scaffoldLicence || scaffoldLicence.trim() === "")) {
+    failures.push(`Scaffold ${height} m height — scaffolding licence required per OHS Regs 2017 (Vic) r.252`);
+  }
+
+  // Guard rails
+  if (!guardRailsPresent) failures.push("Guard rails absent — fall protection non-compliant AS/NZS 1576.1");
+  const topRail = parseFloat(topRailHeight_mm) || 0;
+  if (topRail > 0 && topRail < 900) {
+    failures.push(`Top rail height ${topRail} mm below minimum 900 mm per AS/NZS 1576.1`);
+  }
+  if (!midRailPresent && height > 2) failures.push("Mid rail absent — required for platforms >2 m");
+  if (!toeBoardPresent) failures.push("Toe board absent — required per AS/NZS 1576.1");
+
+  // Plank condition
+  if (planksCondition === "missing") failures.push("Missing scaffold planks — gaps in working platform");
+  if (planksCondition === "damaged") failures.push("Damaged scaffold planks — replace before use");
+
+  // Tie spacing
+  const actualTie = parseFloat(tieSpacing_m) || 0;
+  const designTie = parseFloat(designTieSpacing_m) || 4;
+  if (actualTie > designTie * 1.1) {
+    failures.push(`Tie spacing ${actualTie} m exceeds design ${designTie} m — stability risk`);
+  }
+
+  // Platform gap
+  const platformGap = parseFloat(platformGapMax_mm) || 0;
+  if (platformGap > 25) failures.push(`Platform gap ${platformGap} mm exceeds maximum 25 mm`);
+
+  // Custom critical defects
+  if (Array.isArray(criticalDefects)) criticalDefects.forEach((d) => failures.push(d));
+
+  const result = failures.length > 0 ? "TAKE-OUT-OF-SERVICE" : (overallResult || "FIT-FOR-USE");
+
+  if (result === "TAKE-OUT-OF-SERVICE") {
+    return res.status(422).json({
+      error: "Scaffold inspection — scaffold must be taken out of service",
+      failures,
+      immediateActions: [
+        "Immediately clear all workers from scaffold",
+        "Barricade and tag scaffold as 'DO NOT USE'",
+        "Notify scaffold supervisor and principal contractor",
+        "Rectify all defects before returning to service",
+        "Re-inspect and sign off before allowing access",
+      ],
+      applicableStandards: [
+        "AS/NZS 1576.1",
+        "AS/NZS 1576.3",
+        "OHS Regulations 2017 (Vic) Part 3.4",
+        "WorkSafe Victoria Scaffolding Code of Practice",
+      ],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    scaffold_id: sanitiseInput(scaffoldId),
+    location: sanitiseInput(location),
+    inspection_date: inspectionDate,
+    inspection_type: sanitiseInput(inspectionType),
+    inspector: sanitiseInput(inspector),
+    scaffold_licence: sanitiseInput(scaffoldLicence),
+    scaffold_type: sanitiseInput(scaffoldType),
+    scaffold_height_m: scaffoldHeight_m,
+    bays,
+    lifts,
+    design_load_kpa: designLoadKPa,
+    planks_condition: sanitiseInput(planksCondition),
+    guard_rails_present: guardRailsPresent,
+    top_rail_height_mm: topRailHeight_mm,
+    mid_rail_present: midRailPresent,
+    toe_board_present: toeBoardPresent,
+    toe_board_height_mm: toeBoardHeight_mm,
+    ties_installed: tiesInstalled,
+    tie_spacing_m: tieSpacing_m,
+    design_tie_spacing_m: designTieSpacing_m,
+    bracing_adequate,
+    base_jacks_level: baseJacks_level,
+    base_plates_present,
+    soleboards_on_soft_ground,
+    access_ladder_secured: accessLadderSecured,
+    access_hatch_present: accessHatchPresent,
+    platform_gap_max_mm: platformGapMax_mm,
+    overloading_risk: overloadingRisk,
+    overall_result: result,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("scaffold_inspections")
+      .insert(record);
+    if (dbErr) console.error("DB error /scaffold-inspection:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Scaffold inspection recorded — fit for use",
+    scaffoldId: sanitiseInput(scaffoldId),
+    scaffoldHeight_m: height,
+    overallResult: result,
+    applicableStandards: [
+      "AS/NZS 1576.1",
+      "AS/NZS 1576.3",
+      "OHS Regulations 2017 (Vic) Part 3.4",
+    ],
+    saved,
+  });
+});
+
+// POST /septic-system-inspection — Onsite wastewater system inspection per EPA Vic Code of Practice
+app.post("/septic-system-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    propertyAddress,
+    ownerName,
+    inspectionDate,
+    inspector,
+    inspectorLicence,
+    systemType,           // septic-tank | aerated | composting | grey-water | constructed-wetland | off-mains
+    systemAge_years,
+    tankVolume_L,
+    householdPersons,
+    lastDesludgingDate,
+    tankCondition,        // good | cracked | damaged | collapsed
+    inletBaffle,
+    outletBaffle,
+    effluent_level,       // normal | high | backing-up | overflow
+    absorptionArea,       // trench | mound | sand-filter | drip-irrigation
+    absorptionAreaCondition, // good | saturated | ponding | surface-breakout
+    drainagePonding,
+    surfaceBreakout,      // effluent appearing on surface — public health risk
+    setbackDistances,     // array of { to: boundary|dwelling|waterway|bore, distance_m, minimum_m }
+    waterTableDepth_m,
+    siteSlope_pct,
+    maintenanceContractCurrent,
+    councilApprovalCurrent,
+    overallResult,        // COMPLIANT | NON-COMPLIANT | DESLUDGING-REQUIRED | REPAIR-REQUIRED
+    photos,
+    notes,
+  } = req.body;
+
+  const issues = [];
+
+  // Surface breakout is public health emergency
+  if (surfaceBreakout === true || surfaceBreakout === "true") {
+    issues.push("Surface effluent breakout — public health risk — immediate remediation required");
+  }
+  if (effluent_level === "overflow") {
+    issues.push("Effluent overflow from tank — immediate desludging required");
+  }
+  if (effluent_level === "backing-up") {
+    issues.push("Effluent backing up — absorption area failure or desludging required");
+  }
+
+  // Tank structural failure
+  if (tankCondition === "collapsed") {
+    issues.push("Tank has collapsed — safety risk and complete system failure");
+  } else if (tankCondition === "cracked") {
+    issues.push("Tank is cracked — repair required to prevent groundwater contamination");
+  }
+
+  // Absorption area failure
+  if (absorptionAreaCondition === "ponding" || absorptionAreaCondition === "surface-breakout") {
+    issues.push(`Absorption area ${absorptionAreaCondition} — hydraulic failure`);
+  }
+
+  // Setback distances
+  if (Array.isArray(setbackDistances)) {
+    setbackDistances.forEach((s) => {
+      if (parseFloat(s.distance_m) < parseFloat(s.minimum_m)) {
+        issues.push(`Setback to ${s.to} is ${s.distance_m} m — less than minimum ${s.minimum_m} m`);
+      }
+    });
+  }
+
+  const passed = issues.length === 0;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    property_address: sanitiseInput(propertyAddress),
+    owner_name: sanitiseInput(ownerName),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    inspector_licence: sanitiseInput(inspectorLicence),
+    system_type: sanitiseInput(systemType),
+    system_age_years: systemAge_years,
+    tank_volume_l: tankVolume_L,
+    household_persons: householdPersons,
+    last_desludging_date: lastDesludgingDate,
+    tank_condition: sanitiseInput(tankCondition),
+    inlet_baffle: inletBaffle,
+    outlet_baffle: outletBaffle,
+    effluent_level: sanitiseInput(effluent_level),
+    absorption_area: sanitiseInput(absorptionArea),
+    absorption_area_condition: sanitiseInput(absorptionAreaCondition),
+    drainage_ponding: drainagePonding,
+    surface_breakout: surfaceBreakout,
+    setback_distances: setbackDistances || [],
+    water_table_depth_m: waterTableDepth_m,
+    site_slope_pct: siteSlope_pct,
+    maintenance_contract_current: maintenanceContractCurrent,
+    council_approval_current: councilApprovalCurrent,
+    issues,
+    overall_result: passed ? "COMPLIANT" : "NON-COMPLIANT",
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("septic_system_inspections")
+      .insert(record);
+    if (dbErr) console.error("DB error /septic-system-inspection:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  if (!passed) {
+    return res.status(422).json({
+      error: "Onsite wastewater system inspection — non-compliance identified",
+      issues,
+      overallResult: "NON-COMPLIANT",
+      immediateActions: [
+        "If surface breakout present: isolate area, contact EPA Victoria immediately",
+        "For effluent overflow: arrange emergency desludging",
+        "For absorption area failure: engage licensed system designer for replacement",
+        "Notify council if system is failing and posing public health risk",
+      ],
+      applicableStandards: [
+        "EPA Victoria Code of Practice for Onsite Wastewater Management",
+        "Environment Protection Act 2017 (Vic)",
+        "AS/NZS 1547",
+        "AS 3500.5",
+      ],
+      saved,
+    });
+  }
+
+  res.json({
+    message: "Septic/onsite wastewater system inspection — compliant",
+    overallResult: "COMPLIANT",
+    systemType: sanitiseInput(systemType),
+    applicableStandards: [
+      "EPA Victoria Code of Practice for Onsite Wastewater Management",
+      "AS/NZS 1547",
+      "AS 3500.5",
+    ],
+    saved,
+  });
+});
+
+// POST /ai-scaffold-risk-assessment — AI assesses scaffold risk, loading adequacy, and compliance
+app.post("/ai-scaffold-risk-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    scaffoldType,
+    scaffoldHeight_m,
+    loadKPa,
+    workType,             // bricklaying | painting | light-maintenance | concrete | demolition
+    tiesInstalled,
+    adjacentToTraffic,
+    weatherExposure,      // sheltered | exposed | highly-exposed
+    soilType,             // firm | soft | rock
+    existingDefects,
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are a scaffold engineer and safety specialist with 20 years experience on Australian construction sites. Assess scaffold risk, loading, and compliance per AS/NZS 1576.1, AS/NZS 1576.3, and OHS Regulations 2017 (Vic).
+
+Assess:
+1. Load classification — light duty (0.75 kPa) / general purpose (2.25 kPa) / special duty (4.5 kPa)
+2. Tie requirements — AS/NZS 1576 frequency based on height and wind exposure
+3. Collapse risk factors — wind loading, soft ground, missing ties, overloading
+4. Notifiable work — scaffolding >4 m height triggers licence requirement (OHS Regs 2017 Vic r.252)
+5. Inspection frequency — initial, 30-day routine, post-modification, post-adverse weather
+6. Access and egress requirements
+
+Respond with JSON: { "collapseRisk": "low|medium|high|critical", "loadClassification": "light-duty|general-purpose|special-duty", "requiredTieSpacing_m": number, "notifiableWork": boolean, "windLoadingRisk": "low|medium|high", "groundSupportAdequate": boolean, "requiredInspectionFrequency": "string", "criticalRiskFactors": [], "requiredControls": [], "engineerDesignRequired": boolean, "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Scaffold type: ${scaffoldType || "system"}
+Height: ${scaffoldHeight_m || "not specified"} m
+Design load: ${loadKPa || "not specified"} kPa
+Work type: ${workType || "not specified"}
+Ties installed: ${tiesInstalled || "not specified"}
+Adjacent to traffic: ${adjacentToTraffic || "no"}
+Weather exposure: ${weatherExposure || "sheltered"}
+Soil type: ${soilType || "firm"}
+Existing defects: ${Array.isArray(existingDefects) ? existingDefects.join("; ") : (existingDefects || "none")}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-scaffold-risk-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        collapseRisk: "medium",
+        loadClassification: "general-purpose",
+        requiredTieSpacing_m: 4,
+        notifiableWork: parseFloat(scaffoldHeight_m) > 4,
+        windLoadingRisk: "medium",
+        groundSupportAdequate: true,
+        requiredInspectionFrequency: "Handover inspection, then 30-day routine, post-adverse weather",
+        criticalRiskFactors: [
+          "Overloading with materials stored on platform",
+          "Missing or inadequate ties in high wind exposure",
+          "Soft ground undermining base jack support",
+        ],
+        requiredControls: [
+          "Install ties at maximum 4 m horizontal, 4 m vertical spacing",
+          "Ensure base plates and soleboards on all soft ground",
+          "Mark load capacity on scaffold — maximum 2.25 kPa for general purpose",
+          "Barricade exclusion zone at base for fall-of-object risk",
+          "Daily pre-start inspection by scaffolding supervisor",
+        ],
+        engineerDesignRequired: parseFloat(scaffoldHeight_m) > 15,
+        applicableStandards: [
+          "AS/NZS 1576.1",
+          "AS/NZS 1576.3",
+          "OHS Regulations 2017 (Vic) Part 3.4",
+          "WorkSafe Victoria Scaffolding Code of Practice",
+        ],
+        recommendation:
+          "Scaffold requires handover inspection by licenced scaffolder before first use. Install ties at 4 m spacing. Post load capacity on scaffold. 30-day routine inspection cycle.",
+        summary:
+          "Scaffold presents medium risk manageable with correct tie installation, base support, and regular inspection programme. Scaffolding above 4 m requires licenced scaffolder for erection and dismantling.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
