@@ -38954,6 +38954,212 @@ Return JSON with:
   }
 });
 
+// POST /backflow-prevention-register — Register backflow prevention devices
+app.post("/backflow-prevention-register", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, waterAuthority, deviceType, deviceMake, deviceModel,
+    serialNumber, installationLocation, installationDate,
+    lastTestDate, nextTestDue, testResult = "PASS",
+    testPressurePsi, testedBy, plumberLicenceNumber,
+    zone = "HIGH", notes,
+  } = req.body;
+  if (!propertyAddress || !deviceType || !serialNumber) {
+    return res.status(400).json({ error: "propertyAddress, deviceType, and serialNumber are required." });
+  }
+  const validDeviceTypes = ["RPZD", "DCRPZD", "DBV", "SCBV", "AVB", "HOSE_UNION_BV"];
+  const validZones = ["HIGH", "MEDIUM", "LOW"];
+  if (!validDeviceTypes.includes(deviceType)) {
+    return res.status(400).json({ error: `deviceType must be one of: ${validDeviceTypes.join(", ")}` });
+  }
+  if (!validZones.includes(zone)) {
+    return res.status(400).json({ error: `zone must be one of: ${validZones.join(", ")}` });
+  }
+  const deviceRef = `BFP-${Date.now().toString(36).toUpperCase()}`;
+  const daysUntilTest = nextTestDue
+    ? Math.ceil((new Date(nextTestDue) - new Date()) / (1000 * 60 * 60 * 24))
+    : null;
+  const testStatus = daysUntilTest === null ? "UNKNOWN"
+    : daysUntilTest < 0 ? "OVERDUE"
+    : daysUntilTest <= 30 ? "DUE_SOON"
+    : "CURRENT";
+  const record = {
+    device_ref: deviceRef,
+    property_address: sanitiseInput(propertyAddress),
+    water_authority: sanitiseInput(waterAuthority || ""),
+    device_type: deviceType,
+    device_make: sanitiseInput(deviceMake || ""),
+    device_model: sanitiseInput(deviceModel || ""),
+    serial_number: sanitiseInput(serialNumber),
+    installation_location: sanitiseInput(installationLocation || ""),
+    installation_date: installationDate || null,
+    last_test_date: lastTestDate || null,
+    next_test_due: nextTestDue || null,
+    test_result: testResult,
+    test_pressure_psi: Number(testPressurePsi) || null,
+    tested_by: sanitiseInput(testedBy || ""),
+    plumber_licence: sanitiseInput(plumberLicenceNumber || ""),
+    zone,
+    test_status: testStatus,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("backflow_prevention_devices").insert(record);
+    if (error) console.error("backflow-prevention-register DB error:", error.message);
+  }
+  res.json({
+    deviceRef, deviceType, serialNumber, zone, testResult,
+    testStatus, daysUntilTest, saved: !!supabaseAdmin,
+  });
+});
+
+// GET /backflow-prevention-register — List devices for a property
+app.get("/backflow-prevention-register", apiKeyAuth, async (req, res) => {
+  const { propertyAddress, testStatus } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("backflow_prevention_devices").select("*").order("next_test_due", { ascending: true });
+  if (propertyAddress) query = query.ilike("property_address", `%${propertyAddress}%`);
+  if (testStatus) query = query.eq("test_status", testStatus);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({
+    count: data.length,
+    overdueCount: data.filter(d => d.test_status === "OVERDUE").length,
+    dueSoonCount: data.filter(d => d.test_status === "DUE_SOON").length,
+    devices: data,
+  });
+});
+
+// POST /fire-hydrant-test — Record a fire hydrant flow test
+app.post("/fire-hydrant-test", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, hydrantId, hydrantType = "WET_BARREL", testDate,
+    staticPressureKpa, residualPressureKpa, flowRateLpm,
+    pipeDiameterMm, testedBy, fireAuthorityRef,
+    requiredFlowLpm, requiredPressureKpa, testResult,
+    nextTestDue, notes,
+  } = req.body;
+  if (!propertyAddress || !testDate || !testedBy) {
+    return res.status(400).json({ error: "propertyAddress, testDate, and testedBy are required." });
+  }
+  const validTypes = ["WET_BARREL", "DRY_BARREL", "PILLAR", "LANDING_VALVE"];
+  if (!validTypes.includes(hydrantType)) {
+    return res.status(400).json({ error: `hydrantType must be one of: ${validTypes.join(", ")}` });
+  }
+  const flowMet = Number(flowRateLpm) >= Number(requiredFlowLpm);
+  const pressureMet = Number(residualPressureKpa) >= Number(requiredPressureKpa);
+  const autoResult = testResult || (flowMet && pressureMet ? "PASS" : "FAIL");
+  const testRef = `HYD-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    test_ref: testRef,
+    property_address: sanitiseInput(propertyAddress),
+    hydrant_id: sanitiseInput(hydrantId || ""),
+    hydrant_type: hydrantType,
+    test_date: testDate,
+    static_pressure_kpa: Number(staticPressureKpa) || null,
+    residual_pressure_kpa: Number(residualPressureKpa) || null,
+    flow_rate_lpm: Number(flowRateLpm) || null,
+    pipe_diameter_mm: Number(pipeDiameterMm) || null,
+    tested_by: sanitiseInput(testedBy),
+    fire_authority_ref: sanitiseInput(fireAuthorityRef || ""),
+    required_flow_lpm: Number(requiredFlowLpm) || null,
+    required_pressure_kpa: Number(requiredPressureKpa) || null,
+    test_result: autoResult,
+    next_test_due: nextTestDue || null,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("fire_hydrant_tests").insert(record);
+    if (error) console.error("fire-hydrant-test DB error:", error.message);
+  }
+  res.json({
+    testRef, propertyAddress, hydrantType, testDate,
+    testResult: autoResult, flowMet, pressureMet,
+    flowRateLpm: Number(flowRateLpm) || null, staticPressureKpa: Number(staticPressureKpa) || null,
+    saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-plumbing-compliance-summary — AI summarises plumbing compliance status
+app.post("/ai-plumbing-compliance-summary", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, propertyType = "commercial", state = "VIC",
+    buildYear, lastPlumbingAuditDate, knownDeficiencies = [],
+    backflowDevices = [], hotWaterSystem, drainageIssues = [],
+    gasFittings = [], certifications = [],
+  } = req.body;
+  if (!propertyAddress) {
+    return res.status(400).json({ error: "propertyAddress is required." });
+  }
+  const sanitisedAddress = sanitiseInput(propertyAddress);
+  const sanitisedType = sanitiseInput(propertyType);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian plumbing compliance specialist. Assess plumbing compliance status for properties.`;
+  const userPrompt = `Assess plumbing compliance status for:
+Address: ${sanitisedAddress}
+Property type: ${sanitisedType}
+State: ${sanitisedState}
+Build year: ${buildYear || "Unknown"}
+Last audit: ${sanitiseInput(lastPlumbingAuditDate || "Unknown")}
+Known deficiencies: ${knownDeficiencies.map(d => sanitiseInput(d)).join("; ") || "None"}
+Backflow prevention devices: ${backflowDevices.length}
+Hot water system: ${sanitiseInput(hotWaterSystem || "Not specified")}
+Drainage issues: ${drainageIssues.map(i => sanitiseInput(i)).join("; ") || "None"}
+Gas fittings: ${gasFittings.map(g => sanitiseInput(g)).join("; ") || "None"}
+Certifications held: ${certifications.map(c => sanitiseInput(c)).join("; ") || "None"}
+
+Return JSON with:
+{
+  "overallComplianceStatus": "COMPLIANT|PARTIALLY_COMPLIANT|NON_COMPLIANT|UNKNOWN",
+  "complianceScore": 80,
+  "immediateActions": ["...", "..."],
+  "scheduledActions": [{"action": "...", "timeframe": "...", "priority": "HIGH|MEDIUM|LOW"}],
+  "regulatoryChecklist": [{"requirement": "...", "status": "MET|NOT_MET|UNKNOWN"}],
+  "applicableStandards": ["AS/NZS ...", "..."],
+  "riskAreas": ["...", "..."],
+  "maintenanceRecommendations": ["...", "..."],
+  "certificationGaps": ["...", "..."],
+  "estimatedRectificationCost": "...",
+  "nextAuditRecommended": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const summary = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ propertyAddress: sanitisedAddress, propertyType: sanitisedType, state: sanitisedState, summary });
+  } catch (err) {
+    console.error("ai-plumbing-compliance-summary error:", err.message);
+    res.json({
+      propertyAddress: sanitisedAddress, propertyType: sanitisedType, state: sanitisedState,
+      summary: {
+        overallComplianceStatus: "UNKNOWN",
+        complianceScore: 0,
+        immediateActions: knownDeficiencies.length > 0 ? ["Address known deficiencies immediately"] : ["Conduct comprehensive plumbing audit"],
+        scheduledActions: [{ action: "Commission full plumbing compliance audit", timeframe: "Within 3 months", priority: "HIGH" }],
+        regulatoryChecklist: [
+          { requirement: "Plumbing compliance certificate current", status: "UNKNOWN" },
+          { requirement: "Backflow prevention devices tested annually", status: backflowDevices.length > 0 ? "UNKNOWN" : "NOT_MET" },
+        ],
+        applicableStandards: ["AS/NZS 3500.1 (Water Services)", "AS/NZS 3500.2 (Sanitary Plumbing)", `${sanitisedState} Plumbing Regulations`],
+        riskAreas: drainageIssues.length > 0 ? ["Drainage system non-compliance"] : ["No specific risk areas identified without audit"],
+        maintenanceRecommendations: ["Annual plumbing system inspection", "Regular drain camera inspections"],
+        certificationGaps: ["Plumbing compliance certificate required"],
+        estimatedRectificationCost: "TBD — requires on-site inspection",
+        nextAuditRecommended: "Within 12 months or as soon as practicable",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
