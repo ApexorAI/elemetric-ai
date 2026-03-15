@@ -57253,6 +57253,315 @@ app.post("/cctv-drainage-inspection", apiKeyAuth, async (req, res) => {
   }
 });
 
+// POST /reinforcement-inspection — Pre-pour reinforcement inspection per AS 3600
+app.post("/reinforcement-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      inspectionRef,
+      date,
+      inspector,
+      element,
+      location,
+      gridReference,
+      drawingRef,
+      reinforcementType,
+      barGrade,
+      barSizeMm,
+      spacing,
+      coverSpecMm,
+      coverActualMm,
+      coverBarsMeasured,
+      coverMinReadingMm,
+      tiesAndChairsOk,
+      lapsOk,
+      lapLengthMm,
+      splicesOk,
+      stirrupSpacingOk,
+      bundledBarsOk,
+      penetrationsRebarClear,
+      embedmentDepthOk,
+      levelAndAlignmentOk,
+      contamination,
+      contaminationDescription,
+      foreignObjectsPresent,
+      formworkInspected,
+      formworkReleaseAgent,
+      cleanliness,
+      overallResult,
+      approvedForPour,
+      holdPointWitnessName,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !inspector || !element || !overallResult) {
+      return res.status(400).json({ error: "projectId, date, inspector, element, and overallResult are required" });
+    }
+
+    const failures = [];
+    // AS 3600: minimum cover to reinforcement — 20mm for slabs (internal), 30mm for beams (internal), 40mm for exposure B1
+    if (coverSpecMm && coverActualMm && Number(coverActualMm) < Number(coverSpecMm) - 5) {
+      failures.push(`Concrete cover ${coverActualMm} mm is more than 5 mm below specified ${coverSpecMm} mm — AS 3600 allows -5mm tolerance on cover`);
+    }
+    if (coverMinReadingMm && coverSpecMm && Number(coverMinReadingMm) < Number(coverSpecMm) - 10) {
+      failures.push(`Minimum cover reading ${coverMinReadingMm} mm — exceeds AS 3600 tolerance, risk of steel corrosion and durability failure`);
+    }
+    if (!tiesAndChairsOk) failures.push("Bar ties or cover chairs inadequate — reinforcement must be secured to maintain cover during concrete placement");
+    if (!lapsOk) failures.push("Lap splices non-compliant — check against structural drawing and AS 3600 cl.13.2.2 minimum lap length");
+    if (contamination) failures.push(`Reinforcement contaminated: ${sanitiseInput(contaminationDescription || "details not provided")} — clean before pouring`);
+    if (foreignObjectsPresent) failures.push("Foreign objects present in formwork — must be removed before pour");
+    if (overallResult === "FAIL") failures.push("Reinforcement inspection FAILED — pour must not proceed until rectified and re-inspected");
+
+    if (failures.length > 0) console.warn(`[REBAR INSPECTION] ${element} at ${projectId} — ${failures.join("; ")}`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      inspection_ref: sanitiseInput(inspectionRef || `RI-${Date.now()}`),
+      date,
+      inspector: sanitiseInput(inspector),
+      element: sanitiseInput(element),
+      location: sanitiseInput(location || ""),
+      grid_reference: sanitiseInput(gridReference || ""),
+      drawing_ref: sanitiseInput(drawingRef || ""),
+      reinforcement_type: sanitiseInput(reinforcementType || ""),
+      bar_grade: sanitiseInput(barGrade || "500N"),
+      bar_size_mm: barSizeMm || null,
+      spacing: sanitiseInput(spacing || ""),
+      cover_spec_mm: coverSpecMm || null,
+      cover_actual_mm: coverActualMm || null,
+      cover_bars_measured: coverBarsMeasured || null,
+      cover_min_reading_mm: coverMinReadingMm || null,
+      ties_and_chairs_ok: !!tiesAndChairsOk,
+      laps_ok: !!lapsOk,
+      lap_length_mm: lapLengthMm || null,
+      splices_ok: !!splicesOk,
+      stirrup_spacing_ok: !!stirrupSpacingOk,
+      bundled_bars_ok: !!bundledBarsOk,
+      penetrations_rebar_clear: !!penetrationsRebarClear,
+      embedment_depth_ok: !!embedmentDepthOk,
+      level_and_alignment_ok: !!levelAndAlignmentOk,
+      contamination: !!contamination,
+      contamination_description: sanitiseInput(contaminationDescription || ""),
+      foreign_objects_present: !!foreignObjectsPresent,
+      formwork_inspected: !!formworkInspected,
+      formwork_release_agent: !!formworkReleaseAgent,
+      cleanliness: sanitiseInput(cleanliness || ""),
+      overall_result: sanitiseInput(overallResult),
+      approved_for_pour: !!approvedForPour && failures.length === 0,
+      hold_point_witness_name: sanitiseInput(holdPointWitnessName || ""),
+      failures,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("reinforcement_inspections").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (failures.length > 0 || !approvedForPour) {
+      return res.status(422).json({ approvedForPour: false, failures, message: "Pour must not proceed. Rectify all failures and obtain re-inspection approval.", record, saved });
+    }
+
+    res.json({
+      approvedForPour: true,
+      inspectionRef: record.inspection_ref,
+      failures: [],
+      applicableStandards: ["AS 3600 Concrete structures", "AS/NZS 4671 Steel reinforcing materials", "AS 3600 cl.13 — detailing requirements"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/reinforcement-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record reinforcement inspection" });
+  }
+});
+
+// POST /daily-site-report — Record a daily site diary / site report
+app.post("/daily-site-report", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      reportDate,
+      shift,
+      preparedBy,
+      supervisorName,
+      weatherConditions,
+      maxTempC,
+      minTempC,
+      rainfall,
+      workerCount,
+      subcontractors,
+      workAreas,
+      workCompleted,
+      workProgrammed,
+      variationsInstructions,
+      materialsDelivered,
+      plantEquipmentOnSite,
+      inspectionsCompleted,
+      visitorsOnSite,
+      visitorNames,
+      safetyConcerns,
+      incidentsOccurred,
+      incidentDescription,
+      delaysOccurred,
+      delayReason,
+      delayDuration,
+      openIssues,
+      progressPercentage,
+      notes,
+    } = req.body;
+
+    if (!projectId || !reportDate || !preparedBy) {
+      return res.status(400).json({ error: "projectId, reportDate, and preparedBy are required" });
+    }
+
+    const flags = [];
+    if (incidentsOccurred) flags.push(`Incident occurred: ${sanitiseInput(incidentDescription || "details not provided")} — ensure incident report is completed`);
+    if (safetyConcerns) flags.push("Safety concerns noted — review and assign corrective actions");
+    if (delaysOccurred) flags.push(`Delay recorded: ${sanitiseInput(delayReason || "reason not specified")} — ${sanitiseInput(String(delayDuration || "duration not specified"))}`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      report_date: reportDate,
+      shift: sanitiseInput(shift || "day"),
+      prepared_by: sanitiseInput(preparedBy),
+      supervisor_name: sanitiseInput(supervisorName || ""),
+      weather_conditions: sanitiseInput(weatherConditions || ""),
+      max_temp_c: maxTempC || null,
+      min_temp_c: minTempC || null,
+      rainfall: rainfall !== undefined ? Number(rainfall) : null,
+      worker_count: workerCount || null,
+      subcontractors: Array.isArray(subcontractors) ? subcontractors.map(s => sanitiseInput(s)) : [],
+      work_areas: sanitiseInput(workAreas || ""),
+      work_completed: sanitiseInput(workCompleted || ""),
+      work_programmed: sanitiseInput(workProgrammed || ""),
+      variations_instructions: sanitiseInput(variationsInstructions || ""),
+      materials_delivered: sanitiseInput(materialsDelivered || ""),
+      plant_equipment_on_site: Array.isArray(plantEquipmentOnSite) ? plantEquipmentOnSite.map(p => sanitiseInput(p)) : [],
+      inspections_completed: sanitiseInput(inspectionsCompleted || ""),
+      visitors_on_site: !!visitorsOnSite,
+      visitor_names: Array.isArray(visitorNames) ? visitorNames.map(v => sanitiseInput(v)) : [],
+      safety_concerns: !!safetyConcerns,
+      incidents_occurred: !!incidentsOccurred,
+      incident_description: sanitiseInput(incidentDescription || ""),
+      delays_occurred: !!delaysOccurred,
+      delay_reason: sanitiseInput(delayReason || ""),
+      delay_duration: sanitiseInput(String(delayDuration || "")),
+      open_issues: Array.isArray(openIssues) ? openIssues.map(i => sanitiseInput(i)) : [],
+      progress_percentage: progressPercentage || null,
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("daily_site_reports").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({ reportDate, flags, record, saved });
+  } catch (err) {
+    console.error("/daily-site-report error:", err.message);
+    res.status(500).json({ error: "Failed to record daily site report" });
+  }
+});
+
+// POST /ai-incident-investigation — AI assists workplace incident investigation with root cause analysis
+app.post("/ai-incident-investigation", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      incidentType,
+      incidentDescription,
+      injuryType,
+      location,
+      workActivity,
+      immediateCircumstances,
+      workerExperience,
+      existingControls,
+      environmentalConditions,
+      equipmentInvolved,
+      timeOfDay,
+    } = req.body;
+
+    if (!incidentType || !incidentDescription) {
+      return res.status(400).json({ error: "incidentType and incidentDescription are required" });
+    }
+
+    const prompt = `You are a workplace safety investigator with expertise in Victorian OHS legislation, incident investigation methodologies (5-Whys, Bowtie, ICAM), and Safe Work Australia guidance.
+
+Conduct an incident investigation analysis for:
+- Incident type: ${sanitiseInput(incidentType)}
+- Description: ${sanitiseInput(incidentDescription)}
+- Injury type: ${sanitiseInput(injuryType || "not specified")}
+- Location: ${sanitiseInput(location || "construction site")}
+- Work activity at time: ${sanitiseInput(workActivity || "not specified")}
+- Immediate circumstances: ${sanitiseInput(immediateCircumstances || "not specified")}
+- Worker experience: ${sanitiseInput(workerExperience || "not specified")}
+- Existing controls in place: ${sanitiseInput(existingControls || "not specified")}
+- Environmental conditions: ${sanitiseInput(environmentalConditions || "not specified")}
+- Equipment involved: ${sanitiseInput(equipmentInvolved || "none")}
+- Time of day: ${sanitiseInput(timeOfDay || "not specified")}
+
+Return a JSON object with:
+{
+  "incidentClassification": string,
+  "immediateCauses": [string],
+  "contributingFactors": [string],
+  "rootCauses": [string],
+  "systemicFactors": [string],
+  "fiveWhysAnalysis": [string],
+  "controlHierarchyGaps": [string],
+  "correctiveActions": [{"action": string, "priority": string, "responsibility": string}],
+  "preventiveActions": [string],
+  "lessonLearned": string,
+  "worksafeNotificationRequired": boolean,
+  "applicableLegislation": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1000,
+    });
+    usageStats.openaiCalls++;
+    const investigation = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ incidentType, incidentDescription, investigation });
+  } catch (err) {
+    console.error("/ai-incident-investigation error:", err.message);
+    res.json({
+      incidentType: req.body.incidentType || "",
+      incidentDescription: req.body.incidentDescription || "",
+      investigation: {
+        incidentClassification: "Workplace injury / near miss — further investigation required",
+        immediateCauses: ["Review incident description to identify immediate physical causes"],
+        contributingFactors: ["Inadequate supervision", "Insufficient training or experience", "Environmental or equipment factors"],
+        rootCauses: ["Inadequate hazard identification and risk assessment", "Insufficient safety management systems", "Organisational pressures affecting safety decisions"],
+        systemicFactors: ["Review SWMS adequacy", "Evaluate training and competency records", "Review supervision arrangements"],
+        fiveWhysAnalysis: ["Why 1: Identify what happened immediately before the event", "Why 2: Identify what failed to prevent it", "Why 3: Identify the underlying control failure", "Why 4: Identify the organisational factor", "Why 5: Identify the root cause requiring systemic corrective action"],
+        controlHierarchyGaps: ["Review whether elimination/substitution was considered", "Assess adequacy of engineering controls", "Evaluate administrative controls and training", "Review PPE selection and compliance"],
+        correctiveActions: [
+          { action: "Review and update SWMS for this task", priority: "HIGH", responsibility: "Site supervisor" },
+          { action: "Conduct toolbox talk on hazards related to this incident", priority: "HIGH", responsibility: "Site manager" },
+          { action: "Review and strengthen supervision arrangements", priority: "MEDIUM", responsibility: "Project manager" },
+        ],
+        preventiveActions: ["Implement pre-task briefings for similar activities", "Increase safety observation frequency", "Review similar tasks site-wide for similar hazards"],
+        lessonLearned: "Document and share learnings in next safety committee meeting and toolbox talk. Report to industry safety alert networks where applicable.",
+        worksafeNotificationRequired: false,
+        applicableLegislation: ["OHS Act 2004 (Vic) s.21 — employer duty to provide safe workplace", "OHS Regulations 2017 (Vic)", "WorkSafe Victoria incident notification requirements"],
+        recommendation: "Complete a formal incident investigation using ICAM or 5-Whys methodology within 24–48 hours. Assign corrective actions with owners and due dates. Review at next safety meeting.",
+        summary: "A thorough incident investigation is required to identify root causes and prevent recurrence. All corrective actions must be assigned, tracked, and verified as closed out.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
