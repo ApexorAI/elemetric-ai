@@ -71222,6 +71222,440 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 259 ─────────────────────────────────────────────────────────────────
+
+// POST /rope-access-inspection — Pre-work inspection record for rope access operations
+app.post("/rope-access-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, workLocation, inspectionDate, inspectedBy,
+      technicianLevel, technicianCertExpiry, anchorSystemInspected,
+      primaryAnchorCondition, secondaryAnchorCondition,
+      descendersInspected, descendersOk, ascentDevicesOk,
+      harnessMake, harnessSerial, harnessLastInspectionDate, harnessCondition,
+      ropes, helmetsOk, glovesPpeOk, workPositioningLanyard,
+      rescuePlanInPlace, rescueEquipmentOnSite, weatherConditions,
+      windSpeedKmh, rainPresent, surfaceCondition, worksAtHeight,
+      immediateActionRequired, notes
+    } = req.body;
+
+    if (!workLocation || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "workLocation, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeLocation = sanitiseInput(String(workLocation));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+
+    const ropeList = Array.isArray(ropes) ? ropes : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    // AS/NZS 4488 — Industrial rope access systems
+    // Technician certification
+    const certLevel = parseInt(technicianLevel) || 0;
+    if (!technicianLevel) {
+      criticalIssues.push("Technician IRATA/ARAA level not recorded — must be certified before commencing rope access.");
+    }
+    if (technicianCertExpiry) {
+      const expiry = new Date(technicianCertExpiry);
+      const daysToExpiry = Math.floor((expiry - new Date()) / (1000 * 60 * 60 * 24));
+      if (daysToExpiry < 0) {
+        criticalIssues.push(`Technician certification expired ${Math.abs(daysToExpiry)} days ago — work must not proceed.`);
+      } else if (daysToExpiry < 30) {
+        warnings.push(`Technician certification expires in ${daysToExpiry} days — plan renewal.`);
+      }
+    }
+
+    // Anchor systems — primary and secondary (two independent systems required)
+    if (!anchorSystemInspected) {
+      criticalIssues.push("Anchor system inspection not recorded — mandatory before rope access (AS/NZS 4488).");
+    }
+    const primaryCond = primaryAnchorCondition ? String(primaryAnchorCondition).toUpperCase() : "UNKNOWN";
+    const secondaryCond = secondaryAnchorCondition ? String(secondaryAnchorCondition).toUpperCase() : "UNKNOWN";
+    if (primaryCond === "FAIL" || primaryCond === "DEFECTIVE") {
+      criticalIssues.push("Primary anchor system FAILED inspection — do not use until repaired and re-inspected.");
+    }
+    if (secondaryCond === "FAIL" || secondaryCond === "DEFECTIVE") {
+      criticalIssues.push("Secondary anchor system FAILED — two independent anchor points required for rope access (AS/NZS 4488).");
+    }
+
+    // Equipment
+    if (!descendersInspected || descendersOk === false || descendersOk === "false") {
+      criticalIssues.push("Descender device inspection failed or not completed — do not proceed.");
+    }
+    if (ascentDevicesOk === false || ascentDevicesOk === "false") {
+      criticalIssues.push("Ascent device failed inspection — do not proceed.");
+    }
+
+    // Harness
+    const harnCond = harnessCondition ? String(harnessCondition).toUpperCase() : "UNKNOWN";
+    if (harnCond === "FAIL" || harnCond === "RETIRE") {
+      criticalIssues.push(`Harness ${harnessSerial || ""} condition rated ${harnessCondition} — remove from service immediately (AS/NZS 1891.4).`);
+    }
+    if (harnessLastInspectionDate) {
+      const lastInsp = new Date(harnessLastInspectionDate);
+      const daysSince = Math.floor((new Date() - lastInsp) / (1000 * 60 * 60 * 24));
+      if (daysSince > 180) {
+        warnings.push(`Harness last inspected ${daysSince} days ago — 6-monthly formal inspection required (AS/NZS 1891.4).`);
+      }
+    }
+
+    // Rope checks
+    if (ropeList.length === 0) {
+      warnings.push("No rope details recorded — document working and safety rope condition.");
+    }
+    ropeList.forEach((r, i) => {
+      if (r.condition === "FAIL" || r.condition === "RETIRE") {
+        criticalIssues.push(`Rope ${i + 1} (${r.serial || "unknown serial"}) condition ${r.condition} — remove from service.`);
+      }
+    });
+
+    // Rescue plan
+    if (!rescuePlanInPlace) {
+      criticalIssues.push("No rescue plan in place — mandatory before rope access commences (AS/NZS 4488).");
+    }
+    if (!rescueEquipmentOnSite) {
+      criticalIssues.push("Rescue equipment not confirmed on site — required at all times during rope access.");
+    }
+
+    // Weather
+    const wind = parseFloat(windSpeedKmh) || 0;
+    if (wind > 45) {
+      criticalIssues.push(`Wind speed ${wind} km/h exceeds maximum 45 km/h for rope access — suspend operations.`);
+    } else if (wind > 35) {
+      warnings.push(`Wind speed ${wind} km/h approaching limit — monitor and be prepared to suspend.`);
+    }
+    if (rainPresent === true || rainPresent === "true") {
+      warnings.push("Rain present — wet surfaces increase fall risk. Assess surface condition carefully.");
+    }
+
+    const surfCond = surfaceCondition ? String(surfaceCondition).toUpperCase() : "UNKNOWN";
+    if (surfCond === "WET" || surfCond === "ICY" || surfCond === "CONTAMINATED") {
+      warnings.push(`Surface condition ${surfaceCondition} — increased slip/fall hazard.`);
+    }
+
+    if (immediateActionRequired === true || immediateActionRequired === "true") {
+      criticalIssues.push("Inspector flagged immediate action required — stop work.");
+    }
+
+    const workStatus = criticalIssues.length > 0 ? "DO_NOT_PROCEED" : warnings.length > 0 ? "PROCEED_WITH_CAUTION" : "CLEARED_TO_PROCEED";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("rope_access_inspections")
+        .insert({
+          project_id: safeProject,
+          work_location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          technician_level: certLevel || null,
+          technician_cert_expiry: technicianCertExpiry || null,
+          anchor_system_inspected: anchorSystemInspected || false,
+          primary_anchor_condition: primaryAnchorCondition || null,
+          secondary_anchor_condition: secondaryAnchorCondition || null,
+          descendors_ok: descendersOk !== false && descendersOk !== "false",
+          ascent_devices_ok: ascentDevicesOk !== false && ascentDevicesOk !== "false",
+          harness_serial: harnessSerial ? sanitiseInput(String(harnessSerial)) : null,
+          harness_condition: harnessCondition || null,
+          ropes: ropeList,
+          rescue_plan_in_place: rescuePlanInPlace || false,
+          rescue_equipment_on_site: rescueEquipmentOnSite || false,
+          wind_speed_kmh: wind || null,
+          rain_present: rainPresent || false,
+          surface_condition: surfaceCondition || null,
+          work_status: workStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        workStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Rope access must not proceed — critical safety issues identified.",
+        standards: ["AS/NZS 4488", "AS/NZS 1891.4", "OHS Regulations 2017 (Vic) Part 3.3"],
+      });
+    }
+
+    res.json({
+      workStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      windSpeedKmh: wind,
+      ropeCount: ropeList.length,
+      standards: ["AS/NZS 4488", "AS/NZS 1891.4"],
+    });
+  } catch (err) {
+    console.error("POST /rope-access-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record rope access inspection." });
+  }
+});
+
+// POST /dam-safety-inspection — Record dam safety surveillance inspection per ANCOLD
+app.post("/dam-safety-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      damId, projectId, inspectionDate, inspectedBy, damCategory,
+      storageCapacityML, crestLevelM, upstreamSlopeCondition,
+      downstreamSlopeCondition, seepageObserved, seepageSeverity,
+      seepageClarity, embankmentCracking, crackWidthMm, settlementObserved,
+      settlementMm, spillwayCondition, spillwayDebrisPresent,
+      gateOperational, instrumentationWorking, piezometerReadingM,
+      piezometerAlarmLevel, dischargeOperational, fenceSecure,
+      vegetationOnEmbankment, emergencyActionPlanCurrent, notes
+    } = req.body;
+
+    if (!damId || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "damId, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeDam = sanitiseInput(String(damId));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const criticalIssues = [];
+    const warnings = [];
+
+    const category = String(damCategory || "").toUpperCase();
+    const crackMm = parseFloat(crackWidthMm) || 0;
+    const settleMm = parseFloat(settlementMm) || 0;
+
+    // ANCOLD Guidelines on Dam Safety Management
+    // Seepage
+    if (seepageObserved) {
+      const seepageSev = String(seepageSeverity || "").toUpperCase();
+      const clarity = String(seepageClarity || "").toUpperCase();
+      if (seepageSev === "HIGH" || clarity === "TURBID" || clarity === "MUDDY") {
+        criticalIssues.push("Turbid/high seepage observed — potential internal erosion (piping). Notify dam owner and engineer immediately (ANCOLD Guidelines).");
+      } else if (seepageSev === "MODERATE") {
+        warnings.push("Moderate seepage observed — monitor and report to responsible engineer.");
+      } else if (seepageSev === "LOW") {
+        warnings.push("Low-level seepage — document location and continue monitoring.");
+      }
+    }
+
+    // Embankment cracking / settlement
+    if (embankmentCracking) {
+      if (crackMm > 20) {
+        criticalIssues.push(`Embankment crack width ${crackMm}mm — significant structural concern. Notify dam safety engineer immediately.`);
+      } else if (crackMm > 5) {
+        warnings.push(`Embankment cracking ${crackMm}mm — monitor and report at next scheduled review.`);
+      } else {
+        warnings.push("Embankment cracking observed — document and monitor.");
+      }
+    }
+
+    if (settlementObserved) {
+      if (settleMm > 100) {
+        criticalIssues.push(`Crest settlement ${settleMm}mm — significant. Engage structural engineer immediately.`);
+      } else if (settleMm > 30) {
+        warnings.push(`Settlement ${settleMm}mm observed — monitor with increased frequency.`);
+      } else {
+        warnings.push("Minor settlement noted — document for trend analysis.");
+      }
+    }
+
+    // Spillway
+    const spillwayCond = String(spillwayCondition || "").toUpperCase();
+    if (spillwayCond === "BLOCKED" || spillwayCond === "FAILED") {
+      criticalIssues.push(`Spillway ${spillwayCondition} — overtopping risk during flood event. Urgent remediation required.`);
+    }
+    if (spillwayDebrisPresent) {
+      criticalIssues.push("Debris in spillway — must be cleared immediately to prevent flow obstruction during flood.");
+    }
+
+    // Instrumentation
+    if (piezometerReadingM != null && piezometerAlarmLevel != null) {
+      const piezReading = parseFloat(piezometerReadingM);
+      const piezAlarm = parseFloat(piezometerAlarmLevel);
+      if (!isNaN(piezReading) && !isNaN(piezAlarm) && piezReading >= piezAlarm) {
+        criticalIssues.push(`Piezometer reading ${piezReading}m exceeds alarm level ${piezAlarm}m — trigger Emergency Action Plan.`);
+      }
+    }
+    if (!instrumentationWorking) {
+      warnings.push("Dam instrumentation not fully operational — schedule urgent maintenance.");
+    }
+
+    if (!emergencyActionPlanCurrent) {
+      warnings.push("Emergency Action Plan may not be current — verify and update if required (ANCOLD/DECCA requirement).");
+    }
+
+    // Downstream slope
+    const downCond = String(downstreamSlopeCondition || "").toUpperCase();
+    if (downCond === "POOR" || downCond === "FAILED") {
+      criticalIssues.push(`Downstream slope condition rated ${downstreamSlopeCondition} — slope stability concern.`);
+    }
+
+    const overallStatus = criticalIssues.length > 0 ? "EMERGENCY_ACTION_REQUIRED" : warnings.length > 0 ? "MONITOR_CLOSELY" : "SATISFACTORY";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("dam_safety_inspections")
+        .insert({
+          dam_id: safeDam,
+          project_id: projectId ? sanitiseInput(String(projectId)) : null,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          dam_category: category || null,
+          storage_capacity_ml: storageCapacityML || null,
+          crest_level_m: crestLevelM || null,
+          upstream_slope_condition: upstreamSlopeCondition || null,
+          downstream_slope_condition: downstreamSlopeCondition || null,
+          seepage_observed: seepageObserved || false,
+          seepage_severity: seepageSeverity || null,
+          embankment_cracking: embankmentCracking || false,
+          crack_width_mm: crackMm || null,
+          settlement_observed: settlementObserved || false,
+          settlement_mm: settleMm || null,
+          spillway_condition: spillwayCondition || null,
+          spillway_debris_present: spillwayDebrisPresent || false,
+          gate_operational: gateOperational !== false && gateOperational !== "false",
+          instrumentation_working: instrumentationWorking !== false && instrumentationWorking !== "false",
+          piezometer_reading_m: piezometerReadingM || null,
+          emergency_action_plan_current: emergencyActionPlanCurrent || false,
+          overall_status: overallStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        overallStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Dam safety emergency — activate Emergency Action Plan and notify dam safety engineer immediately.",
+        standards: ["ANCOLD Guidelines on Dam Safety Management", "DECCA Dam Safety Regulations"],
+      });
+    }
+
+    res.json({
+      overallStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      damCategory: category || null,
+      standards: ["ANCOLD Guidelines on Dam Safety Management"],
+    });
+  } catch (err) {
+    console.error("POST /dam-safety-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record dam safety inspection." });
+  }
+});
+
+// POST /ai-dam-risk-assessment — AI assesses dam safety risk from inspection data
+app.post("/ai-dam-risk-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      damCategory, storageCapacityML, ageYears, embankmentType,
+      seepageObserved, seepageSeverity, crackingObserved, settlementMm,
+      spillwayCondition, instrumentationWorking, downstreamHazardCategory,
+      lastMajorReview, knownDeficiencies, siteContext
+    } = req.body;
+
+    if (!damCategory) {
+      return res.status(400).json({ error: "damCategory is required." });
+    }
+
+    const safeDamCat = sanitiseInput(String(damCategory));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const deficiencies = Array.isArray(knownDeficiencies) ? knownDeficiencies.map(d => sanitiseInput(String(d))) : [];
+
+    const prompt = `You are a dam safety engineer conducting a risk assessment for a Victorian dam asset under ANCOLD guidelines.
+
+Dam category: ${safeDamCat}
+Storage capacity: ${storageCapacityML ? storageCapacityML + " ML" : "Unknown"}
+Age: ${ageYears ? ageYears + " years" : "Unknown"}
+Embankment type: ${embankmentType || "Not stated"}
+Seepage observed: ${seepageObserved ? "Yes (" + seepageSeverity + ")" : "No"}
+Cracking: ${crackingObserved ? "Yes" : "No"}
+Settlement: ${settlementMm ? settlementMm + " mm" : "None recorded"}
+Spillway condition: ${spillwayCondition || "Not stated"}
+Instrumentation: ${instrumentationWorking ? "Working" : "Partially/not working"}
+Downstream hazard category: ${downstreamHazardCategory || "Not stated"}
+Last major review: ${lastMajorReview || "Unknown"}
+Known deficiencies: ${deficiencies.length > 0 ? deficiencies.join("; ") : "None"}
+Location: ${safeSite}
+
+Assess under ANCOLD Guidelines on Dam Safety Management:
+1. Overall failure risk (probability × consequence)
+2. Failure modes most likely given observed conditions
+3. Consequence category if failure occurred (D, C, B, A, AA)
+4. Urgency of investigation and remediation
+5. Recommended surveillance actions
+6. Trigger points for activating Emergency Action Plan
+
+Respond ONLY in JSON:
+{
+  "overallRisk": "LOW|SIGNIFICANT|HIGH|EXTREME",
+  "probableFailureModes": ["string"],
+  "consequenceCategory": "D|C|B|A|AA",
+  "investigationUrgency": "ROUTINE|WITHIN_6_MONTHS|URGENT|IMMEDIATE",
+  "surveillanceRecommendations": ["string"],
+  "eapTriggers": ["string"],
+  "remediationPriority": ["string"],
+  "applicableStandards": ["string"],
+  "closureRecommended": true|false,
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallRisk: "SIGNIFICANT",
+        probableFailureModes: ["AI analysis unavailable — engage dam safety engineer"],
+        consequenceCategory: null,
+        investigationUrgency: "URGENT",
+        surveillanceRecommendations: [
+          "Increase inspection frequency to weekly",
+          "Verify instrumentation is operational",
+          "Review Emergency Action Plan currency",
+        ],
+        eapTriggers: ["Seepage turbidity increase", "Piezometer alarm level exceeded", "Rapid settlement"],
+        remediationPriority: ["Engage ANCOLD-certified dam safety engineer for full assessment"],
+        applicableStandards: ["ANCOLD Guidelines on Dam Safety Management"],
+        closureRecommended: false,
+        summary: "AI assessment unavailable. Manual dam safety inspection by qualified engineer required.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      damCategory: safeDamCat,
+      storageCapacityML: storageCapacityML || null,
+      standards: ["ANCOLD Guidelines on Dam Safety Management", "DECCA Dam Safety Regulations (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /ai-dam-risk-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess dam safety risk." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
