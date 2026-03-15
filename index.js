@@ -66855,6 +66855,464 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /excavation-inspection — Excavation and trenching safety inspection per OHS Regulations 2017 (Vic) Part 3.3
+app.post("/excavation-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    excavationId,
+    location,
+    inspectionDate,
+    inspector,
+    excavationType,       // trench | pit | cutting | basement | shaft | tunnel
+    depth_m,
+    width_m,
+    length_m,
+    soilType,             // rock | stiff-clay | firm-clay | soft-clay | sand | fill | mixed
+    groundwaterPresent,
+    groundwaterDepth_m,
+    supportMethod,        // benching | battering | shoring | sheetpiling | no-support | not-required
+    benchingAngle_deg,    // AS 2601: typically 65° for cohesive, 45° for granular
+    battersCompliant,     // correct angle?
+    shoringInstalled,
+    shoringCondition,
+    serviceDiversion,     // array of { service, diverted: true|false, markedOnGround: true|false }
+    servicesCleared,      // all underground services identified and cleared
+    unsatisfactoryServicesMarked,
+    exclusionZoneTop_m,   // clearance from excavation edge to plant/traffic
+    adjacentStructures,   // buildings, trees, retaining walls
+    dewatering,
+    dewateringMethod,
+    floodRisk,
+    vehicleBarrierAtEdge,
+    pedestrianBarrierAtEdge,
+    signage,
+    ladderAccessEvery15m, // AS 2601: ladder every 15 m or 9 m for confined spaces
+    ladderExtendsAboveEdge_mm, // must be ≥900 mm
+    personnelInExcavation,
+    atmosphericTestDone,  // if >1.5 m depth with potential gas
+    soilStabilityAssessed,
+    engineerApprovalFor5mPlus, // required for excavations >5 m depth OHS Regs 2017 Vic
+    immediateCollapseRisk,
+    criticalObservations,
+    photos,
+    notes,
+  } = req.body;
+
+  const failures = [];
+
+  // Depth triggers
+  const depth = parseFloat(depth_m) || 0;
+
+  // >1.5 m: support or batter required
+  if (depth >= 1.5 && supportMethod === "no-support") {
+    failures.push(`Excavation ${depth} m deep with no support — shoring or battering required for depths ≥1.5 m per OHS Regulations 2017 (Vic)`);
+  }
+
+  // >5 m: engineer required
+  if (depth > 5 && !engineerApprovalFor5mPlus) {
+    failures.push(`Excavation ${depth} m deep — engineer approval required for excavations >5 m per OHS Regulations 2017 (Vic) r.143`);
+  }
+
+  // Ladder access
+  if (depth >= 1.5 && personnelInExcavation) {
+    if (!ladderAccessEvery15m) {
+      failures.push("No ladder access — required for all occupied excavations >1.5 m depth");
+    }
+    const ladderExtension = parseFloat(ladderExtendsAboveEdge_mm) || 0;
+    if (ladderExtension < 900) {
+      failures.push(`Ladder extends ${ladderExtension} mm above edge — minimum 900 mm required per AS 2601`);
+    }
+  }
+
+  // Services clearance
+  if (!servicesCleared) {
+    failures.push("Underground services not identified/cleared — risk of electrocution, gas ignition, or flooding");
+  }
+
+  // Immediate collapse risk
+  if (immediateCollapseRisk === true || immediateCollapseRisk === "true") {
+    failures.push("Immediate collapse risk identified — evacuate excavation immediately");
+  }
+
+  // Vehicle barrier
+  if (!vehicleBarrierAtEdge && depth >= 1.5) {
+    failures.push("No vehicle barrier at excavation edge — plant overrun risk");
+  }
+
+  // Atmospheric test for deep excavation
+  if (depth > 1.5 && !atmosphericTestDone) {
+    failures.push("Atmospheric test not performed for excavation >1.5 m — gas or oxygen deficiency risk");
+  }
+
+  if (failures.length > 0) {
+    return res.status(422).json({
+      error: "Excavation inspection — critical safety issues identified",
+      failures,
+      immediateActions: [
+        "Evacuate all personnel from excavation immediately if collapse risk present",
+        "Stop all work in excavation until hazards controlled",
+        "Install shoring or batter to comply with OHS Regs 2017 (Vic) before re-entering",
+        "Identify and mark all underground services before excavation continues",
+      ],
+      applicableStandards: [
+        "OHS Regulations 2017 (Vic) Part 3.3",
+        "AS 2601",
+        "WorkSafe Victoria Excavation Safety Code of Practice",
+      ],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    excavation_id: sanitiseInput(excavationId),
+    location: sanitiseInput(location),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    excavation_type: sanitiseInput(excavationType),
+    depth_m,
+    width_m,
+    length_m,
+    soil_type: sanitiseInput(soilType),
+    groundwater_present: groundwaterPresent,
+    groundwater_depth_m: groundwaterDepth_m,
+    support_method: sanitiseInput(supportMethod),
+    benching_angle_deg: benchingAngle_deg,
+    batters_compliant: battersCompliant,
+    shoring_installed: shoringInstalled,
+    shoring_condition: sanitiseInput(shoringCondition),
+    service_diversion: serviceDiversion || [],
+    services_cleared: servicesCleared,
+    exclusion_zone_top_m: exclusionZoneTop_m,
+    adjacent_structures: adjacentStructures,
+    dewatering,
+    dewatering_method: sanitiseInput(dewateringMethod),
+    flood_risk: floodRisk,
+    vehicle_barrier_at_edge: vehicleBarrierAtEdge,
+    pedestrian_barrier_at_edge: pedestrianBarrierAtEdge,
+    signage,
+    ladder_access_every_15m: ladderAccessEvery15m,
+    ladder_extends_above_edge_mm: ladderExtendsAboveEdge_mm,
+    personnel_in_excavation: personnelInExcavation,
+    atmospheric_test_done: atmosphericTestDone,
+    soil_stability_assessed: soilStabilityAssessed,
+    engineer_approval_for_5m_plus: engineerApprovalFor5mPlus,
+    immediate_collapse_risk: false,
+    critical_observations: criticalObservations || [],
+    result: "SAFE-TO-PROCEED",
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("excavation_inspections")
+      .insert(record);
+    if (dbErr) console.error("DB error /excavation-inspection:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Excavation inspection completed — safe to proceed",
+    excavationId: sanitiseInput(excavationId),
+    depth_m: depth,
+    supportMethod: sanitiseInput(supportMethod),
+    result: "SAFE-TO-PROCEED",
+    applicableStandards: [
+      "OHS Regulations 2017 (Vic) Part 3.3",
+      "AS 2601",
+      "WorkSafe Victoria Excavation Code of Practice",
+    ],
+    saved,
+  });
+});
+
+// POST /ewp-inspection — Elevated work platform pre-start/periodic inspection per AS 2550.10
+app.post("/ewp-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    ewpId,
+    ewpType,              // scissor-lift | boom-lift | spider-lift | vertical-mast | order-picker | telehandler
+    manufacturer,
+    model,
+    serialNumber,
+    inspectionDate,
+    inspectionType,       // daily-prestart | periodic | post-incident | annual
+    inspector,
+    operatorName,
+    operatorLicence,      // required for boom EWPs >11 m in VIC
+    nextServiceDue,
+    groundCondition,      // solid | soft | sloped | uneven | over-pit
+    slopeAngle_deg,
+    maxSlopeRated_deg,
+    workingHeight_m,
+    ratedCapacity_kg,
+    loadOnPlatform_kg,
+    engineStartCheck,     // true | false
+    hydraulicsCheck,      // no leaks, no unusual sounds
+    emergencyLoweringWorking,
+    tipper_alarm_working, // tilt alarm
+    harnessFitted,        // operator wearing harness and attached
+    harnessTieOff,        // attached to anchor point in basket
+    overheadObstacles,
+    overheadClearance_m,
+    windSpeed_kmh,
+    maxWindSpeed_kmh,     // manufacturer's limit — typically 40 km/h for boom lifts
+    tyresCondition,       // good | worn | flat
+    stabilisersDeployed,
+    criticalDefects,      // array of strings
+    overallResult,        // FIT-FOR-USE | TAKE-OUT-OF-SERVICE
+    photos,
+    notes,
+  } = req.body;
+
+  const failures = [];
+
+  // Operator licence for boom EWPs >11 m
+  const height = parseFloat(workingHeight_m) || 0;
+  const boom = ewpType === "boom-lift" || ewpType === "spider-lift";
+  if (boom && height > 11 && (!operatorLicence || operatorLicence.trim() === "")) {
+    failures.push(`Boom EWP >11 m working height — high risk work licence required per OHS Regulations 2017 (Vic) r.252`);
+  }
+
+  // Slope check
+  const slope = parseFloat(slopeAngle_deg) || 0;
+  const maxSlope = parseFloat(maxSlopeRated_deg) || 3;
+  if (slope > maxSlope) {
+    failures.push(`Ground slope ${slope}° exceeds manufacturer maximum ${maxSlope}° — tip-over risk`);
+  }
+
+  // Overload
+  const actualLoad = parseFloat(loadOnPlatform_kg) || 0;
+  const ratedLoad = parseFloat(ratedCapacity_kg) || 0;
+  if (ratedLoad > 0 && actualLoad > ratedLoad) {
+    failures.push(`Platform load ${actualLoad} kg exceeds rated capacity ${ratedLoad} kg`);
+  }
+
+  // Wind speed
+  const wind = parseFloat(windSpeed_kmh) || 0;
+  const windLimit = parseFloat(maxWindSpeed_kmh) || 40;
+  if (wind > windLimit) {
+    failures.push(`Wind speed ${wind} km/h exceeds EWP limit ${windLimit} km/h — cease operations`);
+  }
+
+  // Harness
+  if (!harnessFitted || !harnessTieOff) {
+    failures.push("Operator harness not fitted and/or not tied off — required for all boom/spider EWP operations");
+  }
+
+  // Emergency lowering
+  if (!emergencyLoweringWorking) {
+    failures.push("Emergency lowering function not working — EWP must not be used");
+  }
+
+  // Engine/hydraulics
+  if (!engineStartCheck) failures.push("Engine start check not passed");
+  if (!hydraulicsCheck) failures.push("Hydraulics check not passed — possible leak or abnormal operation");
+
+  // Custom defects
+  if (Array.isArray(criticalDefects)) criticalDefects.forEach((d) => failures.push(d));
+
+  const result = failures.length > 0 ? "TAKE-OUT-OF-SERVICE" : (overallResult || "FIT-FOR-USE");
+
+  if (result === "TAKE-OUT-OF-SERVICE") {
+    return res.status(422).json({
+      error: "EWP inspection — take out of service",
+      failures,
+      immediateActions: [
+        "Lower platform and move all occupants to ground",
+        "Tag EWP as out of service",
+        "Notify plant supervisor and arrange repairs",
+        "Do not operate until defects rectified and re-inspected",
+      ],
+      applicableStandards: [
+        "AS 2550.10",
+        "AS 1418.10",
+        "OHS Regulations 2017 (Vic) Part 3.5",
+        "WorkSafe Victoria EWP Guidance",
+      ],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    ewp_id: sanitiseInput(ewpId),
+    ewp_type: sanitiseInput(ewpType),
+    manufacturer: sanitiseInput(manufacturer),
+    model: sanitiseInput(model),
+    serial_number: sanitiseInput(serialNumber),
+    inspection_date: inspectionDate,
+    inspection_type: sanitiseInput(inspectionType),
+    inspector: sanitiseInput(inspector),
+    operator_name: sanitiseInput(operatorName),
+    operator_licence: sanitiseInput(operatorLicence),
+    next_service_due: nextServiceDue,
+    ground_condition: sanitiseInput(groundCondition),
+    slope_angle_deg: slopeAngle_deg,
+    max_slope_rated_deg: maxSlopeRated_deg,
+    working_height_m: workingHeight_m,
+    rated_capacity_kg: ratedCapacity_kg,
+    load_on_platform_kg: loadOnPlatform_kg,
+    engine_start_check: engineStartCheck,
+    hydraulics_check: hydraulicsCheck,
+    emergency_lowering_working: emergencyLoweringWorking,
+    tilt_alarm_working: tipper_alarm_working,
+    harness_fitted: harnessFitted,
+    harness_tie_off: harnessTieOff,
+    overhead_obstacles: overheadObstacles,
+    overhead_clearance_m: overheadClearance_m,
+    wind_speed_kmh: windSpeed_kmh,
+    max_wind_speed_kmh: maxWindSpeed_kmh || 40,
+    tyres_condition: sanitiseInput(tyresCondition),
+    stabilisers_deployed: stabilisersDeployed,
+    overall_result: result,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("ewp_inspections")
+      .insert(record);
+    if (dbErr) console.error("DB error /ewp-inspection:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "EWP inspection completed — fit for use",
+    ewpId: sanitiseInput(ewpId),
+    workingHeight_m: height,
+    overallResult: result,
+    windSpeedOk: wind <= windLimit,
+    applicableStandards: [
+      "AS 2550.10",
+      "AS 1418.10",
+      "OHS Regulations 2017 (Vic) Part 3.5",
+    ],
+    saved,
+  });
+});
+
+// POST /ai-excavation-risk-assessment — AI assesses excavation collapse risk, services, and shoring requirements
+app.post("/ai-excavation-risk-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    excavationType,
+    depth_m,
+    soilType,
+    groundwaterPresent,
+    adjacentStructures,
+    loadSurcharge,        // vehicles, plant, materials near edge
+    servicesClearanceConfirmed,
+    weatherRecent,        // recent rain, frost
+    supportMethod,
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are a geotechnical engineer specialising in excavation safety with 25 years experience on Australian construction projects. Assess excavation collapse risk and shoring requirements per AS 2601, OHS Regulations 2017 (Vic) Part 3.3, and WorkSafe Victoria Excavation Safety Code of Practice.
+
+Assess:
+1. Soil classification for excavation stability — AS 2601 Class A (rock/cemented), Class B (stiff clay/gravel), Class C (soft clay/sand/fill)
+2. Appropriate support method for each soil class and depth
+3. Benching geometry for cohesive and granular soils
+4. Groundwater effects on stability — hydrostatic and seepage forces
+5. Surcharge effects from plant and materials
+6. Notifiable work — excavation >1.5 m depth is notifiable in Victoria
+7. Adjacent structure protection — underpinning thresholds
+8. AS 2601 Table 5.1 exclusion zones
+
+Respond with JSON: { "collapseRisk": "low|medium|high|critical", "soilClass": "A|B|C", "requiredSupportMethod": "string", "benchingAngle_deg": number, "exclusionZone_m": number, "notifiableWork": boolean, "groundwaterControls": [], "surchargeExclusionZone_m": number, "adjacentStructureRisk": "low|medium|high", "atmosphericMonitoringRequired": boolean, "engineerRequirements": "string", "immediateActions": [], "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Excavation type: ${excavationType || "trench"}
+Depth: ${depth_m || "not specified"} m
+Soil type: ${soilType || "not specified"}
+Groundwater present: ${groundwaterPresent || "no"}
+Adjacent structures: ${adjacentStructures || "none"}
+Load/surcharge near edge: ${loadSurcharge || "no"}
+Services clearance confirmed: ${servicesClearanceConfirmed || "no"}
+Recent weather: ${weatherRecent || "dry"}
+Current support method: ${supportMethod || "none"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-excavation-risk-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        collapseRisk: "high",
+        soilClass: "C",
+        requiredSupportMethod: "Timber or hydraulic shoring for Class C soils at depth ≥1.5 m",
+        benchingAngle_deg: 45,
+        exclusionZone_m: 1,
+        notifiableWork: parseFloat(depth_m) >= 1.5,
+        groundwaterControls: [
+          "Dewater before commencing work",
+          "Monitor groundwater level continuously",
+          "Increase shoring frequency near seepage zones",
+        ],
+        surchargeExclusionZone_m: Math.max(parseFloat(depth_m) || 0, 2),
+        adjacentStructureRisk: "medium",
+        atmosphericMonitoringRequired: parseFloat(depth_m) > 1.5,
+        engineerRequirements:
+          "Engineer approval required for excavations >5 m; consult engineer for adjacent structures or poor soils",
+        immediateActions: [
+          "Identify all underground services before excavation",
+          "Install shoring or batter to appropriate angle before personnel enter",
+          "Conduct atmospheric test before entry",
+          "Install ladder access for all occupied excavations",
+        ],
+        applicableStandards: [
+          "OHS Regulations 2017 (Vic) Part 3.3",
+          "AS 2601",
+          "WorkSafe Victoria Excavation Safety Code of Practice",
+          "AS 1726 (site investigation)",
+        ],
+        recommendation:
+          "Install shoring or batter before personnel enter. Identify all services. Dewater prior to entry. Atmospheric test required. Engineer required for excavations >5 m depth.",
+        summary:
+          "Excavation in Class C soils presents high collapse risk without support. Shoring, battering, or trench shield is mandatory for depths ≥1.5 m. Underground service strikes are the most preventable fatal risk — confirm all services before breaking ground.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
