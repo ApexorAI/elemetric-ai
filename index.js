@@ -78264,6 +78264,402 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 278 ─────────────────────────────────────────────────────────────────
+
+// POST /chws-inspection — Record commercial hot water system inspection per AS/NZS 3500
+app.post("/chws-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, systemId, location, inspectionDate, inspectedBy,
+      systemType, storageCapacityL, heatingSource,
+      setpointTempDegC, storageTempMeasuredDegC, distributionTempDegC,
+      legionellaRiskRating, lastFlushDate, lastTemperatureLog,
+      prv_present, prv_sealing, expansionValvePresent,
+      flueCondition, insulationOk, corrosionPresent,
+      anode_inspected, anodeLifeRemaining,
+      plumbingLicenceRef, lastAnnualInspection, notes
+    } = req.body;
+
+    if (!systemId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "systemId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeSystem = sanitiseInput(String(systemId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+
+    const storageTempMeas = parseFloat(storageTempMeasuredDegC) || null;
+    const setpointTemp = parseFloat(setpointTempDegC) || null;
+    const distributionTemp = parseFloat(distributionTempDegC) || null;
+    const criticalIssues = [];
+    const warnings = [];
+
+    // AS/NZS 3500.4 — Hot water supply; Health (Legionella) Regulations 2016 (Vic)
+    // Storage temperature: must be maintained ≥60°C to inhibit Legionella
+    if (storageTempMeas !== null && storageTempMeas < 60) {
+      criticalIssues.push(`Storage temperature ${storageTempMeas}°C below 60°C minimum — Legionella growth risk. Adjust setpoint immediately (Health (Legionella) Regulations 2016 Vic / AS/NZS 3500.4).`);
+    } else if (storageTempMeas !== null && storageTempMeas < 65) {
+      warnings.push(`Storage temperature ${storageTempMeas}°C — maintain ≥60°C with buffer to 65°C recommended for Legionella control.`);
+    }
+
+    // Distribution temperature: must be ≥55°C at outlets (commercial)
+    if (distributionTemp !== null && distributionTemp < 55) {
+      criticalIssues.push(`Hot water distribution temperature ${distributionTemp}°C below 55°C minimum — Legionella risk in pipework. Investigate dead legs and low-flow zones.`);
+    }
+
+    // Legionella risk
+    const legRisk = String(legionellaRiskRating || "").toUpperCase();
+    if (legRisk === "HIGH" || legRisk === "EXTREME") {
+      criticalIssues.push(`Legionella risk rated ${legionellaRiskRating} — implement control program immediately and notify building owner (Health (Legionella) Regulations 2016 Vic).`);
+    }
+
+    // PRV
+    if (!prv_present) {
+      criticalIssues.push("Pressure Relief Valve (PRV) not present — mandatory safety device per AS/NZS 3500.4 cl.4.3.9. Do not operate system.");
+    }
+    if (prv_sealing === "SEEPING" || prv_sealing === "FAILED") {
+      criticalIssues.push(`PRV ${prv_sealing} — PRV must be replaced immediately (safety device failure).`);
+    }
+
+    if (!expansionValvePresent) {
+      warnings.push("Expansion valve not confirmed present — required with check valve on supply (AS/NZS 3500.4).");
+    }
+
+    const flue = String(flueCondition || "").toUpperCase();
+    if (flue === "BLOCKED" || flue === "FAILED") {
+      criticalIssues.push(`Flue condition ${flueCondition} — carbon monoxide risk. Do not operate gas HWS until flue is repaired and tested.`);
+    }
+
+    if (corrosionPresent === "SEVERE" || corrosionPresent === "ADVANCED") {
+      warnings.push(`Severe corrosion detected — assess remaining tank life and plan replacement.`);
+    }
+
+    if (!lastAnnualInspection) {
+      warnings.push("No record of annual inspection — commercial HWS requires annual inspection and temperature logging under Health (Legionella) Regulations 2016 (Vic).");
+    }
+
+    const systemStatus = criticalIssues.length > 0 ? "TAKE_OUT_OF_SERVICE" : warnings.length > 0 ? "ATTENTION_REQUIRED" : "SERVICEABLE";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("chws_inspections")
+        .insert({
+          project_id: projectId ? sanitiseInput(String(projectId)) : null,
+          system_id: safeSystem,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          system_type: systemType ? sanitiseInput(String(systemType)) : null,
+          storage_capacity_l: storageCapacityL || null,
+          heating_source: heatingSource ? sanitiseInput(String(heatingSource)) : null,
+          setpoint_temp_deg_c: setpointTemp,
+          storage_temp_measured_deg_c: storageTempMeas,
+          distribution_temp_deg_c: distributionTemp,
+          legionella_risk_rating: legionellaRiskRating || null,
+          last_flush_date: lastFlushDate || null,
+          prv_present: prv_present !== false && prv_present !== "false",
+          expansion_valve_present: expansionValvePresent !== false && expansionValvePresent !== "false",
+          flue_condition: flueCondition || null,
+          insulation_ok: insulationOk !== false && insulationOk !== "false",
+          corrosion_present: corrosionPresent || null,
+          plumbing_licence_ref: plumbingLicenceRef ? sanitiseInput(String(plumbingLicenceRef)) : null,
+          last_annual_inspection: lastAnnualInspection || null,
+          system_status: systemStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        systemStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Hot water system critical defects — take out of service until repaired.",
+        standards: ["AS/NZS 3500.4", "Health (Legionella) Regulations 2016 (Vic)"],
+      });
+    }
+
+    res.json({
+      systemStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      storageTempMeasuredDegC: storageTempMeas,
+      distributionTempDegC: distributionTemp,
+      standards: ["AS/NZS 3500.4", "Health (Legionella) Regulations 2016 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /chws-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record hot water system inspection." });
+  }
+});
+
+// POST /staircase-balustrade-inspection — Record staircase and balustrade safety inspection
+app.post("/staircase-balustrade-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, location, inspectionDate, inspectedBy,
+      stairType, riserHeightMm, goingMm,
+      specifiedRiserMm, specifiedGoingMm,
+      handrailPresent, handrailHeightMm, handrailContinuous,
+      balustradePresent, balustradeHeightMm, balustradeOpeningsOk,
+      balustradeOpeningMm, openingSpecMm,
+      climbingCleftsPresent, structuralCondition, finishCondition,
+      nonSlipSurface, contrastNosingPresent, accessibilityCompliant,
+      defectsFound, defectDetails, notes
+    } = req.body;
+
+    if (!location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const defects = Array.isArray(defectDetails) ? defectDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const riser = parseFloat(riserHeightMm) || null;
+    const going = parseFloat(goingMm) || null;
+    const specRiser = parseFloat(specifiedRiserMm) || null;
+    const specGoing = parseFloat(specifiedGoingMm) || null;
+    const handrailH = parseFloat(handrailHeightMm) || null;
+    const balustradeH = parseFloat(balustradeHeightMm) || null;
+    const openingMm = parseFloat(balustradeOpeningMm) || null;
+    const specOpening = parseFloat(openingSpecMm) || 125; // NCC 2022 max 125mm for residential
+
+    // NCC 2022 Section D — Access and egress, AS 1657 — Fixed platforms/walkways
+    // Riser height: NCC 2022 D2.14 — 115mm to 190mm for Class 1, 130mm to 190mm for Class 2-9
+    if (riser !== null) {
+      if (riser > 190) {
+        criticalIssues.push(`Riser height ${riser}mm exceeds NCC maximum 190mm — fall hazard. Rectify (NCC 2022 D2.14).`);
+      } else if (riser < 115) {
+        warnings.push(`Riser height ${riser}mm below NCC minimum 115mm — trip hazard.`);
+      }
+    }
+
+    // Going: NCC 2022 D2.14 — 240mm to 355mm typically
+    if (going !== null) {
+      if (going < 240) {
+        criticalIssues.push(`Going ${going}mm below NCC minimum 240mm — trip/fall hazard (NCC 2022 D2.14).`);
+      } else if (going > 355) {
+        warnings.push(`Going ${going}mm above NCC maximum 355mm — check staircase design.`);
+      }
+    }
+
+    // Handrail height: NCC 2022 D2.17 — 865mm to 1000mm
+    if (handrailH !== null) {
+      if (handrailH < 865) {
+        criticalIssues.push(`Handrail height ${handrailH}mm below NCC minimum 865mm — fall hazard (NCC 2022 D2.17).`);
+      } else if (handrailH > 1000) {
+        warnings.push(`Handrail height ${handrailH}mm above NCC maximum 1000mm.`);
+      }
+    }
+    if (!handrailPresent) {
+      criticalIssues.push("Handrail not present — mandatory for stairs > 1 rise (NCC 2022 D2.16).");
+    }
+    if (!handrailContinuous) {
+      warnings.push("Handrail not continuous — handrails must be continuous on all stairways (NCC 2022 D2.17).");
+    }
+
+    // Balustrade height: NCC 2022 — 1000mm min for floors > 1m height, 865mm for stairs
+    if (balustradeH !== null && balustradeH < 1000) {
+      criticalIssues.push(`Balustrade height ${balustradeH}mm below minimum 1000mm — fall hazard (NCC 2022 D2.16).`);
+    }
+    if (!balustradePresent) {
+      criticalIssues.push("Balustrade/guard not present — required wherever fall from height >1m is possible (NCC 2022 D2.16).");
+    }
+
+    // Balustrade openings: NCC 2022 — no openings allowing passage of 125mm sphere
+    if (openingMm !== null && openingMm > specOpening) {
+      criticalIssues.push(`Balustrade opening ${openingMm}mm exceeds ${specOpening}mm limit — child entrapment hazard (NCC 2022 D2.16).`);
+    }
+
+    if (climbingCleftsPresent === true || climbingCleftsPresent === "true") {
+      criticalIssues.push("Climbing clefts present in balustrade — children can climb and fall. Redesign to eliminate (NCC 2022 D2.16).");
+    }
+
+    const structCond = String(structuralCondition || "").toUpperCase();
+    if (structCond === "POOR" || structCond === "FAILED") {
+      criticalIssues.push(`Structural condition rated ${structuralCondition} — staircase/balustrade may not withstand design loads. Do not use until repaired.`);
+    }
+
+    if (!nonSlipSurface) {
+      warnings.push("Non-slip surface not confirmed — required for stair treads (NCC 2022 D2.14).");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "FAIL" : warnings.length > 0 ? "CONDITIONAL_PASS" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("staircase_balustrade_inspections")
+        .insert({
+          project_id: projectId ? sanitiseInput(String(projectId)) : null,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          stair_type: stairType ? sanitiseInput(String(stairType)) : null,
+          riser_height_mm: riser,
+          going_mm: going,
+          handrail_present: handrailPresent || false,
+          handrail_height_mm: handrailH,
+          handrail_continuous: handrailContinuous || false,
+          balustrade_present: balustradePresent || false,
+          balustrade_height_mm: balustradeH,
+          balustrade_opening_mm: openingMm,
+          climbing_clefts_present: climbingCleftsPresent || false,
+          structural_condition: structuralCondition || null,
+          non_slip_surface: nonSlipSurface || false,
+          contrast_nosing_present: contrastNosingPresent || false,
+          accessibility_compliant: accessibilityCompliant || false,
+          defects_found: defectsFound || false,
+          defect_details: defects,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Staircase/balustrade fails NCC requirements — restrict use until rectified.",
+        standards: ["NCC 2022 D2.14-D2.17", "AS 1657"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      riserHeightMm: riser,
+      balustradeHeightMm: balustradeH,
+      standards: ["NCC 2022 D2.14-D2.17", "AS 1657"],
+    });
+  } catch (err) {
+    console.error("POST /staircase-balustrade-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record staircase/balustrade inspection." });
+  }
+});
+
+// POST /ai-residential-defect-assessment — AI assesses residential building defects and statutory warranty obligations
+app.post("/ai-residential-defect-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      defects, buildingType, completionYear, builderName,
+      ownerOccupied, contractType, contractValue,
+      previousRepairAttempts, warrantyClaimed, siteContext
+    } = req.body;
+
+    if (!defects || !buildingType) {
+      return res.status(400).json({ error: "defects and buildingType are required." });
+    }
+
+    const safeBuildingType = sanitiseInput(String(buildingType));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const defectList = Array.isArray(defects) ? defects.map(d => sanitiseInput(String(d))) : [sanitiseInput(String(defects))];
+
+    const prompt = `You are a domestic building defects consultant advising a Victorian homeowner on building defects and statutory rights.
+
+Building type: ${safeBuildingType}
+Completion year: ${completionYear || "Unknown"}
+Builder: ${builderName || "Not stated"}
+Owner-occupied: ${ownerOccupied ? "Yes" : "No/Unknown"}
+Contract type: ${contractType || "Unknown"}
+Contract value: ${contractValue ? "$" + contractValue : "Unknown"}
+Previous repair attempts: ${previousRepairAttempts ? "Yes" : "No"}
+Warranty claimed: ${warrantyClaimed ? "Yes" : "No"}
+Defects reported: ${defectList.join("; ")}
+Location: ${safeSite}
+
+Assess under Victorian domestic building law:
+- Domestic Building Contracts Act 1995 (Vic) — implied warranties and obligations
+- Building Act 1993 (Vic) — 10-year structural, 2-year non-structural defect liability
+- Victorian Building Authority (VBA) dispute resolution
+- Domestic Building Dispute Resolution Victoria (DBDRV)
+
+Provide:
+1. Classification of defects (structural vs non-structural)
+2. Warranty period applicability
+3. Whether defects are within builder's statutory obligations
+4. Recommended escalation pathway (builder → DBDRV → VBA → VCAT)
+5. Evidence required for warranty/dispute claim
+6. Urgency of each defect
+
+Respond ONLY in JSON:
+{
+  "structuralDefects": ["string"],
+  "nonStructuralDefects": ["string"],
+  "withinWarrantyPeriod": true|false|null,
+  "builderObligationLikelihood": "STRONG|MODERATE|WEAK|UNLIKELY",
+  "escalationPathway": ["string"],
+  "evidenceRequired": ["string"],
+  "urgentDefects": ["string"],
+  "estimatedRectificationCostTier": "LOW|MEDIUM|HIGH|VERY_HIGH",
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        structuralDefects: [],
+        nonStructuralDefects: defectList,
+        withinWarrantyPeriod: null,
+        builderObligationLikelihood: "MODERATE",
+        escalationPathway: [
+          "1. Write formally to builder requesting rectification",
+          "2. Lodge complaint with DBDRV if no resolution",
+          "3. Escalate to VBA for serious/systemic defects",
+          "4. VCAT building claim as last resort",
+        ],
+        evidenceRequired: ["Photos of all defects", "Building permit and plans", "Contract documents", "Correspondence with builder"],
+        urgentDefects: ["AI unavailable — prioritise any water ingress, structural, or safety defects"],
+        estimatedRectificationCostTier: "MEDIUM",
+        applicableStandards: ["Domestic Building Contracts Act 1995 (Vic)", "Building Act 1993 (Vic)"],
+        summary: "AI assessment unavailable. Engage registered building inspector and legal counsel for formal assessment.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      buildingType: safeBuildingType,
+      defectCount: defectList.length,
+      standards: ["Domestic Building Contracts Act 1995 (Vic)", "Building Act 1993 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /ai-residential-defect-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess residential defects." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
