@@ -56037,6 +56037,315 @@ Return a JSON object with:
   }
 });
 
+// POST /electrical-switchboard-inspection — Record an electrical switchboard inspection per AS/NZS 3000
+app.post("/electrical-switchboard-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      inspectionRef,
+      date,
+      inspector,
+      inspectorLicenceNumber,
+      location,
+      switchboardRef,
+      mainSwitchRating,
+      earthingSystemOk,
+      neutralBarOk,
+      rcdProtection,
+      rcdTestResults,
+      arcFaultProtection,
+      overloadProtection,
+      shortCircuitCapacityOk,
+      labellingComplete,
+      circuitDirectoryUpdated,
+      insulationResistanceMohms,
+      earthContinuityOhms,
+      torqueTestCompleted,
+      thermalScanCompleted,
+      thermalHotSpots,
+      hotSpotDescription,
+      neutralIsolationOk,
+      surgeProtectionInstalled,
+      enclosureIpRating,
+      clearancesMaintained,
+      cableEntrySealed,
+      overallResult,
+      defects,
+      certificateIssued,
+      certificateNumber,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !inspector || !switchboardRef || !overallResult) {
+      return res.status(400).json({ error: "projectId, date, inspector, switchboardRef, and overallResult are required" });
+    }
+
+    const failures = [];
+    if (!earthingSystemOk) failures.push("Earthing system defective — AS/NZS 3000 requires effective earthing for protection against electric shock");
+    if (!rcdProtection) failures.push("RCD protection not present — AS/NZS 3000 cl.2.6 requires RCD protection on all socket outlet circuits");
+    if (!labellingComplete) failures.push("Switchboard labelling incomplete — all circuits must be labelled per AS/NZS 3000 cl.3.4");
+    if (!circuitDirectoryUpdated) failures.push("Circuit directory not updated — as-built circuit directory required at every switchboard");
+    if (insulationResistanceMohms && Number(insulationResistanceMohms) < 1) failures.push(`Insulation resistance ${insulationResistanceMohms} MΩ — below 1 MΩ minimum per AS/NZS 3000`);
+    if (thermalHotSpots) failures.push(`Thermal hot spots detected: ${sanitiseInput(hotSpotDescription || "details not provided")} — investigate and rectify connections`);
+    if (!neutralIsolationOk) failures.push("Neutral isolation issue — MEN link or neutral bar connection defective");
+    if (overallResult === "FAIL") failures.push("Electrical switchboard inspection FAILED — do not energise until defects are rectified");
+
+    if (failures.length > 0) console.warn(`[SWITCHBOARD] ${switchboardRef} at ${projectId} — ${failures.join("; ")}`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      inspection_ref: sanitiseInput(inspectionRef || `ESI-${Date.now()}`),
+      date,
+      inspector: sanitiseInput(inspector),
+      inspector_licence_number: sanitiseInput(inspectorLicenceNumber || ""),
+      location: sanitiseInput(location || ""),
+      switchboard_ref: sanitiseInput(switchboardRef),
+      main_switch_rating: sanitiseInput(mainSwitchRating || ""),
+      earthing_system_ok: !!earthingSystemOk,
+      neutral_bar_ok: !!neutralBarOk,
+      rcd_protection: !!rcdProtection,
+      rcd_test_results: sanitiseInput(rcdTestResults || ""),
+      arc_fault_protection: !!arcFaultProtection,
+      overload_protection: !!overloadProtection,
+      short_circuit_capacity_ok: !!shortCircuitCapacityOk,
+      labelling_complete: !!labellingComplete,
+      circuit_directory_updated: !!circuitDirectoryUpdated,
+      insulation_resistance_mohms: insulationResistanceMohms || null,
+      earth_continuity_ohms: earthContinuityOhms || null,
+      torque_test_completed: !!torqueTestCompleted,
+      thermal_scan_completed: !!thermalScanCompleted,
+      thermal_hot_spots: !!thermalHotSpots,
+      hot_spot_description: sanitiseInput(hotSpotDescription || ""),
+      neutral_isolation_ok: !!neutralIsolationOk,
+      surge_protection_installed: !!surgeProtectionInstalled,
+      enclosure_ip_rating: sanitiseInput(enclosureIpRating || ""),
+      clearances_maintained: !!clearancesMaintained,
+      cable_entry_sealed: !!cableEntrySealed,
+      overall_result: sanitiseInput(overallResult),
+      defects: Array.isArray(defects) ? defects.map(d => sanitiseInput(d)) : [],
+      failures,
+      certificate_issued: !!certificateIssued,
+      certificate_number: sanitiseInput(certificateNumber || ""),
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("electrical_switchboard_inspections").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (failures.length > 0) {
+      return res.status(422).json({ passed: false, failures, message: "Switchboard inspection failed. Do not energise until all defects are rectified by a licensed electrician.", record, saved });
+    }
+
+    res.json({
+      passed: true,
+      inspectionRef: record.inspection_ref,
+      failures: [],
+      applicableStandards: ["AS/NZS 3000 Wiring rules", "AS 61439 Low-voltage switchgear and controlgear assemblies", "Electrical Safety Act 1998 (Vic)", "AS/NZS 3017 Electrical installations — verification guidelines"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/electrical-switchboard-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record switchboard inspection" });
+  }
+});
+
+// POST /accessibility-audit — Record a DDA/NCC accessibility compliance audit
+app.post("/accessibility-audit", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      auditRef,
+      date,
+      auditor,
+      auditorAccreditation,
+      propertyAddress,
+      buildingClass,
+      buildingUseDescription,
+      carParkingAccessibleSpacesRequired,
+      carParkingAccessibleSpacesProvided,
+      pathOfTravelGradientOk,
+      pathOfTravelWidthOk,
+      entranceAccessibleOk,
+      doorWidthMm,
+      thresholdHeightMm,
+      liftProvided,
+      liftConformanceOk,
+      toiletFacilitiesOk,
+      accessibleToiletCount,
+      requiredAccessibleToiletCount,
+      tactileIndicatorsOk,
+      receptionCounterAccessibleOk,
+      signageAccessibleOk,
+      brailleSignageOk,
+      hearingLoopInstalled,
+      hearingLoopAreasCovered,
+      emergencyEvacuationOk,
+      refugeAreasProvided,
+      overallResult,
+      nonConformanceList,
+      priorityRectifications,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !auditor || !buildingClass || !overallResult) {
+      return res.status(400).json({ error: "projectId, date, auditor, buildingClass, and overallResult are required" });
+    }
+
+    const nonConformances = [];
+    if (!pathOfTravelGradientOk) nonConformances.push("Path of travel gradient non-compliant — AS 1428.1 maximum 1:20 for accessible paths");
+    if (!pathOfTravelWidthOk) nonConformances.push("Path of travel width inadequate — AS 1428.1 requires minimum 1000 mm clear width");
+    if (doorWidthMm && Number(doorWidthMm) < 850) nonConformances.push(`Door width ${doorWidthMm} mm — below AS 1428.1 minimum 850 mm clear width`);
+    if (thresholdHeightMm && Number(thresholdHeightMm) > 25) nonConformances.push(`Threshold height ${thresholdHeightMm} mm — exceeds AS 1428.1 maximum 25 mm (flush preferred)`);
+    if (!toiletFacilitiesOk) nonConformances.push("Accessible toilet facilities non-compliant with AS 1428.1");
+    if (accessibleToiletCount !== undefined && requiredAccessibleToiletCount !== undefined && Number(accessibleToiletCount) < Number(requiredAccessibleToiletCount)) {
+      nonConformances.push(`${accessibleToiletCount} accessible toilet(s) provided — ${requiredAccessibleToiletCount} required per NCC 2022`);
+    }
+    if (!tactileIndicatorsOk) nonConformances.push("Tactile ground surface indicators non-compliant or missing at hazard locations per AS 1428.4");
+    if (!emergencyEvacuationOk) nonConformances.push("Emergency evacuation provisions for persons with disability non-compliant — AS 3745 emergency management plan required");
+    if (Array.isArray(nonConformanceList)) nonConformanceList.forEach(nc => nonConformances.push(sanitiseInput(nc)));
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      audit_ref: sanitiseInput(auditRef || `AA-${Date.now()}`),
+      date,
+      auditor: sanitiseInput(auditor),
+      auditor_accreditation: sanitiseInput(auditorAccreditation || ""),
+      property_address: sanitiseInput(propertyAddress || ""),
+      building_class: sanitiseInput(buildingClass),
+      building_use_description: sanitiseInput(buildingUseDescription || ""),
+      car_parking_accessible_spaces_required: carParkingAccessibleSpacesRequired || null,
+      car_parking_accessible_spaces_provided: carParkingAccessibleSpacesProvided || null,
+      path_of_travel_gradient_ok: !!pathOfTravelGradientOk,
+      path_of_travel_width_ok: !!pathOfTravelWidthOk,
+      entrance_accessible_ok: !!entranceAccessibleOk,
+      door_width_mm: doorWidthMm || null,
+      threshold_height_mm: thresholdHeightMm || null,
+      lift_provided: !!liftProvided,
+      lift_conformance_ok: liftProvided ? !!liftConformanceOk : null,
+      toilet_facilities_ok: !!toiletFacilitiesOk,
+      accessible_toilet_count: accessibleToiletCount || null,
+      required_accessible_toilet_count: requiredAccessibleToiletCount || null,
+      tactile_indicators_ok: !!tactileIndicatorsOk,
+      reception_counter_accessible_ok: !!receptionCounterAccessibleOk,
+      signage_accessible_ok: !!signageAccessibleOk,
+      braille_signage_ok: !!brailleSignageOk,
+      hearing_loop_installed: !!hearingLoopInstalled,
+      hearing_loop_areas_covered: sanitiseInput(hearingLoopAreasCovered || ""),
+      emergency_evacuation_ok: !!emergencyEvacuationOk,
+      refuge_areas_provided: !!refugeAreasProvided,
+      overall_result: sanitiseInput(overallResult),
+      non_conformances: nonConformances,
+      priority_rectifications: Array.isArray(priorityRectifications) ? priorityRectifications.map(r => sanitiseInput(r)) : [],
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("accessibility_audits").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      overallResult,
+      nonConformanceCount: nonConformances.length,
+      nonConformances,
+      applicableStandards: ["AS 1428.1 Design for access and mobility — general requirements", "AS 1428.4 Design for access and mobility — tactile indicators", "NCC 2022 Volume One Section D (access and egress)", "Disability Discrimination Act 1992 (Cth)"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/accessibility-audit error:", err.message);
+    res.status(500).json({ error: "Failed to record accessibility audit" });
+  }
+});
+
+// POST /ai-electrical-compliance-report — AI assesses electrical installation compliance
+app.post("/ai-electrical-compliance-report", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      installationType,
+      buildingClass,
+      supplyVoltage,
+      maxDemandKva,
+      rcdProtectionInstalled,
+      earthingSystem,
+      observedDefects,
+      lastInspectionDate,
+      age,
+    } = req.body;
+
+    if (!installationType || !buildingClass) {
+      return res.status(400).json({ error: "installationType and buildingClass are required" });
+    }
+
+    const prompt = `You are a licensed electrical inspector and compliance engineer with expertise in AS/NZS 3000, Electrical Safety Act 1998 (Vic), and ESV Victoria requirements.
+
+Assess electrical installation compliance for:
+- Installation type: ${sanitiseInput(installationType)}
+- Building class: ${sanitiseInput(buildingClass)}
+- Supply voltage: ${sanitiseInput(String(supplyVoltage || "230/400V"))}
+- Max demand: ${sanitiseInput(String(maxDemandKva || "not specified"))} kVA
+- RCD protection installed: ${sanitiseInput(String(rcdProtectionInstalled || "unknown"))}
+- Earthing system: ${sanitiseInput(earthingSystem || "TN-S")}
+- Observed defects: ${sanitiseInput(observedDefects || "none")}
+- Last inspection date: ${sanitiseInput(lastInspectionDate || "unknown")}
+- Installation age: ${sanitiseInput(String(age || "unknown"))} years
+
+Return a JSON object with:
+{
+  "complianceRating": "COMPLIANT|MINOR_ISSUES|MAJOR_ISSUES|NON_COMPLIANT",
+  "safetyRisk": "LOW|MEDIUM|HIGH|CRITICAL",
+  "criticalDefects": [string],
+  "immediateActions": [string],
+  "rcdRequirements": string,
+  "earthingRequirements": string,
+  "periodicInspectionFrequency": string,
+  "testingRequired": [string],
+  "upgradeRecommendations": [string],
+  "applicableStandards": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+    });
+    usageStats.openaiCalls++;
+    const report = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ installationType, buildingClass, report });
+  } catch (err) {
+    console.error("/ai-electrical-compliance-report error:", err.message);
+    res.json({
+      installationType: req.body.installationType || "",
+      buildingClass: req.body.buildingClass || "",
+      report: {
+        complianceRating: "MINOR_ISSUES",
+        safetyRisk: "MEDIUM",
+        criticalDefects: [],
+        immediateActions: ["Test all RCDs quarterly per AS/NZS 3000", "Confirm earthing continuity on main earth bond"],
+        rcdRequirements: "All socket outlet circuits require 30 mA RCD protection per AS/NZS 3000 cl.2.6. Lighting circuits in Class 1 residences require RCD protection per amendment.",
+        earthingRequirements: "MEN connection at main switchboard; earthing conductors sized per AS/NZS 3000 Table 5.1; periodically test earth continuity < 0.5 Ω",
+        periodicInspectionFrequency: "Class 1 residential: every 5 years. Commercial/industrial: every 3–5 years. Check ESV Victoria requirements for specific building types.",
+        testingRequired: ["Insulation resistance testing per AS/NZS 3017", "Earth continuity testing", "RCD trip time test per AS/NZS 3017", "Visual inspection of all accessible wiring"],
+        upgradeRecommendations: ["Install arc fault circuit interrupters (AFCI) on bedroom circuits in older installations", "Upgrade switchboard to include RCDs if not present", "Consider surge protection device at main switchboard"],
+        applicableStandards: ["AS/NZS 3000 Wiring rules", "AS/NZS 3017 Electrical installations verification", "Electrical Safety Act 1998 (Vic)", "ESV Victoria — electrical safety obligations"],
+        recommendation: "Commission a licensed electrical inspector to conduct a full compliance inspection and issue an inspection certificate. Rectify all identified defects before occupation.",
+        summary: "Electrical installation compliance requires periodic inspection, functioning RCDs and earthing, and accurate circuit labelling. Engage a licensed electrical inspector for formal compliance assessment.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
