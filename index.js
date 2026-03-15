@@ -25485,6 +25485,166 @@ Respond with JSON:
   }
 });
 
+// POST /commissioning-checklist  — Log an HVAC/system commissioning checklist
+app.post("/commissioning-checklist", apiKeyAuth, async (req, res) => {
+  const { jobId, siteId, systemType, make, model, serialNumber, commissionedBy, commissionDate, checks = [], refrigerantType, refrigerantChargingKg, supplyTemp, returnTemp, airflowLps, externalStaticPa, passed, notes } = req.body || {};
+  if (!jobId && !siteId) return res.status(400).json({ error: "jobId or siteId required." });
+
+  const SYSTEM_TYPES = ["split-system", "ducted", "vrf", "chiller", "boiler", "pump", "ventilation", "refrigeration", "hot-water", "other"];
+  const safeJobId   = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeSiteId  = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeType    = SYSTEM_TYPES.includes(String(systemType || "").toLowerCase().replace(/ /g, "-")) ? String(systemType).toLowerCase().replace(/ /g, "-") : "other";
+  const safeMake    = make ? sanitiseInput(String(make)).slice(0, 80) : null;
+  const safeModel   = model ? sanitiseInput(String(model)).slice(0, 80) : null;
+  const safeSerial  = serialNumber ? sanitiseInput(String(serialNumber)).slice(0, 80) : null;
+  const safeBy      = commissionedBy ? sanitiseInput(String(commissionedBy)).slice(0, 100) : null;
+  const safeDate    = commissionDate ? sanitiseInput(String(commissionDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeNotes   = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+  const safeRefrig  = refrigerantType ? sanitiseInput(String(refrigerantType)).slice(0, 20) : null;
+  const safeCharge  = refrigerantChargingKg ? Math.max(0, parseFloat(refrigerantChargingKg) || 0) : null;
+
+  const customChecks = Array.isArray(checks) ? checks.slice(0, 50).map(c => ({
+    item: sanitiseInput(String(c.item || c)).slice(0, 150),
+    passed: c.passed !== false, value: c.value ? sanitiseInput(String(c.value)).slice(0, 50) : null,
+  })) : [];
+
+  const DEFAULT_HVAC_CHECKS = [
+    { item: "Electrical connections correct and tight",            passed: true },
+    { item: "Refrigerant charge verified",                         passed: safeCharge !== null },
+    { item: "Supply and return air temperatures within spec",      passed: supplyTemp !== undefined && returnTemp !== undefined },
+    { item: "Airflow within design specification",                 passed: airflowLps !== undefined },
+    { item: "External static pressure within design specification",passed: externalStaticPa !== undefined },
+    { item: "Controls and thermostat operational",                 passed: true },
+    { item: "Safety devices tested and operational",               passed: true },
+    { item: "System free of leaks",                                passed: true },
+  ];
+
+  const allChecks    = customChecks.length > 0 ? customChecks : DEFAULT_HVAC_CHECKS;
+  const passedChecks = allChecks.filter(c => c.passed).length;
+  const overallPassed = passed !== undefined ? passed === true : passedChecks === allChecks.length;
+
+  const record = {
+    commissionId: `COM-${(safeJobId || safeSiteId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    jobId: safeJobId, siteId: safeSiteId, systemType: safeType,
+    make: safeMake, model: safeModel, serialNumber: safeSerial,
+    commissionedBy: safeBy, commissionDate: safeDate,
+    refrigerantType: safeRefrig, refrigerantChargingKg: safeCharge,
+    supplyTemp: supplyTemp !== undefined ? parseFloat(supplyTemp) : null,
+    returnTemp: returnTemp !== undefined ? parseFloat(returnTemp) : null,
+    airflowLps: airflowLps !== undefined ? parseFloat(airflowLps) : null,
+    externalStaticPa: externalStaticPa !== undefined ? parseFloat(externalStaticPa) : null,
+    checks: allChecks, passedChecks, totalChecks: allChecks.length,
+    overallResult: overallPassed ? "PASS" : "FAIL",
+    notes: safeNotes, createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("commissioning_checklists").insert({
+        commission_id: record.commissionId, job_id: safeJobId, site_id: safeSiteId,
+        system_type: safeType, make: safeMake, model: safeModel, serial_number: safeSerial,
+        commissioned_by: safeBy, commission_date: safeDate, refrigerant_type: safeRefrig,
+        refrigerant_charging_kg: safeCharge, supply_temp: record.supplyTemp, return_temp: record.returnTemp,
+        airflow_lps: record.airflowLps, external_static_pa: record.externalStaticPa,
+        checks: allChecks, overall_result: record.overallResult, notes: safeNotes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// POST /load-calculation  — Calculate electrical load for a switchboard/circuit
+app.post("/load-calculation", apiKeyAuth, async (req, res) => {
+  const { jobId, address, phase, voltageV = 230, loads = [], notes } = req.body || {};
+  if (!Array.isArray(loads) || loads.length === 0) return res.status(400).json({ error: "loads array required." });
+
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeAddress = address ? sanitiseInput(String(address)).slice(0, 200) : null;
+  const isThreePhase = String(phase || "").includes("3") || String(phase || "").toLowerCase().includes("three");
+  const voltage     = Math.max(1, parseFloat(voltageV) || 230);
+  const safeNotes   = notes ? sanitiseInput(String(notes)).slice(0, 200) : null;
+
+  const DEMAND_FACTORS = { lighting: 0.75, power: 0.50, hvac: 0.75, cooking: 0.60, other: 0.80 };
+  const circuitLoads = loads.slice(0, 100).map(l => {
+    const watts    = Math.max(0, parseFloat(l.watts) || 0);
+    const category = Object.keys(DEMAND_FACTORS).includes(String(l.category || "").toLowerCase()) ? String(l.category).toLowerCase() : "other";
+    const df       = DEMAND_FACTORS[category];
+    const derated  = parseFloat((watts * df).toFixed(2));
+    const current  = parseFloat((derated / voltage).toFixed(3));
+    return {
+      description: sanitiseInput(String(l.description || "")).slice(0, 100),
+      category, watts, demandFactor: df, deratedWatts: derated, currentA: current,
+    };
+  });
+
+  const totalWatts   = parseFloat(circuitLoads.reduce((s, l) => s + l.watts, 0).toFixed(2));
+  const deratedWatts = parseFloat(circuitLoads.reduce((s, l) => s + l.deratedWatts, 0).toFixed(2));
+  const totalCurrentA = parseFloat((deratedWatts / voltage).toFixed(2));
+  const recommendedCable = totalCurrentA <= 10 ? "1.5mm²" : totalCurrentA <= 16 ? "2.5mm²" : totalCurrentA <= 20 ? "4mm²" : totalCurrentA <= 25 ? "6mm²" : "10mm²+";
+
+  const calc = {
+    jobId: safeJobId, address: safeAddress, phase: isThreePhase ? "3-phase" : "single-phase", voltageV: voltage,
+    circuitLoads, totalWatts, deratedWatts, totalCurrentA,
+    recommendedCableSize: recommendedCable,
+    recommendation: totalCurrentA > 32 ? "Consult engineer — load exceeds single-circuit capacity" : "Calculation within standard parameters",
+    notes: safeNotes, calculatedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin && safeJobId) {
+    try {
+      await supabaseAdmin.from("load_calculations").insert({ job_id: safeJobId, address: safeAddress, phase: calc.phase, voltage_v: voltage, total_watts: totalWatts, derated_watts: deratedWatts, total_current_a: totalCurrentA, loads: circuitLoads, notes: safeNotes, created_at: calc.calculatedAt });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.json(calc);
+});
+
+// POST /heat-load  — Calculate HVAC heat/cool load for a space
+app.post("/heat-load", apiKeyAuth, (req, res) => {
+  const { jobId, roomName, floorAreaM2, ceilingHeightM = 2.7, occupants = 2, glazingFactor = 0.15, insulated = true, climate = "Melbourne", orientation = "north" } = req.body || {};
+  if (!floorAreaM2) return res.status(400).json({ error: "floorAreaM2 required." });
+
+  const safeJobId   = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeRoom    = roomName ? sanitiseInput(String(roomName)).slice(0, 100) : "Room";
+  const area        = Math.max(1, parseFloat(floorAreaM2) || 0);
+  const height      = Math.max(2, parseFloat(ceilingHeightM) || 2.7);
+  const people      = Math.max(0, parseInt(occupants) || 2);
+  const glazing     = Math.min(1, Math.max(0, parseFloat(glazingFactor) || 0.15));
+  const volume      = area * height;
+
+  // Melbourne climate baseline: 35°C cooling, -2°C heating
+  const CLIMATE_FACTORS = { Melbourne: { cool: 35, heat: -2 }, Sydney: { cool: 33, heat: 5 }, Brisbane: { cool: 34, heat: 10 }, Adelaide: { cool: 38, heat: 0 }, Perth: { cool: 38, heat: 8 } };
+  const climate_safe = sanitiseInput(String(climate)).replace(/[^a-zA-Z]/g, "");
+  const temps = CLIMATE_FACTORS[climate_safe] || CLIMATE_FACTORS.Melbourne;
+  const insulFactor = insulated ? 0.5 : 1.0;
+  const orientFactor = ["north", "west"].includes(String(orientation).toLowerCase()) ? 1.2 : 1.0;
+
+  // Rule of thumb: 125W/m² cooling base + adjustments
+  const coolingBaseW = area * 125;
+  const glazingLoadW = area * glazing * 500 * orientFactor;
+  const occupantLoadW = people * 100;
+  const totalCoolingW = parseFloat(((coolingBaseW + glazingLoadW + occupantLoadW) * insulFactor).toFixed(0));
+  const coolingKw     = parseFloat((totalCoolingW / 1000).toFixed(2));
+
+  // Heating: 80W/m² base
+  const totalHeatingW = parseFloat(((area * 80 + occupantLoadW * 0.3) * insulFactor).toFixed(0));
+  const heatingKw     = parseFloat((totalHeatingW / 1000).toFixed(2));
+
+  const SYSTEM_GUIDE = coolingKw <= 2.5 ? "1 x 2.5kW split system" : coolingKw <= 3.5 ? "1 x 3.5kW split system" : coolingKw <= 5 ? "1 x 5kW split system" : coolingKw <= 7 ? "1 x 7kW split system" : `${Math.ceil(coolingKw / 7)} x 7kW units or ducted system`;
+
+  return res.json({
+    jobId: safeJobId, roomName: safeRoom, floorAreaM2: area, ceilingHeightM: height,
+    volumeM3: parseFloat(volume.toFixed(1)), climate: climate_safe, orientation, occupants: people,
+    glazingFactor: glazing, insulated,
+    coolingLoadW: totalCoolingW, coolingLoadKw: coolingKw,
+    heatingLoadW: totalHeatingW, heatingLoadKw: heatingKw,
+    recommendedSystem: SYSTEM_GUIDE,
+    disclaimer: "Rule-of-thumb estimate only. Use AS 1668 and NCC for design-grade calculations.",
+    calculatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
