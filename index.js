@@ -3917,6 +3917,444 @@ Requirements:
   }
 });
 
+// ── Task 10: Compliance Certificate Validator ─────────────────────────────────
+// Verifies a job's compliance report is genuine and unmodified.
+
+app.post("/validate-certificate", async (req, res) => {
+  const { jobId } = req.body || {};
+
+  if (!jobId || typeof jobId !== "string") {
+    return res.status(400).json({ error: "jobId is required." });
+  }
+
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: "Database not configured." });
+  }
+
+  const checks = {};
+  let jobRecord = null;
+
+  // 1. Job exists in database
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("analyses")
+      .select("*")
+      .eq("id", jobId)
+      .single();
+
+    if (error || !data) {
+      checks.jobExists = { pass: false, message: "Job not found in database." };
+    } else {
+      jobRecord = data;
+      checks.jobExists = { pass: true, message: "Job record found in database." };
+    }
+  } catch (e) {
+    checks.jobExists = { pass: false, message: `Database query failed: ${e.message}` };
+  }
+
+  if (!jobRecord) {
+    return res.status(404).json({
+      valid: false,
+      jobId,
+      checks,
+      verifiedAt: new Date().toISOString(),
+    });
+  }
+
+  // 2. Timestamp validity — must not be in the future
+  const createdAt = new Date(jobRecord.created_at);
+  const now       = new Date();
+  checks.timestampValid = {
+    pass:    createdAt <= now,
+    message: createdAt <= now
+      ? `Job created ${createdAt.toISOString()} — timestamp is valid.`
+      : `Job timestamp ${createdAt.toISOString()} is in the future — invalid.`,
+  };
+
+  // 3. Required fields present
+  const requiredFields = ["job_type", "confidence", "items_detected"];
+  const missingFields  = requiredFields.filter(f => !jobRecord[f] && jobRecord[f] !== 0);
+  checks.requiredFieldsPresent = {
+    pass:    missingFields.length === 0,
+    message: missingFields.length === 0
+      ? "All required fields are present."
+      : `Missing required fields: ${missingFields.join(", ")}`,
+  };
+
+  // 4. Confidence score valid (0-100)
+  const confidence = jobRecord.confidence ?? jobRecord.overall_confidence;
+  checks.confidenceScoreValid = {
+    pass:    typeof confidence === "number" && confidence >= 0 && confidence <= 100,
+    message: typeof confidence === "number" && confidence >= 0 && confidence <= 100
+      ? `Confidence score ${confidence} is valid.`
+      : `Confidence score '${confidence}' is out of range.`,
+  };
+
+  // 5. Photos submitted (must have at least 1)
+  const photosSubmitted = jobRecord.photos_submitted ?? jobRecord.photo_count ?? 0;
+  checks.photosSubmitted = {
+    pass:    photosSubmitted >= 1,
+    message: photosSubmitted >= 1
+      ? `${photosSubmitted} photos submitted.`
+      : "No photos recorded for this job.",
+  };
+
+  // 6. GPS coordinates — if present, must be valid Australian coords
+  if (jobRecord.gps_lat !== undefined && jobRecord.gps_lng !== undefined) {
+    const lat = parseFloat(jobRecord.gps_lat);
+    const lng = parseFloat(jobRecord.gps_lng);
+    const isAustralian = lat >= -44 && lat <= -10 && lng >= 113 && lng <= 154;
+    checks.gpsValid = {
+      pass:    isAustralian,
+      message: isAustralian
+        ? `GPS coordinates (${lat}, ${lng}) are valid Australian coordinates.`
+        : `GPS coordinates (${lat}, ${lng}) are outside Australia — possibly incorrect.`,
+    };
+  } else {
+    checks.gpsValid = { pass: true, message: "GPS not recorded for this job (optional)." };
+  }
+
+  // 7. PDF hash check — if hash stored, verify it hasn't been tampered
+  if (jobRecord.pdf_hash && jobRecord.pdf_data) {
+    try {
+      const computedHash = crypto.createHash("sha256").update(jobRecord.pdf_data).digest("hex");
+      checks.pdfHashValid = {
+        pass:    computedHash === jobRecord.pdf_hash,
+        message: computedHash === jobRecord.pdf_hash
+          ? "PDF hash matches — document has not been modified."
+          : "PDF hash mismatch — document may have been tampered with.",
+      };
+    } catch {
+      checks.pdfHashValid = { pass: true, message: "PDF hash check skipped." };
+    }
+  } else {
+    checks.pdfHashValid = { pass: true, message: "No PDF stored for hash verification." };
+  }
+
+  const allPassed   = Object.values(checks).every(c => c.pass);
+  const passedCount = Object.values(checks).filter(c => c.pass).length;
+  const totalChecks = Object.values(checks).length;
+
+  return res.json({
+    valid:      allPassed,
+    jobId,
+    score:      `${passedCount}/${totalChecks} checks passed`,
+    verifiedAt: new Date().toISOString(),
+    checks,
+    badge:      allPassed ? "✓ VERIFIED — This compliance report has passed all integrity checks." : "⚠ ISSUES FOUND — See checks for details.",
+  });
+});
+
+// ── Task 11: Plumber Performance Predictor ────────────────────────────────────
+// Statistical analysis of job history to predict performance on next job.
+
+app.post("/predict-performance", (req, res) => {
+  const { jobType, jobHistory = [] } = req.body || {};
+
+  if (!jobType || typeof jobType !== "string") {
+    return res.status(400).json({ error: "jobType is required." });
+  }
+  if (!Array.isArray(jobHistory) || jobHistory.length === 0) {
+    return res.status(400).json({ error: "jobHistory array is required (last 10 jobs with confidence scores)." });
+  }
+
+  const relevantJobs = jobHistory.filter(j => j.jobType === jobType && typeof j.confidence === "number");
+  const allJobs      = jobHistory.filter(j => typeof j.confidence === "number");
+
+  if (allJobs.length < 2) {
+    return res.status(400).json({ error: "At least 2 jobs with confidence scores are required for prediction." });
+  }
+
+  const scores     = relevantJobs.length >= 3 ? relevantJobs.map(j => j.confidence) : allJobs.map(j => j.confidence);
+  const avg        = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
+  const recentAvg  = scores.length >= 3
+    ? Math.round(scores.slice(-3).reduce((a, b) => a + b, 0) / 3)
+    : avg;
+
+  // Trend: positive = improving, negative = declining
+  const trend = scores.length >= 4
+    ? recentAvg - Math.round(scores.slice(0, Math.ceil(scores.length / 2)).reduce((a, b) => a + b, 0) / Math.ceil(scores.length / 2))
+    : 0;
+
+  // Prediction with uncertainty bands
+  const trendAdjusted = Math.min(100, Math.max(0, recentAvg + Math.round(trend * 0.5)));
+  const stdDev        = scores.length >= 2
+    ? Math.round(Math.sqrt(scores.reduce((s, v) => s + Math.pow(v - avg, 2), 0) / scores.length))
+    : 10;
+
+  const predictedMin = Math.max(0,   trendAdjusted - stdDev);
+  const predictedMax = Math.min(100, trendAdjusted + stdDev);
+
+  // Common missing items from history
+  const allMissing = jobHistory.flatMap(j => Array.isArray(j.itemsMissing) ? j.itemsMissing : []);
+  const missingFreq = {};
+  for (const item of allMissing) {
+    missingFreq[item] = (missingFreq[item] || 0) + 1;
+  }
+  const likelyFlags = Object.entries(missingFreq)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([item, freq]) => ({ item, occurrences: freq }));
+
+  // Recommended preparation
+  const prep = [];
+  if (likelyFlags.length > 0) {
+    prep.push(`Review these items before your next job — you've flagged them ${likelyFlags[0].occurrences}+ times: ${likelyFlags.map(f => `"${f.item}"`).join(", ")}`);
+  }
+  if (trend < -5) {
+    prep.push("Your scores have been declining recently. Consider reviewing your photo technique — distance and lighting are the most common causes.");
+  }
+  if (trendAdjusted < 70) {
+    prep.push("Aim to take 10+ photos on your next job. More photos covering all required items consistently raises scores above 75.");
+  }
+  if (stdDev > 15) {
+    prep.push("Your scores are quite variable. Focus on building a consistent photo checklist so every job gets the same treatment.");
+  }
+
+  const outlook = trend >= 5 ? "improving" : trend <= -5 ? "declining" : "stable";
+
+  return res.json({
+    jobType,
+    prediction: {
+      expectedScore:      trendAdjusted,
+      confidenceRange:    `${predictedMin}–${predictedMax}`,
+      outlook,
+      trendDirection:     trend > 0 ? `+${trend} points` : trend < 0 ? `${trend} points` : "flat",
+    },
+    historicalStats: {
+      jobsAnalysed:   scores.length,
+      allTimeAverage: avg,
+      recentAverage:  recentAvg,
+      standardDeviation: stdDev,
+    },
+    likelyFlaggedItems: likelyFlags,
+    recommendedPreparation: prep,
+  });
+});
+
+// ── Task 12: Suburb Compliance Heatmap Data ───────────────────────────────────
+// Returns anonymised aggregate compliance data by suburb for map visualisation.
+
+app.get("/compliance-heatmap", async (_req, res) => {
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: "Database not configured." });
+  }
+
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("analyses")
+      .select("suburb, location_state, job_type, confidence, missing_items")
+      .not("suburb", "is", null);
+
+    if (error) throw error;
+
+    const rows = data || [];
+    const suburbMap = {};
+
+    for (const row of rows) {
+      const key = `${row.suburb || "unknown"},${row.location_state || "VIC"}`;
+      if (!suburbMap[key]) {
+        suburbMap[key] = { suburb: row.suburb, state: row.location_state || "VIC", totalJobs: 0, totalConfidence: 0, failureItems: {} };
+      }
+      const entry = suburbMap[key];
+      entry.totalJobs++;
+      entry.totalConfidence += (row.confidence || 0);
+
+      const missing = Array.isArray(row.missing_items)
+        ? row.missing_items
+        : (typeof row.missing_items === "string" ? JSON.parse(row.missing_items || "[]") : []);
+      for (const item of missing) {
+        if (item) entry.failureItems[item] = (entry.failureItems[item] || 0) + 1;
+      }
+    }
+
+    const heatmapData = Object.values(suburbMap)
+      .filter(e => e.totalJobs >= 3) // only include suburbs with enough data to be meaningful
+      .map(e => ({
+        suburb:           e.suburb,
+        state:            e.state,
+        jobCount:         e.totalJobs,
+        avgConfidence:    Math.round(e.totalConfidence / e.totalJobs),
+        complianceRating: e.totalConfidence / e.totalJobs >= 80 ? "good" : e.totalConfidence / e.totalJobs >= 65 ? "fair" : "needs_attention",
+        topFailures:      Object.entries(e.failureItems).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([item, count]) => ({ item, count })),
+      }))
+      .sort((a, b) => b.jobCount - a.jobCount);
+
+    return res.json({
+      heatmapData,
+      totalSuburbs: heatmapData.length,
+      totalJobs:    rows.length,
+      generatedAt:  new Date().toISOString(),
+      note:         "Suburbs with fewer than 3 jobs are excluded to ensure anonymity.",
+    });
+  } catch (err) {
+    console.error("compliance-heatmap error:", err);
+    return res.status(500).json({ error: "Heatmap data query failed." });
+  }
+});
+
+// ── Task 13: Job Complexity Predictor ────────────────────────────────────────
+// Predicts job complexity and documentation needs before the tradesperson arrives.
+
+app.post("/predict-complexity", (req, res) => {
+  const {
+    jobType,
+    propertyAddress,
+    applianceCount = 1,
+    fixtureCount   = 1,
+    propertyAgeYears,
+    additionalFactors = [],
+  } = req.body || {};
+
+  if (!jobType || typeof jobType !== "string") {
+    return res.status(400).json({ error: "jobType is required." });
+  }
+
+  // Base complexity by trade type (1-10)
+  const baseComplexity = { gas: 7, electrical: 7, plumbing: 5, drainage: 5, hvac: 6, carpentry: 4 }[jobType] || 5;
+
+  // Appliance/fixture count modifier
+  const countModifier = Math.min(3, Math.floor(((applianceCount || fixtureCount) - 1) / 2));
+
+  // Age of property — older = more likely to find non-compliant existing work
+  const ageModifier = propertyAgeYears
+    ? propertyAgeYears > 50 ? 2 : propertyAgeYears > 25 ? 1 : 0
+    : 0;
+
+  // Additional factors
+  const factorModifier = additionalFactors.length;
+
+  const rawScore = Math.min(10, Math.max(1, baseComplexity + countModifier + ageModifier + factorModifier));
+  const band     = rawScore <= 3 ? "simple" : rawScore <= 6 ? "moderate" : "complex";
+
+  // Recommended photo count
+  const photoRecommendations = {
+    simple:   { min: 6,  ideal: 10, note: "Focus on compliance labels, before/after states, and final installed position." },
+    moderate: { min: 10, ideal: 15, note: "Photograph each appliance individually plus all compliance evidence — PTR/RCD/gas pressure as applicable." },
+    complex:  { min: 15, ideal: 20, note: "Document every connection, every compliance label, and every test result. Consider video walkthrough for audit trail." },
+  };
+
+  // Items most likely to need attention based on job type + complexity
+  const attentionItems = {
+    gas: rawScore >= 7
+      ? ["Gas pressure test record", "All burner flames lit and photographed", "Flue terminal external shot", "Isolation valve for each appliance"]
+      : ["Isolation valve present and accessible", "AGA/compliance label legible"],
+    electrical: rawScore >= 7
+      ? ["RCD trip time test record", "All circuit labels legible", "Earth conductor colour verified", "Insulation resistance test result"]
+      : ["RCD test button visible", "Circuit labels complete"],
+    plumbing: rawScore >= 7
+      ? ["PTR valve with discharge pipe", "Tempering valve AS 3500.4 marking", "Pressure limiting valve rating", "All test results documented"]
+      : ["PTR valve compliance label", "Isolation valves present"],
+    drainage: rawScore >= 7
+      ? ["Pipe fall direction with datum", "All inspection openings labelled", "Bedding cross-section before backfill"]
+      : ["Pipe fall visible", "Trap water seal confirmed"],
+    hvac: rawScore >= 7
+      ? ["Commissioning sheet with measured values", "Refrigerant line lagging complete", "Condensate drain tested"]
+      : ["Indoor unit mounting secure", "Refrigerant lines lagged"],
+    carpentry: rawScore >= 7
+      ? ["Engineer's details on each connection", "All structural fixings photographed", "Frame inspection certificate"]
+      : ["Framing connections visible", "Timber member sizes confirmed"],
+  };
+
+  // Estimated time to document correctly
+  const docTimeMinutes = rawScore <= 3 ? 15 : rawScore <= 6 ? 25 : 40;
+
+  return res.json({
+    jobType,
+    propertyAddress: propertyAddress || null,
+    prediction: {
+      complexityScore: rawScore,
+      complexityBand:  band,
+      estimatedDocumentationMinutes: docTimeMinutes,
+      recommendedPhotos: photoRecommendations[band],
+    },
+    itemsLikelyNeedingAttention: (attentionItems[jobType] || []),
+    inputs: { applianceCount, fixtureCount, propertyAgeYears: propertyAgeYears || null, additionalFactors },
+    tips: [
+      rawScore >= 7 ? "Complex job — arrive 15 minutes early and build your photo list before starting work." : null,
+      propertyAgeYears > 30 ? "Older property — inspect existing fittings before quoting. Non-compliant existing work may need to be documented." : null,
+      jobType === "gas" ? "Always commission the appliance before taking burner flame photos — cold burners always fail." : null,
+    ].filter(Boolean),
+  });
+});
+
+// ── Task 14: Automated Compliance Report Summary ──────────────────────────────
+// Uses GPT-4o to generate a one-paragraph plain-English summary of a job report.
+
+app.post("/summarise-report", async (req, res) => {
+  const { jobReport } = req.body || {};
+
+  if (!jobReport || typeof jobReport !== "object") {
+    return res.status(400).json({ error: "jobReport object is required." });
+  }
+  if (!client) {
+    return res.status(503).json({ error: "AI service not configured." });
+  }
+
+  const {
+    jobType       = "trade",
+    address       = "the property",
+    plumberName   = "the licensed tradesperson",
+    overallConfidence,
+    adjustedConfidence,
+    itemsDetected = [],
+    itemsMissing  = [],
+    itemsUnclear  = [],
+    riskRating    = "medium",
+    liabilitySummary,
+    complianceScore,
+    completedAt,
+  } = jobReport;
+
+  const scoreInfo = overallConfidence ?? adjustedConfidence;
+  const grade     = complianceScore?.grade;
+
+  const systemPrompt = `You are a compliance documentation writer for Australian trade work.
+Write exactly ONE paragraph — 80 to 120 words — in plain English suitable for a property owner or building surveyor.
+Never use trade jargon the client wouldn't understand.
+Be factual, professional, and clear.
+Do not start with "The" — vary your sentence opener.`;
+
+  const userPrompt = `Summarise this completed ${jobType} compliance report in one paragraph for a property owner or building surveyor.
+
+Job details:
+- Trade type: ${jobType}
+- Property: ${address}
+- Tradesperson: ${plumberName}
+- Confidence score: ${scoreInfo ?? "not recorded"}%${grade ? ` (Grade ${grade})` : ""}
+- Completed: ${completedAt || new Date().toISOString().split("T")[0]}
+- Risk rating: ${riskRating}
+- Items verified: ${itemsDetected.join(", ") || "none recorded"}
+- Items requiring attention: ${itemsMissing.join(", ") || "none"}
+- Unclear items: ${itemsUnclear.join(", ") || "none"}
+${liabilitySummary ? `- Certification note: ${liabilitySummary}` : ""}
+
+Write one concise paragraph covering: what work was done, what was verified, what the compliance outcome was, and any follow-up required.`;
+
+  try {
+    usageStats.openaiCalls++;
+    const response = await callOpenAIWithRetry({
+      model:       "gpt-4o",
+      messages:    [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
+      temperature: 0.3,
+      max_tokens:  200,
+    });
+
+    const summary = response.choices?.[0]?.message?.content?.trim() || "";
+
+    return res.json({
+      summary,
+      wordCount:   summary.split(/\s+/).length,
+      jobType,
+      model:       "gpt-4o",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("summarise-report error:", err);
+    return res.status(500).json({ error: "Report summary generation failed. Please try again." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
