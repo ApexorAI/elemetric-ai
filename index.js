@@ -30967,6 +30967,175 @@ Provide a realistic cost forecast. Return a JSON object with:
   }
 });
 
+// ── Round 111: Defect liability, practical completion, maintenance period ─────
+
+// POST /practical-completion — Issue a Practical Completion certificate
+app.post("/practical-completion", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, contractor, superintendent,
+    pcDate, defectsLiabilityPeriodMonths = 12,
+    outstandingItems = [], conditions = [],
+    finalContractSum, retentionReleasePercent = 50,
+    notes,
+  } = req.body;
+
+  if (!projectId || !projectName || !pcDate)
+    return res.status(400).json({ error: "projectId, projectName, pcDate required." });
+
+  const pc = new Date(pcDate);
+  const dlpEnd = new Date(pc);
+  dlpEnd.setMonth(dlpEnd.getMonth() + Number(defectsLiabilityPeriodMonths));
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    contractor: sanitiseInput(contractor || ""),
+    superintendent: sanitiseInput(superintendent || ""),
+    pc_date: pcDate,
+    defects_liability_period_months: Number(defectsLiabilityPeriodMonths),
+    dlp_end_date: dlpEnd.toISOString().split("T")[0],
+    outstanding_items: outstandingItems.map(i => sanitiseInput(i)),
+    outstanding_item_count: outstandingItems.length,
+    conditions: conditions.map(c => sanitiseInput(c)),
+    final_contract_sum: Number(finalContractSum) || null,
+    retention_release_percent: Number(retentionReleasePercent),
+    pc_status: outstandingItems.length > 0 ? "PC_WITH_OUTSTANDING" : "PC_CLEAN",
+    notes: sanitiseInput(notes || ""),
+    issued_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("practical_completions")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, pcId: data.id, dlpEndDate: record.dlp_end_date, ...record });
+  }
+
+  res.json({ success: true, pcId: null, dlpEndDate: record.dlp_end_date, ...record, saved: false });
+});
+
+// POST /defect-liability-claim — Lodge a defect during the defects liability period
+app.post("/defect-liability-claim", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, pcId, reportedBy, location, description,
+    severity, trade, photosAttached = 0, discoveredDate,
+    rectificationDeadlineDays = 14,
+  } = req.body;
+
+  if (!projectId || !description) return res.status(400).json({ error: "projectId and description required." });
+
+  const validSeverities = ["MINOR", "MAJOR", "CRITICAL", "COSMETIC"];
+  const sev = (severity || "MINOR").toUpperCase();
+  const defectId = `DLP-${Date.now().toString(36).toUpperCase().slice(-8)}`;
+  const deadline = new Date();
+  deadline.setDate(deadline.getDate() + Number(rectificationDeadlineDays));
+
+  const record = {
+    defect_id: defectId,
+    project_id: sanitiseInput(projectId),
+    pc_id: sanitiseInput(pcId || ""),
+    reported_by: sanitiseInput(reportedBy || ""),
+    location: sanitiseInput(location || ""),
+    description: sanitiseInput(description),
+    severity: validSeverities.includes(sev) ? sev : "MINOR",
+    trade: sanitiseInput(trade || ""),
+    photos_attached: Number(photosAttached),
+    discovered_date: discoveredDate || new Date().toISOString().split("T")[0],
+    rectification_deadline: deadline.toISOString().split("T")[0],
+    rectification_deadline_days: Number(rectificationDeadlineDays),
+    status: "OPEN",
+    lodged_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("defect_liability_claims")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, claimId: data.id, defectId, rectificationDeadline: record.rectification_deadline, ...record });
+  }
+
+  res.json({ success: true, claimId: null, defectId, rectificationDeadline: record.rectification_deadline, ...record, saved: false });
+});
+
+// POST /final-completion — Issue a Final Completion certificate (end of DLP)
+app.post("/final-completion", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, pcId, superintendent, finalDate,
+    allDefectsRectified = true, retentionFullyReleased = false,
+    finalAccountAgreed = false, finalAccountAmount,
+    outstandingMatters = [], notes,
+  } = req.body;
+
+  if (!projectId || !finalDate) return res.status(400).json({ error: "projectId and finalDate required." });
+
+  const cleanCompletion = allDefectsRectified && retentionFullyReleased && finalAccountAgreed && outstandingMatters.length === 0;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    pc_id: sanitiseInput(pcId || ""),
+    superintendent: sanitiseInput(superintendent || ""),
+    final_date: finalDate,
+    all_defects_rectified: Boolean(allDefectsRectified),
+    retention_fully_released: Boolean(retentionFullyReleased),
+    final_account_agreed: Boolean(finalAccountAgreed),
+    final_account_amount: finalAccountAmount ? Number(finalAccountAmount) : null,
+    outstanding_matters: outstandingMatters.map(m => sanitiseInput(m)),
+    completion_status: cleanCompletion ? "FINAL_COMPLETE" : "FINAL_COMPLETE_WITH_ISSUES",
+    notes: sanitiseInput(notes || ""),
+    issued_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("final_completions")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, fcId: data.id, completionStatus: record.completion_status, ...record });
+  }
+
+  res.json({ success: true, fcId: null, completionStatus: record.completion_status, ...record, saved: false });
+});
+
+// GET /project-timeline/:projectId — Get a full project timeline (PC + DLP + FC milestones)
+app.get("/project-timeline/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+
+  if (supabaseAdmin) {
+    const [pcResult, fcResult, milestoneResult, defectResult] = await Promise.all([
+      supabaseAdmin.from("practical_completions").select("*").eq("project_id", projectId).order("pc_date", { ascending: false }).limit(1),
+      supabaseAdmin.from("final_completions").select("*").eq("project_id", projectId).order("final_date", { ascending: false }).limit(1),
+      supabaseAdmin.from("project_milestones").select("*").eq("project_id", projectId).order("planned_date", { ascending: true }),
+      supabaseAdmin.from("defect_liability_claims").select("id, severity, status, discovered_date, rectification_deadline").eq("project_id", projectId),
+    ]);
+
+    const pc = pcResult.data?.[0] || null;
+    const fc = fcResult.data?.[0] || null;
+    const milestones = milestoneResult.data || [];
+    const defects = defectResult.data || [];
+
+    const openDefects = defects.filter(d => d.status === "OPEN").length;
+    const overdueDefects = defects.filter(d => d.status === "OPEN" && new Date(d.rectification_deadline) < new Date()).length;
+
+    return res.json({
+      projectId,
+      practicalCompletion: pc ? { date: pc.pc_date, dlpEnd: pc.dlp_end_date, status: pc.pc_status } : null,
+      finalCompletion: fc ? { date: fc.final_date, status: fc.completion_status } : null,
+      milestones: milestones.map(m => ({ name: m.milestone_name, planned: m.planned_date, actual: m.actual_date, status: m.status })),
+      defectSummary: { total: defects.length, open: openDefects, overdue: overdueDefects },
+    });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
