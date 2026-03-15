@@ -6138,6 +6138,419 @@ app.post("/export-report", async (req, res) => {
   }
 });
 
+// ── POST /licence-lookup ─────────────────────────────────────────────────────
+// Validates VBA (Victorian Building Authority) licence number format and returns
+// trade metadata. Does NOT call VBA API — validates format + returns known fields.
+app.post("/licence-lookup", (req, res) => {
+  const { licenceNumber, tradeType } = req.body || {};
+  if (!licenceNumber || typeof licenceNumber !== "string") {
+    return res.status(400).json({ error: "licenceNumber is required." });
+  }
+  const clean = licenceNumber.trim().toUpperCase().replace(/\s+/g, "");
+
+  // VBA licence number patterns:
+  //  Plumbers:       L followed by 5 digits  (e.g. L12345)
+  //  Electricians:   REC followed by 4-6 digits (e.g. REC1234)
+  //  Gas fitters:    GF followed by 5 digits (e.g. GF12345)
+  //  Building:       DB-L followed by 5-7 digits or CDB-L (e.g. DB-L12345)
+  const LICENCE_PATTERNS = [
+    { regex: /^L\d{5,6}$/, trade: "plumbing", authority: "VBA", description: "Plumbing Licence" },
+    { regex: /^REC\d{4,6}$/, trade: "electrical", authority: "VBA / Energy Safe Victoria", description: "Registered Electrical Contractor" },
+    { regex: /^GF\d{4,6}$/, trade: "gas", authority: "VBA / Energy Safe Victoria", description: "Gas Fitting Licence" },
+    { regex: /^DB-L\d{5,7}$/, trade: "carpentry", authority: "VBA", description: "Domestic Builder (Limited) Licence" },
+    { regex: /^DB-U\d{5,7}$/, trade: "carpentry", authority: "VBA", description: "Domestic Builder (Unlimited) Licence" },
+    { regex: /^CDB-L\d{5,7}$/, trade: "carpentry", authority: "VBA", description: "Commercial Builder Licence" },
+    { regex: /^D\d{5,6}$/, trade: "drainage", authority: "VBA", description: "Drainer Licence" },
+  ];
+
+  const match = LICENCE_PATTERNS.find(p => p.regex.test(clean));
+
+  if (!match) {
+    return res.json({
+      licenceNumber: clean,
+      valid:         false,
+      reason:        "Format does not match any known Victorian licence pattern.",
+      knownFormats: [
+        "Plumbing: L12345",
+        "Electrical: REC1234",
+        "Gas: GF12345",
+        "Drainage: D12345",
+        "Domestic Builder: DB-L12345 or DB-U12345",
+      ],
+    });
+  }
+
+  const tradeMismatch = tradeType && tradeType.toLowerCase() !== match.trade;
+
+  return res.json({
+    licenceNumber:  clean,
+    valid:          true,
+    trade:          match.trade,
+    description:    match.description,
+    issuingAuthority: match.authority,
+    tradeMismatch:  tradeMismatch || false,
+    tradeMismatchNote: tradeMismatch
+      ? `Licence format matches ${match.trade} but job type is ${tradeType}`
+      : null,
+    verificationNote: "Format validated locally. For live status, verify at vba.vic.gov.au.",
+  });
+});
+
+// ── GET /job-types ────────────────────────────────────────────────────────────
+// Returns metadata for all supported job types: required photos, regulatory
+// references, liability periods, checklist counts, award rates.
+app.get("/job-types", (_req, res) => {
+  const JOB_TYPE_METADATA = {
+    plumbing: {
+      label:            "Plumbing",
+      regulatoryBody:   "Victorian Building Authority (VBA)",
+      primaryStandard:  "AS/NZS 3500",
+      certificateRequired: true,
+      certificateType:  "Certificate of Compliance (CoC)",
+      requiredPhotos:   8,
+      checklistItems:   (CHECKLISTS.plumbing || []).length,
+      liabilityYears:   LIABILITY_PERIODS.plumbing?.defects || 7,
+      awardRate:        AWARD_RATES.plumbing?.rate || 58,
+      licenceFormat:    "L12345",
+      commonRisks:      ["Backflow prevention", "PTR valve", "Water pressure", "Pipe support"],
+    },
+    gas: {
+      label:            "Gas Fitting",
+      regulatoryBody:   "Energy Safe Victoria (ESV)",
+      primaryStandard:  "AS/NZS 5601.1",
+      certificateRequired: true,
+      certificateType:  "Gas Compliance Certificate",
+      requiredPhotos:   8,
+      checklistItems:   (CHECKLISTS.gas || []).length,
+      liabilityYears:   LIABILITY_PERIODS.gas?.defects || 7,
+      awardRate:        AWARD_RATES.gas?.rate || 62,
+      licenceFormat:    "GF12345",
+      commonRisks:      ["Gas leak test", "Ventilation", "Pressure test", "Flue clearance"],
+    },
+    electrical: {
+      label:            "Electrical",
+      regulatoryBody:   "Energy Safe Victoria (ESV)",
+      primaryStandard:  "AS/NZS 3000 (Wiring Rules)",
+      certificateRequired: true,
+      certificateType:  "Certificate of Electrical Safety (CoES)",
+      requiredPhotos:   8,
+      checklistItems:   (CHECKLISTS.electrical || []).length,
+      liabilityYears:   LIABILITY_PERIODS.electrical?.defects || 7,
+      awardRate:        AWARD_RATES.electrical?.rate || 64,
+      licenceFormat:    "REC1234",
+      commonRisks:      ["RCD protection", "Earthing", "Circuit labelling", "Clearances"],
+    },
+    drainage: {
+      label:            "Drainage",
+      regulatoryBody:   "Victorian Building Authority (VBA)",
+      primaryStandard:  "AS/NZS 3500.2",
+      certificateRequired: true,
+      certificateType:  "Certificate of Compliance (CoC)",
+      requiredPhotos:   6,
+      checklistItems:   (CHECKLISTS.drainage || []).length,
+      liabilityYears:   LIABILITY_PERIODS.drainage?.defects || 7,
+      awardRate:        AWARD_RATES.drainage?.rate || 56,
+      licenceFormat:    "D12345",
+      commonRisks:      ["Fall compliance", "Trap installation", "Inspection opening", "Backwater valve"],
+    },
+    carpentry: {
+      label:            "Carpentry / Building",
+      regulatoryBody:   "Victorian Building Authority (VBA)",
+      primaryStandard:  "NCC / BCA Volume 2",
+      certificateRequired: false,
+      certificateType:  "Building Permit (via Surveyor)",
+      requiredPhotos:   6,
+      checklistItems:   (CHECKLISTS.carpentry || []).length,
+      liabilityYears:   LIABILITY_PERIODS.carpentry?.defects || 7,
+      awardRate:        AWARD_RATES.carpentry?.rate || 52,
+      licenceFormat:    "DB-L12345",
+      commonRisks:      ["Structural member sizing", "Bracing", "Tie-down connections", "Fire separation"],
+    },
+    hvac: {
+      label:            "HVAC / Refrigeration",
+      regulatoryBody:   "ARC / VBA",
+      primaryStandard:  "AS/NZS 1668.2, AIRAH DA09",
+      certificateRequired: false,
+      certificateType:  "ARC Licence (refrigerants), VBA for ducted heating",
+      requiredPhotos:   6,
+      checklistItems:   (CHECKLISTS.hvac || []).length,
+      liabilityYears:   LIABILITY_PERIODS.hvac?.defects || 7,
+      awardRate:        AWARD_RATES.hvac?.rate || 60,
+      licenceFormat:    "L12345 (if plumbing component)",
+      commonRisks:      ["Refrigerant recovery", "Electrical isolation", "Condensate drainage", "Filter access"],
+    },
+  };
+
+  return res.json({
+    supportedJobTypes: Object.keys(JOB_TYPE_METADATA),
+    jobTypes: JOB_TYPE_METADATA,
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /gap-analysis ────────────────────────────────────────────────────────
+// Compares two compliance snapshots (before and after remediation) to surface
+// specific improvements, regressions, and outstanding gaps.
+app.post("/gap-analysis", (req, res) => {
+  const { before, after, jobType } = req.body || {};
+
+  if (!before || !after) {
+    return res.status(400).json({ error: "before and after objects are required." });
+  }
+  const extractItems = (snapshot) => ({
+    detected: Array.isArray(snapshot.itemsDetected)  ? snapshot.itemsDetected  : [],
+    missing:  Array.isArray(snapshot.itemsMissing)   ? snapshot.itemsMissing   : [],
+    unclear:  Array.isArray(snapshot.itemsUnclear)   ? snapshot.itemsUnclear   : [],
+    score:    typeof snapshot.complianceScore === "number" ? snapshot.complianceScore : null,
+    confidence: typeof snapshot.confidence    === "number" ? snapshot.confidence      : null,
+  });
+
+  const b = extractItems(before);
+  const a = extractItems(after);
+
+  // Items that moved from missing → detected (remediated)
+  const remediated = b.missing.filter(item =>
+    a.detected.some(d => d.toLowerCase().includes(item.toLowerCase().substring(0, 20)))
+  );
+
+  // Items still missing after remediation
+  const stillMissing = a.missing;
+
+  // Items newly missing (regression)
+  const regressions = a.missing.filter(item =>
+    b.detected.some(d => d.toLowerCase().includes(item.toLowerCase().substring(0, 20)))
+  );
+
+  // Score delta
+  const scoreDelta = (a.score !== null && b.score !== null) ? a.score - b.score : null;
+  const confidenceDelta = (a.confidence !== null && b.confidence !== null) ? a.confidence - b.confidence : null;
+
+  const overallDirection = scoreDelta === null ? "unknown"
+    : scoreDelta > 5  ? "improved"
+    : scoreDelta < -5 ? "regressed"
+    : "unchanged";
+
+  return res.json({
+    jobType:           jobType || "unknown",
+    overallDirection,
+    scoreBefore:       b.score,
+    scoreAfter:        a.score,
+    scoreDelta:        scoreDelta !== null ? Math.round(scoreDelta * 10) / 10 : null,
+    confidenceBefore:  b.confidence,
+    confidenceAfter:   a.confidence,
+    confidenceDelta:   confidenceDelta !== null ? Math.round(confidenceDelta * 10) / 10 : null,
+    remediatedCount:   remediated.length,
+    remediatedItems:   remediated,
+    stillMissingCount: stillMissing.length,
+    stillMissingItems: stillMissing,
+    regressionCount:   regressions.length,
+    regressionItems:   regressions,
+    summary: overallDirection === "improved"
+      ? `Compliance improved by ${scoreDelta?.toFixed(1) || "?"} points. ${remediated.length} item(s) resolved. ${stillMissing.length} still outstanding.`
+      : overallDirection === "regressed"
+      ? `Compliance regressed by ${Math.abs(scoreDelta || 0).toFixed(1)} points. ${regressions.length} item(s) newly missing.`
+      : `Compliance score unchanged. ${stillMissing.length} item(s) remain outstanding.`,
+    analysedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /validate-photo-metadata ─────────────────────────────────────────────
+// Heuristic checks for GPS spoofing, timestamp anomalies, and suspiciously
+// uniform metadata across a job's photos. Flags warrant closer human review.
+app.post("/validate-photo-metadata", (req, res) => {
+  const { photos, jobCreatedAt } = req.body || {};
+
+  if (!Array.isArray(photos) || photos.length === 0) {
+    return res.status(400).json({ error: "photos array is required." });
+  }
+
+  const flags = [];
+  const results = [];
+
+  // Check 1: GPS coordinates consistency
+  const gpsCoords = photos
+    .filter(p => p.gpsLat !== undefined && p.gpsLng !== undefined)
+    .map(p => ({ lat: parseFloat(p.gpsLat), lng: parseFloat(p.gpsLng), label: p.label || "unknown" }));
+
+  if (gpsCoords.length > 1) {
+    const latDiffs = gpsCoords.map(c => Math.abs(c.lat - gpsCoords[0].lat));
+    const lngDiffs = gpsCoords.map(c => Math.abs(c.lng - gpsCoords[0].lng));
+    const maxLatDiff = Math.max(...latDiffs);
+    const maxLngDiff = Math.max(...lngDiffs);
+
+    if (maxLatDiff < 0.00001 && maxLngDiff < 0.00001) {
+      flags.push({ type: "GPS_IDENTICAL", severity: "medium", detail: "All photos share identical GPS coordinates — possible copy-paste metadata." });
+    } else if (maxLatDiff > 0.1 || maxLngDiff > 0.1) {
+      flags.push({ type: "GPS_SPREAD", severity: "low", detail: `Photos span ${(maxLatDiff * 111).toFixed(1)} km lat / ${(maxLngDiff * 85).toFixed(1)} km lng — verify this is one job site.` });
+    }
+  }
+
+  // Check 2: Timestamp ordering
+  const timestamps = photos
+    .filter(p => p.takenAt)
+    .map(p => ({ label: p.label || "unknown", ts: new Date(p.takenAt).getTime() }))
+    .filter(p => !isNaN(p.ts))
+    .sort((a, b) => a.ts - b.ts);
+
+  if (timestamps.length > 1) {
+    const spanHours = (timestamps[timestamps.length - 1].ts - timestamps[0].ts) / 3_600_000;
+    if (spanHours > 24) {
+      flags.push({ type: "TIMESTAMP_SPREAD", severity: "low", detail: `Photos span ${spanHours.toFixed(1)} hours — confirm all taken during same job.` });
+    }
+    // Check for future timestamps
+    const now = Date.now();
+    const futurePhotos = timestamps.filter(p => p.ts > now + 60_000);
+    if (futurePhotos.length > 0) {
+      flags.push({ type: "FUTURE_TIMESTAMP", severity: "high", detail: `${futurePhotos.length} photo(s) have future timestamps — possible tampering.` });
+    }
+  }
+
+  // Check 3: If jobCreatedAt is provided, check photos aren't older than 7 days before job
+  if (jobCreatedAt && timestamps.length > 0) {
+    const jobTs = new Date(jobCreatedAt).getTime();
+    const SEVEN_DAYS_MS = 7 * 24 * 3_600_000;
+    const tooOld = timestamps.filter(p => jobTs - p.ts > SEVEN_DAYS_MS);
+    if (tooOld.length > 0) {
+      flags.push({ type: "PHOTOS_PREDATING_JOB", severity: "medium", detail: `${tooOld.length} photo(s) taken more than 7 days before job creation date.` });
+    }
+  }
+
+  for (const photo of photos) {
+    const photoFlags = flags.filter(f =>
+      f.type === "FUTURE_TIMESTAMP" && photo.label
+        ? timestamps.find(t => t.label === photo.label && t.ts > Date.now())
+        : false
+    );
+    results.push({
+      label:  photo.label || "unknown",
+      hasGps: photo.gpsLat !== undefined,
+      hasTimestamp: !!photo.takenAt,
+      flagCount: photoFlags.length,
+    });
+  }
+
+  const highFlags    = flags.filter(f => f.severity === "high").length;
+  const mediumFlags  = flags.filter(f => f.severity === "medium").length;
+  const overallRisk  = highFlags > 0 ? "high" : mediumFlags > 0 ? "medium" : "low";
+
+  return res.json({
+    photoCount:   photos.length,
+    flagCount:    flags.length,
+    overallRisk,
+    flags,
+    photoResults: results,
+    recommendation: overallRisk === "high"
+      ? "Manual review required before accepting this submission."
+      : overallRisk === "medium"
+      ? "Review flagged items before finalising compliance certificate."
+      : "No significant integrity issues detected.",
+    validatedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /incident-report ─────────────────────────────────────────────────────
+// Generates a structured WorkSafe-style incident report document from a job
+// analysis + incident details. Returns JSON document ready for PDF generation.
+app.post("/incident-report", (req, res) => {
+  const {
+    jobType,
+    incidentType,
+    description,
+    location,
+    dateOccurred,
+    personsInvolved = [],
+    immediateActions = [],
+    complianceScore,
+    missingItems = [],
+    traderName,
+    licenceNumber,
+    reportedBy,
+  } = req.body || {};
+
+  if (!jobType || !incidentType || !description) {
+    return res.status(400).json({ error: "jobType, incidentType, and description are required." });
+  }
+
+  const INCIDENT_TYPES = {
+    "near-miss":        { severity: "medium", worksafeNotifiable: false, label: "Near Miss" },
+    "minor-injury":     { severity: "medium", worksafeNotifiable: false, label: "Minor Injury" },
+    "serious-injury":   { severity: "high",   worksafeNotifiable: true,  label: "Serious Injury" },
+    "dangerous-incident": { severity: "high", worksafeNotifiable: true,  label: "Dangerous Incident" },
+    "property-damage":  { severity: "low",    worksafeNotifiable: false, label: "Property Damage" },
+    "compliance-breach":{ severity: "medium", worksafeNotifiable: false, label: "Compliance Breach" },
+  };
+
+  const incidentMeta = INCIDENT_TYPES[incidentType] || { severity: "medium", worksafeNotifiable: false, label: incidentType };
+
+  // Determine contributing factors from missing compliance items
+  const contributingFactors = missingItems.map(item => ({
+    factor: item,
+    type:   "compliance-gap",
+    note:   "This item was flagged as missing from the compliance analysis.",
+  }));
+
+  if ((complianceScore || 100) < 60) {
+    contributingFactors.push({
+      factor: "Low overall compliance score",
+      type:   "systemic",
+      note:   `Job compliance score was ${complianceScore}% — below the 60% minimum threshold.`,
+    });
+  }
+
+  const report = {
+    reportVersion:   "1.0",
+    documentType:    "Incident Report",
+    jurisdiction:    "Victoria, Australia",
+    regulatoryRef:   "Occupational Health and Safety Act 2004 (Vic)",
+    generatedAt:     new Date().toISOString(),
+
+    incident: {
+      type:             incidentMeta.label,
+      severity:         incidentMeta.severity,
+      worksafeNotifiable: incidentMeta.worksafeNotifiable,
+      description:      description.trim(),
+      dateOccurred:     dateOccurred || null,
+      location:         location || null,
+    },
+
+    tradeContext: {
+      jobType,
+      complianceScore:  complianceScore || null,
+      traderName:       traderName || null,
+      licenceNumber:    licenceNumber || null,
+      missingItemCount: missingItems.length,
+    },
+
+    personsInvolved:     personsInvolved,
+    immediateActions:    immediateActions,
+    contributingFactors,
+
+    worksafeGuidance: incidentMeta.worksafeNotifiable
+      ? "This incident may be notifiable to WorkSafe Victoria. Notify within 1 hour (dangerous incidents) or as soon as practicable (serious injuries). Phone: 13 23 60."
+      : "This incident is not classified as notifiable. Retain records for 5 years as required by OHS Regulations 2017.",
+
+    reportedBy:          reportedBy || null,
+    status:              "draft",
+    platform:            "Elemetric AI Compliance Platform",
+  };
+
+  // Log to near-miss log if applicable
+  if (incidentType === "near-miss") {
+    nearMissLog.push({
+      id:          `NM-${Date.now()}`,
+      jobType,
+      description: description.substring(0, 200),
+      severity:    incidentMeta.severity,
+      location:    location || null,
+      loggedAt:    new Date().toISOString(),
+      source:      "incident-report-endpoint",
+    });
+    if (nearMissLog.length > 200) nearMissLog.splice(0, nearMissLog.length - 200);
+  }
+
+  return res.json(report);
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
