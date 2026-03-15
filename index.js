@@ -15985,6 +15985,286 @@ app.post("/ai-compliance-advice", apiKeyAuth, async (req, res) => {
   });
 });
 
+// ── Round 34 ──────────────────────────────────────────────────────────────────
+
+// POST /photo-report  — Generate a structured photo report from a set of annotated photos
+app.post("/photo-report", apiKeyAuth, (req, res) => {
+  const { jobId, jobType, contractorName, address, inspectionDate, photos, notes } = req.body;
+
+  if (!photos || !Array.isArray(photos) || photos.length === 0) {
+    return res.status(400).json({ error: "photos array is required." });
+  }
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+
+  const safeJobType    = sanitiseInput(String(jobType)).toLowerCase();
+  const safeContractor = sanitiseInput(String(contractorName || "Not specified"));
+  const safeAddress    = sanitiseInput(String(address || "Not specified"));
+  const safeDate       = sanitiseInput(String(inspectionDate || new Date().toISOString().slice(0, 10)));
+  const safeNotes      = sanitiseInput(String(notes || ""));
+
+  const STAGES = ["Before", "During", "After", "Defect", "Completed"];
+
+  const photoEntries = photos.slice(0, 30).map((p, i) => {
+    const stage = STAGES.includes(p.stage) ? p.stage : "Completed";
+    return {
+      photoNumber: i + 1,
+      stage,
+      caption:     p.caption     ? sanitiseInput(String(p.caption)).slice(0, 120)     : `Photo ${i + 1}`,
+      location:    p.location    ? sanitiseInput(String(p.location)).slice(0, 80)     : null,
+      complianceFlag: ["PASS", "FAIL", "UNCLEAR"].includes((p.complianceFlag || "").toUpperCase())
+        ? p.complianceFlag.toUpperCase() : "UNCLEAR",
+      timestamp:   p.timestamp || null,
+      gpsCoords:   p.gpsCoords  || null,
+    };
+  });
+
+  const passCount    = photoEntries.filter(p => p.complianceFlag === "PASS").length;
+  const failCount    = photoEntries.filter(p => p.complianceFlag === "FAIL").length;
+  const unclearCount = photoEntries.filter(p => p.complianceFlag === "UNCLEAR").length;
+
+  const byStage = STAGES.reduce((acc, stage) => {
+    const stagePhotos = photoEntries.filter(p => p.stage === stage);
+    if (stagePhotos.length > 0) acc[stage] = stagePhotos;
+    return acc;
+  }, {});
+
+  const overallStatus = failCount > 0 ? "FAIL" : unclearCount > 0 ? "REQUIRES_REVIEW" : "PASS";
+
+  return res.json({
+    reportId:        `PR-${Date.now().toString(36).toUpperCase()}`,
+    jobId:           jobId ? sanitiseInput(String(jobId)) : null,
+    jobType:         safeJobType,
+    contractorName:  safeContractor,
+    address:         safeAddress,
+    inspectionDate:  safeDate,
+    overallStatus,
+    photoCount:      photoEntries.length,
+    summary: { pass: passCount, fail: failCount, unclear: unclearCount },
+    byStage,
+    photos:          photoEntries,
+    notes:           safeNotes || null,
+    generatedAt:     new Date().toISOString(),
+  });
+});
+
+// POST /contractor-profile  — Create or update a contractor's profile
+app.post("/contractor-profile", apiKeyAuth, async (req, res) => {
+  const { contractorId, companyName, tradeTypes, licences, insuranceExpiry,
+          phone, email, address, abn, notes } = req.body;
+
+  if (!companyName || !tradeTypes || !Array.isArray(tradeTypes) || tradeTypes.length === 0) {
+    return res.status(400).json({ error: "companyName and tradeTypes array are required." });
+  }
+
+  const safeId      = contractorId ? sanitiseInput(String(contractorId)) : `CONT-${Date.now().toString(36).toUpperCase()}`;
+  const safeName    = sanitiseInput(String(companyName));
+  const safePhone   = sanitiseInput(String(phone || ""));
+  const safeEmail   = email && isValidEmail(email) ? email : null;
+  const safeAddress = sanitiseInput(String(address || ""));
+  const safeAbn     = sanitiseInput(String(abn || "")).replace(/\D/g, "");
+  const safeNotes   = sanitiseInput(String(notes || ""));
+  const trades      = tradeTypes.map(t => sanitiseInput(String(t)).toLowerCase()).slice(0, 6);
+
+  const now      = new Date();
+  const insExp   = insuranceExpiry ? new Date(insuranceExpiry) : null;
+  const insValid = insExp && !isNaN(insExp.getTime()) ? insExp > now : null;
+
+  // Validate ABN (simple 11-digit check)
+  const abnValid = safeAbn.length === 11;
+
+  const processedLicences = Array.isArray(licences)
+    ? licences.slice(0, 10).map(l => ({
+        licenceNumber: sanitiseInput(String(l.licenceNumber || "")),
+        tradeType:     sanitiseInput(String(l.tradeType || "")).toLowerCase(),
+        expiryDate:    l.expiryDate || null,
+        authority:     sanitiseInput(String(l.authority || "VBA")),
+      }))
+    : [];
+
+  const profile = {
+    contractorId:  safeId,
+    companyName:   safeName,
+    tradeTypes:    trades,
+    licences:      processedLicences,
+    insurance: {
+      expiryDate: insExp ? insExp.toISOString().slice(0, 10) : null,
+      current:    insValid,
+    },
+    contact: {
+      phone:   safePhone   || null,
+      email:   safeEmail,
+      address: safeAddress || null,
+    },
+    abn:       abnValid ? safeAbn : null,
+    abnValid,
+    notes:     safeNotes || null,
+    profileStatus: !insValid && insExp ? "INSURANCE_EXPIRED" : processedLicences.length === 0 ? "INCOMPLETE" : "ACTIVE",
+    updatedAt: now.toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("contractor_profiles").upsert({
+      contractor_id:     safeId,
+      company_name:      safeName,
+      trade_types:       trades,
+      abn:               abnValid ? safeAbn : null,
+      email:             safeEmail,
+      phone:             safePhone || null,
+      insurance_expiry:  insExp ? insExp.toISOString() : null,
+      profile_status:    profile.profileStatus,
+      updated_at:        now.toISOString(),
+    }, { onConflict: "contractor_id" });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...profile, saved });
+});
+
+// GET /contractor-profile/:contractorId  — Retrieve a contractor's profile
+app.get("/contractor-profile/:contractorId", apiKeyAuth, async (req, res) => {
+  const contractorId = sanitiseInput(String(req.params.contractorId || ""));
+  if (!contractorId) return res.status(400).json({ error: "contractorId is required." });
+
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  const { data, error } = await supabaseAdmin
+    .from("contractor_profiles")
+    .select("*")
+    .eq("contractor_id", contractorId)
+    .single();
+
+  if (error || !data) return res.status(404).json({ error: "Contractor profile not found." });
+
+  return res.json(data);
+});
+
+// POST /job-handover-checklist  — Generate a handover checklist for transferring a job to another contractor
+app.post("/job-handover-checklist", apiKeyAuth, (req, res) => {
+  const { jobId, jobType, fromContractor, toContractor, handoverDate,
+          workCompletedToDate, outstandingItems, permitsTransferred,
+          documentsHandedOver, siteAccessArranged, notes } = req.body;
+
+  if (!jobType || !fromContractor || !toContractor) {
+    return res.status(400).json({ error: "jobType, fromContractor, and toContractor are required." });
+  }
+
+  const safeJobType = sanitiseInput(String(jobType)).toLowerCase();
+  const safeFrom    = sanitiseInput(String(fromContractor));
+  const safeTo      = sanitiseInput(String(toContractor));
+  const safeDate    = sanitiseInput(String(handoverDate || new Date().toISOString().slice(0, 10)));
+
+  const completedItems  = Array.isArray(workCompletedToDate) ? workCompletedToDate.slice(0, 20).map(i => sanitiseInput(String(i))) : [];
+  const outstandingList = Array.isArray(outstandingItems)    ? outstandingItems.slice(0, 20).map(i => sanitiseInput(String(i)))    : [];
+
+  const standardChecks = [
+    { item: "Permits transferred or new application submitted", status: !!permitsTransferred ? "COMPLETE" : "REQUIRED" },
+    { item: "As-installed documentation provided",             status: documentsHandedOver  ? "COMPLETE" : "REQUIRED" },
+    { item: "Site access confirmed with client",               status: siteAccessArranged   ? "COMPLETE" : "REQUIRED" },
+    { item: "Compliance certificates for completed work provided", status: "REQUIRED" },
+    { item: "Materials on site itemised and valued",              status: "REQUIRED" },
+    { item: "Tools and equipment inventoried",                    status: "REQUIRED" },
+    { item: "Subcontractors notified of change",                  status: "REQUIRED" },
+    { item: "Insurance certificates exchanged",                   status: "REQUIRED" },
+  ];
+
+  const incompleteStandard = standardChecks.filter(c => c.status === "REQUIRED");
+
+  return res.json({
+    handoverId:        `HO-${Date.now().toString(36).toUpperCase()}`,
+    status:            incompleteStandard.length === 0 ? "COMPLETE" : "INCOMPLETE",
+    jobId:             jobId ? sanitiseInput(String(jobId)) : null,
+    jobType:           safeJobType,
+    fromContractor:    safeFrom,
+    toContractor:      safeTo,
+    handoverDate:      safeDate,
+    workCompletedToDate: completedItems,
+    outstandingItems:  outstandingList,
+    standardChecks,
+    incompleteItems:   incompleteStandard.map(c => c.item),
+    notes:             sanitiseInput(String(notes || "")),
+    warning:           incompleteStandard.length > 0
+      ? `${incompleteStandard.length} handover item${incompleteStandard.length !== 1 ? "s" : ""} are incomplete. Resolve before proceeding.`
+      : null,
+    generatedAt:       new Date().toISOString(),
+  });
+});
+
+// POST /after-hours-request  — Log and assess an after-hours / emergency call-out
+app.post("/after-hours-request", apiKeyAuth, (req, res) => {
+  const { jobType, requestTime, description, severity, address, contactName, contactPhone } = req.body;
+
+  if (!description || !jobType) {
+    return res.status(400).json({ error: "jobType and description are required." });
+  }
+
+  const safeJobType    = sanitiseInput(String(jobType)).toLowerCase();
+  const safeDesc       = sanitiseInput(String(description));
+  const safeAddress    = sanitiseInput(String(address || "Not specified"));
+  const safeContact    = sanitiseInput(String(contactName || "Client"));
+  const safePhone      = sanitiseInput(String(contactPhone || ""));
+  const safeSeverity   = sanitiseInput(String(severity || "medium")).toLowerCase();
+  const requestDateStr = sanitiseInput(String(requestTime || new Date().toISOString()));
+  const requestDate    = new Date(requestDateStr);
+
+  const hour   = isNaN(requestDate.getTime()) ? new Date().getHours() : requestDate.getHours();
+  const dayOfWeek = isNaN(requestDate.getTime()) ? new Date().getDay() : requestDate.getDay();
+  const isWeekend  = dayOfWeek === 0 || dayOfWeek === 6;
+  const isAfterHours = hour < 7 || hour >= 17;
+  const isPublicHoliday = false; // Would check against actual PH list
+
+  // After-hours rate multipliers (rough VIC award estimates)
+  const RATE_MULTIPLIERS = {
+    weeknight_after_hours: 1.5,
+    saturday:              1.5,
+    sunday:                2.0,
+    public_holiday:        2.5,
+    normal:                1.0,
+  };
+
+  let rateType;
+  if (isPublicHoliday)          rateType = "public_holiday";
+  else if (dayOfWeek === 0)     rateType = "sunday";
+  else if (dayOfWeek === 6)     rateType = "saturday";
+  else if (isAfterHours)        rateType = "weeknight_after_hours";
+  else                          rateType = "normal";
+
+  const rateMultiplier = RATE_MULTIPLIERS[rateType];
+  const baseRate       = (AWARD_RATES[safeJobType] && AWARD_RATES[safeJobType].ordinary) || 50;
+  const afterHoursRate = Math.round(baseRate * rateMultiplier * 100) / 100;
+
+  const EMERGENCY_INDICATORS = {
+    plumbing:   ["burst pipe", "flood", "no hot water", "gas leak", "blocked toilet", "overflow"],
+    gas:        ["gas leak", "smell gas", "no gas", "pilot out", "emergency"],
+    electrical: ["no power", "sparks", "burning", "shock", "trip", "emergency"],
+    drainage:   ["sewage overflow", "blocked drain", "basement flooding", "emergency"],
+    hvac:       ["no heating", "no cooling", "refrigerant leak", "emergency"],
+  };
+
+  const indicators   = EMERGENCY_INDICATORS[safeJobType] || [];
+  const isEmergency  = indicators.some(kw => safeDesc.toLowerCase().includes(kw)) || safeSeverity === "critical";
+
+  return res.json({
+    requestId:       `AH-${Date.now().toString(36).toUpperCase()}`,
+    jobType:         safeJobType,
+    isAfterHours:    isAfterHours || isWeekend || isPublicHoliday,
+    rateType,
+    rateMultiplier,
+    estimatedHourlyRate: afterHoursRate,
+    isEmergency,
+    severity:        safeSeverity.toUpperCase(),
+    description:     safeDesc,
+    address:         safeAddress,
+    contactName:     safeContact,
+    contactPhone:    safePhone || null,
+    advice:          isEmergency
+      ? "This appears to be an emergency. Respond immediately and document everything on arrival."
+      : "Schedule with client — standard after-hours rates apply.",
+    calloutNote:     "A call-out fee is billable in addition to the hourly rate. Always confirm rates with client before proceeding.",
+    recordedAt:      new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
