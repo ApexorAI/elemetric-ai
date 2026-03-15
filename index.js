@@ -42191,6 +42191,177 @@ Return JSON with:
   }
 });
 
+// POST /ai-building-code-lookup — AI looks up NCC/BCA requirements
+app.post("/ai-building-code-lookup", apiKeyAuth, async (req, res) => {
+  const {
+    query, buildingClass, state = "VIC", nccVersion = "2022",
+    element, applicationContext,
+  } = req.body;
+  if (!query) {
+    return res.status(400).json({ error: "query is required." });
+  }
+  const sanitisedQuery = sanitiseInput(query);
+  const sanitisedClass = sanitiseInput(buildingClass || "");
+  const sanitisedState = sanitiseInput(state);
+  const sanitisedElement = sanitiseInput(element || "");
+  const systemPrompt = `You are an Australian building code specialist with comprehensive knowledge of the National Construction Code (NCC) and Australian Standards. Provide accurate, referenced NCC guidance.`;
+  const userPrompt = `Answer this NCC/building code question:
+Query: ${sanitisedQuery}
+Building class: ${sanitisedClass || "Not specified"}
+State: ${sanitisedState}
+NCC version: ${nccVersion}
+Building element: ${sanitisedElement || "Not specified"}
+Application context: ${sanitiseInput(applicationContext || "")}
+
+Return JSON with:
+{
+  "question": "...",
+  "directAnswer": "...",
+  "nccReferences": [{"part": "...", "clause": "...", "description": "...", "requirement": "..."}],
+  "stateVariations": "...",
+  "linkedStandards": ["AS/NZS ...", "..."],
+  "performanceSolution": "...",
+  "deemedToSatisfyPath": "...",
+  "warningFlags": ["...", "..."],
+  "practicalGuidance": "...",
+  "disclaimer": "...",
+  "confidenceLevel": "HIGH|MEDIUM|LOW"
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ query: sanitisedQuery, buildingClass: sanitisedClass, state: sanitisedState, nccVersion, result });
+  } catch (err) {
+    console.error("ai-building-code-lookup error:", err.message);
+    res.json({
+      query: sanitisedQuery, buildingClass: sanitisedClass, state: sanitisedState, nccVersion,
+      result: {
+        question: sanitisedQuery,
+        directAnswer: "AI lookup unavailable. Please consult the NCC directly at ncc.abcb.gov.au",
+        nccReferences: [],
+        stateVariations: "Check state-specific variations at your state's building authority website.",
+        linkedStandards: [],
+        performanceSolution: "Consult a building certifier for performance solution pathway.",
+        deemedToSatisfyPath: "Review NCC deemed-to-satisfy provisions for your building class.",
+        warningFlags: ["Always verify NCC requirements with a qualified building certifier"],
+        practicalGuidance: "Engage a building designer or certifier for project-specific guidance.",
+        disclaimer: "This is AI-generated guidance only and does not constitute professional building or legal advice.",
+        confidenceLevel: "LOW",
+      },
+    });
+  }
+});
+
+// POST /ncc-compliance-check — Run a parametric NCC compliance check
+app.post("/ncc-compliance-check", apiKeyAuth, async (req, res) => {
+  const {
+    buildingClass, state = "VIC", floorAreaM2,
+    riseInStoreys = 1, effectiveHeight,
+    fireSprinklered = false, emergencyLighting = false,
+    accessibilityCertified = false, glazingCertified = false,
+    energyEfficiencyPath = "DTS",
+    slopeSite = false, bushfireAttackLevel,
+    proposedOccupancyLoad, ventilationProvided = false,
+    plumbingCompliant = false,
+  } = req.body;
+  if (!buildingClass) {
+    return res.status(400).json({ error: "buildingClass is required." });
+  }
+  const checks = [];
+  const bc = sanitiseInput(buildingClass).toUpperCase();
+  // NCC fire safety requirements (simplified)
+  const requiresSprinklers = (bc.startsWith("2") || bc.startsWith("3") || (bc.startsWith("5") && Number(riseInStoreys) > 3));
+  if (requiresSprinklers) {
+    checks.push({ requirement: "Fire sprinkler system", status: fireSprinklered ? "PASS" : "FAIL", note: "Required for this building class/height" });
+  }
+  // Emergency lighting
+  if (!["1A", "1B"].includes(bc)) {
+    checks.push({ requirement: "Emergency lighting", status: emergencyLighting ? "PASS" : "NEEDS_ASSESSMENT", note: "Required for most non-Class 1 buildings" });
+  }
+  // Accessibility — Class 5,6,7,8,9 typically require access
+  if (["5", "6", "7", "8", "9A", "9B", "9C"].some(c => bc.startsWith(c))) {
+    checks.push({ requirement: "Accessibility (DDA/BCA Part D3)", status: accessibilityCertified ? "PASS" : "NEEDS_ASSESSMENT", note: "Access and egress requirements apply" });
+  }
+  // Glazing
+  checks.push({ requirement: "Glazing (AS 1288)", status: glazingCertified ? "PASS" : "NEEDS_ASSESSMENT", note: "All glazing must comply with AS 1288" });
+  // Energy efficiency
+  checks.push({ requirement: `Energy efficiency (Section J, ${energyEfficiencyPath})`, status: "NEEDS_ASSESSMENT", note: "Requires energy assessment" });
+  // Bushfire
+  if (bushfireAttackLevel) {
+    checks.push({ requirement: `Bushfire construction (BAL: ${sanitiseInput(bushfireAttackLevel)})`, status: "NEEDS_ASSESSMENT", note: "AS 3959 compliance required" });
+  }
+  // Plumbing
+  checks.push({ requirement: "Plumbing (AS/NZS 3500)", status: plumbingCompliant ? "PASS" : "NEEDS_ASSESSMENT", note: "Plumbing must comply with AS/NZS 3500" });
+  const failCount = checks.filter(c => c.status === "FAIL").length;
+  const overallResult = failCount > 0 ? "NON_COMPLIANT" : checks.some(c => c.status === "NEEDS_ASSESSMENT") ? "ASSESSMENT_REQUIRED" : "LIKELY_COMPLIANT";
+  const checkRef = `NCC-${Date.now().toString(36).toUpperCase()}`;
+  res.json({
+    checkRef, buildingClass: bc, state, riseInStoreys, overallResult,
+    failCount, assessmentRequired: checks.filter(c => c.status === "NEEDS_ASSESSMENT").length,
+    checks,
+    disclaimer: "This is a high-level parametric check only. Engage a qualified building certifier for formal NCC compliance assessment.",
+  });
+});
+
+// POST /planning-permit-checklist — Generate a planning permit application checklist
+app.post("/planning-permit-checklist", apiKeyAuth, async (req, res) => {
+  const {
+    projectType, state = "VIC", lga, zoning,
+    proposedUse, floorAreaM2, buildingHeight,
+    newBuilding = true, demolitionRequired = false,
+    heritageOverlay = false, floodZone = false, bushfireZone = false,
+    vegetationProtected = false, subdivisionRequired = false,
+  } = req.body;
+  if (!projectType || !state) {
+    return res.status(400).json({ error: "projectType and state are required." });
+  }
+  const sanitisedType = sanitiseInput(projectType);
+  const sanitisedState = sanitiseInput(state);
+  const sanitisedLga = sanitiseInput(lga || "");
+  const sanitisedZoning = sanitiseInput(zoning || "");
+  // Build checklist items
+  const requiredDocuments = [
+    { item: "Completed planning permit application form", mandatory: true, notes: "Available from council or planning.vic.gov.au" },
+    { item: "Application fee", mandatory: true, notes: "Fee schedule varies by council — confirm with LGA" },
+    { item: "Certificate of Title (current within 3 months)", mandatory: true, notes: "" },
+    { item: "Copy of Plan of Subdivision (if applicable)", mandatory: subdivisionRequired, notes: "" },
+    { item: "Written description of the proposal", mandatory: true, notes: "" },
+    { item: "Site analysis plan", mandatory: newBuilding, notes: "Shows existing conditions, setbacks, orientation, neighbouring properties" },
+    { item: "Architectural plans (site plan, floor plans, elevations)", mandatory: newBuilding, notes: "Drawn to scale, dimensioned" },
+    { item: "Shadow diagrams", mandatory: floorAreaM2 > 200 || Number(buildingHeight) > 9, notes: "Often required for larger developments" },
+    { item: "Materials and finishes schedule", mandatory: newBuilding, notes: "" },
+    { item: "Heritage impact statement", mandatory: heritageOverlay, notes: "Required if Heritage Overlay applies" },
+    { item: "Bushfire Management Statement", mandatory: bushfireZone, notes: "Required in Bushfire Management Overlay areas" },
+    { item: "Flood impact assessment", mandatory: floodZone, notes: "Required in flood overlay zones" },
+    { item: "Vegetation assessment", mandatory: vegetationProtected, notes: "Required if vegetation removal is proposed" },
+    { item: "Demolition plan and waste management plan", mandatory: demolitionRequired, notes: "" },
+    { item: "WSUD plan (water sensitive urban design)", mandatory: sanitisedState === "VIC" && newBuilding, notes: "Required in Victoria for new developments" },
+  ].filter(d => d.mandatory);
+  const checklistRef = `PPC-${Date.now().toString(36).toUpperCase()}`;
+  res.json({
+    checklistRef, projectType: sanitisedType, state: sanitisedState, lga: sanitisedLga, zoning: sanitisedZoning,
+    documentCount: requiredDocuments.length,
+    specialOverlays: { heritage: heritageOverlay, flood: floodZone, bushfire: bushfireZone, vegetation: vegetationProtected },
+    requiredDocuments,
+    processNotes: [
+      "Engage a town planner for complex applications",
+      "Pre-application consultation with council is recommended",
+      "Standard processing time is 60 days from lodgement",
+      "Third-party objection period applies for most applications",
+    ],
+    feeNote: "Application fees depend on the estimated cost of development — confirm with council.",
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
