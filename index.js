@@ -48041,6 +48041,298 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /scaffolding-erection-record — Log a scaffolding erection and inspection record
+app.post("/scaffolding-erection-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, siteAddress,
+    scaffoldRef, scaffoldType, scaffoldClass,
+    locationDescription, heightM, lengthM, bayCount,
+    erectionStartDate, erectionCompletedDate,
+    scaffolderName, scaffolderLicence, scaffolderCompany,
+    supervisorName, supervisorLicence,
+    designRequired, designProvidedBy, designRef,
+    // Inspection checks
+    foundationsAdequate, standardsVertical, ledgersHorizontal,
+    transomsFitted, soleBoarsFitted, baseJacksAdjusted,
+    guardrailsInstalled, guardrailHeightMm, midRailsInstalled,
+    toeboardsInstalled, toeboardHeightMm,
+    planksSecure, planksOverlap, planksFlush,
+    accessLaddersInstalled, laddersSecure, ladderExtensionOk,
+    tiesInstalledPerDesign, catchNetInstalled,
+    loadsNotExceeded, overloadingRisk,
+    nonCompliances, notes,
+  } = req.body;
+
+  if (!projectId || !scaffoldRef || !scaffoldType || !erectionCompletedDate || !scaffolderName) {
+    return res.status(400).json({ error: "projectId, scaffoldRef, scaffoldType, erectionCompletedDate, and scaffolderName are required." });
+  }
+
+  const sanitisedRef = sanitiseInput(scaffoldRef, 60);
+  const sanitisedScaffolder = sanitiseInput(scaffolderName, 120);
+
+  // AS/NZS 4576 minimum guardrail heights
+  const MIN_GUARDRAIL_HEIGHT_MM = 900;
+  const MIN_TOEBOARD_HEIGHT_MM = 150;
+
+  const failures = [];
+
+  // Foundation and structure
+  if (foundationsAdequate === false) failures.push("Foundations not adequate — assess bearing capacity before loading.");
+  if (standardsVertical === false) failures.push("Standards not plumb — check and correct plumb before use.");
+  if (ledgersHorizontal === false) failures.push("Ledgers not level — rectify before handover.");
+  if (!soleBoarsFitted && heightM > 3) failures.push("Sole boards not fitted — required on soft or uneven ground.");
+
+  // Guardrails
+  if (!guardrailsInstalled) failures.push("Guardrails not installed (required for working platforms above 2m per WHS Regulations 2017 r.78).");
+  if (guardrailsInstalled && guardrailHeightMm && Number(guardrailHeightMm) < MIN_GUARDRAIL_HEIGHT_MM) {
+    failures.push(`Guardrail height ${guardrailHeightMm}mm < ${MIN_GUARDRAIL_HEIGHT_MM}mm minimum (AS/NZS 4576 clause 4.7).`);
+  }
+  if (!midRailsInstalled && guardrailsInstalled) failures.push("Mid-rails not installed (AS/NZS 4576 clause 4.7).");
+  if (!toeboardsInstalled) failures.push("Toeboards not installed — required to prevent objects falling.");
+  if (toeboardsInstalled && toeboardHeightMm && Number(toeboardHeightMm) < MIN_TOEBOARD_HEIGHT_MM) {
+    failures.push(`Toeboard height ${toeboardHeightMm}mm < ${MIN_TOEBOARD_HEIGHT_MM}mm minimum.`);
+  }
+
+  // Platforms
+  if (planksSecure === false) failures.push("Scaffold planks not secured — fix before use.");
+  if (planksOverlap === false) failures.push("Plank overlap insufficient — minimum 150mm required.");
+
+  // Access
+  if (accessLaddersInstalled === false) failures.push("Access ladders not installed.");
+  if (laddersSecure === false) failures.push("Ladders not secured at top and bottom.");
+
+  // Ties
+  if (tiesInstalledPerDesign === false) failures.push("Ties not installed as per design — do not exceed tie-free height.");
+
+  // Overloading
+  if (overloadingRisk) failures.push("Overloading risk identified — display load rating and briefing required.");
+
+  // Design requirement check (high scaffolds > 4m require design in Vic)
+  const designRequired_calc = (heightM || 0) > 4 || scaffoldClass === "SPECIAL";
+  if (designRequired_calc && !designProvidedBy) {
+    failures.push("Scaffold design required for height > 4m or Special Class — engage a competent engineer.");
+  }
+
+  // Additional non-compliances
+  const addlNC = (nonCompliances || []).map(n => sanitiseInput(String(n), 200)).slice(0, 10);
+  const allFailures = [...failures, ...addlNC];
+  const inspectionResult = allFailures.length === 0 ? "PASS" : "FAIL";
+  const handoverStatus = inspectionResult === "PASS" ? "READY_FOR_HANDOVER" : "HOLD_RECTIFY_FIRST";
+
+  const ref = `SCAF-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectName: sanitiseInput(projectName || "", 200),
+    siteAddress: sanitiseInput(siteAddress || "", 300),
+    scaffold: {
+      ref: sanitisedRef,
+      type: sanitiseInput(scaffoldType, 60),
+      class: sanitiseInput(scaffoldClass || "STANDARD", 30),
+      location: sanitiseInput(locationDescription || "", 200),
+      heightM: heightM || null,
+      lengthM: lengthM || null,
+      bayCount: bayCount || null,
+    },
+    erection: {
+      startDate: erectionStartDate || null,
+      completedDate: erectionCompletedDate,
+      scaffolderName: sanitisedScaffolder,
+      scaffolderLicence: sanitiseInput(scaffolderLicence || "", 60),
+      scaffolderCompany: sanitiseInput(scaffolderCompany || "", 150),
+      supervisorName: sanitiseInput(supervisorName || "", 120),
+      supervisorLicence: sanitiseInput(supervisorLicence || "", 60),
+    },
+    design: {
+      required: designRequired || designRequired_calc,
+      providedBy: sanitiseInput(designProvidedBy || "", 120),
+      ref: sanitiseInput(designRef || "", 60),
+    },
+    inspectionResult,
+    allFailures,
+    handoverStatus,
+    handoverSignedBy: null,
+    handoverSignedAt: null,
+    handoverNotes: null,
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("scaffolding_erection_records").insert(record);
+      if (error) console.error("Scaffolding record insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Scaffolding record DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    scaffoldRef: sanitisedRef,
+    inspectionResult,
+    handoverStatus,
+    failureCount: allFailures.length,
+    failures: allFailures,
+    designRequired: designRequired || designRequired_calc,
+    message: inspectionResult === "PASS"
+      ? `Scaffolding ${sanitisedRef} passed inspection — ${handoverStatus}.`
+      : `Scaffolding ${sanitisedRef} inspection FAILED — ${allFailures.length} issue(s) must be rectified before handover.`,
+    saved,
+    record,
+  });
+});
+
+// PATCH /scaffolding-erection-record/:ref/handover — Sign off scaffold handover to user
+app.patch("/scaffolding-erection-record/:ref/handover", apiKeyAuth, async (req, res) => {
+  const { ref: scaffRef } = req.params;
+  const { signedBy, organisation, notes } = req.body;
+
+  if (!signedBy) return res.status(400).json({ error: "signedBy is required." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  try {
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("scaffolding_erection_records")
+      .select("inspectionResult, handoverStatus")
+      .eq("ref", sanitiseInput(scaffRef, 60))
+      .single();
+
+    if (fetchErr || !existing) return res.status(404).json({ error: "Scaffolding record not found." });
+
+    if (existing.inspectionResult !== "PASS") {
+      return res.status(422).json({ error: "Cannot sign off handover — scaffolding inspection has not passed. Rectify failures first." });
+    }
+
+    const { error: updateErr } = await supabaseAdmin
+      .from("scaffolding_erection_records")
+      .update({
+        handoverStatus: "HANDED_OVER",
+        handoverSignedBy: sanitiseInput(signedBy, 120),
+        handoverSignedAt: new Date().toISOString(),
+        handoverNotes: sanitiseInput(notes || "", 300),
+      })
+      .eq("ref", sanitiseInput(scaffRef, 60));
+
+    if (updateErr) throw updateErr;
+
+    return res.json({
+      success: true,
+      ref: scaffRef,
+      handoverStatus: "HANDED_OVER",
+      handoverSignedBy: sanitiseInput(signedBy, 120),
+      handoverSignedAt: new Date().toISOString(),
+      message: `Scaffolding ${scaffRef} handed over to ${sanitiseInput(organisation || signedBy, 100)} — authorised for use.`,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to sign off handover.", detail: e.message });
+  }
+});
+
+// POST /ai-scaffolding-risk-assessment — AI assesses scaffolding safety risks
+app.post("/ai-scaffolding-risk-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    scaffoldType, scaffoldClass, heightM, adjacentToPublic,
+    loadClass, siteConditions, weatherExposure,
+    specialHazards, worksAbove, notes,
+  } = req.body;
+
+  if (!scaffoldType || !heightM) {
+    return res.status(400).json({ error: "scaffoldType and heightM are required." });
+  }
+
+  const sanitisedType = sanitiseInput(scaffoldType, 80);
+  const sanitisedHazards = Array.isArray(specialHazards)
+    ? specialHazards.map(h => sanitiseInput(String(h), 100)).slice(0, 10)
+    : [];
+
+  const prompt = `You are a scaffolding safety expert in Victoria, Australia with expertise in AS/NZS 4576, WHS Regulations 2017, and the Code of Practice for Scaffolding.
+
+Assess the risks for the following scaffold:
+- Type: ${sanitisedType}
+- Class: ${sanitiseInput(scaffoldClass || "Not specified", 30)}
+- Height: ${heightM}m
+- Adjacent to public: ${adjacentToPublic ? "Yes" : "No"}
+- Load class: ${sanitiseInput(loadClass || "Not specified", 30)}
+- Site conditions: ${sanitiseInput(siteConditions || "Standard", 100)}
+- Weather exposure: ${sanitiseInput(weatherExposure || "Standard", 60)}
+- Special hazards: ${sanitisedHazards.join(", ") || "None"}
+- Works above: ${sanitiseInput(worksAbove || "None", 100)}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Respond ONLY with a JSON object:
+{
+  "riskLevel": "LOW|MEDIUM|HIGH|CRITICAL",
+  "designRequired": boolean,
+  "loadClassRecommended": string,
+  "keyRisks": [{"risk": string, "control": string, "priority": "IMMEDIATE|HIGH|MEDIUM|LOW"}],
+  "inspectionFrequency": string,
+  "publicProtectionRequired": boolean,
+  "publicProtectionMeasures": [string],
+  "competencyRequirements": [string],
+  "weatherRestrictions": [string],
+  "regulatoryNotes": [string],
+  "summary": string (2 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      scaffoldType: sanitisedType,
+      heightM,
+      riskLevel: parsed.riskLevel || "MEDIUM",
+      designRequired: parsed.designRequired ?? (Number(heightM) > 4),
+      loadClassRecommended: parsed.loadClassRecommended || "",
+      keyRisks: parsed.keyRisks || [],
+      inspectionFrequency: parsed.inspectionFrequency || "Before first use, then daily or after adverse weather",
+      publicProtectionRequired: parsed.publicProtectionRequired ?? !!adjacentToPublic,
+      publicProtectionMeasures: parsed.publicProtectionMeasures || [],
+      competencyRequirements: parsed.competencyRequirements || [],
+      weatherRestrictions: parsed.weatherRestrictions || [],
+      regulatoryNotes: parsed.regulatoryNotes || [],
+      summary: parsed.summary || "Scaffolding risk assessment complete.",
+    });
+  } catch (e) {
+    console.error("AI scaffolding risk error:", e.message);
+    const h = Number(heightM);
+    return res.json({
+      success: true,
+      scaffoldType: sanitisedType,
+      heightM,
+      riskLevel: h > 10 ? "HIGH" : h > 4 ? "MEDIUM" : "LOW",
+      designRequired: h > 4,
+      loadClassRecommended: h > 10 ? "Class 3+ (design required)" : "Class 1–2 for light work",
+      keyRisks: [
+        { risk: "Fall of person from scaffold", control: "Guardrails ≥ 900mm, mid-rails, toeboards, and inspected access ladders", priority: "IMMEDIATE" },
+        { risk: "Collapse of scaffold structure", control: "Inspect ties and bracing after adverse weather; engage licensed scaffolder", priority: "HIGH" },
+        { risk: "Falling objects", control: "Toeboards, catch nets or overhead protection if pedestrians below", priority: adjacentToPublic ? "IMMEDIATE" : "HIGH" },
+      ],
+      inspectionFrequency: "Before first use, after any modification, after severe weather, and at regular intervals not exceeding 30 days",
+      publicProtectionRequired: !!adjacentToPublic,
+      publicProtectionMeasures: adjacentToPublic ? ["Hoarding or containment netting at public boundary", "Signage warning of overhead works", "Designated pedestrian bypass route"] : [],
+      competencyRequirements: h > 4 ? ["Licensed scaffolder for erection/dismantling", "Supervisor to hold scaffolding competency card"] : ["Competent person to erect/inspect low-level scaffold"],
+      weatherRestrictions: ["Do not use scaffold when wind speed exceeds 45 km/h", "Inspect after rainfall for ground stability issues"],
+      regulatoryNotes: ["WHS Regulations 2017 reg.79 — scaffolding over 4m requires design by competent person", "AS/NZS 4576 applies to all scaffolding in Australia"],
+      summary: "Standard scaffolding risk controls apply. Ensure licensed scaffolder erects all scaffold over 4m and conduct daily inspections.",
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
