@@ -50430,6 +50430,382 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /crane-lift-plan — Create a crane lift plan (AS 2550, WHS Regulations 2017)
+app.post("/crane-lift-plan", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, liftDate, liftRef,
+    craneType, craneModel, craneSWLtonne, craneRegistrationNumber,
+    operatorName, operatorLicenceNumber, operatorLicenceClass,
+    riggerName, riggerLicence, dogmanName, dogmanLicence,
+    loadDescription, loadWeightKg, loadDimensionsM,
+    liftHeightM, liftRadiusM, maximumLiftCapacityPercent,
+    hookLoadKg, slingsAndRigging,
+    // Pre-lift checks
+    groundConditionsSuitable, craneLevelBearing, outriggersDeployed,
+    radiusVerified, loadWeightVerified, riggingInspected,
+    exclusionZoneEstablished, communicationsConfirmed, signallerPresent,
+    nearOPL, oplClearanceM, nearStructures,
+    windSpeedMs, maxAllowableWindMs,
+    criticalLift, engineeringDesignRequired,
+    liftPlanApprovedBy, notes,
+  } = req.body;
+
+  if (!projectId || !liftDate || !craneType || !loadWeightKg || !operatorName) {
+    return res.status(400).json({ error: "projectId, liftDate, craneType, loadWeightKg, and operatorName are required." });
+  }
+
+  const sanitisedCraneType = sanitiseInput(craneType, 80);
+  const sanitisedOperator = sanitiseInput(operatorName, 120);
+  const loadWeightKgNum = Number(loadWeightKg);
+  const craneSWLNum = craneSWLtonne ? Number(craneSWLtonne) * 1000 : null;
+
+  // Lift capacity calculation
+  const hookLoad = hookLoadKg ? Number(hookLoadKg) : loadWeightKgNum * 1.05; // approximate with rigging allowance
+  const liftCapacityPercent = craneSWLNum ? Math.round((hookLoad / craneSWLNum) * 100) : null;
+
+  // Determine if critical lift (AS 2550 — typically > 75% SWL, near OPL, tandem, suspended loads with persons)
+  const isCriticalLift = criticalLift || (liftCapacityPercent !== null && liftCapacityPercent >= 75) || nearOPL;
+  const requiresEngineeringDesign = engineeringDesignRequired || isCriticalLift;
+
+  const failures = [];
+  const criticalFailures = [];
+
+  if (craneSWLNum && hookLoad > craneSWLNum) {
+    criticalFailures.push(`Hook load ${Math.round(hookLoad)}kg EXCEEDS crane SWL of ${craneSWLNum}kg — lift MUST NOT proceed.`);
+  } else if (liftCapacityPercent !== null && liftCapacityPercent >= 90) {
+    failures.push(`Hook load is ${liftCapacityPercent}% of crane SWL — critical lift threshold exceeded. Engineering assessment and supervisor approval required.`);
+  }
+
+  if (!groundConditionsSuitable) failures.push("Ground conditions not suitable for crane — conduct bearing capacity assessment.");
+  if (!outriggersDeployed && ["MOBILE", "TRUCK", "ALL_TERRAIN"].some(t => (craneType || "").toUpperCase().includes(t))) {
+    failures.push("Outriggers not deployed — all outriggers must be fully extended and on solid bearing.");
+  }
+  if (!riggingInspected) failures.push("Rigging not inspected — slings, shackles, and hooks must be inspected before use.");
+  if (!exclusionZoneEstablished) failures.push("Exclusion zone not established — no-go zone required under and adjacent to lift.");
+  if (!communicationsConfirmed) failures.push("Communications not confirmed — crane operator and rigger/dogman must confirm signals before lift.");
+
+  if (nearOPL) {
+    if (!oplClearanceM || Number(oplClearanceM) < 3) {
+      criticalFailures.push("Crane operation near OPL with insufficient clearance — contact electricity network provider before any lift near OPL.");
+    }
+  }
+
+  const windSpeed = windSpeedMs !== undefined ? Number(windSpeedMs) : null;
+  const maxWind = maxAllowableWindMs || 10; // AS 2550 — typically manufacturer's limit
+  if (windSpeed !== null && windSpeed > maxWind) {
+    criticalFailures.push(`Wind speed ${windSpeed} m/s exceeds maximum ${maxWind} m/s — lift MUST NOT proceed.`);
+  }
+
+  const allCritical = criticalFailures;
+  const allFailures = failures;
+  const canProceedWithLift = allCritical.length === 0;
+
+  const ref = `LFT-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectName: sanitiseInput(projectName || "", 200),
+    liftDate,
+    liftRef: sanitiseInput(liftRef || ref, 60),
+    crane: {
+      type: sanitisedCraneType,
+      model: sanitiseInput(craneModel || "", 100),
+      swlTonne: craneSWLtonne || null,
+      registrationNumber: sanitiseInput(craneRegistrationNumber || "", 60),
+    },
+    personnel: {
+      operator: { name: sanitisedOperator, licence: sanitiseInput(operatorLicenceNumber || "", 60), class: sanitiseInput(operatorLicenceClass || "", 20) },
+      rigger: { name: sanitiseInput(riggerName || "", 120), licence: sanitiseInput(riggerLicence || "", 60) },
+      dogman: { name: sanitiseInput(dogmanName || "", 120), licence: sanitiseInput(dogmanLicence || "", 60) },
+    },
+    load: {
+      description: sanitiseInput(loadDescription || "", 200),
+      weightKg: loadWeightKgNum,
+      dimensionsM: sanitiseInput(loadDimensionsM || "", 60),
+    },
+    liftParameters: {
+      liftHeightM: liftHeightM || null,
+      liftRadiusM: liftRadiusM || null,
+      hookLoadKg: Math.round(hookLoad),
+      liftCapacityPercent,
+    },
+    rigging: (slingsAndRigging || []).map(s => ({
+      type: sanitiseInput(String(s.type || s), 60),
+      wllTonne: s.wllTonne || null,
+      length: s.length || null,
+      inspected: s.inspected ?? null,
+    })).slice(0, 10),
+    preLiftChecks: {
+      groundConditionsSuitable: !!groundConditionsSuitable,
+      craneLevelBearing: craneLevelBearing ?? null,
+      outriggersDeployed: outriggersDeployed ?? null,
+      radiusVerified: !!radiusVerified,
+      loadWeightVerified: !!loadWeightVerified,
+      riggingInspected: !!riggingInspected,
+      exclusionZoneEstablished: !!exclusionZoneEstablished,
+      communicationsConfirmed: !!communicationsConfirmed,
+      signallerPresent: !!signallerPresent,
+      windSpeedMs: windSpeed,
+      maxAllowableWindMs: maxWind,
+    },
+    siteHazards: { nearOPL: !!nearOPL, oplClearanceM: oplClearanceM || null, nearStructures: !!nearStructures },
+    isCriticalLift,
+    requiresEngineeringDesign,
+    canProceedWithLift,
+    criticalFailures: allCritical,
+    failures: allFailures,
+    liftPlanApprovedBy: sanitiseInput(liftPlanApprovedBy || "", 120),
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("crane_lift_plans").insert(record);
+      if (error) console.error("Lift plan insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Lift plan DB error:", e.message);
+    }
+  }
+
+  return res.status(canProceedWithLift ? 201 : 422).json({
+    success: canProceedWithLift,
+    ref,
+    isCriticalLift,
+    liftCapacityPercent,
+    canProceedWithLift,
+    criticalFailures: allCritical,
+    failures: allFailures,
+    message: !canProceedWithLift
+      ? `LIFT HOLD — ${allCritical[0]}`
+      : isCriticalLift
+        ? `CRITICAL LIFT plan ${ref} recorded — extra controls required. ${liftCapacityPercent ? `${liftCapacityPercent}% of SWL.` : ""}`
+        : `Lift plan ${ref} recorded. ${allFailures.length > 0 ? `${allFailures.length} item(s) require attention.` : "Ready for lift."}`,
+    saved,
+    record,
+  });
+});
+
+// POST /lifting-equipment-register — Register and log inspection of lifting equipment
+app.post("/lifting-equipment-register", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, itemType, itemDescription, manufacturer, serialNumber,
+    wllKg, swlKg, proofLoadKg, certificateNumber,
+    lastInspectionDate, nextInspectionDate, inspectedBy,
+    conditionRating, defectsFound, defectDetails,
+    retiredFromService, notes,
+  } = req.body;
+
+  if (!projectId || !itemType || !wllKg) {
+    return res.status(400).json({ error: "projectId, itemType, and wllKg are required." });
+  }
+
+  const validItemTypes = ["CHAIN_SLING", "WIRE_ROPE_SLING", "WEBBING_SLING", "ROUND_SLING", "SHACKLE", "HOOK", "SPREADER_BAR", "BEAM_CLAMP", "EYE_BOLT", "TURNBUCKLE", "SWIVEL", "LIFTING_BEAM", "CRANE_BLOCK", "OTHER"];
+  const resolvedType = validItemTypes.find(t => t.includes((itemType || "").toUpperCase().replace(/ /g, "_"))) || sanitiseInput(itemType, 60);
+
+  const validConditions = ["GOOD", "FAIR", "POOR", "CONDEMN"];
+  const resolvedCondition = validConditions.includes((conditionRating || "").toUpperCase()) ? conditionRating.toUpperCase() : "GOOD";
+
+  const failures = [];
+  if (resolvedCondition === "CONDEMN" || defectsFound) {
+    failures.push(`Item in ${resolvedCondition} condition — remove from service immediately. ${defectDetails ? sanitiseInput(defectDetails, 200) : "Defects found."}`);
+  }
+  if (resolvedCondition === "POOR") {
+    failures.push("Item in POOR condition — requires close monitoring or replacement.");
+  }
+  if (retiredFromService) failures.push("Item retired from service — do not use.");
+
+  // Check overdue inspection (quarterly for most lifting gear per AS 4991)
+  let overdueDays = null;
+  let inspectionWarning = null;
+  if (nextInspectionDate) {
+    overdueDays = Math.ceil((new Date() - new Date(nextInspectionDate)) / (1000 * 60 * 60 * 24));
+    if (overdueDays > 0) {
+      inspectionWarning = `Inspection overdue by ${overdueDays} day(s) — remove from service until re-inspected.`;
+      failures.push(inspectionWarning);
+    } else if (overdueDays > -14) {
+      inspectionWarning = `Inspection due in ${Math.abs(overdueDays)} day(s) — arrange inspection soon.`;
+    }
+  }
+
+  const safeToUse = failures.length === 0 && !retiredFromService;
+
+  const ref = `LIFT-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    itemType: resolvedType,
+    itemDescription: sanitiseInput(itemDescription || "", 200),
+    manufacturer: sanitiseInput(manufacturer || "", 100),
+    serialNumber: sanitiseInput(serialNumber || "", 60),
+    ratings: {
+      wllKg: Number(wllKg),
+      swlKg: swlKg ? Number(swlKg) : null,
+      proofLoadKg: proofLoadKg ? Number(proofLoadKg) : null,
+    },
+    certificateNumber: sanitiseInput(certificateNumber || "", 60),
+    inspection: {
+      lastDate: lastInspectionDate || null,
+      nextDate: nextInspectionDate || null,
+      inspectedBy: sanitiseInput(inspectedBy || "", 120),
+      overdueDays: overdueDays || null,
+    },
+    condition: {
+      rating: resolvedCondition,
+      defectsFound: !!defectsFound,
+      defectDetails: sanitiseInput(defectDetails || "", 200),
+    },
+    retiredFromService: !!retiredFromService,
+    safeToUse,
+    failures,
+    inspectionWarning,
+    notes: sanitiseInput(notes || "", 300),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("lifting_equipment_register").insert(record);
+      if (error) console.error("Lifting equipment insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Lifting equipment DB error:", e.message);
+    }
+  }
+
+  return res.status(safeToUse ? 201 : 422).json({
+    success: safeToUse,
+    ref,
+    itemType: resolvedType,
+    wllKg: Number(wllKg),
+    conditionRating: resolvedCondition,
+    safeToUse,
+    failures,
+    inspectionWarning,
+    message: !safeToUse
+      ? `REMOVE FROM SERVICE — ${failures[0]}`
+      : `Lifting equipment ${ref} registered — WLL: ${wllKg}kg, condition: ${resolvedCondition}.`,
+    saved,
+    record,
+  });
+});
+
+// POST /ai-crane-lift-risk — AI assesses crane lift risks and generates key requirements
+app.post("/ai-crane-lift-risk", apiKeyAuth, async (req, res) => {
+  const {
+    craneType, loadWeightKg, liftHeightM, liftRadiusM,
+    loadShape, siteConstraints, undergroundServices,
+    nearOPL, nearBuildings, weatherConditions, liftType, notes,
+  } = req.body;
+
+  if (!craneType || !loadWeightKg) {
+    return res.status(400).json({ error: "craneType and loadWeightKg are required." });
+  }
+
+  const sanitisedCraneType = sanitiseInput(craneType, 80);
+  const sanitisedConstraints = Array.isArray(siteConstraints)
+    ? siteConstraints.map(c => sanitiseInput(String(c), 100)).slice(0, 8)
+    : [];
+
+  const prompt = `You are a crane and lifting operations safety specialist with expertise in AS 2550 and WHS Regulations 2017 (Victoria).
+
+Assess the lifting risks for:
+- Crane type: ${sanitisedCraneType}
+- Load weight: ${loadWeightKg}kg
+- Lift height: ${liftHeightM ? `${liftHeightM}m` : "Not specified"}
+- Lift radius: ${liftRadiusM ? `${liftRadiusM}m` : "Not specified"}
+- Load shape/characteristics: ${sanitiseInput(loadShape || "Standard", 80)}
+- Site constraints: ${sanitisedConstraints.join(", ") || "None specified"}
+- Underground services: ${undergroundServices ? "Yes" : "No"}
+- Near overhead power lines: ${nearOPL ? "Yes" : "No"}
+- Near buildings/structures: ${nearBuildings ? "Yes" : "No"}
+- Weather conditions: ${sanitiseInput(weatherConditions || "Fine", 40)}
+- Lift type: ${sanitiseInput(liftType || "Standard", 60)}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Respond ONLY with a JSON object:
+{
+  "liftCategory": "ROUTINE|CRITICAL|COMPLEX",
+  "riskLevel": "LOW|MEDIUM|HIGH|CRITICAL",
+  "criticalLiftThreshold": boolean,
+  "liftPlanRequired": boolean,
+  "engineerRequired": boolean,
+  "keyRisks": [{"risk": string, "control": string}],
+  "riggingRequirements": [string],
+  "groundRequirements": [string],
+  "exclusionZoneRecommendation": string,
+  "communicationsPlan": [string],
+  "weatherLimitations": [string],
+  "specialEquipment": [string],
+  "regulatoryRequirements": [string],
+  "summary": string (2 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      craneType: sanitisedCraneType,
+      loadWeightKg: Number(loadWeightKg),
+      liftCategory: parsed.liftCategory || "ROUTINE",
+      riskLevel: parsed.riskLevel || "MEDIUM",
+      criticalLiftThreshold: parsed.criticalLiftThreshold ?? false,
+      liftPlanRequired: parsed.liftPlanRequired ?? true,
+      engineerRequired: parsed.engineerRequired ?? false,
+      keyRisks: parsed.keyRisks || [],
+      riggingRequirements: parsed.riggingRequirements || [],
+      groundRequirements: parsed.groundRequirements || [],
+      exclusionZoneRecommendation: parsed.exclusionZoneRecommendation || "",
+      communicationsPlan: parsed.communicationsPlan || [],
+      weatherLimitations: parsed.weatherLimitations || [],
+      specialEquipment: parsed.specialEquipment || [],
+      regulatoryRequirements: parsed.regulatoryRequirements || [],
+      summary: parsed.summary || "Crane lift risk assessment complete.",
+    });
+  } catch (e) {
+    console.error("AI crane lift risk error:", e.message);
+    return res.json({
+      success: true,
+      craneType: sanitisedCraneType,
+      loadWeightKg: Number(loadWeightKg),
+      liftCategory: nearOPL ? "CRITICAL" : Number(loadWeightKg) > 10000 ? "COMPLEX" : "ROUTINE",
+      riskLevel: nearOPL ? "CRITICAL" : "MEDIUM",
+      criticalLiftThreshold: false,
+      liftPlanRequired: true,
+      engineerRequired: nearOPL || Number(loadWeightKg) > 50000,
+      keyRisks: [
+        { risk: "Overloading crane", control: "Verify load weight and confirm within crane chart for radius and height" },
+        { risk: "Crane overturning", control: "Deploy outriggers on solid ground; verify ground bearing capacity" },
+        { risk: "Load swing", control: "Use taglines, limit wind speed, ensure clear lift path" },
+        ...(nearOPL ? [{ risk: "Contact with overhead power lines", control: "Contact electricity network owner; establish 3m minimum clearance; spotter required" }] : []),
+      ],
+      riggingRequirements: ["Slings and rigging selected for load weight and geometry", "All lifting gear inspected and certified", "Rigging arranged to maintain load balance"],
+      groundRequirements: ["Outrigger pads on all extends", "Ground bearing capacity confirmed > 100 kPa for crane outriggers"],
+      exclusionZoneRecommendation: "Exclusion zone extending beyond maximum working radius + 1.5m on all sides",
+      communicationsPlan: ["Confirm radio channels before lift", "Hand signals agreed between operator and dogman", "Only one signaller to give commands to operator"],
+      weatherLimitations: ["Maximum wind speed 10 m/s (36 km/h) unless crane chart specifies lower", "Do not lift in thunder/lightning"],
+      specialEquipment: ["Outrigger mats for soft ground", "Taglines for load control"],
+      regulatoryRequirements: ["AS 2550.1 — Cranes, hoists and winches", "WHS Regulations 2017 reg.221 — crane operator must hold appropriate licence", "Lift plan required for all lifts"],
+      summary: "Standard crane lift safety requirements apply. A lift plan is required before commencing. Ensure ground conditions and crane configuration are verified.",
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
