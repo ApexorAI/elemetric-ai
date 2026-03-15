@@ -57843,6 +57843,268 @@ app.post("/material-approval", apiKeyAuth, async (req, res) => {
   }
 });
 
+// POST /shop-drawing-register — Record a shop drawing / submittal for review and approval
+app.post("/shop-drawing-register", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      drawingRef,
+      revision,
+      title,
+      discipline,
+      preparedBy,
+      submittedDate,
+      requiredByDate,
+      specificationRef,
+      drawingCategory,
+      relatedPurchaseOrder,
+      reviewedBy,
+      reviewDate,
+      reviewResult,
+      comments,
+      resubmissionRequired,
+      resubmissionDate,
+      approvedBy,
+      approvalDate,
+      approvalStatus,
+      constructionUse,
+      asBuiltRequired,
+      asBuiltSubmitted,
+      notes,
+    } = req.body;
+
+    if (!projectId || !drawingRef || !title || !submittedDate || !discipline) {
+      return res.status(400).json({ error: "projectId, drawingRef, title, submittedDate, and discipline are required" });
+    }
+
+    const flags = [];
+    if (reviewResult === "REJECTED" || approvalStatus === "REJECTED") flags.push(`Shop drawing ${drawingRef} rejected — resubmission required before fabrication/construction can proceed`);
+    if (requiredByDate) {
+      const today = new Date();
+      const due = new Date(requiredByDate);
+      const daysRemaining = Math.floor((due - today) / 86400000);
+      if (daysRemaining < 0 && !["APPROVED", "APPROVED WITH COMMENTS"].includes(String(approvalStatus || "").toUpperCase())) {
+        flags.push(`Shop drawing ${drawingRef} approval overdue by ${Math.abs(daysRemaining)} day(s)`);
+      }
+    }
+    if (constructionUse && !["APPROVED", "APPROVED WITH COMMENTS", "APPROVED FOR CONSTRUCTION"].includes(String(approvalStatus || "").toUpperCase())) {
+      flags.push("Drawing in use for construction but not yet approved — unapproved shop drawings must not be used for construction");
+    }
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      drawing_ref: sanitiseInput(drawingRef),
+      revision: sanitiseInput(String(revision || "A")),
+      title: sanitiseInput(title),
+      discipline: sanitiseInput(discipline),
+      prepared_by: sanitiseInput(preparedBy || ""),
+      submitted_date: submittedDate,
+      required_by_date: requiredByDate || null,
+      specification_ref: sanitiseInput(specificationRef || ""),
+      drawing_category: sanitiseInput(drawingCategory || ""),
+      related_purchase_order: sanitiseInput(relatedPurchaseOrder || ""),
+      reviewed_by: sanitiseInput(reviewedBy || ""),
+      review_date: reviewDate || null,
+      review_result: sanitiseInput(reviewResult || ""),
+      comments: sanitiseInput(comments || ""),
+      resubmission_required: !!resubmissionRequired,
+      resubmission_date: resubmissionDate || null,
+      approved_by: sanitiseInput(approvedBy || ""),
+      approval_date: approvalDate || null,
+      approval_status: sanitiseInput(approvalStatus || "PENDING"),
+      construction_use: !!constructionUse,
+      as_built_required: !!asBuiltRequired,
+      as_built_submitted: !!asBuiltSubmitted,
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("shop_drawing_register").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({ drawingRef, revision: record.revision, approvalStatus: record.approval_status, flags, record, saved });
+  } catch (err) {
+    console.error("/shop-drawing-register error:", err.message);
+    res.status(500).json({ error: "Failed to register shop drawing" });
+  }
+});
+
+// POST /safety-walk-record — Record a safety leadership walk / gemba walk
+app.post("/safety-walk-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      walkRef,
+      date,
+      conductor,
+      conductorRole,
+      participants,
+      areasInspected,
+      duration,
+      positiveObservations,
+      safetyIssuesObserved,
+      issueDetails,
+      engagementTopics,
+      workerFeedback,
+      ppeCompliance,
+      hskCompliance,
+      swmsCompliance,
+      immediateActionsOnWalk,
+      actionItems,
+      overallImpression,
+      followUpRequired,
+      nextWalkDate,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !conductor || !areasInspected) {
+      return res.status(400).json({ error: "projectId, date, conductor, and areasInspected are required" });
+    }
+
+    const flags = [];
+    if (Array.isArray(safetyIssuesObserved) && safetyIssuesObserved.length > 0) {
+      flags.push(`${safetyIssuesObserved.length} safety issue(s) observed during walk — assign corrective actions and track to close-out`);
+    }
+    if (!ppeCompliance) flags.push("PPE non-compliance observed — conduct targeted PPE toolbox talk and monitor compliance");
+    if (!swmsCompliance) flags.push("SWMS compliance issues observed — review SWMS with workers and update if scope has changed");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      walk_ref: sanitiseInput(walkRef || `SW-${Date.now()}`),
+      date,
+      conductor: sanitiseInput(conductor),
+      conductor_role: sanitiseInput(conductorRole || ""),
+      participants: Array.isArray(participants) ? participants.map(p => sanitiseInput(p)) : [],
+      areas_inspected: sanitiseInput(areasInspected),
+      duration: sanitiseInput(duration || ""),
+      positive_observations: sanitiseInput(positiveObservations || ""),
+      safety_issues_observed: Array.isArray(safetyIssuesObserved) ? safetyIssuesObserved.map(i => sanitiseInput(i)) : [],
+      issue_details: sanitiseInput(issueDetails || ""),
+      engagement_topics: sanitiseInput(engagementTopics || ""),
+      worker_feedback: sanitiseInput(workerFeedback || ""),
+      ppe_compliance: !!ppeCompliance,
+      hsk_compliance: !!hskCompliance,
+      swms_compliance: !!swmsCompliance,
+      immediate_actions_on_walk: sanitiseInput(immediateActionsOnWalk || ""),
+      action_items: Array.isArray(actionItems) ? actionItems.map(a => sanitiseInput(a)) : [],
+      overall_impression: sanitiseInput(overallImpression || ""),
+      follow_up_required: !!followUpRequired,
+      next_walk_date: nextWalkDate || null,
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("safety_walk_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({ walkRef: record.walk_ref, issueCount: (safetyIssuesObserved || []).length, flags, record, saved });
+  } catch (err) {
+    console.error("/safety-walk-record error:", err.message);
+    res.status(500).json({ error: "Failed to record safety walk" });
+  }
+});
+
+// POST /ai-contract-risk-assessment — AI assesses construction contract risk and key obligations
+app.post("/ai-contract-risk-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      contractType,
+      projectValue,
+      contractDuration,
+      ownerType,
+      keyRisks,
+      contractConditions,
+      paymentTerms,
+      retentionPercent,
+      liquidatedDamages,
+      extensionOfTimeProvisions,
+      variationRights,
+      disputeResolution,
+      securityAmount,
+    } = req.body;
+
+    if (!contractType || !projectValue) {
+      return res.status(400).json({ error: "contractType and projectValue are required" });
+    }
+
+    const prompt = `You are a construction contract lawyer and project manager with expertise in Victorian construction contracts, SOPA Victoria, DBI Act 1995, and Australian Standard contract forms (AS 4000, AS 4902, HIA, MBA).
+
+Assess contract risk for:
+- Contract type: ${sanitiseInput(contractType)}
+- Project value: ${sanitiseInput(String(projectValue))}
+- Duration: ${sanitiseInput(contractDuration || "not specified")}
+- Owner type: ${sanitiseInput(ownerType || "private")}
+- Key risks identified: ${sanitiseInput(keyRisks || "not specified")}
+- Contract conditions: ${sanitiseInput(contractConditions || "Australian Standard")}
+- Payment terms: ${sanitiseInput(paymentTerms || "monthly progress claims")}
+- Retention: ${sanitiseInput(String(retentionPercent || "5"))}%
+- Liquidated damages: ${sanitiseInput(liquidatedDamages || "not specified")}
+- Extension of time provisions: ${sanitiseInput(extensionOfTimeProvisions || "standard")}
+- Variation rights: ${sanitiseInput(variationRights || "standard")}
+- Dispute resolution: ${sanitiseInput(disputeResolution || "adjudication/arbitration")}
+- Security: ${sanitiseInput(securityAmount || "not specified")}
+
+Return a JSON object with:
+{
+  "riskRating": "LOW|MEDIUM|HIGH|EXTREME",
+  "keyContractRisks": [string],
+  "sopaObligations": string,
+  "paymentRisks": string,
+  "timeRisks": string,
+  "variationRisks": string,
+  "securityObligations": string,
+  "disputeResolutionAdvice": string,
+  "onusOfProofIssues": string,
+  "recommendedContracts": [string],
+  "preContractActions": [string],
+  "applicableLegislation": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ contractType, projectValue, assessment });
+  } catch (err) {
+    console.error("/ai-contract-risk-assessment error:", err.message);
+    res.json({
+      contractType: req.body.contractType || "",
+      projectValue: req.body.projectValue || "",
+      assessment: {
+        riskRating: "HIGH",
+        keyContractRisks: ["Payment timing and SOPA compliance", "Extension of time conditions precedent", "Variation valuation disputes", "Back charges and set-offs"],
+        sopaObligations: "Payment claims must be served under SOPA Victoria by the reference date. Payment schedule must be given within 10 business days. Adjudication available if schedule not given or disputed amount not paid.",
+        paymentRisks: "Ensure all payment claims include the magic words 'This is a payment claim made under the Building and Construction Industry Security of Payment Act 2002'. Retain copies of all delivery dockets, labour records, and subcontractor invoices.",
+        timeRisks: "Extension of time claims must typically be submitted within 14–28 days of the event. Late submissions may be time-barred. Document all delay events contemporaneously.",
+        variationRisks: "Most contracts require written instruction before performing variations. Oral instructions should be confirmed in writing immediately. Preserve right to payment for variations under SOPA even if written instruction missing.",
+        securityObligations: "Performance security bonds must be maintained for the required period. Check return of retention and security obligations on practical completion and end of defects liability period.",
+        disputeResolutionAdvice: "SOPA adjudication is available for payment disputes within strict timeframes. For broader disputes, exhaust contract dispute resolution steps before proceeding to court or arbitration.",
+        onusOfProofIssues: "Contractor bears onus to demonstrate entitlement to payment, time extensions, and variations. Document all costs and delays with contemporaneous records.",
+        recommendedContracts: ["AS 4000-1997 General Conditions of Contract", "AS 4902-2000 General Conditions of Contract for Design and Construct", "MBA/HIA for domestic building", "ABIC for architect-administered contracts"],
+        preContractActions: ["Review and negotiate onerous clauses before signing", "Ensure payment terms comply with SOPA", "Confirm insurance requirements and arrange cover", "Engage solicitor for contracts above $500K"],
+        applicableLegislation: ["Building and Construction Industry Security of Payment Act 2002 (Vic)", "Domestic Building Contracts Act 1995 (Vic)", "Australian Consumer Law", "Sale of Land Act 1962 (Vic)"],
+        recommendation: "Obtain legal advice before signing contracts above $100K. Establish systems for timely payment claim submission, variation tracking, and delay documentation from day one.",
+        summary: "Construction contract risk is elevated by complex time, payment, and variation provisions. Strict compliance with SOPA Victoria notice periods and contemporaneous record-keeping are essential to protect your entitlements.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
