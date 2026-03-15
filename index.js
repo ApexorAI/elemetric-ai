@@ -23908,6 +23908,199 @@ app.post("/confined-space-entry", apiKeyAuth, async (req, res) => {
   return res.status(201).json({ ...record, saved: !!supabaseAdmin });
 });
 
+// POST /warranty-register  — Register warranty details for completed work
+app.post("/warranty-register", apiKeyAuth, async (req, res) => {
+  const { jobId, contractorId, clientName, clientEmail, jobType, workDescription, startDate, warrantyYears, exclusions, notes } = req.body || {};
+  if (!jobId || !contractorId || !warrantyYears) return res.status(400).json({ error: "jobId, contractorId, and warrantyYears required." });
+
+  const safeJobId   = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeCId     = sanitiseInput(String(contractorId)).slice(0, 80);
+  const safeName    = clientName ? sanitiseInput(String(clientName)).slice(0, 100) : null;
+  const safeEmail   = clientEmail && isValidEmail(clientEmail) ? clientEmail.toLowerCase() : null;
+  const safeType    = jobType ? sanitiseInput(String(jobType)).toLowerCase().slice(0, 40) : null;
+  const safeDesc    = workDescription ? sanitiseInput(String(workDescription)).slice(0, 500) : null;
+  const years       = Math.min(25, Math.max(0, parseFloat(warrantyYears) || 1));
+  const safeExcl    = exclusions ? sanitiseInput(String(exclusions)).slice(0, 500) : null;
+  const safeNotes   = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const warrantyStart = startDate ? sanitiseInput(String(startDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const expiryDate    = new Date(warrantyStart);
+  expiryDate.setFullYear(expiryDate.getFullYear() + Math.floor(years));
+
+  const record = {
+    warrantyId: `WRN-${safeJobId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    jobId: safeJobId, contractorId: safeCId,
+    clientName: safeName, clientEmail: safeEmail,
+    jobType: safeType, workDescription: safeDesc,
+    warrantyStart, warrantyYears: years,
+    warrantyExpiry: expiryDate.toISOString().split("T")[0],
+    exclusions: safeExcl, notes: safeNotes,
+    status: "ACTIVE",
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("warranty_register").insert({
+        warranty_id: record.warrantyId, job_id: safeJobId, contractor_id: safeCId,
+        client_name: safeName, client_email: safeEmail, job_type: safeType,
+        work_description: safeDesc, warranty_start: warrantyStart, warranty_years: years,
+        warranty_expiry: record.warrantyExpiry, exclusions: safeExcl, notes: safeNotes,
+        status: "ACTIVE", created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// GET /warranty-register/:contractorId  — Get all warranties for a contractor
+app.get("/warranty-register/:contractorId", apiKeyAuth, async (req, res) => {
+  const contractorId = sanitiseInput(String(req.params.contractorId || "")).slice(0, 80);
+  const status       = req.query.status ? sanitiseInput(String(req.query.status)).toUpperCase() : null;
+  if (!contractorId) return res.status(400).json({ error: "contractorId required." });
+
+  let warranties = [];
+  if (supabaseAdmin) {
+    try {
+      let q = supabaseAdmin.from("warranty_register").select("*").eq("contractor_id", contractorId).order("warranty_expiry", { ascending: true }).limit(100);
+      if (status) q = q.eq("status", status);
+      const { data } = await q;
+      warranties = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const now = new Date().toISOString().split("T")[0];
+  const expiredCount = warranties.filter(w => w.warranty_expiry < now).length;
+  const activeCount  = warranties.filter(w => w.warranty_expiry >= now).length;
+
+  return res.json({ contractorId, total: warranties.length, active: activeCount, expired: expiredCount, warranties, generatedAt: new Date().toISOString() });
+});
+
+// POST /insurance-register  — Log insurance policies for a contractor
+app.post("/insurance-register", apiKeyAuth, async (req, res) => {
+  const { contractorId, policies = [] } = req.body || {};
+  if (!contractorId || !Array.isArray(policies) || policies.length === 0) return res.status(400).json({ error: "contractorId and policies array required." });
+
+  const POLICY_TYPES = ["public-liability", "professional-indemnity", "workers-compensation", "tool-and-equipment", "income-protection", "contract-works", "other"];
+  const safeCId = sanitiseInput(String(contractorId)).slice(0, 80);
+
+  const stored = policies.slice(0, 20).map(p => ({
+    policyType:   POLICY_TYPES.includes(String(p.policyType || "").toLowerCase().replace(/ /g, "-")) ? String(p.policyType).toLowerCase().replace(/ /g, "-") : "other",
+    insurer:      sanitiseInput(String(p.insurer || "")).slice(0, 100),
+    policyNumber: p.policyNumber ? sanitiseInput(String(p.policyNumber)).slice(0, 80) : null,
+    coverAmount:  p.coverAmount ? Math.max(0, parseFloat(p.coverAmount) || 0) : null,
+    expiryDate:   p.expiryDate ? sanitiseInput(String(p.expiryDate)).slice(0, 20) : null,
+    notes:        p.notes ? sanitiseInput(String(p.notes)).slice(0, 200) : null,
+  }));
+
+  const now = new Date().toISOString().split("T")[0];
+  const expiredPolicies = stored.filter(p => p.expiryDate && p.expiryDate < now);
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("insurance_register").upsert(
+        stored.map(p => ({ contractor_id: safeCId, ...p, updated_at: new Date().toISOString() })),
+        { onConflict: "contractor_id,policy_type" }
+      );
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.json({
+    contractorId: safeCId, policiesStored: stored.length,
+    expiredCount: expiredPolicies.length,
+    warnings: expiredPolicies.map(p => `${p.policyType} expired ${p.expiryDate}`),
+    policies: stored, savedAt: new Date().toISOString(),
+  });
+});
+
+// GET /insurance-register/:contractorId  — Get insurance policies and expiry status
+app.get("/insurance-register/:contractorId", apiKeyAuth, async (req, res) => {
+  const contractorId = sanitiseInput(String(req.params.contractorId || "")).slice(0, 80);
+  if (!contractorId) return res.status(400).json({ error: "contractorId required." });
+
+  let policies = [];
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin.from("insurance_register").select("*").eq("contractor_id", contractorId).order("expiry_date", { ascending: true }).limit(20);
+      policies = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const now = new Date();
+  const enriched = policies.map(p => {
+    const expired  = p.expiry_date && new Date(p.expiry_date) < now;
+    const daysLeft = p.expiry_date ? Math.round((new Date(p.expiry_date) - now) / 86400000) : null;
+    return { ...p, expired, daysLeft, urgency: daysLeft !== null && daysLeft < 30 ? "URGENT" : daysLeft !== null && daysLeft < 60 ? "SOON" : "OK" };
+  });
+
+  const REQUIRED_TYPES = ["public-liability", "workers-compensation"];
+  const missing = REQUIRED_TYPES.filter(t => !enriched.some(p => p.policy_type === t));
+
+  return res.json({ contractorId, totalPolicies: enriched.length, expired: enriched.filter(p => p.expired).length, missingRequiredTypes: missing, policies: enriched, generatedAt: new Date().toISOString() });
+});
+
+// POST /ai-variation-assess  — AI assesses whether a scope variation is reasonable
+app.post("/ai-variation-assess", apiKeyAuth, async (req, res) => {
+  const { jobType, originalScope, variationDescription, additionalCost, additionalDays, reason } = req.body || {};
+  if (!jobType || !originalScope || !variationDescription) return res.status(400).json({ error: "jobType, originalScope, and variationDescription required." });
+
+  const safeType   = sanitiseInput(String(jobType)).slice(0, 40);
+  const safeOrig   = sanitiseInput(String(originalScope)).slice(0, 1500);
+  const safeVar    = sanitiseInput(String(variationDescription)).slice(0, 1500);
+  const safeReason = reason ? sanitiseInput(String(reason)).slice(0, 500) : null;
+  const safeCost   = additionalCost ? Math.max(0, parseFloat(additionalCost) || 0) : null;
+  const safeDays   = additionalDays ? Math.max(0, parseFloat(additionalDays) || 0) : null;
+
+  const prompt = `You are a construction contract expert in Victoria, Australia.
+
+Assess the following scope variation for a ${safeType} job:
+
+Original scope: ${safeOrig}
+Proposed variation: ${safeVar}
+${safeReason ? `Reason: ${safeReason}` : ""}
+${safeCost ? `Additional cost: $${safeCost.toLocaleString()}` : ""}
+${safeDays ? `Additional days: ${safeDays}` : ""}
+
+Assess in JSON:
+{
+  "verdict": "REASONABLE|QUESTIONABLE|UNREASONABLE",
+  "reasonableness": 0-100,
+  "assessment": "1-2 sentence assessment",
+  "redFlags": ["flag1", ...],
+  "clientAdvice": "advice for the client",
+  "contractorAdvice": "advice for the contractor",
+  "priceCheck": "commentary on the cost if provided"
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 500 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      jobType: safeType, additionalCost: safeCost, additionalDays: safeDays,
+      verdict:           parsed.verdict || "QUESTIONABLE",
+      reasonableness:    typeof parsed.reasonableness === "number" ? parsed.reasonableness : 50,
+      assessment:        parsed.assessment || "",
+      redFlags:          Array.isArray(parsed.redFlags) ? parsed.redFlags : [],
+      clientAdvice:      parsed.clientAdvice || "",
+      contractorAdvice:  parsed.contractorAdvice || "",
+      priceCheck:        parsed.priceCheck || null,
+      disclaimer: "This is an AI assessment only. Seek legal advice for significant variations.",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      jobType: safeType, verdict: "QUESTIONABLE", reasonableness: 50,
+      assessment: "Variation assessment temporarily unavailable.",
+      redFlags: [], clientAdvice: "Obtain written documentation for all variations.", contractorAdvice: "Ensure variation is approved in writing before proceeding.",
+      priceCheck: null,
+      disclaimer: "This is an AI assessment only. Seek legal advice for significant variations.",
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
