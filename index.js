@@ -13714,6 +13714,348 @@ app.post("/cost-estimate-breakdown", apiKeyAuth, (req, res) => {
   });
 });
 
+// ── Round 26 ──────────────────────────────────────────────────────────────────
+
+// POST /photo-annotation  — Return annotation suggestions for a compliance photo set
+app.post("/photo-annotation", apiKeyAuth, async (req, res) => {
+  const { jobType, photos, analysisId } = req.body;
+  if (!photos || !Array.isArray(photos) || photos.length === 0) {
+    return res.status(400).json({ error: "photos array is required." });
+  }
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+
+  const safeJobType = sanitiseInput(String(jobType)).toLowerCase();
+
+  const ANNOTATION_PROMPTS = {
+    plumbing:   "Label each photo with: pipe type, fitting type, inspection access point, isolation valve location, and any visible compliance items or defects.",
+    gas:        "Label each photo with: gas appliance type, regulator location, isolation valve, ventilation details, and any visible gas compliance items.",
+    electrical: "Label each photo with: circuit breaker/MCB labels, RCD location, cable types, earthing details, and any visible electrical compliance items.",
+    drainage:   "Label each photo with: drain type, gradient direction, cleanout access, pipe material, and any visible drainage defects.",
+    carpentry:  "Label each photo with: member sizes, fixing types, bracing locations, load path, and any visible structural compliance items.",
+    hvac:       "Label each photo with: unit model, refrigerant type, condensate drain path, electrical disconnect, and any visible HVAC compliance items.",
+  };
+
+  const systemPrompt = `You are a Victorian trade compliance inspector reviewing job site photos for documentation purposes. ${ANNOTATION_PROMPTS[safeJobType] || "Label visible compliance items and defects."}
+
+For each photo, return a JSON object with:
+- "photoIndex": number (1-based)
+- "suggestedCaption": a short description (max 15 words)
+- "annotations": array of { "label": string, "detail": string }
+- "complianceFlag": "PASS" | "FAIL" | "UNCLEAR"
+- "requiredAction": string or null
+
+Return a JSON array. No markdown.`;
+
+  const imageMessages = photos.slice(0, 8).map((p, i) => ({
+    type: "image_url",
+    image_url: { url: p.dataUrl || p.url, detail: "low" },
+  }));
+
+  let annotations = [];
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: [
+          { type: "text", text: `Annotate these ${photos.length} photo(s) for a ${safeJobType} compliance job.` },
+          ...imageMessages,
+        ]},
+      ],
+      max_tokens: 1200,
+      response_format: { type: "json_object" },
+    });
+    const raw = JSON.parse(aiRes.choices[0].message.content);
+    annotations = Array.isArray(raw) ? raw : (raw.annotations || raw.photos || []);
+  } catch {
+    annotations = photos.slice(0, 8).map((_, i) => ({
+      photoIndex: i + 1,
+      suggestedCaption: `${safeJobType} compliance photo ${i + 1}`,
+      annotations: [{ label: "Inspection required", detail: "Manual review needed" }],
+      complianceFlag: "UNCLEAR",
+      requiredAction: null,
+    }));
+  }
+
+  return res.json({
+    jobType: safeJobType,
+    analysisId: analysisId || null,
+    photoCount: photos.length,
+    annotations,
+    exportHint: "Use these captions and labels when uploading photos to your compliance report or insurance claim.",
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /handover-sms  — Generate a templated handover SMS message for a job
+app.post("/handover-sms", apiKeyAuth, (req, res) => {
+  const { jobType, contractorName, clientFirstName, address, completionDate,
+          complianceScore, certificateFiled, callbackNumber, language } = req.body;
+
+  if (!contractorName || !clientFirstName) {
+    return res.status(400).json({ error: "contractorName and clientFirstName are required." });
+  }
+
+  const safeName       = sanitiseInput(String(contractorName));
+  const safeClient     = sanitiseInput(String(clientFirstName));
+  const safeAddress    = sanitiseInput(String(address || "your property"));
+  const safeCallback   = sanitiseInput(String(callbackNumber || ""));
+  const safeJobType    = sanitiseInput(String(jobType || "trade")).toLowerCase();
+  const safeDate       = sanitiseInput(String(completionDate || new Date().toISOString().slice(0, 10)));
+  const certStatus     = certificateFiled ? "Certificate of Compliance has been filed." : "Cert of Compliance will be filed within 5 business days.";
+  const scoreNote      = complianceScore ? ` Compliance score: ${complianceScore}/100.` : "";
+  const callbackNote   = safeCallback ? ` Questions? Call ${safeCallback}.` : "";
+
+  const lang = sanitiseInput(String(language || "en")).toLowerCase();
+
+  let message;
+  if (lang === "vi") {
+    message = `Xin chào ${safeClient}, ${safeName} đã hoàn thành công việc ${safeJobType} tại ${safeAddress} vào ngày ${safeDate}. ${certStatus}${scoreNote}${callbackNote} Cảm ơn bạn đã tin tưởng chúng tôi.`;
+  } else {
+    message = `Hi ${safeClient}, ${safeName} has completed your ${safeJobType} work at ${safeAddress} on ${safeDate}. ${certStatus}${scoreNote}${callbackNote} Thank you for your business.`;
+  }
+
+  const charCount = message.length;
+  const smsSegments = Math.ceil(charCount / 160);
+
+  return res.json({
+    message,
+    charCount,
+    smsSegments,
+    language: lang,
+    note: smsSegments > 1 ? "This message will be sent as a multi-part SMS." : "Single SMS segment.",
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// GET /trade-standards/:jobType  — List all key Australian Standards for a trade
+app.get("/trade-standards/:jobType", apiKeyAuth, (req, res) => {
+  const TRADE_STANDARDS = {
+    plumbing: [
+      { code: "AS/NZS 3500",     title: "Plumbing and Drainage",           scope: "National plumbing and drainage standard, Parts 0–5" },
+      { code: "AS/NZS 4020",     title: "Testing of products for use in contact with drinking water", scope: "Material suitability" },
+      { code: "AS/NZS 3718",     title: "Water supply — Tapware",          scope: "Compliance marking and testing" },
+      { code: "AS 1668.2",       title: "Mechanical ventilation for acceptable indoor-air quality", scope: "Bathroom/laundry ventilation" },
+      { code: "NCC/BCA Plumbing Code", title: "National Construction Code Volume 3", scope: "Regulatory framework" },
+    ],
+    gas: [
+      { code: "AS/NZS 5601.1",   title: "Gas installations — Part 1: General installations", scope: "All Type A gas appliance installations" },
+      { code: "AS 4575",         title: "Servicing Type A gas appliances", scope: "Appliance servicing requirements" },
+      { code: "AS/NZS 1596",     title: "LP Gas — Storage and handling",  scope: "LPG cylinder and tank requirements" },
+      { code: "AS 4041",         title: "Pressure piping",                 scope: "Gas piping above 200 kPa" },
+      { code: "AG 601",          title: "AGA certification for gas appliances", scope: "Appliance approval marking" },
+    ],
+    electrical: [
+      { code: "AS/NZS 3000",     title: "Wiring Rules",                    scope: "All Australian electrical installations" },
+      { code: "AS/NZS 3001",     title: "Electrical installations — Caravans and movable premises", scope: "Caravan parks and RVs" },
+      { code: "AS/NZS 3008.1",   title: "Electrical installations — Selection of cables", scope: "Cable sizing and selection" },
+      { code: "AS/NZS 61008",    title: "Residual current devices",        scope: "RCD type and testing requirements" },
+      { code: "AS/NZS 3017",     title: "Electrical installations — Verification guidelines", scope: "Testing and verification" },
+      { code: "AS/NZS 4836",     title: "Safe working on low-voltage electrical installations", scope: "Electrical safety procedures" },
+    ],
+    drainage: [
+      { code: "AS/NZS 3500.2",   title: "Sanitary plumbing and drainage", scope: "Drainage gradient, materials, inspection" },
+      { code: "AS/NZS 3500.3",   title: "Stormwater drainage",            scope: "Stormwater system requirements" },
+      { code: "AS 1289",         title: "Methods of testing soils",        scope: "Soil compaction for drainage trenches" },
+      { code: "AS 1260",         title: "PVC-U pipes and fittings",        scope: "Drainage pipe material standards" },
+      { code: "EN 1610",         title: "Construction and testing of drains", scope: "International reference for CCTV inspection" },
+    ],
+    carpentry: [
+      { code: "AS 1684",         title: "Residential timber-framed construction", scope: "Timber framing for class 1 and 10 buildings" },
+      { code: "AS 4440",         title: "Installation of nailplated timber roof trusses", scope: "Truss installation requirements" },
+      { code: "AS 4055",         title: "Wind loads for housing",          scope: "Structural wind classification" },
+      { code: "AS/NZS 1748",     title: "Timber — Mechanically stress graded", scope: "Timber grading marks" },
+      { code: "NCC/BCA Volume 2", title: "National Construction Code — Class 1 and 10 buildings", scope: "Residential building code" },
+    ],
+    hvac: [
+      { code: "AS/NZS 1677",     title: "Refrigerating systems",          scope: "Design, construction and installation of RAC systems" },
+      { code: "AS/NZS 3000",     title: "Wiring Rules",                    scope: "Electrical connections for HVAC systems" },
+      { code: "AS 1668.1",       title: "Fire and smoke control in multi-compartment buildings", scope: "HVAC fire dampers" },
+      { code: "AS 1668.2",       title: "Mechanical ventilation",         scope: "Fresh air requirements and ventilation rates" },
+      { code: "AS/NZS 4776",     title: "Heat pump water heaters",        scope: "HPWH installation requirements" },
+      { code: "ARCtick Code",    title: "ARC Refrigerant Handling Code",  scope: "Refrigerant recovery and handling" },
+    ],
+  };
+
+  const safeJobType = sanitiseInput(String(req.params.jobType || "")).toLowerCase();
+  const standards = TRADE_STANDARDS[safeJobType];
+
+  if (!standards) {
+    return res.status(404).json({
+      error: `No standards found for trade: ${safeJobType}`,
+      availableTrades: Object.keys(TRADE_STANDARDS),
+    });
+  }
+
+  return res.json({
+    jobType: safeJobType,
+    standards,
+    count: standards.length,
+    note: "Standards current as of 2025. Always verify the current edition at standards.org.au.",
+  });
+});
+
+// POST /invoice-line-items  — Generate invoice line items from a job record
+app.post("/invoice-line-items", apiKeyAuth, (req, res) => {
+  const { jobType, workItems, hours, travelTime, calloutFee, materialsCost,
+          complexity, applyGst, discount } = req.body;
+
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+
+  const safeJobType  = sanitiseInput(String(jobType)).toLowerCase();
+  const rateTable    = AWARD_RATES[safeJobType] || AWARD_RATES.plumbing;
+  const baseRate     = (rateTable && rateTable.ordinary) ? rateTable.ordinary : 45;
+
+  const COMPLEXITY_MULT = { simple: 1.0, medium: 1.2, complex: 1.5, "very complex": 1.8 };
+  const mult  = COMPLEXITY_MULT[sanitiseInput(String(complexity || "medium")).toLowerCase()] || 1.2;
+  const rate  = Math.round(baseRate * mult * 100) / 100;
+
+  const lineItems = [];
+  let subtotal = 0;
+
+  if (calloutFee && parseFloat(calloutFee) > 0) {
+    const fee = parseFloat(calloutFee);
+    lineItems.push({ description: "Call-out / Service fee", qty: 1, unitPrice: fee, total: fee });
+    subtotal += fee;
+  }
+
+  if (hours && parseFloat(hours) > 0) {
+    const h = parseFloat(hours);
+    const labourTotal = Math.round(h * rate * 100) / 100;
+    lineItems.push({ description: `Labour — ${safeJobType} (${complexity || "medium"} complexity)`, qty: h, unitPrice: rate, unit: "hr", total: labourTotal });
+    subtotal += labourTotal;
+  }
+
+  if (travelTime && parseFloat(travelTime) > 0) {
+    const tt = parseFloat(travelTime);
+    const travelRate = Math.round(baseRate * 0.75 * 100) / 100;
+    const travelTotal = Math.round(tt * travelRate * 100) / 100;
+    lineItems.push({ description: "Travel time", qty: tt, unitPrice: travelRate, unit: "hr", total: travelTotal });
+    subtotal += travelTotal;
+  }
+
+  if (materialsCost && parseFloat(materialsCost) > 0) {
+    const mc = parseFloat(materialsCost);
+    const markup = 1.20;
+    const matsTotal = Math.round(mc * markup * 100) / 100;
+    lineItems.push({ description: "Materials and consumables (inc. 20% markup)", qty: 1, unitPrice: matsTotal, total: matsTotal });
+    subtotal += matsTotal;
+  }
+
+  if (workItems && Array.isArray(workItems)) {
+    for (const wi of workItems.slice(0, 10)) {
+      const desc  = sanitiseInput(String(wi.description || "Miscellaneous item"));
+      const qty   = parseFloat(wi.qty || 1);
+      const price = parseFloat(wi.unitPrice || 0);
+      const tot   = Math.round(qty * price * 100) / 100;
+      lineItems.push({ description: desc, qty, unitPrice: price, total: tot });
+      subtotal += tot;
+    }
+  }
+
+  subtotal = Math.round(subtotal * 100) / 100;
+
+  const discountAmt  = discount ? Math.round(parseFloat(discount) * subtotal / 100 * 100) / 100 : 0;
+  const afterDiscount = Math.round((subtotal - discountAmt) * 100) / 100;
+  const gstAmt       = applyGst ? Math.round(afterDiscount * 0.1 * 100) / 100 : 0;
+  const total        = Math.round((afterDiscount + gstAmt) * 100) / 100;
+
+  return res.json({
+    jobType: safeJobType,
+    lineItems,
+    subtotal,
+    discount: discountAmt > 0 ? { percentage: discount, amount: discountAmt } : null,
+    gst: applyGst ? gstAmt : null,
+    total,
+    currency: "AUD",
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /site-conditions  — Record and evaluate site conditions before/during a job
+app.post("/site-conditions", apiKeyAuth, (req, res) => {
+  const { jobType, temperature, humidity, rainfall, windSpeed, confined,
+          asbestosPresent, leadPresent, heightWork, electricalHazard,
+          excavationRequired, publicAccess, notes } = req.body;
+
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+  const safeJobType = sanitiseInput(String(jobType)).toLowerCase();
+
+  const hazards = [];
+  const controls = [];
+
+  if (temperature !== undefined) {
+    const temp = parseFloat(temperature);
+    if (temp > 35) {
+      hazards.push({ hazard: "Extreme heat", risk: "HIGH", note: `${temp}°C — heat stress risk` });
+      controls.push("Schedule work in early morning or evening", "Provide shaded rest areas and drinking water");
+    } else if (temp < 5) {
+      hazards.push({ hazard: "Cold conditions", risk: "MEDIUM", note: `${temp}°C — hypothermia and icy surfaces risk` });
+      controls.push("Provide warm clothing and breaks", "Inspect for ice on all surfaces before work");
+    }
+  }
+
+  if (rainfall) {
+    hazards.push({ hazard: "Rain/wet conditions", risk: "HIGH", note: "Electrical and slip hazards elevated" });
+    controls.push("Isolate all electrical work", "Use non-slip footwear and cover all open trenches");
+  }
+
+  if (parseFloat(windSpeed) > 40) {
+    hazards.push({ hazard: "High wind", risk: "HIGH", note: `${windSpeed} km/h — overhead work prohibited above 20 m` });
+    controls.push("Do not work at height in winds above 40 km/h", "Secure all loose materials");
+  }
+
+  if (confined) {
+    hazards.push({ hazard: "Confined space entry", risk: "CRITICAL", note: "Atmospheric testing and standby person required" });
+    controls.push("Obtain confined space entry permit", "Test atmosphere for O2, CO, H2S before entry", "Assign a trained standby person");
+  }
+
+  if (asbestosPresent) {
+    hazards.push({ hazard: "Asbestos-containing material", risk: "CRITICAL", note: "Licensed removalist required for friable asbestos" });
+    controls.push("Do not disturb ACM without asbestos clearance", "Engage licensed asbestos removalist");
+  }
+
+  if (leadPresent) {
+    hazards.push({ hazard: "Lead-based paint present", risk: "HIGH", note: "Common in pre-1970 buildings" });
+    controls.push("Use P2 respirator when cutting or sanding", "Wet-wipe all dust, bag and dispose at approved site");
+  }
+
+  if (heightWork) {
+    hazards.push({ hazard: "Work at height", risk: "HIGH", note: "Fall protection required above 2 m" });
+    controls.push("Use scaffold or EWP for heights > 2 m", "Inspect all ladders before use", "Use fall arrest harness where required");
+  }
+
+  if (electricalHazard) {
+    hazards.push({ hazard: "Live electrical hazard nearby", risk: "CRITICAL", note: "Maintain exclusion zones around live conductors" });
+    controls.push("Establish electrical exclusion zones", "Do not work within 1 m of live conductors without isolation");
+  }
+
+  if (excavationRequired) {
+    hazards.push({ hazard: "Excavation", risk: "HIGH", note: "Underground services must be located before digging" });
+    controls.push("Call Dial Before You Dig (1100) at least 3 days prior", "Ensure trench shoring for depths > 1.5 m");
+  }
+
+  if (publicAccess) {
+    hazards.push({ hazard: "Public access to site", risk: "MEDIUM", note: "Unauthorised persons may enter work zone" });
+    controls.push("Erect hoarding and site signage", "Lock site access when unattended");
+  }
+
+  const criticalHazards = hazards.filter(h => h.risk === "CRITICAL");
+  const highHazards     = hazards.filter(h => h.risk === "HIGH");
+
+  return res.json({
+    jobType: safeJobType,
+    siteRating: criticalHazards.length > 0 ? "CRITICAL" : highHazards.length > 0 ? "HIGH" : hazards.length > 0 ? "MEDIUM" : "LOW",
+    canProceed: criticalHazards.length === 0,
+    hazardCount: hazards.length,
+    criticalHazards: criticalHazards.map(h => h.hazard),
+    hazards,
+    controls: [...new Set(controls)],
+    notes: sanitiseInput(String(notes || "")),
+    recordedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
