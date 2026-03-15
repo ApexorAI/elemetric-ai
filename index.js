@@ -41830,6 +41830,180 @@ Return JSON with:
   }
 });
 
+// POST /trade-price-guide — Store trade pricing and rate cards
+app.post("/trade-price-guide", apiKeyAuth, async (req, res) => {
+  const {
+    trade, state = "VIC", priceType = "LABOUR",
+    description, unit, rateAud, includedItems = [],
+    excludedItems = [], applicableFrom, validUntilDate,
+    source = "INTERNAL", notes,
+  } = req.body;
+  if (!trade || !description || !rateAud || !unit) {
+    return res.status(400).json({ error: "trade, description, rateAud, and unit are required." });
+  }
+  const validPriceTypes = ["LABOUR", "MATERIAL", "PLANT", "CALL_OUT", "ALLOWANCE", "COMPOSITE"];
+  const validSources = ["INTERNAL", "MARKET_SURVEY", "INDUSTRY_BODY", "GOVERNMENT", "SUPPLIER_QUOTE"];
+  if (!validPriceTypes.includes(priceType)) return res.status(400).json({ error: `priceType must be one of: ${validPriceTypes.join(", ")}` });
+  if (!validSources.includes(source)) return res.status(400).json({ error: `source must be one of: ${validSources.join(", ")}` });
+  const priceRef = `PG-${Date.now().toString(36).toUpperCase()}`;
+  const gstAmount = Number(rateAud) * 0.1;
+  const rateIncGst = Number(rateAud) * 1.1;
+  const record = {
+    price_ref: priceRef,
+    trade: sanitiseInput(trade),
+    state: sanitiseInput(state),
+    price_type: priceType,
+    description: sanitiseInput(description),
+    unit: sanitiseInput(unit),
+    rate_aud_ex_gst: Number(rateAud),
+    gst_amount: +gstAmount.toFixed(2),
+    rate_aud_inc_gst: +rateIncGst.toFixed(2),
+    included_items: Array.isArray(includedItems) ? includedItems.map(i => sanitiseInput(i)) : [],
+    excluded_items: Array.isArray(excludedItems) ? excludedItems.map(i => sanitiseInput(i)) : [],
+    applicable_from: applicableFrom || new Date().toISOString().split("T")[0],
+    valid_until: validUntilDate || null,
+    source,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("trade_price_guide").insert(record);
+    if (error) console.error("trade-price-guide DB error:", error.message);
+  }
+  res.json({
+    priceRef, trade, priceType, description, unit,
+    rateExGst: Number(rateAud), rateIncGst: +rateIncGst.toFixed(2),
+    saved: !!supabaseAdmin,
+  });
+});
+
+// GET /trade-price-guide — Query trade prices
+app.get("/trade-price-guide", apiKeyAuth, async (req, res) => {
+  const { trade, state, priceType } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("trade_price_guide").select("*").order("trade", { ascending: true }).order("description", { ascending: true });
+  if (trade) query = query.eq("trade", trade);
+  if (state) query = query.eq("state", state);
+  if (priceType) query = query.eq("price_type", priceType);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ count: data.length, prices: data });
+});
+
+// POST /benchmark-comparison — Compare a job quote against industry benchmarks
+app.post("/benchmark-comparison", apiKeyAuth, async (req, res) => {
+  const {
+    trade, state = "VIC", jobType, jobDescription,
+    quotedAmountAud, floorAreaM2, linearMetres, itemCount,
+    laborHours, unit = "job",
+  } = req.body;
+  if (!trade || !quotedAmountAud) {
+    return res.status(400).json({ error: "trade and quotedAmountAud are required." });
+  }
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedState = sanitiseInput(state);
+  const quoted = Number(quotedAmountAud);
+  // Derived metrics
+  const ratePerM2 = floorAreaM2 ? +(quoted / Number(floorAreaM2)).toFixed(2) : null;
+  const ratePerLm = linearMetres ? +(quoted / Number(linearMetres)).toFixed(2) : null;
+  const ratePerItem = itemCount ? +(quoted / Number(itemCount)).toFixed(2) : null;
+  const ratePerHour = laborHours ? +(quoted / Number(laborHours)).toFixed(2) : null;
+  let benchmarkRef = null;
+  let benchmarkData = null;
+  if (supabaseAdmin) {
+    const { data } = await supabaseAdmin
+      .from("trade_price_guide")
+      .select("rate_aud_ex_gst, rate_aud_inc_gst, unit, description")
+      .eq("trade", sanitisedTrade)
+      .eq("state", sanitisedState)
+      .order("created_at", { ascending: false })
+      .limit(10);
+    if (data && data.length > 0) {
+      benchmarkData = data;
+      const avgRate = data.reduce((s, r) => s + r.rate_aud_ex_gst, 0) / data.length;
+      benchmarkRef = +avgRate.toFixed(2);
+    }
+  }
+  const assessmentRef = `BNC-${Date.now().toString(36).toUpperCase()}`;
+  res.json({
+    assessmentRef, trade: sanitisedTrade, state: sanitisedState, jobType,
+    quotedAmount: quoted,
+    derivedRates: { perM2: ratePerM2, perLinearM: ratePerLm, perItem: ratePerItem, perHour: ratePerHour },
+    benchmarkAverageRate: benchmarkRef,
+    benchmarkItems: benchmarkData ? benchmarkData.length : 0,
+    assessment: benchmarkRef
+      ? (quoted > benchmarkRef * 1.3 ? "HIGH" : quoted < benchmarkRef * 0.7 ? "LOW" : "MARKET_RATE")
+      : "INSUFFICIENT_DATA",
+    note: "Benchmarks are indicative only. Engage a quantity surveyor for formal cost assessment.",
+  });
+});
+
+// POST /ai-construction-blog — AI writes a construction industry article
+app.post("/ai-construction-blog", apiKeyAuth, async (req, res) => {
+  const {
+    topic, trade, audience = "tradespeople", wordCount = 400,
+    includeKeywords = [], tone = "professional", state = "VIC",
+  } = req.body;
+  if (!topic) {
+    return res.status(400).json({ error: "topic is required." });
+  }
+  const sanitisedTopic = sanitiseInput(topic);
+  const sanitisedTrade = sanitiseInput(trade || "construction");
+  const sanitisedAudience = sanitiseInput(audience);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an experienced Australian construction industry writer. Create accurate, practical, and engaging content for trade professionals.`;
+  const userPrompt = `Write a ${wordCount}-word ${sanitiseInput(tone)} article about:
+Topic: ${sanitisedTopic}
+Trade focus: ${sanitisedTrade}
+Target audience: ${sanitisedAudience}
+State context: ${sanitisedState}
+Include keywords: ${includeKeywords.map(k => sanitiseInput(k)).join(", ")}
+
+Return JSON with:
+{
+  "title": "...",
+  "subtitle": "...",
+  "introduction": "...",
+  "bodyParagraphs": ["...", "..."],
+  "keyTakeaways": ["...", "..."],
+  "conclusion": "...",
+  "metaDescription": "...",
+  "suggestedTags": ["...", "..."],
+  "wordCount": 400
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const article = JSON.parse(aiRes.choices[0].message.content);
+    const articleRef = `ART-${Date.now().toString(36).toUpperCase()}`;
+    res.json({ articleRef, topic: sanitisedTopic, trade: sanitisedTrade, audience: sanitisedAudience, article });
+  } catch (err) {
+    console.error("ai-construction-blog error:", err.message);
+    res.json({
+      articleRef: "ART-FALLBACK", topic: sanitisedTopic, trade: sanitisedTrade, audience: sanitisedAudience,
+      article: {
+        title: sanitisedTopic,
+        subtitle: `A guide for ${sanitisedAudience} in ${sanitisedState}`,
+        introduction: `${sanitisedTopic} is an important consideration for ${sanitisedTrade} professionals working in Australia.`,
+        bodyParagraphs: ["Content generation unavailable. Please try again."],
+        keyTakeaways: ["Consult industry experts for guidance"],
+        conclusion: "For more information, consult your industry association or regulatory body.",
+        metaDescription: sanitisedTopic,
+        suggestedTags: [sanitisedTrade, sanitisedState, "construction"],
+        wordCount: 0,
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
