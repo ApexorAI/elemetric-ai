@@ -76245,6 +76245,321 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 272 ─────────────────────────────────────────────────────────────────
+
+// POST /variation-register — Track construction contract variations
+app.post("/variation-register", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, variationNumber, submittedDate, submittedBy,
+      description, reason, tradeCategory,
+      claimedAmountAud, approvedAmountAud, status,
+      timeImpactDays, timeImpactApproved,
+      principalInstructionRef, drawingRevision,
+      approvedBy, approvedDate, rejectedReason, notes
+    } = req.body;
+
+    if (!projectId || !description || !submittedDate) {
+      return res.status(400).json({ error: "projectId, description, submittedDate are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeDescription = sanitiseInput(String(description));
+    const safeSubmittedBy = submittedBy ? sanitiseInput(String(submittedBy)) : null;
+    const safeReason = reason ? sanitiseInput(String(reason)) : null;
+
+    const claimed = parseFloat(claimedAmountAud) || 0;
+    const approved = parseFloat(approvedAmountAud) || null;
+    const timeImpact = parseInt(timeImpactDays) || 0;
+    const variationStatus = String(status || "SUBMITTED").toUpperCase();
+
+    const warnings = [];
+
+    // Variation management under AS 4000/AS 4902 (construction contracts)
+    if (claimed > 100000) {
+      warnings.push(`High-value variation claim $${claimed.toLocaleString()} — verify written principal instruction exists per contract conditions.`);
+    }
+
+    if (!principalInstructionRef && claimed > 10000) {
+      warnings.push("Principal instruction reference not recorded for variation >$10,000 — ensure written instruction obtained.");
+    }
+
+    if (timeImpact > 0 && !timeImpactApproved) {
+      warnings.push(`Variation has ${timeImpact}-day time impact — submit Extension of Time claim to protect programme rights.`);
+    }
+
+    if (variationStatus === "REJECTED" && !rejectedReason) {
+      warnings.push("Variation rejected but rejection reason not recorded — document reason for dispute resolution purposes.");
+    }
+
+    const costDifference = approved !== null ? claimed - approved : null;
+    if (costDifference !== null && Math.abs(costDifference) > claimed * 0.2 && claimed > 0) {
+      warnings.push(`Approved amount $${(approved || 0).toLocaleString()} differs significantly from claimed $${claimed.toLocaleString()} (${Math.abs(Math.round((costDifference / claimed) * 100))}% difference).`);
+    }
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("variation_register")
+        .insert({
+          project_id: safeProject,
+          variation_number: variationNumber ? sanitiseInput(String(variationNumber)) : null,
+          submitted_date: submittedDate,
+          submitted_by: safeSubmittedBy,
+          description: safeDescription,
+          reason: safeReason,
+          trade_category: tradeCategory ? sanitiseInput(String(tradeCategory)) : null,
+          claimed_amount_aud: claimed || null,
+          approved_amount_aud: approved,
+          variation_status: variationStatus,
+          time_impact_days: timeImpact || null,
+          time_impact_approved: timeImpactApproved || false,
+          principal_instruction_ref: principalInstructionRef ? sanitiseInput(String(principalInstructionRef)) : null,
+          drawing_revision: drawingRevision ? sanitiseInput(String(drawingRevision)) : null,
+          approved_by: approvedBy ? sanitiseInput(String(approvedBy)) : null,
+          approved_date: approvedDate || null,
+          rejected_reason: rejectedReason ? sanitiseInput(String(rejectedReason)) : null,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    res.json({
+      variationStatus,
+      warnings,
+      savedId,
+      claimedAmountAud: claimed,
+      approvedAmountAud: approved,
+      timeImpactDays: timeImpact,
+      costDifference,
+      standards: ["AS 4000-1997 (General Conditions of Contract)", "AS 4902-2000"],
+    });
+  } catch (err) {
+    console.error("POST /variation-register error:", err.message);
+    res.status(500).json({ error: "Failed to record variation." });
+  }
+});
+
+// POST /payment-claim-record — Record progress payment claims under Victorian SOP legislation
+app.post("/payment-claim-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, claimNumber, claimDate, claimBy,
+      contractSum, claimedToDateAud, previouslyApprovedAud,
+      thisClaim, retentionHeld, retentionReleased,
+      workCompleted, materialsOnSite,
+      scheduleOfRatesRef, progressAssessment,
+      respondentDueDate, paymentScheduleRef, paymentScheduleDate,
+      paymentScheduleAmount, disputeNoticeServed, adjudicationRef, notes
+    } = req.body;
+
+    if (!projectId || !claimNumber || !claimDate || !thisClaim) {
+      return res.status(400).json({ error: "projectId, claimNumber, claimDate, thisClaim are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeClaimNum = sanitiseInput(String(claimNumber));
+    const safeClaimBy = claimBy ? sanitiseInput(String(claimBy)) : null;
+
+    const claimAmount = parseFloat(thisClaim) || 0;
+    const previousAmount = parseFloat(previouslyApprovedAud) || 0;
+    const contractSumVal = parseFloat(contractSum) || null;
+
+    const warnings = [];
+    const issues = [];
+
+    // Building and Construction Industry Security of Payment Act 2002 (Vic) — SOP Act
+    // Respondent must serve payment schedule within 10 business days of receiving claim
+    if (respondentDueDate) {
+      const dueDate = new Date(respondentDueDate);
+      const now = new Date();
+      const daysRemaining = Math.floor((dueDate - now) / (1000 * 60 * 60 * 24));
+      if (daysRemaining < 0 && !paymentScheduleRef) {
+        issues.push(`Payment schedule response overdue by ${Math.abs(daysRemaining)} days — respondent may be liable to pay full claimed amount under SOP Act 2002 (Vic) s.16(4).`);
+      } else if (daysRemaining >= 0 && daysRemaining <= 3 && !paymentScheduleRef) {
+        warnings.push(`Payment schedule response due in ${daysRemaining} days — ensure timely response to avoid SOP Act liability.`);
+      }
+    }
+
+    if (paymentScheduleAmount !== null && paymentScheduleAmount !== undefined) {
+      const scheduledAmount = parseFloat(paymentScheduleAmount) || 0;
+      if (scheduledAmount < claimAmount * 0.5 && claimAmount > 10000) {
+        warnings.push(`Scheduled payment $${scheduledAmount.toLocaleString()} is less than 50% of claimed $${claimAmount.toLocaleString()} — claimant may refer to adjudication under SOP Act 2002 (Vic) s.18.`);
+      }
+    }
+
+    if (contractSumVal !== null) {
+      const completion = contractSumVal > 0 ? Math.round((previousAmount + claimAmount) / contractSumVal * 100) : null;
+      if (completion !== null && completion > 110) {
+        warnings.push(`Cumulative claims ($${((previousAmount + claimAmount) / 1000000).toFixed(2)}M) exceed 110% of contract sum — review scope and variations.`);
+      }
+    }
+
+    if (!workCompleted && claimAmount > 0) {
+      warnings.push("Work completion status not documented — required to support progress payment claim.");
+    }
+
+    const claimStatus = issues.length > 0 ? "ACTION_REQUIRED" : warnings.length > 0 ? "REVIEW_REQUIRED" : "SUBMITTED";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("payment_claim_records")
+        .insert({
+          project_id: safeProject,
+          claim_number: safeClaimNum,
+          claim_date: claimDate,
+          claim_by: safeClaimBy,
+          contract_sum: contractSumVal,
+          claimed_to_date_aud: claimedToDateAud || null,
+          previously_approved_aud: previousAmount || null,
+          this_claim_aud: claimAmount,
+          retention_held: retentionHeld || null,
+          retention_released: retentionReleased || null,
+          work_completed: workCompleted || false,
+          respondent_due_date: respondentDueDate || null,
+          payment_schedule_ref: paymentScheduleRef ? sanitiseInput(String(paymentScheduleRef)) : null,
+          payment_schedule_date: paymentScheduleDate || null,
+          payment_schedule_amount: paymentScheduleAmount || null,
+          dispute_notice_served: disputeNoticeServed || false,
+          adjudication_ref: adjudicationRef ? sanitiseInput(String(adjudicationRef)) : null,
+          claim_status: claimStatus,
+          issues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (issues.length > 0) {
+      return res.status(422).json({
+        claimStatus,
+        issues,
+        warnings,
+        savedId,
+        message: "Payment claim action required — SOP Act obligations may be triggered.",
+        standards: ["Building and Construction Industry Security of Payment Act 2002 (Vic)"],
+      });
+    }
+
+    res.json({
+      claimStatus,
+      issues,
+      warnings,
+      savedId,
+      thisClaimAud: claimAmount,
+      standards: ["Building and Construction Industry Security of Payment Act 2002 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /payment-claim-record error:", err.message);
+    res.status(500).json({ error: "Failed to record payment claim." });
+  }
+});
+
+// POST /ai-programme-delay-assessment — AI assesses construction programme delay causes and recovery options
+app.post("/ai-programme-delay-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectType, originalCompletionDate, currentForecastDate,
+      delayDays, delayCategories, criticalPathActivities,
+      concurrentDelays, variationsContributing,
+      contractualFloatDays, externalDelays, clientCausedDelays,
+      weatherDelayDays, siteContext
+    } = req.body;
+
+    if (!projectType || delayDays == null) {
+      return res.status(400).json({ error: "projectType and delayDays are required." });
+    }
+
+    const safeProjectType = sanitiseInput(String(projectType));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const delayCateg = Array.isArray(delayCategories) ? delayCategories.map(d => sanitiseInput(String(d))) : [];
+    const critPath = Array.isArray(criticalPathActivities) ? criticalPathActivities.map(a => sanitiseInput(String(a))) : [];
+
+    const prompt = `You are a construction programme and delay expert assessing programme delay entitlement for a Victorian construction project.
+
+Project type: ${safeProjectType}
+Original completion date: ${originalCompletionDate || "Not stated"}
+Current forecast date: ${currentForecastDate || "Not stated"}
+Total delay (calendar days): ${delayDays}
+Delay categories: ${delayCateg.join(", ") || "Not specified"}
+Critical path activities affected: ${critPath.join(", ") || "Not specified"}
+Concurrent delays present: ${concurrentDelays ? "Yes" : "No"}
+Variations contributing to delay: ${variationsContributing ? "Yes" : "No"}
+Contractual float available: ${contractualFloatDays != null ? contractualFloatDays + " days" : "Unknown"}
+External/force majeure delays: ${externalDelays || "None identified"}
+Client-caused delays: ${clientCausedDelays || "None identified"}
+Weather delays: ${weatherDelayDays ? weatherDelayDays + " days" : "Not quantified"}
+Location: ${safeSite}
+
+Assess under AS 4000-1997 (cl.34 — Extension of Time) and Victorian construction law:
+1. EOT entitlement — likely days of compensable vs non-compensable delay
+2. Concurrent delay impact on EOT claim
+3. Liquidated damages exposure
+4. Recovery programme feasibility
+5. Documentation requirements to support EOT claim
+6. Risk of Superintendent/Principal challenge
+
+Respond ONLY in JSON:
+{
+  "totalDelayDays": number,
+  "compensableDelayDays": number or null,
+  "nonCompensableDelayDays": number or null,
+  "ldExposureDays": number or null,
+  "concurrentDelayImpact": "string",
+  "eotLikelihood": "STRONG|MODERATE|WEAK|UNLIKELY",
+  "recoveryOptions": ["string"],
+  "documentationRequired": ["string"],
+  "risks": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        totalDelayDays: delayDays,
+        compensableDelayDays: null,
+        nonCompensableDelayDays: null,
+        ldExposureDays: null,
+        concurrentDelayImpact: "AI assessment unavailable — concurrent delay analysis requires manual programme review.",
+        eotLikelihood: "MODERATE",
+        recoveryOptions: ["Review critical path and identify float", "Identify resources for accelerated works"],
+        documentationRequired: ["Daily site records", "Weather records", "Correspondence log", "Programme updates"],
+        risks: ["LD exposure if EOT not granted", "Concurrent delay may reduce entitlement"],
+        applicableStandards: ["AS 4000-1997 cl.34", "AS 4902-2000"],
+        summary: "AI delay assessment unavailable. Engage construction claims consultant for formal delay analysis.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      projectType: safeProjectType,
+      delayDays,
+      standards: ["AS 4000-1997", "AS 4902-2000", "Building and Construction Industry Security of Payment Act 2002 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /ai-programme-delay-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess programme delay." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
