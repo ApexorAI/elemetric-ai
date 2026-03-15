@@ -74348,6 +74348,368 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 267 ─────────────────────────────────────────────────────────────────
+
+// POST /occupancy-permit-checklist — Record pre-occupancy permit inspection checklist
+app.post("/occupancy-permit-checklist", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, buildingAddress, inspectionDate, inspectedBy,
+      buildingClass, buildingSurveyor,
+      structuralInspectionComplete, certRef,
+      buildingEnvelopeComplete, waterproofingCertRef,
+      plumbingPermitFinal, plumbingPermitRef,
+      electricalSafetyCertRef, gasSafetyCertRef,
+      essentialSafetyCertRef, fireSafetyCommissioned, fireCertRef,
+      liftsCertRef, accessAuditComplete, accessAuditRef,
+      energyEfficiencyCompliant, nccComplianceRef,
+      occupancyPermitConditions, defectsList, notes
+    } = req.body;
+
+    if (!projectId || !buildingAddress || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "projectId, buildingAddress, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeAddress = sanitiseInput(String(buildingAddress));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+
+    const defects = Array.isArray(defectsList) ? defectsList : [];
+    const conditions = Array.isArray(occupancyPermitConditions) ? occupancyPermitConditions : [];
+    const blockers = [];
+    const warnings = [];
+
+    // Building Act 1993 (Vic) s.53 — mandatory items for occupancy permit
+    if (!structuralInspectionComplete) {
+      blockers.push("Structural engineering inspection not completed — mandatory for occupancy permit (Building Act 1993 Vic s.53).");
+    }
+    if (!plumbingPermitFinal) {
+      blockers.push("Plumbing permit final inspection not completed — required before occupation (Plumbing Regulations 2018 Vic).");
+    }
+    if (!electricalSafetyCertRef) {
+      blockers.push("Electrical safety certificate not issued — required before occupation (Electricity Safety Act 1998 Vic).");
+    }
+    if (!fireSafetyCommissioned) {
+      blockers.push("Fire safety systems not confirmed commissioned — required for occupancy permit (Building Act 1993 Vic).");
+    }
+
+    const buildClass = parseInt(buildingClass) || null;
+    if (buildClass && buildClass >= 2 && buildClass <= 9) {
+      if (!essentialSafetyCertRef) {
+        blockers.push("Essential Safety Measures certificate not issued — required for Class 2-9 buildings (Building Regulations 2018 Vic reg 229).");
+      }
+    }
+
+    if (!buildingEnvelopeComplete) {
+      warnings.push("Building envelope works not confirmed complete — verify weather protection before occupation.");
+    }
+    if (!accessAuditComplete) {
+      warnings.push("Accessibility audit not confirmed complete — NCC Section D access requirements must be met.");
+    }
+    if (!energyEfficiencyCompliant) {
+      warnings.push("Energy efficiency compliance not confirmed — NCC Section J / NatHERS compliance required.");
+    }
+
+    if (defects.length > 0) {
+      const critDefects = defects.filter(d => /structural|fire|electrical|plumbing|water|access/i.test(String(d)));
+      if (critDefects.length > 0) {
+        blockers.push(`Critical defects must be rectified before occupation: ${critDefects.map(d => sanitiseInput(String(d))).join("; ")}`);
+      } else {
+        warnings.push(`Outstanding defects: ${defects.map(d => sanitiseInput(String(d))).join("; ")} — document defect liability obligations.`);
+      }
+    }
+
+    const readyForPermit = blockers.length === 0;
+    const checklistStatus = blockers.length > 0 ? "NOT_READY" : warnings.length > 0 ? "READY_WITH_CONDITIONS" : "READY";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("occupancy_permit_checklists")
+        .insert({
+          project_id: safeProject,
+          building_address: safeAddress,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          building_class: buildClass,
+          building_surveyor: buildingSurveyor ? sanitiseInput(String(buildingSurveyor)) : null,
+          structural_inspection_complete: structuralInspectionComplete || false,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          plumbing_permit_final: plumbingPermitFinal || false,
+          electrical_safety_cert_ref: electricalSafetyCertRef ? sanitiseInput(String(electricalSafetyCertRef)) : null,
+          gas_safety_cert_ref: gasSafetyCertRef ? sanitiseInput(String(gasSafetyCertRef)) : null,
+          essential_safety_cert_ref: essentialSafetyCertRef ? sanitiseInput(String(essentialSafetyCertRef)) : null,
+          fire_safety_commissioned: fireSafetyCommissioned || false,
+          fire_cert_ref: fireCertRef ? sanitiseInput(String(fireCertRef)) : null,
+          lifts_cert_ref: liftsCertRef ? sanitiseInput(String(liftsCertRef)) : null,
+          access_audit_complete: accessAuditComplete || false,
+          energy_efficiency_compliant: energyEfficiencyCompliant || false,
+          ready_for_permit: readyForPermit,
+          checklist_status: checklistStatus,
+          blockers,
+          warnings,
+          occupancy_permit_conditions: conditions,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (blockers.length > 0) {
+      return res.status(422).json({
+        checklistStatus,
+        readyForPermit,
+        blockers,
+        warnings,
+        savedId,
+        message: "Occupancy permit cannot be issued — critical items outstanding.",
+        standards: ["Building Act 1993 (Vic) s.53", "Building Regulations 2018 (Vic)", "NCC 2022"],
+      });
+    }
+
+    res.json({
+      checklistStatus,
+      readyForPermit,
+      blockers,
+      warnings,
+      savedId,
+      standards: ["Building Act 1993 (Vic) s.53", "Building Regulations 2018 (Vic)", "NCC 2022"],
+    });
+  } catch (err) {
+    console.error("POST /occupancy-permit-checklist error:", err.message);
+    res.status(500).json({ error: "Failed to record occupancy permit checklist." });
+  }
+});
+
+// POST /defects-liability-register — Track defects during defect liability period
+app.post("/defects-liability-register", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, contractorName, projectCompletionDate, dlpEndDate,
+      defects, principalContactName, contractorContactName, notes
+    } = req.body;
+
+    if (!projectId || !projectCompletionDate) {
+      return res.status(400).json({ error: "projectId and projectCompletionDate are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeContractor = contractorName ? sanitiseInput(String(contractorName)) : null;
+
+    const defectList = Array.isArray(defects) ? defects : [];
+    const now = new Date();
+
+    // Process each defect and classify
+    const processedDefects = defectList.map(d => {
+      const defectType = String(d.type || "").toLowerCase();
+      const isStructural = /structural|crack|settlement|water|foundation|subsidence/i.test(defectType + " " + String(d.description || ""));
+      const isLifeSafety = /fire|electrical|gas|escape|egress|sprinkler/i.test(defectType + " " + String(d.description || ""));
+
+      let liabilityPeriodYears;
+      if (isStructural) {
+        liabilityPeriodYears = 10; // Building Act 1993 (Vic) — structural 10 years
+      } else {
+        liabilityPeriodYears = 2;  // Non-structural 2 years
+      }
+
+      const reportedDate = d.reportedDate ? new Date(d.reportedDate) : now;
+      const liabilityExpiry = new Date(new Date(projectCompletionDate).getTime() + liabilityPeriodYears * 365.25 * 24 * 60 * 60 * 1000);
+      const isWithinLiability = now <= liabilityExpiry;
+      const daysSinceReported = Math.floor((now - reportedDate) / (1000 * 60 * 60 * 24));
+      const daysToExpiry = Math.floor((liabilityExpiry - now) / (1000 * 60 * 60 * 24));
+
+      return {
+        ...d,
+        description: d.description ? sanitiseInput(String(d.description)) : null,
+        isStructural,
+        isLifeSafety,
+        liabilityPeriodYears,
+        liabilityExpiry: liabilityExpiry.toISOString().split("T")[0],
+        isWithinLiability,
+        daysSinceReported,
+        daysToExpiry: Math.max(0, daysToExpiry),
+        status: d.status || "OPEN",
+      };
+    });
+
+    const openDefects = processedDefects.filter(d => d.status === "OPEN" || d.status === "IN_PROGRESS");
+    const overdueDefects = openDefects.filter(d => {
+      const targetDays = d.isStructural || d.isLifeSafety ? 5 : 30;
+      return d.daysSinceReported > targetDays;
+    });
+    const lifeSafetyDefects = openDefects.filter(d => d.isLifeSafety);
+
+    const warnings = [];
+    const criticalIssues = [];
+
+    if (lifeSafetyDefects.length > 0) {
+      criticalIssues.push(`${lifeSafetyDefects.length} life-safety defects open — immediate contractor rectification required.`);
+    }
+    if (overdueDefects.length > 0) {
+      warnings.push(`${overdueDefects.length} defects overdue for rectification — issue formal notice to contractor.`);
+    }
+
+    const dlpEnd = dlpEndDate ? new Date(dlpEndDate) : null;
+    const daysToFinalClaim = dlpEnd ? Math.floor((dlpEnd - now) / (1000 * 60 * 60 * 24)) : null;
+    if (daysToFinalClaim !== null && daysToFinalClaim < 30 && daysToFinalClaim > 0) {
+      warnings.push(`DLP ends in ${daysToFinalClaim} days — issue final defects notice to contractor before expiry.`);
+    } else if (daysToFinalClaim !== null && daysToFinalClaim <= 0) {
+      warnings.push("DLP has expired — any remaining defects may require legal action to recover rectification costs.");
+    }
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("defects_liability_registers")
+        .insert({
+          project_id: safeProject,
+          contractor_name: safeContractor,
+          project_completion_date: projectCompletionDate,
+          dlp_end_date: dlpEndDate || null,
+          defects: processedDefects,
+          open_defect_count: openDefects.length,
+          overdue_defect_count: overdueDefects.length,
+          life_safety_defect_count: lifeSafetyDefects.length,
+          principal_contact: principalContactName ? sanitiseInput(String(principalContactName)) : null,
+          contractor_contact: contractorContactName ? sanitiseInput(String(contractorContactName)) : null,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        criticalIssues,
+        warnings,
+        savedId,
+        openDefectCount: openDefects.length,
+        overdueDefectCount: overdueDefects.length,
+        lifeSafetyDefectCount: lifeSafetyDefects.length,
+        daysToFinalClaim,
+        message: "Life-safety defects require immediate contractor notification.",
+        standards: ["Building Act 1993 (Vic)", "Domestic Building Contracts Act 1995 (Vic)"],
+      });
+    }
+
+    res.json({
+      criticalIssues,
+      warnings,
+      savedId,
+      openDefectCount: openDefects.length,
+      overdueDefectCount: overdueDefects.length,
+      totalDefectCount: processedDefects.length,
+      daysToFinalClaim,
+      standards: ["Building Act 1993 (Vic)", "Domestic Building Contracts Act 1995 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /defects-liability-register error:", err.message);
+    res.status(500).json({ error: "Failed to record defects liability register." });
+  }
+});
+
+// POST /ai-defect-root-cause-analysis — AI identifies root cause and responsibility for building defects
+app.post("/ai-defect-root-cause-analysis", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      defectDescription, defectLocation, buildingType, buildingAge,
+      affectedSystem, symptomOnset, weatherExposure,
+      constructionDocumentsAvailable, photosAvailable, siteContext
+    } = req.body;
+
+    if (!defectDescription) {
+      return res.status(400).json({ error: "defectDescription is required." });
+    }
+
+    const safeDefect = sanitiseInput(String(defectDescription));
+    const safeLocation = defectLocation ? sanitiseInput(String(defectLocation)) : "Not specified";
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+
+    const prompt = `You are a building defects consultant specialising in root cause analysis and contractor responsibility under Victorian building law.
+
+Defect: ${safeDefect}
+Location in building: ${safeLocation}
+Building type: ${buildingType || "Not stated"}
+Building age: ${buildingAge ? buildingAge + " years" : "Not stated"}
+Affected system: ${affectedSystem || "Not stated"}
+When symptom appeared: ${symptomOnset || "Not stated"}
+Weather exposure: ${weatherExposure || "Not stated"}
+Construction documents available: ${constructionDocumentsAvailable ? "Yes" : "No"}
+Photos available: ${photosAvailable ? "Yes" : "No"}
+Location: ${safeSite}
+
+Analyse under:
+- Building Act 1993 (Vic) — statutory warranties
+- Domestic Building Contracts Act 1995 (Vic) — implied warranties
+- AS 4349.0-4 (inspection of buildings)
+- NCC 2022 — applicable performance requirements
+
+Determine:
+1. Most likely root cause (design, installation, materials, maintenance)
+2. Responsible party (builder, subcontractor, designer, owner, manufacturer)
+3. Whether within defect liability period or statutory warranty
+4. Urgency of repair
+5. Investigation steps required
+6. Documentation needed for claim
+
+Respond ONLY in JSON:
+{
+  "probableRootCause": ["string"],
+  "responsibleParty": "BUILDER|SUBCONTRACTOR|DESIGNER|OWNER|MANUFACTURER|UNCERTAIN",
+  "liabilityAssessment": "string",
+  "urgency": "IMMEDIATE|WITHIN_30_DAYS|SCHEDULED",
+  "isStructuralDefect": true|false,
+  "withinStatutoryWarranty": true|false|null,
+  "investigationSteps": ["string"],
+  "documentationRequired": ["string"],
+  "applicableStandards": ["string"],
+  "claimRecommendation": "string",
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        probableRootCause: ["AI analysis unavailable — engage building defects consultant"],
+        responsibleParty: "UNCERTAIN",
+        liabilityAssessment: "Legal advice required to determine liability under Building Act 1993 (Vic).",
+        urgency: "WITHIN_30_DAYS",
+        isStructuralDefect: null,
+        withinStatutoryWarranty: null,
+        investigationSteps: ["Commission AS 4349.1 inspection by registered building inspector", "Obtain all relevant construction documentation"],
+        documentationRequired: ["Photos of defect", "Building permit records", "Contract documents", "Inspector report"],
+        applicableStandards: ["Building Act 1993 (Vic)", "Domestic Building Contracts Act 1995 (Vic)", "AS 4349.1"],
+        claimRecommendation: "Seek legal advice and engage registered building inspector for formal assessment.",
+        summary: "AI assessment unavailable. Engage registered building inspector and legal counsel.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      defectDescription: safeDefect,
+      standards: ["Building Act 1993 (Vic)", "Domestic Building Contracts Act 1995 (Vic)", "AS 4349.1"],
+    });
+  } catch (err) {
+    console.error("POST /ai-defect-root-cause-analysis error:", err.message);
+    res.status(500).json({ error: "Failed to analyse defect root cause." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
