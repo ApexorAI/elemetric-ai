@@ -56346,6 +56346,344 @@ Return a JSON object with:
   }
 });
 
+// POST /ndt-record — Record a Non-Destructive Testing (NDT) inspection (UT, MPI, PT, RT, ET)
+app.post("/ndt-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      ndtRef,
+      date,
+      inspector,
+      inspectorCertificationLevel,
+      certificationBody,
+      method,
+      procedure,
+      component,
+      material,
+      componentDimensions,
+      location,
+      drawingRef,
+      weldId,
+      weldType,
+      instrumentRef,
+      calibrationDate,
+      surfaceCondition,
+      testTemperatureC,
+      penetrantType,
+      magneticFieldStrength,
+      ultrasonicFrequencyMhz,
+      coverage,
+      indications,
+      indicationCount,
+      indicationDescriptions,
+      acceptanceCriteria,
+      overallResult,
+      reportRef,
+      requiresRepair,
+      repairScope,
+      retestRequired,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !inspector || !method || !component || !overallResult) {
+      return res.status(400).json({ error: "projectId, date, inspector, method, component, and overallResult are required" });
+    }
+
+    const flags = [];
+    if (overallResult === "REJECT" || overallResult === "FAIL") {
+      flags.push(`${method} inspection: REJECT — ${indicationCount || "unspecified"} indication(s) found exceeding acceptance criteria per ${acceptanceCriteria || "applicable standard"}`);
+    }
+    if (requiresRepair) flags.push(`Repair required: ${sanitiseInput(repairScope || "details not specified")} — re-test after repair before accepting component`);
+    if (retestRequired && overallResult !== "REJECT") flags.push("Re-test required — additional examination needed before final acceptance");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      ndt_ref: sanitiseInput(ndtRef || `NDT-${Date.now()}`),
+      date,
+      inspector: sanitiseInput(inspector),
+      inspector_certification_level: sanitiseInput(inspectorCertificationLevel || ""),
+      certification_body: sanitiseInput(certificationBody || ""),
+      method: sanitiseInput(method),
+      procedure: sanitiseInput(procedure || ""),
+      component: sanitiseInput(component),
+      material: sanitiseInput(material || ""),
+      component_dimensions: sanitiseInput(componentDimensions || ""),
+      location: sanitiseInput(location || ""),
+      drawing_ref: sanitiseInput(drawingRef || ""),
+      weld_id: sanitiseInput(weldId || ""),
+      weld_type: sanitiseInput(weldType || ""),
+      instrument_ref: sanitiseInput(instrumentRef || ""),
+      calibration_date: calibrationDate || null,
+      surface_condition: sanitiseInput(surfaceCondition || ""),
+      test_temperature_c: testTemperatureC || null,
+      penetrant_type: sanitiseInput(penetrantType || ""),
+      magnetic_field_strength: magneticFieldStrength || null,
+      ultrasonic_frequency_mhz: ultrasonicFrequencyMhz || null,
+      coverage: sanitiseInput(coverage || "100%"),
+      indications: !!indications,
+      indication_count: indicationCount || 0,
+      indication_descriptions: Array.isArray(indicationDescriptions) ? indicationDescriptions.map(d => sanitiseInput(d)) : [],
+      acceptance_criteria: sanitiseInput(acceptanceCriteria || ""),
+      overall_result: sanitiseInput(overallResult),
+      report_ref: sanitiseInput(reportRef || ""),
+      requires_repair: !!requiresRepair,
+      repair_scope: sanitiseInput(repairScope || ""),
+      retest_required: !!retestRequired,
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("ndt_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (flags.length > 0) {
+      return res.status(overallResult === "REJECT" || overallResult === "FAIL" ? 422 : 200).json({
+        accepted: overallResult !== "REJECT" && overallResult !== "FAIL",
+        flags,
+        record,
+        saved,
+      });
+    }
+
+    res.json({
+      accepted: true,
+      ndtRef: record.ndt_ref,
+      method,
+      flags: [],
+      applicableStandards: ["AS/NZS ISO 9712 Non-destructive testing — qualification and certification of NDT personnel", "AS/NZS 1554.1 Structural steel welding", "AS/NZS 3992 Pressure equipment — welding and brazing qualification"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/ndt-record error:", err.message);
+    res.status(500).json({ error: "Failed to record NDT inspection" });
+  }
+});
+
+// POST /demolition-permit-checklist — Pre-demolition safety planning checklist
+app.post("/demolition-permit-checklist", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      checklistRef,
+      date,
+      preparedBy,
+      propertyAddress,
+      buildingClass,
+      structureType,
+      estimatedDemolitionMethod,
+      buildingHeight,
+      footprintM2,
+      asbestosAssessmentCompleted,
+      asbestosRegisterRef,
+      asbestosPresent,
+      asbestosRemovalRequired,
+      asbestosRemovalContractorLicenced,
+      leadPaintSuspected,
+      hazardousMaterialsSurveyCompleted,
+      utilityServicesDisconnected,
+      waterDisconnected,
+      gasDisconnected,
+      electricityDisconnected,
+      sewerCapped,
+      neighborNotified,
+      councilPermitRef,
+      epaApprovalRequired,
+      epaApprovalRef,
+      structuralEngineerReview,
+      adjacentStructureProtection,
+      excavationRequired,
+      deepExcavationRisk,
+      demolitionPlanRef,
+      trafficManagementRequired,
+      dustSuppressionPlan,
+      wasteManagementPlan,
+      overallReadiness,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !preparedBy || !propertyAddress || !structureType) {
+      return res.status(400).json({ error: "projectId, date, preparedBy, propertyAddress, and structureType are required" });
+    }
+
+    const blockers = [];
+    const warnings = [];
+
+    if (!asbestosAssessmentCompleted) blockers.push("Asbestos assessment not completed — mandatory before any demolition per OHS Regulations 2017 (Vic) Part 4.1");
+    if (asbestosPresent && asbestosRemovalRequired && !asbestosRemovalContractorLicenced) {
+      blockers.push("Asbestos removal contractor not confirmed as Class A or B licensed — WorkSafe licensed contractor required for all asbestos removal");
+    }
+    if (!utilityServicesDisconnected) {
+      if (!waterDisconnected) warnings.push("Water supply not yet disconnected");
+      if (!gasDisconnected) blockers.push("Gas supply not disconnected — gas must be disconnected and capped before demolition commences");
+      if (!electricityDisconnected) blockers.push("Electricity not disconnected — mandatory before demolition. Obtain disconnection certificate from network operator.");
+    }
+    if (!councilPermitRef) warnings.push("Building permit for demolition not confirmed — permit required for most demolitions per Building Act 1993 (Vic)");
+    if (buildingHeight && Number(buildingHeight) >= 10 && !structuralEngineerReview) {
+      blockers.push("Structural engineer review required for demolition of structures > 10 m height per OHS Regulations 2017 (Vic)");
+    }
+    if (!dustSuppressionPlan) warnings.push("Dust suppression plan not prepared — required for EPA compliance and neighbour protection");
+    if (!wasteManagementPlan) warnings.push("Waste management plan not prepared — required for EPA Victoria waste tracking");
+
+    const allIssues = [...blockers, ...warnings];
+
+    if (blockers.length > 0) console.warn(`[DEMOLITION] ${propertyAddress} at ${projectId} — blockers: ${blockers.join("; ")}`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      checklist_ref: sanitiseInput(checklistRef || `DEM-${Date.now()}`),
+      date,
+      prepared_by: sanitiseInput(preparedBy),
+      property_address: sanitiseInput(propertyAddress),
+      building_class: sanitiseInput(buildingClass || ""),
+      structure_type: sanitiseInput(structureType),
+      estimated_demolition_method: sanitiseInput(estimatedDemolitionMethod || ""),
+      building_height: buildingHeight || null,
+      footprint_m2: footprintM2 || null,
+      asbestos_assessment_completed: !!asbestosAssessmentCompleted,
+      asbestos_register_ref: sanitiseInput(asbestosRegisterRef || ""),
+      asbestos_present: !!asbestosPresent,
+      asbestos_removal_required: !!asbestosRemovalRequired,
+      asbestos_removal_contractor_licenced: !!asbestosRemovalContractorLicenced,
+      lead_paint_suspected: !!leadPaintSuspected,
+      hazardous_materials_survey_completed: !!hazardousMaterialsSurveyCompleted,
+      utility_services_disconnected: !!utilityServicesDisconnected,
+      water_disconnected: !!waterDisconnected,
+      gas_disconnected: !!gasDisconnected,
+      electricity_disconnected: !!electricityDisconnected,
+      sewer_capped: !!sewerCapped,
+      neighbor_notified: !!neighborNotified,
+      council_permit_ref: sanitiseInput(councilPermitRef || ""),
+      epa_approval_required: !!epaApprovalRequired,
+      epa_approval_ref: sanitiseInput(epaApprovalRef || ""),
+      structural_engineer_review: !!structuralEngineerReview,
+      adjacent_structure_protection: !!adjacentStructureProtection,
+      excavation_required: !!excavationRequired,
+      deep_excavation_risk: !!deepExcavationRisk,
+      demolition_plan_ref: sanitiseInput(demolitionPlanRef || ""),
+      traffic_management_required: !!trafficManagementRequired,
+      dust_suppression_plan: !!dustSuppressionPlan,
+      waste_management_plan: !!wasteManagementPlan,
+      blockers,
+      warnings,
+      overall_readiness: sanitiseInput(overallReadiness || (blockers.length === 0 ? "READY" : "BLOCKED")),
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("demolition_permit_checklists").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (blockers.length > 0) {
+      return res.status(422).json({
+        readyToCommence: false,
+        blockers,
+        warnings,
+        message: "Demolition cannot commence until all blockers are resolved.",
+        record,
+        saved,
+      });
+    }
+
+    res.json({
+      readyToCommence: true,
+      blockers: [],
+      warnings,
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/demolition-permit-checklist error:", err.message);
+    res.status(500).json({ error: "Failed to record demolition permit checklist" });
+  }
+});
+
+// POST /ai-ndt-interpretation — AI interprets NDT results and provides compliance guidance
+app.post("/ai-ndt-interpretation", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      method,
+      component,
+      material,
+      weldType,
+      indications,
+      indicationSizes,
+      applicableStandard,
+      serviceCondition,
+    } = req.body;
+
+    if (!method || !component) {
+      return res.status(400).json({ error: "method and component are required" });
+    }
+
+    const prompt = `You are an NDT Level 3 specialist and welding engineer familiar with AS/NZS 1554, AS/NZS 3992, ISO 17636, ISO 17640, and Victorian pressure equipment regulations.
+
+Interpret NDT results for:
+- Method: ${sanitiseInput(method)} (e.g., UT, MPI, PT, RT)
+- Component: ${sanitiseInput(component)}
+- Material: ${sanitiseInput(material || "carbon steel")}
+- Weld type: ${sanitiseInput(weldType || "butt weld")}
+- Indications found: ${sanitiseInput(indications || "none")}
+- Indication sizes: ${sanitiseInput(indicationSizes || "not specified")}
+- Applicable standard: ${sanitiseInput(applicableStandard || "AS/NZS 1554.1")}
+- Service condition: ${sanitiseInput(serviceCondition || "structural")}
+
+Return a JSON object with:
+{
+  "acceptanceDecision": "ACCEPT|REJECT|CONDITIONAL_ACCEPT|FURTHER_INVESTIGATION",
+  "indicationClassification": string,
+  "probableDefectType": string,
+  "structuralSignificance": string,
+  "repairRequired": boolean,
+  "repairMethod": string,
+  "retestAfterRepair": boolean,
+  "fitnessForService": string,
+  "reportingRequirements": string,
+  "applicableAcceptanceCriteria": string,
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+    });
+    usageStats.openaiCalls++;
+    const interpretation = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ method, component, interpretation });
+  } catch (err) {
+    console.error("/ai-ndt-interpretation error:", err.message);
+    res.json({
+      method: req.body.method || "",
+      component: req.body.component || "",
+      interpretation: {
+        acceptanceDecision: "FURTHER_INVESTIGATION",
+        indicationClassification: "Unclassified — insufficient data for definitive classification",
+        probableDefectType: "Require actual indication dimensions and location to classify defect type (porosity, lack of fusion, cracking, etc.)",
+        structuralSignificance: "Cannot determine without indication dimensions relative to acceptance criteria",
+        repairRequired: false,
+        repairMethod: "If reject: excavate and re-weld using qualified WPS. Re-test using same method after repair.",
+        retestAfterRepair: true,
+        fitnessForService: "Fitness-for-service assessment per AS 3788 or BS 7910 may be required for complex indications in pressure equipment",
+        reportingRequirements: "NDT report to include: procedure reference, instrument calibration, indication locations (sketch), dimensions, acceptance criteria, and pass/fail decision. Signed by certified Level 2 or 3 inspector.",
+        applicableAcceptanceCriteria: "AS/NZS 1554.1 Table 6.1 for structural welds. AS/NZS 3992 Table 6.3 for pressure equipment welds.",
+        recommendation: "Review actual indication sizes against acceptance criteria in the applicable standard. Engage a Level 3 NDT inspector for interpretation of complex or borderline indications.",
+        summary: "NDT result interpretation requires comparison of actual indication dimensions against standard acceptance criteria. Engage a certified NDT inspector to formally classify and disposition all indications.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
