@@ -79824,6 +79824,423 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 282 ─────────────────────────────────────────────────────────────────
+
+// POST /emergency-generator-inspection — Record emergency generator inspection per AS 2790 / AS 61439
+app.post("/emergency-generator-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, generatorId, location, inspectionDate, inspectedBy,
+      generatorMake, generatorModel, ratedKva, fuelType,
+      lastTestDate, testRunDurationMin, testLoadPercent,
+      startTestPassed, autoTransferSwitchOk, voltageOnLoadOk, frequencyOnLoadHz,
+      fuelLevelPercent, fuelLeaksDetected, oilLevelOk, coolantLevelOk,
+      batteryVoltageV, batteryChargerOk,
+      exhaustSystemOk, ventilationAdequate,
+      alarmsPanelOk, remoteMonitoringOk,
+      maintenanceLogUpToDate, certRef, notes
+    } = req.body;
+
+    if (!generatorId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "generatorId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeGenId = sanitiseInput(String(generatorId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const criticalIssues = [];
+    const warnings = [];
+
+    const fuelLevel = parseFloat(fuelLevelPercent) || null;
+    const battVoltage = parseFloat(batteryVoltageV) || null;
+    const testLoad = parseFloat(testLoadPercent) || null;
+    const testDuration = parseFloat(testRunDurationMin) || null;
+    const freqHz = parseFloat(frequencyOnLoadHz) || null;
+
+    // AS 2790 / AS 61439 / AS/NZS 3000 — Emergency supply equipment
+    if (!startTestPassed) {
+      criticalIssues.push("Generator failed to start during test — emergency supply not available. Investigate and repair immediately.");
+    }
+
+    if (!autoTransferSwitchOk) {
+      criticalIssues.push("Automatic transfer switch (ATS) fault — mains to generator changeover may fail during power outage. Repair ATS immediately.");
+    }
+
+    if (!voltageOnLoadOk) {
+      criticalIssues.push("Generator output voltage not within acceptable range under load — connected equipment at risk.");
+    }
+
+    if (freqHz !== null && (freqHz < 49 || freqHz > 51)) {
+      criticalIssues.push(`Generator frequency ${freqHz} Hz outside 49–51 Hz band — frequency-sensitive equipment may be damaged.`);
+    }
+
+    if (fuelLeaksDetected === true || fuelLeaksDetected === "true") {
+      criticalIssues.push("Fuel leak detected — fire risk. Isolate and repair immediately. Do not run generator until repaired.");
+    }
+
+    if (fuelLevel !== null && fuelLevel < 25) {
+      criticalIssues.push(`Fuel level ${fuelLevel}% is below 25% minimum — insufficient for extended emergency operation. Refuel immediately.`);
+    }
+
+    if (!oilLevelOk) {
+      criticalIssues.push("Engine oil level low or out of range — risk of engine seizure. Check and top up to specified level.");
+    }
+
+    if (!coolantLevelOk) {
+      warnings.push("Coolant level low — check for leaks and top up. Monitor temperature during next test run.");
+    }
+
+    if (battVoltage !== null && battVoltage < 24) {
+      warnings.push(`Starting battery voltage ${battVoltage}V low — check battery charger and replace battery if required.`);
+    } else if (!batteryChargerOk) {
+      warnings.push("Battery charger fault detected — generator may fail to start after extended mains outage.");
+    }
+
+    if (testLoad !== null && testLoad < 30) {
+      warnings.push(`Test load ${testLoad}% below recommended 30% minimum — low-load running risk (wet stacking on diesel). Schedule load bank test.`);
+    }
+
+    if (testDuration !== null && testDuration < 30) {
+      warnings.push(`Test run duration ${testDuration} min below recommended 30-minute minimum for warm-up and stabilisation.`);
+    }
+
+    if (!exhaustSystemOk) {
+      warnings.push("Exhaust system deficiency detected — check for leaks, corrosion, and adequate discharge point.");
+    }
+
+    if (!ventilationAdequate) {
+      warnings.push("Generator room ventilation inadequate — overheating risk during extended operation. Review ventilation per AS 2790.");
+    }
+
+    if (!maintenanceLogUpToDate) {
+      warnings.push("Maintenance log not up to date — ESM annual statement may be non-compliant.");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "FAIL" : warnings.length > 0 ? "ATTENTION_REQUIRED" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("emergency_generator_inspections")
+        .insert({
+          project_id: safeProject,
+          generator_id: safeGenId,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          generator_make: generatorMake ? sanitiseInput(String(generatorMake)) : null,
+          generator_model: generatorModel ? sanitiseInput(String(generatorModel)) : null,
+          rated_kva: ratedKva ? parseFloat(ratedKva) : null,
+          fuel_type: fuelType ? sanitiseInput(String(fuelType)) : null,
+          last_test_date: lastTestDate || null,
+          test_run_duration_min: testDuration,
+          test_load_percent: testLoad,
+          start_test_passed: startTestPassed !== false && startTestPassed !== "false",
+          ats_ok: autoTransferSwitchOk !== false && autoTransferSwitchOk !== "false",
+          voltage_on_load_ok: voltageOnLoadOk !== false && voltageOnLoadOk !== "false",
+          frequency_hz: freqHz,
+          fuel_level_percent: fuelLevel,
+          fuel_leaks: fuelLeaksDetected || false,
+          oil_level_ok: oilLevelOk !== false && oilLevelOk !== "false",
+          coolant_level_ok: coolantLevelOk !== false && coolantLevelOk !== "false",
+          battery_voltage_v: battVoltage,
+          battery_charger_ok: batteryChargerOk !== false && batteryChargerOk !== "false",
+          exhaust_ok: exhaustSystemOk !== false && exhaustSystemOk !== "false",
+          ventilation_adequate: ventilationAdequate !== false && ventilationAdequate !== "false",
+          alarms_panel_ok: alarmsPanelOk !== false && alarmsPanelOk !== "false",
+          remote_monitoring_ok: remoteMonitoringOk !== false && remoteMonitoringOk !== "false",
+          maintenance_log_current: maintenanceLogUpToDate !== false && maintenanceLogUpToDate !== "false",
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Emergency generator defects found — emergency power supply reliability compromised.",
+        standards: ["AS 2790", "AS 61439", "AS/NZS 3000", "Building Regulations 2018 (Vic)"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      generatorId: safeGenId,
+      standards: ["AS 2790", "AS 61439", "AS/NZS 3000"],
+    });
+  } catch (err) {
+    console.error("POST /emergency-generator-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record emergency generator inspection." });
+  }
+});
+
+// POST /backflow-prevention-test — Record backflow prevention device test per AS/NZS 2845.1
+app.post("/backflow-prevention-test", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, deviceId, location, testDate, testedBy,
+      plumberLicenceNumber, deviceMake, deviceModel, deviceSize,
+      deviceType, installationLocation,
+      test1CheckValve1Closed, test1CheckValve2Closed, test1ReliefValveOpened,
+      test2CheckValve1Passed, test2CheckValve2Passed,
+      test3DifferentialPressureKpa, minimumRequiredDifferentialKpa,
+      testPassed, deviceReplaced, replacementSerialNumber,
+      nextTestDue, certRef, notes
+    } = req.body;
+
+    if (!deviceId || !location || !testDate || !testedBy) {
+      return res.status(400).json({ error: "deviceId, location, testDate, testedBy are required." });
+    }
+
+    const safeDeviceId = sanitiseInput(String(deviceId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeTester = sanitiseInput(String(testedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const criticalIssues = [];
+    const warnings = [];
+
+    const diffPressure = parseFloat(test3DifferentialPressureKpa) || null;
+    const minDiffPressure = parseFloat(minimumRequiredDifferentialKpa) || 14; // AS/NZS 2845.1 default minimum
+
+    const dType = String(deviceType || "").toUpperCase();
+
+    // AS/NZS 2845.1 — Water supply — Backflow prevention devices
+    if (testPassed === false || testPassed === "false") {
+      criticalIssues.push("Backflow prevention device FAILED test — drinking water contamination risk. Device must be repaired or replaced before re-commissioning (AS/NZS 2845.1).");
+    }
+
+    // Reduced Pressure Zone (RPZ) device tests
+    if (dType === "RPZ" || dType === "REDUCED_PRESSURE_ZONE") {
+      if (test1CheckValve1Closed === false || test1CheckValve1Closed === "false") {
+        criticalIssues.push("RPZ Test 1: First check valve not holding — backflow protection compromised. Replace check valve (AS/NZS 2845.1 cl.5.3).");
+      }
+      if (test1CheckValve2Closed === false || test1CheckValve2Closed === "false") {
+        criticalIssues.push("RPZ Test 2: Second check valve not holding — redundant backflow protection failed (AS/NZS 2845.1 cl.5.3).");
+      }
+      if (test1ReliefValveOpened === false || test1ReliefValveOpened === "false") {
+        criticalIssues.push("RPZ relief valve did not open during test — relief valve failure. Replace relief valve (AS/NZS 2845.1 cl.5.3).");
+      }
+      if (diffPressure !== null && diffPressure < minDiffPressure) {
+        criticalIssues.push(`RPZ differential pressure ${diffPressure} kPa below minimum ${minDiffPressure} kPa — device does not meet AS/NZS 2845.1 performance criteria.`);
+      }
+    }
+
+    // Double Check Valve (DCV) tests
+    if (dType === "DCV" || dType === "DOUBLE_CHECK_VALVE") {
+      if (test2CheckValve1Passed === false || test2CheckValve1Passed === "false") {
+        criticalIssues.push("DCV Test: First check valve failed — backflow protection compromised. Repair or replace (AS/NZS 2845.1 cl.5.2).");
+      }
+      if (test2CheckValve2Passed === false || test2CheckValve2Passed === "false") {
+        criticalIssues.push("DCV Test: Second check valve failed — both protection stages must pass (AS/NZS 2845.1 cl.5.2).");
+      }
+    }
+
+    if (!plumberLicenceNumber) {
+      criticalIssues.push("Backflow prevention device test must be performed by a licensed plumber — licence number not recorded (Plumbing Regulations 2018 (Vic)).");
+    }
+
+    const nextDue = nextTestDue || (() => {
+      const d = new Date(testDate);
+      d.setFullYear(d.getFullYear() + 1);
+      return d.toISOString().split("T")[0];
+    })();
+
+    if (!certRef) {
+      warnings.push("No certificate reference recorded — AS/NZS 2845.1 requires a test certificate issued by the licensed tester.");
+    }
+
+    const testStatus = criticalIssues.length > 0 ? "FAIL" : warnings.length > 0 ? "PASS_WITH_WARNINGS" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("backflow_prevention_tests")
+        .insert({
+          project_id: safeProject,
+          device_id: safeDeviceId,
+          location: safeLocation,
+          test_date: testDate,
+          tested_by: safeTester,
+          plumber_licence_number: plumberLicenceNumber ? sanitiseInput(String(plumberLicenceNumber)) : null,
+          device_make: deviceMake ? sanitiseInput(String(deviceMake)) : null,
+          device_model: deviceModel ? sanitiseInput(String(deviceModel)) : null,
+          device_size: deviceSize ? sanitiseInput(String(deviceSize)) : null,
+          device_type: dType || null,
+          installation_location: installationLocation ? sanitiseInput(String(installationLocation)) : null,
+          differential_pressure_kpa: diffPressure,
+          test_passed: testPassed !== false && testPassed !== "false",
+          device_replaced: deviceReplaced || false,
+          replacement_serial: replacementSerialNumber ? sanitiseInput(String(replacementSerialNumber)) : null,
+          next_test_due: nextDue,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          test_status: testStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        testStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Backflow prevention device failed test — potable water protection compromised. Do not reinstate until repaired and re-tested.",
+        standards: ["AS/NZS 2845.1", "AS/NZS 3500.1", "Plumbing Regulations 2018 (Vic)"],
+      });
+    }
+
+    res.json({
+      testStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      deviceId: safeDeviceId,
+      nextTestDue: nextDue,
+      standards: ["AS/NZS 2845.1", "AS/NZS 3500.1"],
+    });
+  } catch (err) {
+    console.error("POST /backflow-prevention-test error:", err.message);
+    res.status(500).json({ error: "Failed to record backflow prevention test." });
+  }
+});
+
+// POST /ai-utility-services-assessment — AI assesses gas, water, and electrical utility service condition
+app.post("/ai-utility-services-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      siteId, siteType, gasMeterAge, gasRegulatorAge, gasPressureKpa, gasLeaksHistory,
+      waterMeterAge, backflowDevicesCount, backflowDevicesOverdue, lastBackflowTest,
+      mainElectricalSwitchboardAge, meterBoxCondition, privatePolesCount,
+      lastThermographyDate, overheadOrUnderground,
+      solarInstalled, solarCapacityKw, batteryStorageKwh,
+      deficienciesNoted, serviceInterruptionsLastYear, notes
+    } = req.body;
+
+    if (!siteId) {
+      return res.status(400).json({ error: "siteId is required." });
+    }
+
+    const safeSite = sanitiseInput(String(siteId));
+    const deficiencies = Array.isArray(deficienciesNoted) ? deficienciesNoted : [];
+
+    const prompt = `You are an expert utility services engineer. Assess the condition and compliance risk of the utility services for this site under Victorian/Australian regulations.
+
+Site ID: ${safeSite}
+Site type: ${siteType || "Unknown"}
+
+GAS SERVICES:
+- Gas meter age: ${gasMeterAge ? gasMeterAge + " years" : "Unknown"}
+- Gas regulator age: ${gasRegulatorAge ? gasRegulatorAge + " years" : "Unknown"}
+- Gas pressure at meter: ${gasPressureKpa ? gasPressureKpa + " kPa" : "Unknown"}
+- History of gas leaks: ${gasLeaksHistory || "None recorded"}
+
+WATER SERVICES:
+- Water meter age: ${waterMeterAge ? waterMeterAge + " years" : "Unknown"}
+- Backflow prevention devices: ${backflowDevicesCount || 0}
+- Backflow devices overdue for testing: ${backflowDevicesOverdue || 0}
+- Last backflow test: ${lastBackflowTest || "Unknown"}
+
+ELECTRICAL SERVICES:
+- Main switchboard age: ${mainElectricalSwitchboardAge ? mainElectricalSwitchboardAge + " years" : "Unknown"}
+- Meter box condition: ${meterBoxCondition || "Unknown"}
+- Private poles: ${privatePolesCount || 0}
+- Last thermography survey: ${lastThermographyDate || "None recorded"}
+- Service type: ${overheadOrUnderground || "Unknown"}
+- Solar PV installed: ${solarInstalled ? "Yes (" + solarCapacityKw + " kW)" : "No"}
+- Battery storage: ${batteryStorageKwh ? batteryStorageKwh + " kWh" : "None"}
+
+Deficiencies noted: ${deficiencies.join("; ") || "None"}
+Service interruptions (last 12 months): ${serviceInterruptionsLastYear || 0}
+
+Assess under:
+- AS/NZS 2845.1 (backflow prevention)
+- AS/NZS 4677 (gas meter installation)
+- AS 4041 (pressure piping — gas)
+- AS/NZS 3000 (electrical wiring rules)
+- AS/NZS 4777.1 (grid-connected inverter systems)
+- Energy Safe Victoria requirements
+- SEPP Waters 2018 (Vic) cross-connection control
+
+Provide:
+1. Overall utility services risk rating
+2. Gas compliance risk
+3. Water/plumbing compliance risk
+4. Electrical compliance risk
+5. Priority actions
+6. Recommended inspection schedule
+
+Respond ONLY in JSON:
+{
+  "overallRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "gasRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "waterRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "electricalRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "priorityActions": ["string"],
+  "gasFindings": ["string"],
+  "waterFindings": ["string"],
+  "electricalFindings": ["string"],
+  "recommendedInspectionSchedule": {"gas": "string", "water": "string", "electrical": "string"},
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 900,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallRisk: "MODERATE",
+        gasRisk: "MODERATE",
+        waterRisk: "MODERATE",
+        electricalRisk: "MODERATE",
+        priorityActions: ["Commission licensed plumber to test all backflow prevention devices annually", "Engage Energy Safe Victoria registered contractor for gas appliance and regulator inspection"],
+        gasFindings: ["AI assessment unavailable — engage Gas Networks Australia registered contractor for meter and regulator inspection"],
+        waterFindings: ["AI assessment unavailable — verify all backflow prevention devices are current under AS/NZS 2845.1"],
+        electricalFindings: ["AI assessment unavailable — engage licensed electrician for switchboard thermography survey"],
+        recommendedInspectionSchedule: { gas: "Annual gas leak survey; 5-year regulator inspection", water: "Annual backflow prevention tests", electrical: "Annual thermography survey; 5-year switchboard inspection" },
+        applicableStandards: ["AS/NZS 2845.1", "AS 4041", "AS/NZS 3000", "AS/NZS 4777.1"],
+        summary: "AI assessment unavailable. Engage licensed contractors to inspect all utility services against Victorian/Australian standards.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      siteId: safeSite,
+      standards: ["AS/NZS 2845.1", "AS 4041", "AS/NZS 3000", "AS/NZS 4777.1", "Energy Safe Victoria"],
+    });
+  } catch (err) {
+    console.error("POST /ai-utility-services-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess utility services." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
