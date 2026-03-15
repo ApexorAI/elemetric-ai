@@ -35157,6 +35157,165 @@ Return a JSON object with:
   }
 });
 
+// ── Round 133: Price indexing, material cost trends, AI market analysis ───────
+
+// GET /material-price-index — Get current material price indices for key construction materials
+app.get("/material-price-index", apiKeyAuth, (req, res) => {
+  const { material, state = "VIC" } = req.query;
+
+  // Price index data — indicative indices relative to Jan 2020 = 100
+  // These are approximate market trend indicators, not official ABS data
+  const priceIndices = {
+    "structural_steel": { index: 148, trend: "STABLE", changeYoY: -3, unit: "tonne", approxPriceAud: 2400 },
+    "reinforcing_steel": { index: 152, trend: "DECREASING", changeYoY: -5, unit: "tonne", approxPriceAud: 1200 },
+    "concrete_ready_mix": { index: 138, trend: "INCREASING", changeYoY: 4, unit: "m3", approxPriceAud: 185 },
+    "structural_timber": { index: 124, trend: "STABLE", changeYoY: 1, unit: "m3", approxPriceAud: 950 },
+    "engineered_timber_lvl": { index: 118, trend: "STABLE", changeYoY: 2, unit: "m3", approxPriceAud: 2200 },
+    "brick_clay": { index: 127, trend: "INCREASING", changeYoY: 5, unit: "1000", approxPriceAud: 1100 },
+    "aluminium_extrusion": { index: 141, trend: "STABLE", changeYoY: -2, unit: "tonne", approxPriceAud: 6800 },
+    "copper_pipe": { index: 168, trend: "INCREASING", changeYoY: 8, unit: "kg", approxPriceAud: 18 },
+    "pvc_pipe_100mm": { index: 122, trend: "STABLE", changeYoY: 0, unit: "lm", approxPriceAud: 12 },
+    "insulation_glasswool": { index: 119, trend: "STABLE", changeYoY: 2, unit: "m2", approxPriceAud: 8 },
+    "plasterboard_13mm": { index: 131, trend: "INCREASING", changeYoY: 6, unit: "m2", approxPriceAud: 14 },
+    "roofing_colorbond": { index: 145, trend: "STABLE", changeYoY: 1, unit: "m2", approxPriceAud: 45 },
+    "float_glass_6mm": { index: 133, trend: "STABLE", changeYoY: 3, unit: "m2", approxPriceAud: 55 },
+    "ceramic_tile_300x300": { index: 115, trend: "DECREASING", changeYoY: -1, unit: "m2", approxPriceAud: 28 },
+    "electrical_cable_2p5mm": { index: 158, trend: "INCREASING", changeYoY: 10, unit: "100m", approxPriceAud: 180 },
+  };
+
+  if (material) {
+    const key = material.toLowerCase().replace(/\s+/g, "_");
+    const data = priceIndices[key];
+    if (!data) return res.status(404).json({ error: "Material not found in index." });
+    return res.json({ material: key, state, ...data, baseYear: 2020, disclaimer: "Indicative indices only. Verify with current supplier pricing.", timestamp: new Date().toISOString() });
+  }
+
+  const overview = Object.entries(priceIndices).map(([mat, data]) => ({ material: mat, ...data }));
+  const avgIndex = Math.round(overview.reduce((s, m) => s + m.index, 0) / overview.length);
+  const increasing = overview.filter(m => m.trend === "INCREASING").length;
+  const decreasing = overview.filter(m => m.trend === "DECREASING").length;
+
+  res.json({
+    state,
+    baseYear: 2020,
+    overallIndex: avgIndex,
+    overallTrend: increasing > decreasing ? "GENERALLY_INCREASING" : "BROADLY_STABLE",
+    materials: overview,
+    disclaimer: "Indicative indices only. Not official ABS data. Verify with current supplier pricing and ABS Producer Price Index.",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// POST /cost-escalation — Calculate cost escalation adjustment for a project budget
+app.post("/cost-escalation", apiKeyAuth, (req, res) => {
+  const {
+    originalBudget, originalEstimateDate, currentDate,
+    escalationRatePercent = 5, projectType = "building",
+    breakdown = {},
+  } = req.body;
+
+  if (!originalBudget || !originalEstimateDate)
+    return res.status(400).json({ error: "originalBudget and originalEstimateDate required." });
+
+  const original = new Date(originalEstimateDate);
+  const current = currentDate ? new Date(currentDate) : new Date();
+
+  if (isNaN(original)) return res.status(400).json({ error: "Invalid originalEstimateDate." });
+
+  const monthsDiff = (current.getFullYear() - original.getFullYear()) * 12 + (current.getMonth() - original.getMonth());
+  const yearsDiff = monthsDiff / 12;
+  const annualRate = Number(escalationRatePercent) / 100;
+
+  // Compound escalation
+  const escalationFactor = Math.pow(1 + annualRate, yearsDiff);
+  const budget = Number(originalBudget);
+  const escalatedBudget = Math.round(budget * escalationFactor);
+  const escalationAmount = escalatedBudget - budget;
+  const escalationPercent = Math.round((escalationFactor - 1) * 1000) / 10;
+
+  // Apply to breakdown if provided
+  const escalatedBreakdown = {};
+  let breakdownTotal = 0;
+  for (const [key, value] of Object.entries(breakdown)) {
+    const escalatedValue = Math.round(Number(value) * escalationFactor);
+    escalatedBreakdown[key] = { original: Number(value), escalated: escalatedValue, increase: escalatedValue - Number(value) };
+    breakdownTotal += escalatedValue;
+  }
+
+  res.json({
+    originalBudget: budget,
+    originalEstimateDate: originalEstimateDate,
+    currentDate: current.toISOString().split("T")[0],
+    monthsElapsed: monthsDiff,
+    annualEscalationRate: Number(escalationRatePercent),
+    escalationFactor: Math.round(escalationFactor * 10000) / 10000,
+    escalationPercent,
+    escalationAmount,
+    escalatedBudget,
+    breakdown: Object.keys(escalatedBreakdown).length > 0 ? escalatedBreakdown : null,
+    disclaimer: "Escalation is indicative only. Use industry forecasts for project-specific rates.",
+    calculatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /ai-market-analysis — AI analyses current construction market conditions
+app.post("/ai-market-analysis", apiKeyAuth, async (req, res) => {
+  const {
+    trade, state = "VIC", projectType, analysisType = "pricing",
+    additionalContext,
+  } = req.body;
+
+  if (!trade || !analysisType) return res.status(400).json({ error: "trade and analysisType required." });
+
+  const prompt = `You are a senior construction economist and market analyst specialising in the Australian construction industry. Provide a current market analysis based on publicly available knowledge up to your training data.
+
+Analysis type: ${sanitiseInput(analysisType)} (pricing/supply/demand/risk/forecast)
+Trade/sector: ${sanitiseInput(trade)}
+State: ${sanitiseInput(state)}
+Project type: ${sanitiseInput(projectType || "General construction")}
+Additional context: ${sanitiseInput(additionalContext || "None provided")}
+
+Return a JSON object with:
+- "marketSentiment": "STRONG"|"MODERATE"|"WEAK"|"VOLATILE"
+- "pricingPressure": "INCREASING"|"STABLE"|"DECREASING"|"VOLATILE"
+- "supplyChainStatus": "NORMAL"|"CONSTRAINED"|"DISRUPTED"
+- "labourMarket": "SHORTAGE"|"BALANCED"|"SURPLUS"
+- "keyFindings": array of 5-7 key market findings
+- "pricingOutlook": string — 6-12 month pricing outlook
+- "risks": array of { "risk": string, "likelihood": "LOW"|"MEDIUM"|"HIGH", "impact": "LOW"|"MEDIUM"|"HIGH" }
+- "opportunities": array of market opportunities
+- "tenderAdvice": strategic advice for tendering in current market
+- "regionSpecificNotes": any state/region-specific market notes
+- "disclaimer": data limitation disclaimer`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, trade, state, analysisType, analysedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      marketSentiment: "MODERATE",
+      pricingPressure: "STABLE",
+      supplyChainStatus: "NORMAL",
+      labourMarket: "SHORTAGE",
+      keyFindings: ["Market analysis temporarily unavailable. Consult industry reports for current data."],
+      pricingOutlook: "Unable to forecast — consult ABS Producer Price Index and industry bodies.",
+      risks: [],
+      opportunities: [],
+      tenderAdvice: "Consult current market data before pricing tenders.",
+      regionSpecificNotes: "",
+      disclaimer: "Market analysis is AI-generated based on training data and may not reflect current conditions.",
+      trade, state, analysisType, analysedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
