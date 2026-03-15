@@ -32770,6 +32770,197 @@ app.get("/payroll-summary/:contractorId", apiKeyAuth, async (req, res) => {
   res.status(503).json({ error: "Database not configured." });
 });
 
+// ── Round 121: SOP library, toolbox talk generator, safety observation ────────
+
+// POST /sop — Create a Standard Operating Procedure (SOP)
+app.post("/sop", apiKeyAuth, async (req, res) => {
+  const {
+    trade, task, version = "1.0", authoredBy,
+    purpose, scope, responsibilities = [],
+    tools = [], ppe = [], steps = [],
+    hazards = [], emergencyProcedure,
+    reviewDate, approvedBy,
+  } = req.body;
+
+  if (!trade || !task || !steps.length) return res.status(400).json({ error: "trade, task, steps required." });
+
+  const sopNumber = `SOP-${sanitiseInput(trade).slice(0, 4).toUpperCase()}-${Date.now().toString(36).toUpperCase().slice(-6)}`;
+
+  const processedSteps = steps.map((step, idx) => ({
+    stepNumber: idx + 1,
+    description: sanitiseInput(step.description || step || ""),
+    criticalStep: Boolean(step.criticalStep),
+    photo: sanitiseInput(step.photo || ""),
+  }));
+
+  const record = {
+    sop_number: sopNumber,
+    trade: sanitiseInput(trade),
+    task: sanitiseInput(task),
+    version: sanitiseInput(version),
+    authored_by: sanitiseInput(authoredBy || ""),
+    purpose: sanitiseInput(purpose || ""),
+    scope: sanitiseInput(scope || ""),
+    responsibilities: responsibilities.map(r => sanitiseInput(r)),
+    tools: tools.map(t => sanitiseInput(t)),
+    ppe: ppe.map(p => sanitiseInput(p)),
+    steps: processedSteps,
+    step_count: processedSteps.length,
+    hazards: hazards.map(h => ({
+      hazard: sanitiseInput(h.hazard || h || ""),
+      risk: sanitiseInput(h.risk || ""),
+      control: sanitiseInput(h.control || ""),
+    })),
+    emergency_procedure: sanitiseInput(emergencyProcedure || "Cease work, make safe, call emergency services if required, report to supervisor."),
+    review_date: reviewDate || null,
+    approved_by: sanitiseInput(approvedBy || ""),
+    status: approvedBy ? "APPROVED" : "DRAFT",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("sop_library")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, sopId: data.id, sopNumber, status: record.status, ...record });
+  }
+
+  res.json({ success: true, sopId: null, sopNumber, status: record.status, ...record, saved: false });
+});
+
+// GET /sop/:trade — List SOPs for a trade
+app.get("/sop/:trade", apiKeyAuth, async (req, res) => {
+  const { trade } = req.params;
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("sop_library")
+      .select("sop_number, task, version, status, approved_by, created_at")
+      .ilike("trade", trade)
+      .order("task", { ascending: true });
+    if (error) return res.status(500).json({ error: "DB error." });
+    return res.json({ trade, sops: data || [], count: (data || []).length });
+  }
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /ai-toolbox-talk — AI generates a toolbox talk script on a safety topic
+app.post("/ai-toolbox-talk", apiKeyAuth, async (req, res) => {
+  const {
+    topic, trade, duration = 10, audience = "site workers",
+    recentIncident, state = "VIC",
+  } = req.body;
+
+  if (!topic) return res.status(400).json({ error: "topic required." });
+
+  const sanitisedTopic = sanitiseInput(topic);
+  const sanitisedIncident = recentIncident ? sanitiseInput(recentIncident) : null;
+
+  const prompt = `You are a senior WHS officer preparing a toolbox talk for an Australian construction site. Write a complete toolbox talk script on the following topic.
+
+Topic: ${sanitisedTopic}
+Trade/audience: ${sanitiseInput(trade || "")} — ${sanitiseInput(audience)}
+Duration: approximately ${duration} minutes
+State: ${sanitiseInput(state)}
+Recent incident to reference: ${sanitisedIncident || "None — use general examples"}
+
+Return a JSON object with:
+- "title": toolbox talk title
+- "objective": one-sentence learning objective
+- "openingStatement": engaging opening (1-2 sentences)
+- "keyPoints": array of { "point": string, "details": string, "example": string }
+- "statistics": any relevant Australian safety statistics
+- "legalRequirements": relevant WHS Act/Regulations requirements
+- "discussion Questions": array of questions to engage workers
+- "keyMessages": array of 3-5 key take-away messages
+- "closingStatement": closing summary
+- "signOffPrompt": instruction to collect signatures
+- "estimatedDuration": string`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, topic, trade, state, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      title: `Toolbox Talk: ${sanitisedTopic}`,
+      objective: `Ensure all workers understand safe practices related to ${sanitisedTopic}.`,
+      openingStatement: `Today we're discussing ${sanitisedTopic} — an important safety topic for our site.`,
+      keyPoints: [
+        { point: "Be aware of hazards", details: `Identify all hazards related to ${sanitisedTopic} before commencing work.`, example: "Check your work area before starting." },
+        { point: "Follow safe work procedures", details: "Always follow the SOP and site safety plan.", example: "Never take shortcuts." },
+        { point: "Report incidents immediately", details: "All incidents, near-misses, and hazards must be reported.", example: "Report to your supervisor immediately." },
+      ],
+      statistics: "Safe Work Australia reports construction is one of Australia's highest-risk industries.",
+      legalRequirements: `Work Health and Safety Act ${state === "VIC" ? "2004" : "2011"} requires all workers to take reasonable care for their own health and safety.`,
+      "discussion Questions": ["What are the main hazards in this area?", "What can you do to reduce risk today?", "Has anyone seen a near-miss recently?"],
+      keyMessages: [`Always be aware of ${sanitisedTopic} hazards.`, "Follow the SOP.", "Report incidents immediately."],
+      closingStatement: "Your safety is the most important thing on this site. Look out for each other.",
+      signOffPrompt: "Please sign the attendance sheet to confirm you have attended this toolbox talk.",
+      estimatedDuration: `${duration} minutes`,
+      topic, trade, state, generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /safety-observation — Record a positive or negative safety observation
+app.post("/safety-observation", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, projectId, observedBy, observationDate,
+    observationType, category, description,
+    location, trade, personInvolved, actionTaken,
+    immediateCorrection = false, followUpRequired = false,
+    followUpDate, severity,
+  } = req.body;
+
+  if (!siteId || !description) return res.status(400).json({ error: "siteId and description required." });
+
+  const validTypes = ["POSITIVE", "NEGATIVE", "NEAR_MISS", "HAZARD", "IMPROVEMENT"];
+  const validCategories = ["PPE", "HOUSEKEEPING", "PLANT_EQUIPMENT", "WORKING_AT_HEIGHT", "ELECTRICAL", "MANUAL_HANDLING", "HAZARDOUS_SUBSTANCES", "TRAFFIC", "EXCAVATION", "HOT_WORK", "OTHER"];
+  const type = (observationType || "NEGATIVE").toUpperCase();
+  const cat = (category || "OTHER").toUpperCase();
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    project_id: sanitiseInput(projectId || ""),
+    observed_by: sanitiseInput(observedBy || ""),
+    observation_date: observationDate || new Date().toISOString().split("T")[0],
+    observation_type: validTypes.includes(type) ? type : "NEGATIVE",
+    category: validCategories.includes(cat) ? cat : "OTHER",
+    description: sanitiseInput(description),
+    location: sanitiseInput(location || ""),
+    trade: sanitiseInput(trade || ""),
+    person_involved: sanitiseInput(personInvolved || ""),
+    action_taken: sanitiseInput(actionTaken || ""),
+    immediate_correction: Boolean(immediateCorrection),
+    follow_up_required: Boolean(followUpRequired),
+    follow_up_date: followUpRequired ? (followUpDate || null) : null,
+    severity: ["LOW", "MEDIUM", "HIGH", "CRITICAL"].includes((severity || "").toUpperCase()) ? severity.toUpperCase() : "MEDIUM",
+    status: followUpRequired ? "FOLLOW_UP_REQUIRED" : "CLOSED",
+    observed_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("safety_observations")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, observationId: data.id, ...record });
+  }
+
+  res.json({ success: true, observationId: null, ...record, saved: false });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
