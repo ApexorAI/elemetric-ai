@@ -59316,6 +59316,343 @@ Return a JSON object with:
   }
 });
 
+// POST /worksafe-notifiable-incident — Record a WorkSafe Victoria notifiable incident
+app.post("/worksafe-notifiable-incident", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      incidentRef,
+      incidentDate,
+      incidentTime,
+      location,
+      incidentType,
+      incidentDescription,
+      injuredPersonName,
+      injuredPersonEmployer,
+      injuredPersonRole,
+      injuryType,
+      injurySeverity,
+      bodyPartAffected,
+      treatmentRequired,
+      hospitalName,
+      hospitalisedOvernight,
+      deathOccurred,
+      workActivity,
+      equipmentInvolved,
+      immediateCause,
+      scenePreserved,
+      scenePreservationDetails,
+      supervisorName,
+      supervisorPhone,
+      worksafeNotifiedDate,
+      worksafeNotifiedTime,
+      worksafeNotificationMethod,
+      worksafeRef,
+      notificationStatus,
+      witnessNames,
+      witnessContacts,
+      photographsTaken,
+      investigationRequired,
+      investigationRef,
+      notes,
+    } = req.body;
+
+    if (!projectId || !incidentDate || !incidentType || !incidentDescription || !location) {
+      return res.status(400).json({ error: "projectId, incidentDate, incidentType, incidentDescription, and location are required" });
+    }
+
+    const notificationFlags = [];
+    // OHS Act 2004 (Vic) s.38: Employer must notify WorkSafe immediately if person killed or requires hospitalisation, or dangerous incident
+    const isNotifiable = deathOccurred || hospitalisedOvernight || treatmentRequired === "hospitalisation" ||
+      ["DEATH", "SERIOUS INJURY", "DANGEROUS INCIDENT", "NOTIFIABLE"].includes(String(incidentType || "").toUpperCase());
+
+    if (isNotifiable && !worksafeRef && notificationStatus !== "NOTIFIED") {
+      notificationFlags.push("IMMEDIATE ACTION REQUIRED: This incident appears notifiable under OHS Act 2004 s.38 — notify WorkSafe Victoria on 13 23 60 immediately");
+    }
+    if (!scenePreserved && isNotifiable) {
+      notificationFlags.push("Scene must be preserved until WorkSafe grants permission to disturb — do not move equipment or disturb scene unless necessary to assist injured person or prevent further injury");
+    }
+    if (isNotifiable && !investigationRequired) {
+      notificationFlags.push("Investigation is mandatory for all notifiable incidents — commence investigation within 24 hours");
+    }
+
+    if (notificationFlags.length > 0) {
+      console.warn(`[WORKSAFE NOTIFIABLE] ${incidentType} at ${projectId} on ${incidentDate} — ${notificationFlags.join("; ")}`);
+    }
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      incident_ref: sanitiseInput(incidentRef || `WSI-${Date.now()}`),
+      incident_date: incidentDate,
+      incident_time: sanitiseInput(incidentTime || ""),
+      location: sanitiseInput(location),
+      incident_type: sanitiseInput(incidentType),
+      incident_description: sanitiseInput(incidentDescription),
+      injured_person_name: sanitiseInput(injuredPersonName || ""),
+      injured_person_employer: sanitiseInput(injuredPersonEmployer || ""),
+      injured_person_role: sanitiseInput(injuredPersonRole || ""),
+      injury_type: sanitiseInput(injuryType || ""),
+      injury_severity: sanitiseInput(injurySeverity || ""),
+      body_part_affected: sanitiseInput(bodyPartAffected || ""),
+      treatment_required: sanitiseInput(treatmentRequired || ""),
+      hospital_name: sanitiseInput(hospitalName || ""),
+      hospitalised_overnight: !!hospitalisedOvernight,
+      death_occurred: !!deathOccurred,
+      work_activity: sanitiseInput(workActivity || ""),
+      equipment_involved: sanitiseInput(equipmentInvolved || ""),
+      immediate_cause: sanitiseInput(immediateCause || ""),
+      scene_preserved: !!scenePreserved,
+      scene_preservation_details: sanitiseInput(scenePreservationDetails || ""),
+      supervisor_name: sanitiseInput(supervisorName || ""),
+      supervisor_phone: sanitiseInput(supervisorPhone || ""),
+      worksafe_notified_date: worksafeNotifiedDate || null,
+      worksafe_notified_time: sanitiseInput(worksafeNotifiedTime || ""),
+      worksafe_notification_method: sanitiseInput(worksafeNotificationMethod || "phone"),
+      worksafe_ref: sanitiseInput(worksafeRef || ""),
+      notification_status: sanitiseInput(notificationStatus || (isNotifiable ? "PENDING" : "NOT_REQUIRED")),
+      is_notifiable: isNotifiable,
+      witness_names: Array.isArray(witnessNames) ? witnessNames.map(n => sanitiseInput(n)) : [],
+      witness_contacts: Array.isArray(witnessContacts) ? witnessContacts.map(c => sanitiseInput(c)) : [],
+      photographs_taken: !!photographsTaken,
+      investigation_required: !!investigationRequired || isNotifiable,
+      investigation_ref: sanitiseInput(investigationRef || ""),
+      notification_flags: notificationFlags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("worksafe_notifiable_incidents").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (isNotifiable && !worksafeRef) {
+      return res.status(422).json({
+        isNotifiable: true,
+        notificationRequired: true,
+        notificationFlags,
+        worksafePhone: "13 23 60",
+        message: "This incident is notifiable to WorkSafe Victoria. Call 13 23 60 immediately. Do not disturb the scene without WorkSafe permission.",
+        record,
+        saved,
+      });
+    }
+
+    res.json({ isNotifiable, notificationStatus: record.notification_status, notificationFlags, record, saved });
+  } catch (err) {
+    console.error("/worksafe-notifiable-incident error:", err.message);
+    res.status(500).json({ error: "Failed to record WorkSafe notifiable incident" });
+  }
+});
+
+// POST /roof-inspection — Record a roof condition inspection
+app.post("/roof-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      inspectionRef,
+      date,
+      inspector,
+      propertyAddress,
+      roofType,
+      roofMaterial,
+      roofAgeYears,
+      roofPitchDegrees,
+      accessMethod,
+      ridgeCapOk,
+      flashingOk,
+      flashingLocations,
+      guttersOk,
+      downpipesOk,
+      valleysOk,
+      skylightsOk,
+      chimneyOk,
+      solarPanelsPresent,
+      solarPanelCondition,
+      tilesCondition,
+      crackedTilesCount,
+      missingTilesCount,
+      mossLichenPresent,
+      ponding,
+      pondingLocations,
+      penetrationsSealed,
+      insectPestDamage,
+      moistureIngressEvidence,
+      moistureIngressLocations,
+      structuralConcerns,
+      structuralConcernDetails,
+      overallConditionGrade,
+      urgentRepairs,
+      urgentRepairList,
+      recommendedActions,
+      estimatedRemainingLifeYears,
+      nextInspectionDue,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !inspector || !propertyAddress || !roofType || !overallConditionGrade) {
+      return res.status(400).json({ error: "projectId, date, inspector, propertyAddress, roofType, and overallConditionGrade are required" });
+    }
+
+    const flags = [];
+    if (urgentRepairs) flags.push(`Urgent roof repairs required: ${Array.isArray(urgentRepairList) ? urgentRepairList.map(r => sanitiseInput(r)).join(", ") : sanitiseInput(String(urgentRepairList || ""))}`);
+    if (structuralConcerns) flags.push(`Structural concerns: ${sanitiseInput(structuralConcernDetails || "details not provided")} — engage structural engineer`);
+    if (moistureIngressEvidence) flags.push(`Moisture ingress detected at: ${sanitiseInput(moistureIngressLocations || "locations not specified")} — repair immediately to prevent structural damage`);
+    if (!flashingOk) flags.push("Flashing defective or missing — leading cause of roof leaks, prioritise repair");
+    if (["E", "F", "CRITICAL", "POOR"].includes(String(overallConditionGrade || "").toUpperCase())) {
+      flags.push(`Roof condition grade ${overallConditionGrade} — urgent comprehensive repair or replacement may be required`);
+    }
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      inspection_ref: sanitiseInput(inspectionRef || `RF-${Date.now()}`),
+      date,
+      inspector: sanitiseInput(inspector),
+      property_address: sanitiseInput(propertyAddress),
+      roof_type: sanitiseInput(roofType),
+      roof_material: sanitiseInput(roofMaterial || ""),
+      roof_age_years: roofAgeYears || null,
+      roof_pitch_degrees: roofPitchDegrees || null,
+      access_method: sanitiseInput(accessMethod || ""),
+      ridge_cap_ok: !!ridgeCapOk,
+      flashing_ok: !!flashingOk,
+      flashing_locations: sanitiseInput(flashingLocations || ""),
+      gutters_ok: !!guttersOk,
+      downpipes_ok: !!downpipesOk,
+      valleys_ok: !!valleysOk,
+      skylights_ok: skylightsOk !== undefined ? !!skylightsOk : null,
+      chimney_ok: chimneyOk !== undefined ? !!chimneyOk : null,
+      solar_panels_present: !!solarPanelsPresent,
+      solar_panel_condition: sanitiseInput(solarPanelCondition || ""),
+      tiles_condition: sanitiseInput(tilesCondition || ""),
+      cracked_tiles_count: crackedTilesCount || null,
+      missing_tiles_count: missingTilesCount || null,
+      moss_lichen_present: !!mossLichenPresent,
+      ponding: !!ponding,
+      ponding_locations: sanitiseInput(pondingLocations || ""),
+      penetrations_sealed: !!penetrationsSealed,
+      insect_pest_damage: !!insectPestDamage,
+      moisture_ingress_evidence: !!moistureIngressEvidence,
+      moisture_ingress_locations: sanitiseInput(moistureIngressLocations || ""),
+      structural_concerns: !!structuralConcerns,
+      structural_concern_details: sanitiseInput(structuralConcernDetails || ""),
+      overall_condition_grade: sanitiseInput(overallConditionGrade),
+      urgent_repairs: !!urgentRepairs,
+      urgent_repair_list: Array.isArray(urgentRepairList) ? urgentRepairList.map(r => sanitiseInput(r)) : [],
+      recommended_actions: Array.isArray(recommendedActions) ? recommendedActions.map(a => sanitiseInput(a)) : [],
+      estimated_remaining_life_years: estimatedRemainingLifeYears || null,
+      next_inspection_due: nextInspectionDue || null,
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("roof_inspections").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      overallConditionGrade,
+      urgentRepairs: !!urgentRepairs,
+      flags,
+      estimatedRemainingLifeYears: estimatedRemainingLifeYears || null,
+      applicableStandards: ["AS 4349.0 Inspection of buildings — general requirements", "AS 4349.1 Pre-purchase inspections", "AS 3959 Construction of buildings in bushfire-prone areas (if applicable)"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/roof-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record roof inspection" });
+  }
+});
+
+// POST /ai-worksafe-notification-guide — AI guides through WorkSafe Victoria notification requirements
+app.post("/ai-worksafe-notification-guide", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      incidentType,
+      injurySeverity,
+      treatmentRequired,
+      deathOccurred,
+      equipmentInvolved,
+      workActivity,
+      incidentDescription,
+    } = req.body;
+
+    if (!incidentType || !incidentDescription) {
+      return res.status(400).json({ error: "incidentType and incidentDescription are required" });
+    }
+
+    const prompt = `You are a WorkSafe Victoria compliance expert with expertise in OHS Act 2004 (Vic), WHS Regulations 2017, and the notification of workplace incidents.
+
+Assess WorkSafe notification requirements for the following incident:
+- Incident type: ${sanitiseInput(incidentType)}
+- Injury severity: ${sanitiseInput(injurySeverity || "not specified")}
+- Treatment required: ${sanitiseInput(treatmentRequired || "not specified")}
+- Death occurred: ${sanitiseInput(String(deathOccurred || false))}
+- Equipment involved: ${sanitiseInput(equipmentInvolved || "none")}
+- Work activity: ${sanitiseInput(workActivity || "not specified")}
+- Description: ${sanitiseInput(incidentDescription)}
+
+Return a JSON object with:
+{
+  "isNotifiable": boolean,
+  "notificationType": string,
+  "immediateNotificationRequired": boolean,
+  "notificationMethod": string,
+  "worksafePhone": string,
+  "timeframeToNotify": string,
+  "scenePreservationRequired": boolean,
+  "scenePreservationDetails": string,
+  "immediateActions": [string],
+  "investigationRequired": boolean,
+  "reportRequired": boolean,
+  "reportTimeframe": string,
+  "penaltiesForNonNotification": string,
+  "applicableLegislation": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+    });
+    usageStats.openaiCalls++;
+    const guide = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ incidentType, guide });
+  } catch (err) {
+    console.error("/ai-worksafe-notification-guide error:", err.message);
+    res.json({
+      incidentType: req.body.incidentType || "",
+      guide: {
+        isNotifiable: true,
+        notificationType: "Serious injury or illness / Dangerous incident",
+        immediateNotificationRequired: true,
+        notificationMethod: "Telephone",
+        worksafePhone: "13 23 60",
+        timeframeToNotify: "IMMEDIATELY — as soon as practicable after becoming aware of the incident",
+        scenePreservationRequired: true,
+        scenePreservationDetails: "Do not disturb the scene (except to assist injured, prevent further injury, or make area safe) until WorkSafe grants permission. Document scene with photographs.",
+        immediateActions: ["Call emergency services (000) if required", "Provide first aid to injured person", "Call WorkSafe Victoria on 13 23 60", "Preserve the scene and restrict access", "Brief witnesses and record details"],
+        investigationRequired: true,
+        reportRequired: true,
+        reportTimeframe: "Within 48 hours of the incident (for some categories). WorkSafe will advise timeframe on notification.",
+        penaltiesForNonNotification: "Failure to notify WorkSafe is an offence under OHS Act 2004 (Vic) s.38. Maximum penalty: $313,056 for body corporates, $62,611 for individuals (as at 2024).",
+        applicableLegislation: ["OHS Act 2004 (Vic) s.38 — notification of incidents", "OHS Regulations 2017 (Vic)", "WorkSafe Victoria Incident Notification requirements"],
+        recommendation: "When in doubt, notify WorkSafe. The cost of failing to notify far exceeds the inconvenience of an unnecessary notification. Preserve the scene, record witness accounts, and commence investigation immediately.",
+        summary: "Notifiable incidents must be reported to WorkSafe Victoria immediately by telephone. Preserve the scene and commence an investigation. Failure to notify is a criminal offence.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
