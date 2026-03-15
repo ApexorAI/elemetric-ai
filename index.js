@@ -36930,6 +36930,217 @@ Return JSON with:
   }
 });
 
+// POST /certificate-of-currency — Track insurance certificates of currency
+app.post("/certificate-of-currency", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, contractorName, insurerName, policyNumber, policyType,
+    coverageAmountAud, expiryDate, inceptionDate, insuredActivities,
+    brokerName, brokerPhone, brokerEmail, notes,
+  } = req.body;
+  if (!contractorName || !policyType || !expiryDate) {
+    return res.status(400).json({ error: "contractorName, policyType, and expiryDate are required." });
+  }
+  const validPolicyTypes = [
+    "PUBLIC_LIABILITY", "PROFESSIONAL_INDEMNITY", "WORKERS_COMPENSATION",
+    "CONTRACTORS_ALL_RISK", "PRODUCT_LIABILITY", "TOOL_AND_EQUIPMENT",
+  ];
+  if (!validPolicyTypes.includes(policyType)) {
+    return res.status(400).json({ error: `policyType must be one of: ${validPolicyTypes.join(", ")}` });
+  }
+  const daysUntilExpiry = Math.ceil((new Date(expiryDate) - new Date()) / (1000 * 60 * 60 * 24));
+  const expiryStatus = daysUntilExpiry < 0 ? "EXPIRED"
+    : daysUntilExpiry <= 30 ? "EXPIRING_SOON"
+    : "CURRENT";
+  const cocRef = `COC-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    coc_ref: cocRef,
+    contractor_id: contractorId || null,
+    contractor_name: sanitiseInput(contractorName),
+    insurer_name: sanitiseInput(insurerName || ""),
+    policy_number: sanitiseInput(policyNumber || ""),
+    policy_type: policyType,
+    coverage_amount_aud: Number(coverageAmountAud) || null,
+    expiry_date: expiryDate,
+    inception_date: inceptionDate || null,
+    insured_activities: sanitiseInput(insuredActivities || ""),
+    broker_name: sanitiseInput(brokerName || ""),
+    broker_phone: sanitiseInput(brokerPhone || ""),
+    broker_email: brokerEmail && isValidEmail(brokerEmail) ? brokerEmail : null,
+    expiry_status: expiryStatus,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("certificates_of_currency").insert(record);
+    if (error) console.error("certificate-of-currency DB error:", error.message);
+  }
+  res.json({
+    cocRef, contractorName, policyType, expiryDate, daysUntilExpiry,
+    expiryStatus, coverageAmountAud: Number(coverageAmountAud) || null,
+    saved: !!supabaseAdmin,
+  });
+});
+
+// GET /certificate-of-currency/:contractorId — Get all CoCs for a contractor
+app.get("/certificate-of-currency/:contractorId", apiKeyAuth, async (req, res) => {
+  const { contractorId } = req.params;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  const { data, error } = await supabaseAdmin
+    .from("certificates_of_currency")
+    .select("*")
+    .eq("contractor_id", contractorId)
+    .order("expiry_date", { ascending: true });
+  if (error) return res.status(500).json({ error: error.message });
+  const now = new Date();
+  const summary = {
+    total: data.length,
+    current: data.filter(c => c.expiry_status === "CURRENT").length,
+    expiringSoon: data.filter(c => c.expiry_status === "EXPIRING_SOON").length,
+    expired: data.filter(c => c.expiry_status === "EXPIRED" || new Date(c.expiry_date) < now).length,
+  };
+  res.json({ contractorId, summary, certificates: data });
+});
+
+// POST /project-budget — Set or update a project budget
+app.post("/project-budget", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, totalBudgetAud,
+    labourBudget, materialsBudget, subcontractorsBudget, overheadBudget,
+    contingencyPercentage = 10, startDate, endDate, currency = "AUD",
+  } = req.body;
+  if (!projectId || !totalBudgetAud) {
+    return res.status(400).json({ error: "projectId and totalBudgetAud are required." });
+  }
+  const total = Number(totalBudgetAud);
+  const contingency = total * (Number(contingencyPercentage) / 100);
+  const allocatedBudget = (Number(labourBudget) || 0) + (Number(materialsBudget) || 0)
+    + (Number(subcontractorsBudget) || 0) + (Number(overheadBudget) || 0);
+  const unallocated = total - contingency - allocatedBudget;
+  const record = {
+    project_id: projectId,
+    project_name: sanitiseInput(projectName || ""),
+    total_budget_aud: total,
+    labour_budget: Number(labourBudget) || 0,
+    materials_budget: Number(materialsBudget) || 0,
+    subcontractors_budget: Number(subcontractorsBudget) || 0,
+    overhead_budget: Number(overheadBudget) || 0,
+    contingency_pct: Number(contingencyPercentage),
+    contingency_amount: +contingency.toFixed(2),
+    allocated: +allocatedBudget.toFixed(2),
+    unallocated: +unallocated.toFixed(2),
+    currency,
+    start_date: startDate || null,
+    end_date: endDate || null,
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin
+      .from("project_budgets")
+      .upsert(record, { onConflict: "project_id" });
+    if (error) console.error("project-budget DB error:", error.message);
+  }
+  res.json({
+    projectId, projectName, currency,
+    budget: {
+      total, labour: record.labour_budget, materials: record.materials_budget,
+      subcontractors: record.subcontractors_budget, overhead: record.overhead_budget,
+      contingency: +contingency.toFixed(2), unallocated: +unallocated.toFixed(2),
+    },
+    allocationPercent: total > 0 ? +(allocatedBudget / total * 100).toFixed(1) : 0,
+    saved: !!supabaseAdmin,
+  });
+});
+
+// GET /project-budget/:projectId — Get budget and spending summary
+app.get("/project-budget/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  const [budgetRes, spendRes] = await Promise.all([
+    supabaseAdmin.from("project_budgets").select("*").eq("project_id", projectId).single(),
+    supabaseAdmin.from("job_costing").select("actual_cost_aud").eq("project_id", projectId),
+  ]);
+  if (budgetRes.error) return res.status(404).json({ error: "Budget not found." });
+  const budget = budgetRes.data;
+  const spent = spendRes.data
+    ? spendRes.data.reduce((s, r) => s + (Number(r.actual_cost_aud) || 0), 0)
+    : 0;
+  const remaining = budget.total_budget_aud - spent;
+  const burnPercent = budget.total_budget_aud > 0 ? +(spent / budget.total_budget_aud * 100).toFixed(1) : 0;
+  const forecastToComplete = budget.total_budget_aud;
+  res.json({
+    projectId, budget,
+    spending: {
+      spent: +spent.toFixed(2),
+      remaining: +remaining.toFixed(2),
+      burnPercent,
+      forecastToComplete,
+      varianceAtCompletion: +(budget.total_budget_aud - forecastToComplete).toFixed(2),
+    },
+  });
+});
+
+// POST /ai-specification-checker — AI reviews a scope/spec against Australian Standards
+app.post("/ai-specification-checker", apiKeyAuth, async (req, res) => {
+  const { trade, specificationText, applicableStandards = [], projectType = "residential" } = req.body;
+  if (!trade || !specificationText) {
+    return res.status(400).json({ error: "trade and specificationText are required." });
+  }
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedSpec = sanitiseInput(specificationText);
+  const sanitisedProjectType = sanitiseInput(projectType);
+  const systemPrompt = `You are an Australian construction specification expert and compliance auditor.`;
+  const userPrompt = `Review this ${sanitisedTrade} specification for an Australian ${sanitisedProjectType} project.
+Specification text: ${sanitisedSpec}
+Relevant standards specified: ${applicableStandards.map(s => sanitiseInput(s)).join(", ") || "None specified"}
+
+Return JSON with:
+{
+  "overallCompliance": "COMPLIANT|PARTIALLY_COMPLIANT|NON_COMPLIANT",
+  "complianceScore": 85,
+  "missingRequirements": ["...", "..."],
+  "nonCompliantClauses": [{"clause": "...", "issue": "...", "recommendation": "..."}],
+  "applicableStandards": ["AS/NZS ...", "..."],
+  "bestPracticeGaps": ["...", "..."],
+  "strengths": ["...", "..."],
+  "suggestedAdditions": ["...", "..."],
+  "riskLevel": "HIGH|MEDIUM|LOW",
+  "certificationRequired": true,
+  "summary": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const review = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ trade: sanitisedTrade, projectType: sanitisedProjectType, review });
+  } catch (err) {
+    console.error("ai-specification-checker error:", err.message);
+    res.json({
+      trade: sanitisedTrade, projectType: sanitisedProjectType,
+      review: {
+        overallCompliance: "PARTIALLY_COMPLIANT",
+        complianceScore: 0,
+        missingRequirements: ["AI review unavailable — manual review required"],
+        nonCompliantClauses: [],
+        applicableStandards: applicableStandards,
+        bestPracticeGaps: [],
+        strengths: [],
+        suggestedAdditions: [],
+        riskLevel: "MEDIUM",
+        certificationRequired: true,
+        summary: "Automated review is currently unavailable. Please have a qualified professional review the specification.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
