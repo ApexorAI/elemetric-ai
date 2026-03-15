@@ -25976,6 +25976,156 @@ app.post("/energy-efficiency-check", apiKeyAuth, (req, res) => {
   });
 });
 
+// POST /fire-rating-check  — Check fire resistance level requirements for construction
+app.post("/fire-rating-check", apiKeyAuth, (req, res) => {
+  const { jobId, buildingClass, buildingType, floors, distanceFromBoundaryM, construction, notes } = req.body || {};
+  if (!buildingClass) return res.status(400).json({ error: "buildingClass required." });
+
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeClass  = sanitiseInput(String(buildingClass)).toUpperCase().slice(0, 5);
+  const safeType   = buildingType ? sanitiseInput(String(buildingType)).slice(0, 60) : null;
+  const floorCount = Math.max(1, parseInt(floors) || 1);
+  const boundary   = distanceFromBoundaryM ? Math.max(0, parseFloat(distanceFromBoundaryM) || 0) : null;
+  const safeCons   = construction ? sanitiseInput(String(construction)).slice(0, 80) : null;
+
+  // Simplified NCC fire requirements (indicative only)
+  const TYPE_REQUIREMENTS = {
+    "TYPE_A": { description: "Fully fire-resisting", wallFRL: "120/120/120", columnFRL: "120/120/120", beamFRL: "120/120/120", floorFRL: "120/120/120" },
+    "TYPE_B": { description: "Fire-protected timber",  wallFRL: "90/90/90",  columnFRL: "90/90/90",  beamFRL: "90/90/90",  floorFRL: "90/90/90"  },
+    "TYPE_C": { description: "Non-combustible",        wallFRL: "60/60/60",  columnFRL: "60/60/60",  beamFRL: "60/60/60",  floorFRL: "60/60/60"  },
+  };
+
+  let typeKey = "TYPE_C";
+  if (floorCount >= 4 || ["1", "2", "3"].some(c => safeClass.includes(c))) typeKey = "TYPE_A";
+  else if (floorCount >= 3) typeKey = "TYPE_B";
+
+  const requirements = TYPE_REQUIREMENTS[typeKey];
+  const boundaryReq  = boundary !== null && boundary < 3 ? "External walls must have FRL of 90/90/90 to boundary" : null;
+
+  const safeNotes = notes ? sanitiseInput(String(notes)).slice(0, 200) : null;
+  return res.json({
+    jobId: safeJobId, buildingClass: safeClass, buildingType: safeType,
+    floors: floorCount, distanceFromBoundaryM: boundary, construction: safeCons,
+    constructionType: typeKey, description: requirements.description,
+    requirements: {
+      externalWallFRL:   requirements.wallFRL,
+      columnFRL:         requirements.columnFRL,
+      beamFRL:           requirements.beamFRL,
+      floorCeilingFRL:   requirements.floorFRL,
+      boundaryRequirement: boundaryReq,
+    },
+    notes: safeNotes,
+    disclaimer: "Indicative only. A fire engineer must verify all FRL requirements under NCC 2022.",
+    standard: "NCC 2022 Spec 5 — Fire-resisting construction",
+    calculatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /accessibility-check  — Check AS 1428 accessibility compliance
+app.post("/accessibility-check", apiKeyAuth, (req, res) => {
+  const { jobId, spaceType, doorWidthMm, corridorWidthMm, rampGradient, handrailHeight, toiletAccessible, parkingBays, notes } = req.body || {};
+  if (!spaceType) return res.status(400).json({ error: "spaceType required." });
+
+  const safeJobId   = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeType    = sanitiseInput(String(spaceType)).slice(0, 60);
+  const safeNotes   = notes ? sanitiseInput(String(notes)).slice(0, 200) : null;
+
+  const doorW   = doorWidthMm ? parseInt(doorWidthMm) : null;
+  const corrW   = corridorWidthMm ? parseInt(corridorWidthMm) : null;
+  const ramp    = rampGradient ? parseFloat(rampGradient) : null;
+  const handrail = handrailHeight ? parseInt(handrailHeight) : null;
+
+  const checks = [];
+  if (doorW !== null)    checks.push({ item: "Doorway clear width",      required: "≥850mm",  provided: `${doorW}mm`,     passed: doorW >= 850,  standard: "AS 1428.1 cl 7.2" });
+  if (corrW !== null)    checks.push({ item: "Corridor clear width",     required: "≥1000mm", provided: `${corrW}mm`,     passed: corrW >= 1000, standard: "AS 1428.1 cl 7.4" });
+  if (ramp !== null)     checks.push({ item: "Ramp gradient",            required: "≤1:14",   provided: `1:${ramp}`,      passed: ramp >= 14,    standard: "AS 1428.1 cl 8.1" });
+  if (handrail !== null) checks.push({ item: "Handrail height",          required: "865-1000mm", provided: `${handrail}mm`, passed: handrail >= 865 && handrail <= 1000, standard: "AS 1428.1 cl 10.4" });
+  if (toiletAccessible !== undefined) checks.push({ item: "Accessible toilet provided", required: "Yes", provided: toiletAccessible ? "Yes" : "No", passed: toiletAccessible === true, standard: "AS 1428.1" });
+
+  const compliant = checks.length > 0 && checks.every(c => c.passed);
+  return res.json({
+    jobId: safeJobId, spaceType: safeType,
+    checks, compliant,
+    failures: checks.filter(c => !c.passed).map(c => `${c.item}: ${c.provided} does not meet ${c.required} (${c.standard})`),
+    notes: safeNotes, standard: "AS 1428.1:2021 — Design for access and mobility",
+    calculatedAt: new Date().toISOString(),
+  });
+});
+
+// GET /ncc-requirements/:buildingClass  — Get NCC requirements summary for a building class
+app.get("/ncc-requirements/:buildingClass", apiKeyAuth, (req, res) => {
+  const buildingClass = sanitiseInput(String(req.params.buildingClass || "")).toUpperCase().replace(/\s/g, "");
+
+  const NCC_CLASSES = {
+    "1A": { name: "Single dwelling — house or townhouse", typical: "residential house or attached dwelling", applications: ["New homes", "Alterations/additions", "Granny flats"], keyRequirements: ["NCC Section H — Residential provisions", "Bushfire attack level if in BAL zone", "Energy efficiency (NatHERS 7-star rating)", "Condensation management", "Livable housing design (if applicable)"] },
+    "1B": { name: "3+ dwellings on one allotment", typical: "residential flats or boarding house", applications: ["Boarding houses", "Guest houses", "4+ bed residential buildings"], keyRequirements: ["Fire separation between dwellings", "Exit provisions", "Energy efficiency", "Disability access"] },
+    "2":  { name: "Multi-unit residential building", typical: "apartments or units above ground level", applications: ["Apartment blocks", "Strata title units"], keyRequirements: ["Fire resistance — Type A or B construction", "Lift requirements", "Smoke detection in common areas", "Exit design", "Disability access"] },
+    "3":  { name: "Hotel/motel/residential buildings (other)", typical: "hotels, boarding houses, backpacker accommodation", applications: ["Hotels", "Motels", "Hostels"], keyRequirements: ["Smoke detection in all rooms", "Exit lighting", "Fire sprinklers above 3 storeys", "Disability access"] },
+    "5":  { name: "Office buildings", typical: "commercial office space", applications: ["Corporate offices", "Professional suites"], keyRequirements: ["Lifts if >25m rise", "Fire safety systems", "Disability access", "Energy efficiency (Section J)"] },
+    "6":  { name: "Retail/shop", typical: "shops, cafes, restaurants, markets", applications: ["Retail shops", "Food and drink premises"], keyRequirements: ["Public area accessibility", "Emergency lighting", "Exit signage", "Food safety for commercial kitchens"] },
+    "7A": { name: "Carpark", typical: "car park", applications: ["Public/private carparks"], keyRequirements: ["Ventilation", "Fire separation", "Structural loading"] },
+    "7B": { name: "Storage/warehouse", typical: "warehouse or storage facility", applications: ["Warehouses", "Self-storage"], keyRequirements: ["Exit provisions", "Fire sprinklers if >2000m²", "Dangerous goods if applicable"] },
+    "8":  { name: "Factory/industrial", typical: "factory, laboratory, laundry", applications: ["Manufacturing", "Food processing"], keyRequirements: ["Exit design", "Ventilation", "Hazardous area classification if applicable"] },
+    "10A": { name: "Shed/garage/carport", typical: "non-habitable structure", applications: ["Domestic sheds", "Carports"], keyRequirements: ["Setback requirements", "Site coverage", "Council DCP may apply"] },
+    "10B": { name: "Swimming pool / fence", typical: "pool or fence", applications: ["Swimming pools", "Spas"], keyRequirements: ["AS 1926.1 pool safety barriers", "CPR sign required", "Pool fencing heights and gate requirements"] },
+  };
+
+  const info = NCC_CLASSES[buildingClass] || null;
+  if (!info) {
+    return res.json({ buildingClass, info: null, message: `Class not found. Available: ${Object.keys(NCC_CLASSES).join(", ")}` });
+  }
+
+  return res.json({ buildingClass, ...info, note: "Summary only. Consult NCC 2022 and local council DCP for complete requirements.", generatedAt: new Date().toISOString() });
+});
+
+// POST /ai-ncc-query  — AI answers a question about NCC building requirements
+app.post("/ai-ncc-query", apiKeyAuth, async (req, res) => {
+  const { question, buildingClass, state = "VIC" } = req.body || {};
+  if (!question) return res.status(400).json({ error: "question required." });
+
+  const safeQ      = sanitiseInput(String(question)).slice(0, 500);
+  const safeClass  = buildingClass ? sanitiseInput(String(buildingClass)).toUpperCase().slice(0, 5) : null;
+  const safeState  = sanitiseInput(String(state)).toUpperCase().slice(0, 5);
+
+  const prompt = `You are an NCC 2022 (National Construction Code) expert for Australia, with specific knowledge of ${safeState} state variations.
+
+Question about: ${safeClass ? `Building Class ${safeClass}` : "general building requirements"}
+State: ${safeState}
+Question: ${safeQ}
+
+Provide a clear, accurate answer in JSON:
+{
+  "answer": "clear answer to the question",
+  "relevantSections": ["NCC section or clause reference"],
+  "keyPoints": ["key point 1", "key point 2"],
+  "stateVariations": "any VIC/state-specific variation",
+  "disclaimer": "standard disclaimer about professional advice"
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 600 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      question: safeQ, buildingClass: safeClass, state: safeState,
+      answer:           parsed.answer || "Unable to answer at this time.",
+      relevantSections: Array.isArray(parsed.relevantSections) ? parsed.relevantSections : [],
+      keyPoints:        Array.isArray(parsed.keyPoints) ? parsed.keyPoints : [],
+      stateVariations:  parsed.stateVariations || null,
+      disclaimer: parsed.disclaimer || "This is AI-generated guidance only. Consult a registered building practitioner or certifier for formal advice.",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      question: safeQ, buildingClass: safeClass, state: safeState,
+      answer: "NCC query service temporarily unavailable. Consult ncc.abcb.gov.au for authoritative information.",
+      relevantSections: [], keyPoints: [], stateVariations: null,
+      disclaimer: "Consult a registered building practitioner or certifier for formal advice.",
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
