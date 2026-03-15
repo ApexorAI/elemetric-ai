@@ -82078,6 +82078,448 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 287 ─────────────────────────────────────────────────────────────────
+
+// POST /fuel-storage-tank-inspection — Record fuel/chemical storage tank inspection per AS 1940 / AS 3780
+app.post("/fuel-storage-tank-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, tankId, location, inspectionDate, inspectedBy,
+      tankMaterial, tankCapacityL, fluidStored, tankAge,
+      aboveOrBelow, secondaryContainment, secondaryContainmentIntact,
+      corrosionProtectionOk, cathodicProtectionOk, cathodicProtectionReadingMv,
+      leakDetectionSystemFunctional, lastLeakTestDate, leakTestPassed,
+      ventilationAdequate, ventPipeOk,
+      overfillProtectionOk, highLevelAlarmOk,
+      earthingBondingOk, staticEarthingOk,
+      fillPointLockable, gaugeOk,
+      visualLeakDetected, groundwaterMonitoringWells, lastGroundwaterSample,
+      registeredWithEpa, epaRegistrationNumber,
+      spillKitAdjacent, fireExtinguisherAdjacent,
+      defectsFound, defectDetails, nextInspectionDue, notes
+    } = req.body;
+
+    if (!tankId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "tankId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeTankId = sanitiseInput(String(tankId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const defects = Array.isArray(defectDetails) ? defectDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const tankAgeYrs = parseInt(tankAge) || null;
+    const cpReading = parseFloat(cathodicProtectionReadingMv) || null;
+
+    // AS 1940 — The storage and handling of flammable and combustible liquids
+    // AS 3780 — The storage and handling of corrosive substances
+    // Environment Protection Act 2017 (Vic) / Dangerous Goods Act 1985 (Vic)
+    if (visualLeakDetected === true || visualLeakDetected === "true") {
+      criticalIssues.push("LEAK DETECTED — isolate tank immediately. Notify EPA Victoria and implement spill response procedures. Do not refill until leak source identified and repaired (Environment Protection Act 2017 (Vic) s.27).");
+    }
+
+    if (!secondaryContainment) {
+      criticalIssues.push("No secondary containment — tanks storing flammable/corrosive substances require bunded secondary containment of 110% capacity (AS 1940 cl.4.4 / AS 3780 cl.4.4).");
+    } else if (!secondaryContainmentIntact) {
+      criticalIssues.push("Secondary containment bund not intact — repair bund immediately. A compromised bund provides no spill protection (AS 1940 cl.4.4).");
+    }
+
+    if (!leakDetectionSystemFunctional) {
+      criticalIssues.push("Leak detection system not functional — all underground and above-ground tanks in sensitive locations require functioning leak detection (Environment Protection Act 2017 (Vic)).");
+    }
+
+    if (!overfillProtectionOk) {
+      criticalIssues.push("Overfill protection not functional — risk of overflow and environmental contamination. Repair high-level shutoff/alarm before next fill (AS 1940 cl.5.3).");
+    }
+
+    if (!earthingBondingOk || !staticEarthingOk) {
+      criticalIssues.push("Earthing/bonding not confirmed — static electricity bonding is mandatory for flammable liquid storage to prevent ignition (AS 1940 cl.9.3 / Dangerous Goods Act 1985 (Vic)).");
+    }
+
+    const isBelow = String(aboveOrBelow || "").toUpperCase() === "BELOW";
+    if (isBelow) {
+      if (!cathodicProtectionOk) {
+        criticalIssues.push("Underground tank cathodic protection not operational — required to prevent corrosion and leakage (AS 1940 cl.4.3).");
+      } else if (cpReading !== null && cpReading > -850) {
+        warnings.push(`Cathodic protection potential ${cpReading} mV — should be more negative than -850 mV (vs Cu/CuSO₄) for adequate steel protection.`);
+      }
+      if (!leakTestPassed) {
+        criticalIssues.push("Underground tank leak test not passed — all underground tanks must pass periodic pressure/tightness tests (AS 1940 cl.4.3).");
+      }
+    }
+
+    if (!registeredWithEpa) {
+      warnings.push("Tank may require EPA registration — fuel/chemical storage above certain quantities is notifiable under Environment Protection Act 2017 (Vic). Confirm registration status.");
+    }
+
+    if (tankAgeYrs !== null && tankAgeYrs > 25 && isBelow) {
+      warnings.push(`Underground tank age ${tankAgeYrs} years — tanks over 25 years old should undergo comprehensive inspection and integrity assessment.`);
+    }
+
+    if (!spillKitAdjacent) {
+      warnings.push("Spill kit not positioned adjacent to tank — required as first response measure for incidental spills (AS 1940 / AS 3780).");
+    }
+
+    if (!fireExtinguisherAdjacent) {
+      warnings.push("Fire extinguisher not confirmed adjacent to fuel storage area — required for flammable liquid storage (AS 1940 / AS 1851).");
+    }
+
+    if (!ventilationAdequate || !ventPipeOk) {
+      warnings.push("Ventilation system issue — check vent pipes are clear, properly sized, and located away from ignition sources (AS 1940 cl.6.2).");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "FAIL" : warnings.length > 0 ? "ATTENTION_REQUIRED" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("fuel_storage_tank_inspections")
+        .insert({
+          project_id: safeProject,
+          tank_id: safeTankId,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          tank_material: tankMaterial ? sanitiseInput(String(tankMaterial)) : null,
+          tank_capacity_l: parseFloat(tankCapacityL) || null,
+          fluid_stored: fluidStored ? sanitiseInput(String(fluidStored)) : null,
+          tank_age_years: tankAgeYrs,
+          above_or_below: aboveOrBelow ? sanitiseInput(String(aboveOrBelow)) : null,
+          secondary_containment: secondaryContainment !== false && secondaryContainment !== "false",
+          secondary_containment_intact: secondaryContainmentIntact !== false && secondaryContainmentIntact !== "false",
+          corrosion_protection_ok: corrosionProtectionOk !== false && corrosionProtectionOk !== "false",
+          cathodic_protection_ok: cathodicProtectionOk !== false && cathodicProtectionOk !== "false",
+          cathodic_protection_mv: cpReading,
+          leak_detection_functional: leakDetectionSystemFunctional !== false && leakDetectionSystemFunctional !== "false",
+          last_leak_test_date: lastLeakTestDate || null,
+          leak_test_passed: leakTestPassed !== false && leakTestPassed !== "false",
+          ventilation_adequate: ventilationAdequate !== false && ventilationAdequate !== "false",
+          overfill_protection_ok: overfillProtectionOk !== false && overfillProtectionOk !== "false",
+          earthing_bonding_ok: earthingBondingOk !== false && earthingBondingOk !== "false",
+          visual_leak: visualLeakDetected || false,
+          registered_epa: registeredWithEpa !== false && registeredWithEpa !== "false",
+          epa_registration_number: epaRegistrationNumber ? sanitiseInput(String(epaRegistrationNumber)) : null,
+          defects_found: defectsFound || false,
+          defect_details: defects,
+          next_inspection_due: nextInspectionDue || null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Storage tank defects — immediate action required to prevent environmental contamination and fire hazard.",
+        standards: ["AS 1940", "AS 3780", "Environment Protection Act 2017 (Vic)", "Dangerous Goods Act 1985 (Vic)"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      tankId: safeTankId,
+      nextInspectionDue: nextInspectionDue || null,
+      standards: ["AS 1940", "AS 3780"],
+    });
+  } catch (err) {
+    console.error("POST /fuel-storage-tank-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record fuel storage tank inspection." });
+  }
+});
+
+// POST /chemical-spill-response-record — Record chemical/hazmat spill response per AS 3745 / Environment Protection Act 2017 (Vic)
+app.post("/chemical-spill-response-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, incidentId, siteAddress, incidentDate, incidentTime,
+      reportedBy, chemicalName, chemicalClass, quantitySpilledL,
+      spillCause, spillLocation, reachedDrain, reachedWaterway,
+      immediateActionsToken, evacuationRequired, personelExposed,
+      exposedPersonnelCount, medicalAttentionRequired,
+      containmentAchieved, containmentMethod, absorptionMaterialUsed,
+      cleanupMethod, wasteDisposalMethod, wasteQuantityL,
+      epaNotificationRequired, epaNotified, epaNotificationTime, epaReferenceNumber,
+      workSafeNotificationRequired, workSafeNotified,
+      rootCause, preventiveActions, followUpRequired,
+      closedOut, closedDate, closedBy, certRef, notes
+    } = req.body;
+
+    if (!incidentId || !siteAddress || !incidentDate || !reportedBy) {
+      return res.status(400).json({ error: "incidentId, siteAddress, incidentDate, reportedBy are required." });
+    }
+
+    const safeIncidentId = sanitiseInput(String(incidentId));
+    const safeAddress = sanitiseInput(String(siteAddress));
+    const safeReporter = sanitiseInput(String(reportedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const criticalIssues = [];
+    const warnings = [];
+
+    const spillQty = parseFloat(quantitySpilledL) || null;
+
+    // Environment Protection Act 2017 (Vic) — Duty to notify
+    // Dangerous Goods Act 1985 (Vic)
+    // OHS Regulations 2017 (Vic)
+    if ((reachedWaterway === true || reachedWaterway === "true") && !epaNotified) {
+      criticalIssues.push("Spill reached waterway — EPA notification is MANDATORY under Environment Protection Act 2017 (Vic). Notify EPA immediately (after-hours: 1300 372 842).");
+    }
+
+    if ((reachedDrain === true || reachedDrain === "true") && !epaNotified) {
+      criticalIssues.push("Spill reached stormwater drain — notify EPA Victoria immediately. Stormwater drains connect to waterways and this constitutes potential material harm (Environment Protection Act 2017 (Vic) s.27).");
+    }
+
+    if (medicalAttentionRequired === true || medicalAttentionRequired === "true") {
+      if (workSafeNotificationRequired && !workSafeNotified) {
+        criticalIssues.push("WorkSafe Victoria notification required for chemical exposure incident resulting in medical treatment — notify within 48 hours (OHS Regulations 2017 (Vic)).");
+      }
+    }
+
+    if (!containmentAchieved) {
+      criticalIssues.push("Spill containment not achieved — spill is still spreading. Implement containment immediately using absorbents, berms, or drain blocking. Stop spread before cleanup (AS 3745).");
+    }
+
+    const chemClass = String(chemicalClass || "").toUpperCase();
+    if ((chemClass === "3" || chemClass === "FLAMMABLE_LIQUID" || chemClass === "FLAMMABLE") && spillQty !== null && spillQty > 1) {
+      criticalIssues.push(`Flammable liquid spill ${spillQty} L — eliminate all ignition sources immediately. No hot work, no electrical equipment near spill. Class 3 DG (Dangerous Goods Act 1985 (Vic)).`);
+    }
+
+    if ((chemClass === "8" || chemClass === "CORROSIVE") && personelExposed) {
+      criticalIssues.push("Corrosive substance exposure — arrange immediate medical treatment. Flush affected areas with water for minimum 20 minutes (AS 3745 / OHS Regulations 2017 (Vic)).");
+    }
+
+    if (epaNotificationRequired === true || epaNotificationRequired === "true") {
+      if (!epaNotificationTime) {
+        warnings.push("EPA notification required but notification time not recorded — document notification time for evidence of compliance with Environment Protection Act 2017 (Vic) duty to notify timeframe.");
+      }
+    }
+
+    if (!wasteDisposalMethod) {
+      warnings.push("Waste disposal method not recorded — contaminated absorbents and cleanup materials must be disposed of as hazardous waste per Environment Protection Act 2017 (Vic).");
+    }
+
+    if (!preventiveActions) {
+      warnings.push("Preventive actions not identified — root cause analysis and preventive actions are required to prevent recurrence (OHS Act 2004 (Vic) s.36).");
+    }
+
+    const incidentStatus = criticalIssues.length > 0 ? "IMMEDIATE_ACTION_REQUIRED" : warnings.length > 0 ? "FOLLOW_UP_REQUIRED" : closedOut ? "CLOSED" : "OPEN";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("chemical_spill_responses")
+        .insert({
+          project_id: safeProject,
+          incident_id: safeIncidentId,
+          site_address: safeAddress,
+          incident_date: incidentDate,
+          incident_time: incidentTime || null,
+          reported_by: safeReporter,
+          chemical_name: chemicalName ? sanitiseInput(String(chemicalName)) : null,
+          chemical_class: chemClass || null,
+          quantity_spilled_l: spillQty,
+          spill_cause: spillCause ? sanitiseInput(String(spillCause)) : null,
+          spill_location: spillLocation ? sanitiseInput(String(spillLocation)) : null,
+          reached_drain: reachedDrain || false,
+          reached_waterway: reachedWaterway || false,
+          evacuation_required: evacuationRequired || false,
+          personnel_exposed: personelExposed || false,
+          exposed_count: parseInt(exposedPersonnelCount) || 0,
+          medical_attention: medicalAttentionRequired || false,
+          containment_achieved: containmentAchieved !== false && containmentAchieved !== "false",
+          containment_method: containmentMethod ? sanitiseInput(String(containmentMethod)) : null,
+          waste_disposal_method: wasteDisposalMethod ? sanitiseInput(String(wasteDisposalMethod)) : null,
+          waste_quantity_l: parseFloat(wasteQuantityL) || null,
+          epa_notification_required: epaNotificationRequired || false,
+          epa_notified: epaNotified || false,
+          epa_notification_time: epaNotificationTime || null,
+          epa_reference: epaReferenceNumber ? sanitiseInput(String(epaReferenceNumber)) : null,
+          worksafe_notification_required: workSafeNotificationRequired || false,
+          worksafe_notified: workSafeNotified || false,
+          root_cause: rootCause ? sanitiseInput(String(rootCause)) : null,
+          preventive_actions: preventiveActions ? sanitiseInput(String(preventiveActions)) : null,
+          follow_up_required: followUpRequired || false,
+          closed_out: closedOut || false,
+          closed_date: closedDate || null,
+          closed_by: closedBy ? sanitiseInput(String(closedBy)) : null,
+          incident_status: incidentStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        incidentStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Spill response incomplete — immediate action required. EPA: 1300 372 842 (24hr).",
+        standards: ["Environment Protection Act 2017 (Vic)", "Dangerous Goods Act 1985 (Vic)", "OHS Regulations 2017 (Vic)", "AS 3745"],
+      });
+    }
+
+    res.json({
+      incidentStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      incidentId: safeIncidentId,
+      standards: ["Environment Protection Act 2017 (Vic)", "Dangerous Goods Act 1985 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /chemical-spill-response-record error:", err.message);
+    res.status(500).json({ error: "Failed to record chemical spill response." });
+  }
+});
+
+// POST /ai-chemical-safety-assessment — AI assesses chemical safety management compliance
+app.post("/ai-chemical-safety-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      siteId, siteType, chemicalCount, dangerousGoodsCategories,
+      totalFlammableLiquidL, totalCorrosiveKg, totalToxicKg,
+      storageFacilityType, storageFacilityAge,
+      dgLicenceHeld, dgLicenceNumber, dgLicenceExpiry,
+      sdsLibraryCurrent, sdsTrainingProvided,
+      chemicalRegisterCurrent, chemicalRegisterLastReview,
+      spillResponsePlanInPlace, spillKitsAdequate,
+      emergencyResponsePlanInPlace, fireSuppressionInStorage,
+      epaPermitHeld, epaPermitExpiry,
+      workerChemicalTraining, exposureMonitoringConducted,
+      incidentsRelatedToChemicals, deficienciesNoted, notes
+    } = req.body;
+
+    if (!siteId) {
+      return res.status(400).json({ error: "siteId is required." });
+    }
+
+    const safeSite = sanitiseInput(String(siteId));
+    const deficiencies = Array.isArray(deficienciesNoted) ? deficienciesNoted : [];
+    const dgCategories = Array.isArray(dangerousGoodsCategories) ? dangerousGoodsCategories : [];
+
+    const prompt = `You are a chemical safety and dangerous goods management expert. Assess this site's chemical safety compliance under Victorian and Australian regulations.
+
+Site ID: ${safeSite}
+Site type: ${siteType || "Unknown"}
+Number of chemicals on site: ${chemicalCount || 0}
+Dangerous goods categories present: ${dgCategories.join(", ") || "Not specified"}
+
+QUANTITIES:
+- Flammable liquids: ${totalFlammableLiquidL ? totalFlammableLiquidL + " L" : "Unknown"}
+- Corrosives: ${totalCorrosiveKg ? totalCorrosiveKg + " kg" : "Unknown"}
+- Toxics: ${totalToxicKg ? totalToxicKg + " kg" : "Unknown"}
+
+STORAGE:
+- Facility type: ${storageFacilityType || "Unknown"}
+- Facility age: ${storageFacilityAge ? storageFacilityAge + " years" : "Unknown"}
+- DG licence held: ${dgLicenceHeld ? "Yes — " + (dgLicenceNumber || "not recorded") + ", expires " + (dgLicenceExpiry || "unknown") : "No"}
+- EPA permit: ${epaPermitHeld ? "Yes, expires " + (epaPermitExpiry || "unknown") : "No/NA"}
+
+MANAGEMENT SYSTEMS:
+- SDS library current: ${sdsLibraryCurrent ? "Yes" : "No"}
+- SDS training provided: ${sdsTrainingProvided ? "Yes" : "No"}
+- Chemical register current: ${chemicalRegisterCurrent ? "Yes (last review: " + (chemicalRegisterLastReview || "unknown") + ")" : "No"}
+- Spill response plan: ${spillResponsePlanInPlace ? "Yes" : "No"}
+- Spill kits adequate: ${spillKitsAdequate ? "Yes" : "No"}
+- Emergency response plan: ${emergencyResponsePlanInPlace ? "Yes" : "No"}
+- Fire suppression in storage: ${fireSuppressionInStorage ? "Yes" : "No"}
+
+WORKERS:
+- Chemical handling training: ${workerChemicalTraining ? "Yes" : "No"}
+- Exposure monitoring: ${exposureMonitoringConducted ? "Yes" : "No"}
+
+Incidents related to chemicals (12 months): ${incidentsRelatedToChemicals || 0}
+Deficiencies: ${deficiencies.join("; ") || "None"}
+
+Assess under:
+- Dangerous Goods Act 1985 (Vic) / Dangerous Goods (Storage and Handling) Regulations 2012 (Vic)
+- Environment Protection Act 2017 (Vic)
+- OHS Regulations 2017 (Vic) Part 4.1 (hazardous substances)
+- AS 1940 (flammable/combustible liquids)
+- AS 3780 (corrosive substances)
+- GHS/SDS requirements (Safe Work Australia)
+- AS 3745 (emergency planning)
+
+Provide:
+1. Overall chemical safety compliance risk
+2. Regulatory licensing gap analysis
+3. Storage compliance assessment
+4. Worker safety assessment
+5. Emergency preparedness assessment
+6. Immediate and priority actions
+
+Respond ONLY in JSON:
+{
+  "overallRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "licensingComplianceRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "storageComplianceRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "workerSafetyRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "emergencyPreparednessRisk": "LOW|MODERATE|HIGH",
+  "licensingGaps": ["string"],
+  "storageGaps": ["string"],
+  "workerSafetyGaps": ["string"],
+  "immediateActions": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallRisk: "MODERATE",
+        licensingComplianceRisk: "MODERATE",
+        storageComplianceRisk: "MODERATE",
+        workerSafetyRisk: "MODERATE",
+        emergencyPreparednessRisk: "MODERATE",
+        licensingGaps: ["AI assessment unavailable — verify DG licence is current per Dangerous Goods (Storage and Handling) Regulations 2012 (Vic)"],
+        storageGaps: ["AI assessment unavailable — engage dangerous goods auditor for storage compliance review"],
+        workerSafetyGaps: ["Ensure all SDS sheets are accessible and workers trained in chemical hazards per OHS Regulations 2017 (Vic) Part 4.1"],
+        immediateActions: ["Review chemical register currency", "Verify spill response kits are fully stocked"],
+        applicableStandards: ["Dangerous Goods Act 1985 (Vic)", "AS 1940", "AS 3780", "OHS Regulations 2017 (Vic) Part 4.1"],
+        summary: "AI chemical safety assessment unavailable. Engage a dangerous goods consultant for formal compliance audit.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      siteId: safeSite,
+      standards: ["Dangerous Goods Act 1985 (Vic)", "Environment Protection Act 2017 (Vic)", "OHS Regulations 2017 (Vic)", "AS 1940", "AS 3780"],
+    });
+  } catch (err) {
+    console.error("POST /ai-chemical-safety-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess chemical safety." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
