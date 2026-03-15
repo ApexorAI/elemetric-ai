@@ -25314,6 +25314,177 @@ app.get("/contractor-invoice/:contractorId", apiKeyAuth, async (req, res) => {
   return res.json({ contractorId, invoiceCount: invoices.length, totalValue, outstanding, statusCounts, invoices, generatedAt: new Date().toISOString() });
 });
 
+// POST /drainage-test  — Log a drainage test (air/water/smoke)
+app.post("/drainage-test", apiKeyAuth, async (req, res) => {
+  const { jobId, siteId, address, testDate, testMethod, testPressureKpa, holdTimeMinutes, finalPressureKpa, waterRetained, leakObserved, passedTest, inspectedBy, notes } = req.body || {};
+  if (!jobId && !siteId) return res.status(400).json({ error: "jobId or siteId required." });
+
+  const VALID_METHODS = ["water", "air", "smoke"];
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeDate   = testDate ? sanitiseInput(String(testDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeMethod = VALID_METHODS.includes(String(testMethod || "").toLowerCase()) ? String(testMethod).toLowerCase() : "air";
+  const safeBy     = inspectedBy ? sanitiseInput(String(inspectedBy)).slice(0, 100) : null;
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const initP  = testPressureKpa !== undefined ? Math.max(0, parseFloat(testPressureKpa) || 0) : (safeMethod === "air" ? 5 : null);
+  const finalP = finalPressureKpa !== undefined ? Math.max(0, parseFloat(finalPressureKpa) || 0) : null;
+  const holdTime = Math.max(0, parseFloat(holdTimeMinutes) || 15);
+  const drop   = (initP !== null && finalP !== null) ? parseFloat(Math.max(0, initP - finalP).toFixed(3)) : null;
+  const leaked = leakObserved === true;
+  const passed = passedTest !== undefined ? passedTest === true : (!leaked && (drop === null || drop <= 0.5));
+
+  const record = {
+    testId: `DT-${(safeJobId || safeSiteId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    jobId: safeJobId, siteId: safeSiteId,
+    address: address ? sanitiseInput(String(address)).slice(0, 200) : null,
+    testDate: safeDate, testMethod: safeMethod,
+    testPressureKpa: initP, holdTimeMinutes: holdTime, finalPressureKpa: finalP,
+    pressureDropKpa: drop, waterRetained: waterRetained === true, leakObserved: leaked,
+    passedTest: passed, result: passed ? "PASS" : "FAIL",
+    standard: "AS/NZS 3500.2 — Sanitary plumbing and drainage",
+    inspectedBy: safeBy, notes: safeNotes, testedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("drainage_tests").insert({
+        test_id: record.testId, job_id: safeJobId, site_id: safeSiteId, address: record.address,
+        test_date: safeDate, test_method: safeMethod, test_pressure_kpa: initP,
+        hold_time_minutes: holdTime, final_pressure_kpa: finalP, pressure_drop_kpa: drop,
+        leak_observed: leaked, passed_test: passed, result: record.result,
+        inspected_by: safeBy, notes: safeNotes, tested_at: record.testedAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// GET /drainage-test/:jobId  — Get drainage test results for a job
+app.get("/drainage-test/:jobId", apiKeyAuth, async (req, res) => {
+  const jobId = sanitiseInput(String(req.params.jobId || "")).slice(0, 80);
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  let tests = [];
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin.from("drainage_tests").select("*").eq("job_id", jobId).order("test_date", { ascending: false }).limit(20);
+      tests = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const passed = tests.filter(t => t.result === "PASS").length;
+  return res.json({ jobId, testCount: tests.length, passed, failed: tests.length - passed, allPassed: tests.length > 0 && passed === tests.length, tests, generatedAt: new Date().toISOString() });
+});
+
+// POST /soil-percolation  — Log a soil percolation test for drainage design
+app.post("/soil-percolation", apiKeyAuth, async (req, res) => {
+  const { siteId, address, testDate, depth, waterDropCm, timeMinutes, percolationRateMmPerHour, soilDescription, suitableForAbsorption, notes } = req.body || {};
+  if (!siteId) return res.status(400).json({ error: "siteId required." });
+
+  const safeSiteId = sanitiseInput(String(siteId)).slice(0, 80);
+  const safeDate   = testDate ? sanitiseInput(String(testDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+  const safeSoil   = soilDescription ? sanitiseInput(String(soilDescription)).slice(0, 200) : null;
+  const safeDepth  = depth ? Math.max(0, parseFloat(depth) || 0) : null;
+
+  const waterDrop = waterDropCm ? Math.max(0, parseFloat(waterDropCm) || 0) : null;
+  const timeMins  = timeMinutes ? Math.max(0, parseFloat(timeMinutes) || 0) : null;
+  let percRate = percolationRateMmPerHour ? Math.max(0, parseFloat(percolationRateMmPerHour) || 0) : null;
+  if (!percRate && waterDrop && timeMins && timeMins > 0) {
+    percRate = parseFloat(((waterDrop * 10 / timeMins) * 60).toFixed(2)); // cm→mm, convert to per hour
+  }
+
+  const suitable = suitableForAbsorption !== undefined ? suitableForAbsorption === true : (percRate !== null && percRate >= 6 && percRate <= 300);
+
+  const record = {
+    testId: `SP-${safeSiteId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId,
+    address: address ? sanitiseInput(String(address)).slice(0, 200) : null,
+    testDate: safeDate, depthMm: safeDepth, waterDropCm: waterDrop, timeMinutes: timeMins,
+    percolationRateMmPerHour: percRate, soilDescription: safeSoil,
+    suitableForAbsorption: suitable,
+    classification: percRate === null ? "UNKNOWN" : percRate < 6 ? "IMPERMEABLE" : percRate <= 50 ? "GOOD" : percRate <= 150 ? "MODERATE" : percRate <= 300 ? "FAST" : "TOO_FAST",
+    notes: safeNotes, testedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("soil_percolation").insert({
+        test_id: record.testId, site_id: safeSiteId, address: record.address,
+        test_date: safeDate, depth_mm: safeDepth, water_drop_cm: waterDrop, time_minutes: timeMins,
+        percolation_rate_mm_per_hour: percRate, soil_description: safeSoil,
+        suitable_for_absorption: suitable, classification: record.classification,
+        notes: safeNotes, tested_at: record.testedAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// POST /ai-project-plan  — AI generates a high-level project plan with milestones
+app.post("/ai-project-plan", apiKeyAuth, async (req, res) => {
+  const { projectName, jobType, scope, startDate, durationWeeks, teamSize } = req.body || {};
+  if (!projectName || !jobType || !scope) return res.status(400).json({ error: "projectName, jobType, and scope required." });
+
+  const safeName    = sanitiseInput(String(projectName)).slice(0, 100);
+  const safeType    = sanitiseInput(String(jobType)).slice(0, 40);
+  const safeScope   = sanitiseInput(String(scope)).slice(0, 1500);
+  const safeStart   = startDate ? sanitiseInput(String(startDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeDuration = durationWeeks ? Math.min(104, Math.max(1, parseInt(durationWeeks) || 4)) : null;
+  const safeTeam    = teamSize ? Math.min(50, Math.max(1, parseInt(teamSize) || 2)) : null;
+
+  const prompt = `You are a construction project manager for ${safeType} work in Victoria, Australia.
+
+Create a project plan for: ${safeName}
+Scope: ${safeScope}
+Start date: ${safeStart}
+${safeDuration ? `Duration: ${safeDuration} weeks` : ""}
+${safeTeam ? `Team size: ${safeTeam} people` : ""}
+
+Respond with JSON:
+{
+  "phases": [
+    {
+      "name": "phase name",
+      "startWeek": 1,
+      "durationWeeks": 2,
+      "activities": ["activity 1"],
+      "milestones": ["milestone"],
+      "dependencies": ["depends on phase name or none"]
+    }
+  ],
+  "criticalPath": ["phase names in order"],
+  "keyRisks": ["risk"],
+  "totalWeeks": number,
+  "summary": "1-2 sentence summary"
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 700 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      projectName: safeName, jobType: safeType, startDate: safeStart,
+      phases:        Array.isArray(parsed.phases) ? parsed.phases : [],
+      criticalPath:  Array.isArray(parsed.criticalPath) ? parsed.criticalPath : [],
+      keyRisks:      Array.isArray(parsed.keyRisks) ? parsed.keyRisks : [],
+      totalWeeks:    typeof parsed.totalWeeks === "number" ? parsed.totalWeeks : safeDuration,
+      summary:       parsed.summary || "",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      projectName: safeName, jobType: safeType, startDate: safeStart,
+      phases: [], criticalPath: [], keyRisks: [], totalWeeks: safeDuration,
+      summary: "Project plan generation temporarily unavailable.",
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
