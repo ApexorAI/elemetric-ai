@@ -1,4 +1,5 @@
 require("dotenv").config();
+const crypto = require("crypto");
 
 const express = require("express");
 const cors    = require("cors");
@@ -10,6 +11,139 @@ const Stripe  = require("stripe");
 const { createClient } = require("@supabase/supabase-js");
 const sharp   = require("sharp");
 const { Resend } = require("resend");
+
+// ── Victorian Regulations Knowledge Base ──────────────────────────────────────
+// Verified requirements from AS/NZS 3500, AS/NZS 5601.1, AS/NZS 3000, AS 1684.
+const VICTORIAN_REGULATIONS = {
+  plumbing: {
+    ptrValveDischarge:  "PTR valve discharge pipe must terminate within 300mm of floor level (AS/NZS 3500)",
+    temperingValve:     "Tempering valve must limit hot water outlet temperature to maximum 50°C (AS/NZS 3500.4)",
+    maxSystemPressure:  "Hot water system pressure must not exceed 850kPa (AS/NZS 3500)",
+    pipeSupport:        "Minimum pipe support intervals: 1.2m horizontal copper, 1.8m vertical copper (AS/NZS 3500)",
+  },
+  gas: {
+    applianceClearance: "Gas appliance minimum 500mm clearance from combustible materials (AS/NZS 5601.1)",
+    flueTermination:    "Flue terminal must be at least 500mm from any opening into a building (AS/NZS 5601.1)",
+    testPressure:       "Gas installation leak test pressure minimum 1.5 kPa sustained for 5 minutes (AS/NZS 5601.1)",
+  },
+  electrical: {
+    rcdTripTime:         "RCD must trip within 300 milliseconds at rated residual current (AS/NZS 3000 Clause 2.6)",
+    earthConductorColour:"Earth conductors must have green/yellow striped insulation (AS/NZS 3000)",
+    insulationResistance:"Minimum insulation resistance 1 MΩ between any live conductor and earth (AS/NZS 3000)",
+  },
+  drainage: {
+    pipeGradient: "Minimum drainage pipe gradient 1:60 for 100mm pipe (AS/NZS 3500.2)",
+    trapSeal:     "Minimum trap water seal depth 50mm (AS/NZS 3500.2)",
+    ventStack:    "All sanitary fixtures must be vented within 3m of the trap (AS/NZS 3500.2)",
+  },
+  carpentry: {
+    timberFraming: "Residential timber framing must comply with AS 1684 series (span tables and connection requirements)",
+    deckingFixings:"Decking fixings must be corrosion-resistant — stainless steel or hot-dipped galvanised (AS 1684)",
+  },
+};
+
+// ── API usage statistics (in-memory) ─────────────────────────────────────────
+const usageStats = {
+  totalRequests:   0,
+  openaiCalls:     0,
+  replicateCalls:  0,
+  emailsSent:      0,
+  cacheHits:       0,
+  dedupHits:       0,
+  startedAt:       new Date().toISOString(),
+};
+const COST_PER_OPENAI_CALL    = 0.002;  // GPT-4.1-mini vision (USD estimate)
+const COST_PER_REPLICATE_CALL = 0.05;   // Stable Diffusion inpainting (USD estimate)
+const COST_PER_EMAIL          = 0.001;  // Resend transactional (USD estimate)
+
+// ── In-memory analysis cache (1-hour TTL) + request deduplication ────────────
+const analysisCache   = new Map();
+const CACHE_TTL_MS    = 60 * 60 * 1000;
+const pendingAnalyses = new Map(); // cacheKey → Promise
+
+function getCacheKey(type, images) {
+  const h = crypto.createHash("sha256");
+  h.update(type);
+  for (const img of images) {
+    h.update(img.label || "");
+    h.update(img.data  || "");
+  }
+  return h.digest("hex");
+}
+
+function getCached(key) {
+  const entry = analysisCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { analysisCache.delete(key); return null; }
+  return entry.result;
+}
+
+function setCache(key, result) {
+  analysisCache.set(key, { result, expiresAt: Date.now() + CACHE_TTL_MS });
+}
+
+// ── AI response validation ────────────────────────────────────────────────────
+function validateAIResponse(parsed) {
+  if (typeof parsed.overall_confidence !== "number")  parsed.overall_confidence  = 0;
+  if (!Array.isArray(parsed.items_detected))          parsed.items_detected      = [];
+  if (!Array.isArray(parsed.items_missing))           parsed.items_missing       = [];
+  if (!Array.isArray(parsed.items_unclear))           parsed.items_unclear       = [];
+  if (!["low", "medium", "high"].includes(parsed.risk_rating))
+    parsed.risk_rating = "medium";
+  if (!Array.isArray(parsed.recommended_actions) || parsed.recommended_actions.length === 0)
+    parsed.recommended_actions = ["Retake photos and resubmit for analysis."];
+  if (typeof parsed.liability_summary !== "string" || !parsed.liability_summary)
+    parsed.liability_summary = "Review is incomplete. Retake missing photos before certifying this installation.";
+  return parsed;
+}
+
+// ── OpenAI retry helper (retries once after 2s on failure) ───────────────────
+async function callOpenAIWithRetry(params) {
+  try {
+    return await client.chat.completions.create(params);
+  } catch (err) {
+    console.warn("[openai] Request failed, retrying in 2s:", err.message);
+    await new Promise(r => setTimeout(r, 2000));
+    return await client.chat.completions.create(params);
+  }
+}
+
+// ── HTML escaping (prevents XSS in email content) ────────────────────────────
+function escHtml(s) {
+  if (typeof s !== "string") return "";
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#x27;");
+}
+
+// ── Email address validation ──────────────────────────────────────────────────
+function isValidEmail(addr) {
+  return typeof addr === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(addr);
+}
+
+// ── Safe URL validation (http/https only — prevents javascript: injection) ────
+function isSafeUrl(url) {
+  if (typeof url !== "string") return false;
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" || u.protocol === "http:";
+  } catch { return false; }
+}
+
+// ── Victorian regulations summary for AI prompts ─────────────────────────────
+function buildRegulationsNote(jobType) {
+  const items = [];
+  if (jobType === "plumbing")  items.push(...Object.values(VICTORIAN_REGULATIONS.plumbing));
+  if (jobType === "gas")       items.push(...Object.values(VICTORIAN_REGULATIONS.gas));
+  if (jobType === "electrical")items.push(...Object.values(VICTORIAN_REGULATIONS.electrical));
+  if (jobType === "drainage")  items.push(...Object.values(VICTORIAN_REGULATIONS.drainage), ...Object.values(VICTORIAN_REGULATIONS.plumbing));
+  if (jobType === "carpentry") items.push(...Object.values(VICTORIAN_REGULATIONS.carpentry));
+  if (items.length === 0) return "";
+  return `\nVICTORIAN REGULATIONS REFERENCE (apply these requirements in your analysis):\n${items.map(r => `- ${r}`).join("\n")}\n`;
+}
 
 const app = express();
 
@@ -25,6 +159,9 @@ const stripe = process.env.STRIPE_SECRET_KEY
 const supabaseAdmin = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
   ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
   : null;
+
+const resend     = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+const EMAIL_FROM = process.env.EMAIL_FROM || "Elemetric <noreply@elemetric.app>";
 
 // Map Stripe price IDs → app role names
 function roleFromSubscription(subscription) {
@@ -72,11 +209,13 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
+    console.log(`Webhook: received event type=${event.type} id=${event.id}`);
+
     try {
       if (event.type === "customer.subscription.created" || event.type === "customer.subscription.updated") {
         const subscription = event.data.object;
+        console.log(`Webhook: ${event.type} — subscription=${subscription.id} status=${subscription.status}`);
 
-        // Retrieve the Stripe customer to get their email
         const customer = await stripe.customers.retrieve(subscription.customer);
         const email = customer.email;
         if (!email) {
@@ -86,13 +225,12 @@ app.post(
 
         const role = roleFromSubscription(subscription);
 
-        // Look up the Supabase user by email
         const { data: users, error: listErr } = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 });
         if (listErr) throw listErr;
 
         const user = users?.users?.find((u) => u.email === email);
         if (!user) {
-          console.warn(`Webhook: No Supabase user found for email ${email}`);
+          console.warn(`Webhook: No Supabase user found for email ${email.replace(/(?<=.{2}).(?=.*@)/g, "*")}`);
           return res.sendStatus(200);
         }
 
@@ -106,11 +244,12 @@ app.post(
           { onConflict: "user_id" }
         );
 
-        console.log(`Webhook: Updated ${email} → role=${role}`);
+        console.log(`Webhook: Updated user → role=${role} status=${subscription.status}`);
       }
 
       if (event.type === "customer.subscription.deleted") {
         const subscription = event.data.object;
+        console.log(`Webhook: customer.subscription.deleted — subscription=${subscription.id}`);
 
         const customer = await stripe.customers.retrieve(subscription.customer);
         const email = customer.email;
@@ -129,10 +268,108 @@ app.post(
           { onConflict: "user_id" }
         );
 
-        console.log(`Webhook: Downgraded ${email} → free`);
+        console.log(`Webhook: Downgraded user → free (subscription canceled)`);
       }
+
+      if (event.type === "payment_intent.payment_failed") {
+        const paymentIntent = event.data.object;
+        console.log(`Webhook: payment_intent.payment_failed — id=${paymentIntent.id} amount=${paymentIntent.amount} customer=${paymentIntent.customer}`);
+
+        if (paymentIntent.customer && resend && stripe) {
+          try {
+            const customer = await stripe.customers.retrieve(paymentIntent.customer);
+            const email = customer.email;
+            const customerName = customer.name || "there";
+            if (email) {
+              const firstName = escHtml(customerName.split(" ")[0]);
+              const amountAUD  = ((paymentIntent.amount || 0) / 100).toFixed(2);
+              const content = `
+                <h1 style="margin:0 0 8px;font-size:24px;font-weight:700;color:#0f172a;">Payment failed.</h1>
+                <p style="margin:0 0 24px;font-size:14px;color:#64748b;">We couldn't process your most recent payment.</p>
+                <p style="margin:0 0 16px;font-size:15px;color:#1e293b;line-height:1.7;">
+                  Hi ${firstName}, your payment of AUD ${escHtml(amountAUD)} could not be processed.
+                  Please update your payment method to continue using Elemetric without interruption.
+                </p>
+                <table cellpadding="0" cellspacing="0" style="margin:0 0 24px;">
+                  <tr>
+                    <td style="background:#f97316;border-radius:8px;padding:14px 32px;">
+                      <a href="https://elemetric.app/settings/billing" style="font-size:15px;font-weight:700;color:#ffffff;text-decoration:none;display:block;">
+                        Update Payment Method &rarr;
+                      </a>
+                    </td>
+                  </tr>
+                </table>
+                <p style="margin:0;font-size:14px;color:#64748b;line-height:1.7;">
+                  Questions? Contact us at <a href="mailto:support@elemetric.app" style="color:#f97316;text-decoration:none;">support@elemetric.app</a>.
+                </p>`;
+              await resend.emails.send({
+                from: EMAIL_FROM,
+                to: email,
+                subject: "Payment failed — action required",
+                html: buildEmailHtml("Payment failed — Elemetric", content),
+              });
+              usageStats.emailsSent++;
+              console.log(`Webhook: payment failed email sent`);
+            }
+          } catch (emailErr) {
+            console.error("Webhook: Failed to send payment failed email:", emailErr.message);
+          }
+        }
+      }
+
+      if (event.type === "customer.subscription.trial_will_end") {
+        const subscription = event.data.object;
+        const trialEnd  = subscription.trial_end;
+        const daysLeft  = trialEnd ? Math.ceil((trialEnd * 1000 - Date.now()) / (1000 * 60 * 60 * 24)) : null;
+        console.log(`Webhook: customer.subscription.trial_will_end — subscription=${subscription.id} daysLeft=${daysLeft}`);
+
+        if (subscription.customer && resend && stripe) {
+          try {
+            const customer = await stripe.customers.retrieve(subscription.customer);
+            const email = customer.email;
+            const customerName = customer.name || "there";
+            if (email) {
+              const firstName     = escHtml(customerName.split(" ")[0]);
+              const trialEndLabel = trialEnd
+                ? new Date(trialEnd * 1000).toLocaleDateString("en-AU", { timeZone: "Australia/Melbourne", day: "2-digit", month: "long", year: "numeric" })
+                : "soon";
+              const subjectDays = daysLeft === 3 ? "in 3 days" : "soon";
+              const content = `
+                <h1 style="margin:0 0 8px;font-size:24px;font-weight:700;color:#0f172a;">Your trial ends ${escHtml(subjectDays)}.</h1>
+                <p style="margin:0 0 24px;font-size:14px;color:#64748b;">Keep your compliance records protected.</p>
+                <p style="margin:0 0 16px;font-size:15px;color:#1e293b;line-height:1.7;">
+                  Hi ${firstName}, your Elemetric free trial ends on <strong>${escHtml(trialEndLabel)}</strong>.
+                  Add your payment details now to continue using all features without interruption.
+                </p>
+                <table cellpadding="0" cellspacing="0" style="margin:0 0 24px;">
+                  <tr>
+                    <td style="background:#f97316;border-radius:8px;padding:14px 32px;">
+                      <a href="https://elemetric.app/settings/billing" style="font-size:15px;font-weight:700;color:#ffffff;text-decoration:none;display:block;">
+                        Add Payment Details &rarr;
+                      </a>
+                    </td>
+                  </tr>
+                </table>
+                <p style="margin:0;font-size:14px;color:#64748b;line-height:1.7;">
+                  Questions? Contact us at <a href="mailto:support@elemetric.app" style="color:#f97316;text-decoration:none;">support@elemetric.app</a>.
+                </p>`;
+              await resend.emails.send({
+                from: EMAIL_FROM,
+                to: email,
+                subject: `Your Elemetric trial ends ${subjectDays}`,
+                html: buildEmailHtml("Trial ending — Elemetric", content),
+              });
+              usageStats.emailsSent++;
+              console.log(`Webhook: trial ending email sent daysLeft=${daysLeft}`);
+            }
+          } catch (emailErr) {
+            console.error("Webhook: Failed to send trial ending email:", emailErr.message);
+          }
+        }
+      }
+
     } catch (err) {
-      console.error("Webhook handler error:", err);
+      console.error("Webhook handler error:", err.message);
       // Still return 200 so Stripe doesn't retry
     }
 
@@ -182,6 +419,12 @@ app.use((req, res, next) => {
       `[${new Date().toISOString()}] ${req.method} ${req.path} → ${res.statusCode} (${ms}ms)`
     );
   });
+  next();
+});
+
+// ── Request counter (for /stats) ──────────────────────────────────────────────
+app.use((req, _res, next) => {
+  if (req.path !== "/health") usageStats.totalRequests++;
   next();
 });
 
@@ -346,6 +589,7 @@ function calculateComplexity(type, photoCount, totalItems, missingCount) {
 }
 
 app.post("/review", reviewLimiter, async (req, res) => {
+let resolveDedup, rejectDedup, cacheKey;
 try {
 const { type, images } = req.body || {};
 
@@ -360,6 +604,23 @@ return res.status(400).json({
 error: "No images provided",
 });
 }
+
+// Task 4: Cache check
+cacheKey = getCacheKey(type, images);
+const cached = getCached(cacheKey);
+if (cached) {
+  usageStats.cacheHits++;
+  return res.json(cached);
+}
+
+// Task 7: Deduplication — if same request in-flight, wait for first result
+if (pendingAnalyses.has(cacheKey)) {
+  usageStats.dedupHits++;
+  const result = await pendingAnalyses.get(cacheKey);
+  return res.json(result);
+}
+const dedupPromise = new Promise((res, rej) => { resolveDedup = res; rejectDedup = rej; });
+pendingAnalyses.set(cacheKey, dedupPromise);
 
 const isGas = type === "gas";
 const isElectrical = type === "electrical";
@@ -768,7 +1029,7 @@ Example response shape:
 const inputContent = [
 {
 type: "text",
-text: promptText,
+text: buildRegulationsNote(type) + promptText,
 },
 ...images.flatMap((img) => [
 {
@@ -784,7 +1045,8 @@ url: `data:${img.mime};base64,${img.data}`,
 ]),
 ];
 
-const response = await client.chat.completions.create({
+usageStats.openaiCalls++;
+const response = await callOpenAIWithRetry({
 model: "gpt-4.1-mini",
 response_format: { type: "json_object" },
 messages: [
@@ -802,7 +1064,9 @@ let parsed;
 try {
 parsed = JSON.parse(raw);
 } catch {
-console.error("AI returned invalid JSON:", raw);
+console.error("AI returned invalid JSON (truncated):", raw.slice(0, 200));
+if (typeof rejectDedup === "function") rejectDedup(new Error("Invalid JSON"));
+if (cacheKey) pendingAnalyses.delete(cacheKey);
 return res.status(500).json({
   error: "AI returned an unreadable response. Please try again.",
 });
@@ -810,10 +1074,15 @@ return res.status(500).json({
 
 // Quality gate — AI signals that too many photos are unrecognisable
 if (parsed.photo_quality_error === true) {
+  if (typeof rejectDedup === "function") rejectDedup(new Error("photo_quality_error"));
+  if (cacheKey) pendingAnalyses.delete(cacheKey);
   return res.status(422).json({
     error: "Photos are too blurry or unclear. Please retake in better lighting.",
   });
 }
+
+// Task 3: Validate and fill missing fields
+validateAIResponse(parsed);
 
 const relevant = !!parsed.relevant;
 const overallConfidence =
@@ -860,7 +1129,7 @@ const { score: complexityScore, band: complexityBand } = calculateComplexity(
 const complexityBonus = complexityBand === "complex" ? 10 : complexityBand === "moderate" ? 5 : 0;
 const adjustedConfidence = Math.min(100, overallConfidence + complexityBonus);
 
-return res.json({
+const finalResult = {
   relevant,
   overall_confidence: overallConfidence,
   adjusted_confidence: adjustedConfidence,
@@ -873,8 +1142,19 @@ return res.json({
   recommended_actions: recommendedActions,
   liability_summary: liabilitySummary,
   analysis,
-});
+};
+
+// Cache result and resolve any waiting dedup requests
+if (cacheKey) {
+  setCache(cacheKey, finalResult);
+  if (typeof resolveDedup === "function") resolveDedup(finalResult);
+  setTimeout(() => pendingAnalyses.delete(cacheKey), 10000);
+}
+
+return res.json(finalResult);
 } catch (error) {
+if (typeof rejectDedup === "function") rejectDedup(error);
+if (cacheKey) pendingAnalyses.delete(cacheKey);
 console.error("AI review error:", error);
 
 return res.status(500).json({
@@ -1031,6 +1311,7 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
 
     let output;
     try {
+      usageStats.replicateCalls++;
       output = await replicate.run(
         "stability-ai/stable-diffusion-inpainting:95b7223104132402a9ae91cc677285bc5eb997834bd2349fa486f53910fd68b3",
         {
@@ -1050,7 +1331,12 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
       console.error("[visualise] Step 3 - Replicate call failed:");
       console.error("  message:", replicateErr.message);
       console.error("  status:", replicateErr.status ?? replicateErr.statusCode);
-      console.error("  stack:", replicateErr.stack);
+      const msg = (replicateErr.message || "").toLowerCase();
+      if (msg.includes("timeout") || msg.includes("timed out") || msg.includes("deadline")) {
+        return res.status(503).json({
+          error: "The visualiser took too long to respond. Please try again in a moment.",
+        });
+      }
       throw replicateErr;
     }
 
@@ -1189,12 +1475,30 @@ app.get("/property-passport", async (req, res) => {
       return res.status(503).json({ error: "Passport service not configured on server." });
     }
 
+    // Task 9: Pagination — max 20 jobs per page
+    const pageRaw  = parseInt(req.query.page,  10);
+    const limitRaw = parseInt(req.query.limit, 10);
+    const page  = Number.isFinite(pageRaw)  && pageRaw  >= 1 ? pageRaw  : 1;
+    const limit = Number.isFinite(limitRaw) && limitRaw >= 1 ? Math.min(limitRaw, 20) : 20;
+    const offset = (page - 1) * limit;
+
+    // Get total count for pagination metadata
+    const { count: totalCount, error: countErr } = await supabaseAdmin
+      .from("jobs")
+      .select("id", { count: "exact", head: true })
+      .ilike("job_addr", `%${address}%`);
+
+    if (countErr) {
+      console.error("Property passport count error:", countErr);
+      return res.status(500).json({ error: "Database query failed." });
+    }
+
     const { data: jobs, error } = await supabaseAdmin
       .from("jobs")
       .select("id, job_type, job_name, job_addr, confidence, relevant, detected, missing, created_at, installer_name, status")
       .ilike("job_addr", `%${address}%`)
       .order("created_at", { ascending: false })
-      .limit(100);
+      .range(offset, offset + limit - 1);
 
     if (error) {
       console.error("Property passport DB error:", error);
@@ -1203,7 +1507,7 @@ app.get("/property-passport", async (req, res) => {
 
     const jobList = jobs || [];
 
-    // Compliance trend — average confidence per calendar month
+    // Compliance trend — average confidence per calendar month (across all pages)
     const monthMap = {};
     for (const job of jobList) {
       const month = (job.created_at || "").slice(0, 7); // "YYYY-MM"
@@ -1225,8 +1529,15 @@ app.get("/property-passport", async (req, res) => {
       ? Math.round(jobList.reduce((s, j) => s + (j.confidence ?? 0), 0) / jobList.length)
       : null;
 
+    const totalJobs   = totalCount ?? 0;
+    const totalPages  = Math.ceil(totalJobs / limit);
+
     return res.json({
       address,
+      totalJobs,
+      page,
+      limit,
+      totalPages,
       jobCount: jobList.length,
       overallCompliance,
       trend,
@@ -1252,13 +1563,7 @@ app.get("/property-passport", async (req, res) => {
   }
 });
 
-// ── Resend email client ────────────────────────────────────────────────────────
-
-const resend = process.env.RESEND_API_KEY
-  ? new Resend(process.env.RESEND_API_KEY)
-  : null;
-
-const EMAIL_FROM = process.env.EMAIL_FROM || "Elemetric <noreply@elemetric.app>";
+// ── Resend email helpers ───────────────────────────────────────────────────────
 
 /**
  * buildEmailHtml — wraps body content in the shared branded shell.
@@ -1320,14 +1625,14 @@ app.post("/send-welcome", async (req, res) => {
     }
 
     const { to, name } = req.body || {};
-    if (!to || typeof to !== "string") {
-      return res.status(400).json({ error: "Missing recipient email address." });
+    if (!to || !isValidEmail(to)) {
+      return res.status(400).json({ error: "Missing or invalid recipient email address." });
     }
     if (!name || typeof name !== "string") {
       return res.status(400).json({ error: "Missing recipient name." });
     }
 
-    const firstName = name.split(" ")[0];
+    const firstName = escHtml(name.split(" ")[0]);
 
     const content = `
       <h1 style="margin:0 0 8px;font-size:24px;font-weight:700;color:#0f172a;">Welcome to Elemetric, ${firstName}.</h1>
@@ -1377,6 +1682,7 @@ app.post("/send-welcome", async (req, res) => {
       return res.status(500).json({ error: "Failed to send welcome email." });
     }
 
+    usageStats.emailsSent++;
     return res.json({ sent: true, id: data?.id });
   } catch (error) {
     console.error("send-welcome error:", error);
@@ -1395,8 +1701,8 @@ app.post("/send-job-complete", async (req, res) => {
     }
 
     const { to, name, jobName, jobType, confidence, pdfUrl } = req.body || {};
-    if (!to || typeof to !== "string") {
-      return res.status(400).json({ error: "Missing recipient email address." });
+    if (!to || !isValidEmail(to)) {
+      return res.status(400).json({ error: "Missing or invalid recipient email address." });
     }
     if (!name || typeof name !== "string") {
       return res.status(400).json({ error: "Missing recipient name." });
@@ -1405,10 +1711,10 @@ app.post("/send-job-complete", async (req, res) => {
       return res.status(400).json({ error: "Missing job name." });
     }
 
-    const firstName  = name.split(" ")[0];
-    const tradeLabel = typeof jobType === "string"
+    const firstName  = escHtml(name.split(" ")[0]);
+    const tradeLabel = escHtml(typeof jobType === "string"
       ? jobType.charAt(0).toUpperCase() + jobType.slice(1)
-      : "Trade";
+      : "Trade");
     const confidenceNum = typeof confidence === "number"
       ? Math.max(0, Math.min(100, Math.round(confidence)))
       : null;
@@ -1438,16 +1744,16 @@ app.post("/send-job-complete", async (req, res) => {
       </table>
 
       <p style="margin:0 0 20px;font-size:15px;color:#1e293b;line-height:1.7;">
-        Hi ${firstName}, your job <strong>${jobName}</strong> has been marked complete and your
+        Hi ${firstName}, your job <strong>${escHtml(jobName)}</strong> has been marked complete and your
         compliance record has been saved to Elemetric.
         ${pdfUrl ? "Your PDF report is attached below &mdash; keep it on file for your records." : ""}
       </p>
 
-      ${pdfUrl ? `
+      ${(pdfUrl && isSafeUrl(pdfUrl)) ? `
       <table cellpadding="0" cellspacing="0" style="margin:0 0 24px;">
         <tr>
           <td style="background:#f97316;border-radius:8px;padding:14px 32px;">
-            <a href="${pdfUrl}" style="font-size:15px;font-weight:700;color:#ffffff;text-decoration:none;display:block;">
+            <a href="${escHtml(pdfUrl)}" style="font-size:15px;font-weight:700;color:#ffffff;text-decoration:none;display:block;">
               Download PDF Report &darr;
             </a>
           </td>
@@ -1470,6 +1776,7 @@ app.post("/send-job-complete", async (req, res) => {
       return res.status(500).json({ error: "Failed to send job completion email." });
     }
 
+    usageStats.emailsSent++;
     return res.json({ sent: true, id: data?.id });
   } catch (error) {
     console.error("send-job-complete error:", error);
@@ -1487,8 +1794,8 @@ app.post("/send-team-invite", async (req, res) => {
     }
 
     const { to, invitedBy, teamName, joinCode } = req.body || {};
-    if (!to || typeof to !== "string") {
-      return res.status(400).json({ error: "Missing recipient email address." });
+    if (!to || !isValidEmail(to)) {
+      return res.status(400).json({ error: "Missing or invalid recipient email address." });
     }
     if (!invitedBy || typeof invitedBy !== "string") {
       return res.status(400).json({ error: "Missing invitedBy name." });
@@ -1500,12 +1807,16 @@ app.post("/send-team-invite", async (req, res) => {
       return res.status(400).json({ error: "Missing join code." });
     }
 
+    const safeInvitedBy = escHtml(invitedBy);
+    const safeTeamName  = escHtml(teamName);
+    const safeJoinCode  = escHtml(joinCode);
+
     const content = `
       <h1 style="margin:0 0 8px;font-size:24px;font-weight:700;color:#0f172a;">You've been invited.</h1>
-      <p style="margin:0 0 24px;font-size:14px;color:#64748b;">${invitedBy} has invited you to join their team on Elemetric.</p>
+      <p style="margin:0 0 24px;font-size:14px;color:#64748b;">${safeInvitedBy} has invited you to join their team on Elemetric.</p>
 
       <p style="margin:0 0 20px;font-size:15px;color:#1e293b;line-height:1.7;">
-        <strong>${invitedBy}</strong> has added you to the <strong>${teamName}</strong> team on Elemetric.
+        <strong>${safeInvitedBy}</strong> has added you to the <strong>${safeTeamName}</strong> team on Elemetric.
         Use the code below when you sign up or log in to join the team and start collaborating on jobs.
       </p>
 
@@ -1513,7 +1824,7 @@ app.post("/send-team-invite", async (req, res) => {
         <tr>
           <td align="center" style="background:#0f172a;border-radius:12px;padding:28px 20px;">
             <p style="margin:0 0 8px;font-size:11px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:2px;">Your join code</p>
-            <p style="margin:0;font-size:36px;font-weight:800;color:#f97316;letter-spacing:8px;font-family:'Courier New',Courier,monospace;">${joinCode}</p>
+            <p style="margin:0;font-size:36px;font-weight:800;color:#f97316;letter-spacing:8px;font-family:'Courier New',Courier,monospace;">${safeJoinCode}</p>
           </td>
         </tr>
       </table>
@@ -1539,7 +1850,7 @@ app.post("/send-team-invite", async (req, res) => {
       </table>
 
       <p style="margin:0;font-size:13px;color:#94a3b8;line-height:1.6;">
-        This invite was sent by ${invitedBy}. If you don't know this person, you can ignore this email.
+        This invite was sent by ${safeInvitedBy}. If you don't know this person, you can ignore this email.
         The join code expires once used or after 7 days.
       </p>`;
 
@@ -1547,7 +1858,7 @@ app.post("/send-team-invite", async (req, res) => {
       from: EMAIL_FROM,
       to,
       subject: `${invitedBy} invited you to join ${teamName} on Elemetric`,
-      html: buildEmailHtml(`Team invitation — ${teamName}`, content),
+      html: buildEmailHtml(`Team invitation — ${escHtml(teamName)}`, content),
     });
 
     if (sendError) {
@@ -1555,11 +1866,120 @@ app.post("/send-team-invite", async (req, res) => {
       return res.status(500).json({ error: "Failed to send team invite email." });
     }
 
+    usageStats.emailsSent++;
     return res.json({ sent: true, id: data?.id });
   } catch (error) {
     console.error("send-team-invite error:", error);
     return res.status(500).json({ error: "Failed to send team invite email." });
   }
+});
+
+// ── POST /send-near-miss-alert ─────────────────────────────────────────────────
+// Body: { to, employerName, workerName, jobName, reportDetails }
+// Emails the employer when a team member files a near-miss report.
+
+app.post("/send-near-miss-alert", async (req, res) => {
+  try {
+    if (!resend) return res.status(503).json({ error: "Email service not configured." });
+
+    const { to, employerName, workerName, jobName, reportDetails } = req.body || {};
+    if (!to || !isValidEmail(to))
+      return res.status(400).json({ error: "Missing or invalid recipient email address." });
+    if (!employerName || typeof employerName !== "string")
+      return res.status(400).json({ error: "Missing employerName." });
+    if (!workerName || typeof workerName !== "string")
+      return res.status(400).json({ error: "Missing workerName." });
+    if (!jobName || typeof jobName !== "string")
+      return res.status(400).json({ error: "Missing jobName." });
+    if (!reportDetails || typeof reportDetails !== "string")
+      return res.status(400).json({ error: "Missing reportDetails." });
+
+    const firstName       = escHtml(employerName.split(" ")[0]);
+    const safeWorker      = escHtml(workerName);
+    const safeJob         = escHtml(jobName);
+    const safeDetails     = escHtml(reportDetails);
+    const safeEmployer    = escHtml(employerName);
+
+    const content = `
+      <h1 style="margin:0 0 8px;font-size:24px;font-weight:700;color:#0f172a;">Near-miss report filed.</h1>
+      <p style="margin:0 0 24px;font-size:14px;color:#64748b;">A team member has logged a near-miss incident.</p>
+
+      <table width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 28px;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;">
+        <tr style="background:#f8fafc;">
+          <td style="padding:12px 20px;font-size:12px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;" width="40%">Reported by</td>
+          <td style="padding:12px 20px;font-size:14px;color:#1e293b;font-weight:600;">${safeWorker}</td>
+        </tr>
+        <tr>
+          <td style="padding:12px 20px;font-size:12px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;border-top:1px solid #e2e8f0;">Job</td>
+          <td style="padding:12px 20px;font-size:14px;color:#1e293b;border-top:1px solid #e2e8f0;">${safeJob}</td>
+        </tr>
+      </table>
+
+      <table width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 28px;">
+        <tr>
+          <td style="background:#fff7ed;border-left:4px solid #f97316;padding:16px 20px;border-radius:0 8px 8px 0;">
+            <p style="margin:0 0 6px;font-size:13px;font-weight:600;color:#c2410c;text-transform:uppercase;letter-spacing:0.5px;">Incident details</p>
+            <p style="margin:0;font-size:14px;color:#1e293b;line-height:1.6;">${safeDetails}</p>
+          </td>
+        </tr>
+      </table>
+
+      <p style="margin:0 0 16px;font-size:15px;color:#1e293b;line-height:1.7;">
+        Hi ${firstName}, <strong>${safeWorker}</strong> has filed a near-miss report on job
+        <strong>${safeJob}</strong>. Review the incident details above and take appropriate action
+        to prevent future occurrences.
+      </p>
+
+      <table cellpadding="0" cellspacing="0" style="margin:0 0 24px;">
+        <tr>
+          <td style="background:#f97316;border-radius:8px;padding:14px 32px;">
+            <a href="https://elemetric.app" style="font-size:15px;font-weight:700;color:#ffffff;text-decoration:none;display:block;">
+              View in Elemetric &rarr;
+            </a>
+          </td>
+        </tr>
+      </table>
+
+      <p style="margin:0;font-size:14px;color:#64748b;line-height:1.7;">
+        This notification was sent automatically when a near-miss report was filed in Elemetric.
+      </p>`;
+
+    const { data, error: sendError } = await resend.emails.send({
+      from: EMAIL_FROM,
+      to,
+      subject: `Near-miss report: ${jobName} — filed by ${workerName}`,
+      html: buildEmailHtml("Near-miss report — Elemetric", content),
+    });
+
+    if (sendError) {
+      console.error("Resend /send-near-miss-alert error:", sendError);
+      return res.status(500).json({ error: "Failed to send near-miss alert email." });
+    }
+
+    usageStats.emailsSent++;
+    return res.json({ sent: true, id: data?.id });
+  } catch (error) {
+    console.error("send-near-miss-alert error:", error);
+    return res.status(500).json({ error: "Failed to send near-miss alert email." });
+  }
+});
+
+// ── GET /stats ────────────────────────────────────────────────────────────────
+// Protected by API key middleware. Returns usage metrics and estimated costs.
+
+app.get("/stats", (_req, res) => {
+  const estimatedCostUSD =
+    usageStats.openaiCalls    * COST_PER_OPENAI_CALL  +
+    usageStats.replicateCalls * COST_PER_REPLICATE_CALL +
+    usageStats.emailsSent     * COST_PER_EMAIL;
+
+  return res.json({
+    ...usageStats,
+    estimatedCostUSD: parseFloat(estimatedCostUSD.toFixed(4)),
+    uptimeSeconds:    Math.round(process.uptime()),
+    cacheSize:        analysisCache.size,
+    pendingAnalyses:  pendingAnalyses.size,
+  });
 });
 
 // ── 404 handler ───────────────────────────────────────────────────────────────
