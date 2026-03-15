@@ -27403,6 +27403,164 @@ app.post("/benchmark-job", apiKeyAuth, (req, res) => {
   });
 });
 
+// GET /site-summary/:siteId  — Get a comprehensive summary for a site
+app.get("/site-summary/:siteId", apiKeyAuth, async (req, res) => {
+  const siteId = sanitiseInput(String(req.params.siteId || "")).slice(0, 80);
+  if (!siteId) return res.status(400).json({ error: "siteId required." });
+
+  const summary = { siteId, fetchedAt: new Date().toISOString(), components: {} };
+
+  if (supabaseAdmin) {
+    try {
+      const results = await Promise.allSettled([
+        supabaseAdmin.from("site_diary").select("count").eq("site_id", siteId),
+        supabaseAdmin.from("hazard_log").select("risk_rating").eq("site_id", siteId).eq("status", "OPEN"),
+        supabaseAdmin.from("site_inductions").select("count").eq("site_id", siteId),
+        supabaseAdmin.from("safety_alerts").select("severity, status").eq("site_id", siteId).eq("status", "ACTIVE"),
+        supabaseAdmin.from("noise_complaints").select("count").eq("site_id", siteId),
+        supabaseAdmin.from("hot_work_permits").select("count").eq("site_id", siteId).eq("status", "ACTIVE"),
+        supabaseAdmin.from("chemical_register").select("count").eq("site_id", siteId),
+        supabaseAdmin.from("excavation_permits").select("count").eq("site_id", siteId).eq("status", "ACTIVE"),
+        supabaseAdmin.from("jsa_records").select("count").eq("site_id", siteId),
+        supabaseAdmin.from("site_clean_checklists").select("rating, inspection_date").eq("site_id", siteId).order("inspection_date", { ascending: false }).limit(1),
+      ]);
+
+      summary.components.diaryEntries      = results[0].status === "fulfilled" ? (results[0].value.data?.length || 0) : null;
+      summary.components.openHazards       = results[1].status === "fulfilled" ? results[1].value.data || [] : [];
+      summary.components.inductionCount    = results[2].status === "fulfilled" ? (results[2].value.data?.length || 0) : null;
+      summary.components.activeAlerts      = results[3].status === "fulfilled" ? results[3].value.data || [] : [];
+      summary.components.noiseComplaints   = results[4].status === "fulfilled" ? (results[4].value.data?.length || 0) : null;
+      summary.components.activeHotWork     = results[5].status === "fulfilled" ? (results[5].value.data?.length || 0) : null;
+      summary.components.chemicals         = results[6].status === "fulfilled" ? (results[6].value.data?.length || 0) : null;
+      summary.components.activeExcavations = results[7].status === "fulfilled" ? (results[7].value.data?.length || 0) : null;
+      summary.components.jsaCount          = results[8].status === "fulfilled" ? (results[8].value.data?.length || 0) : null;
+      summary.components.lastCleanRating   = results[9].status === "fulfilled" && results[9].value.data?.[0] ? results[9].value.data[0].rating : null;
+
+      const openHazards = summary.components.openHazards;
+      summary.components.hazardSummary = {
+        total: openHazards.length,
+        critical: openHazards.filter(h => h.risk_rating === "CRITICAL").length,
+        high:     openHazards.filter(h => h.risk_rating === "HIGH").length,
+      };
+      summary.components.criticalAlerts = summary.components.activeAlerts.filter(a => a.severity === "CRITICAL").length;
+    } catch (_) { /* ignore */ }
+  }
+
+  return res.json(summary);
+});
+
+// POST /ai-weekly-report  — AI generates a weekly site progress report
+app.post("/ai-weekly-report", apiKeyAuth, async (req, res) => {
+  const { projectId, siteId, weekEnding, workCompleted, plannedNextWeek, issues, safetyEvents, budgetStatus, scheduleStatus, workforce } = req.body || {};
+  if (!projectId) return res.status(400).json({ error: "projectId required." });
+
+  const safeProjectId = sanitiseInput(String(projectId)).slice(0, 80);
+  const safeSiteId    = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeWeek      = weekEnding ? sanitiseInput(String(weekEnding)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeWork      = workCompleted ? sanitiseInput(String(workCompleted)).slice(0, 1500) : null;
+  const safePlanned   = plannedNextWeek ? sanitiseInput(String(plannedNextWeek)).slice(0, 1000) : null;
+  const safeIssues    = issues ? sanitiseInput(String(issues)).slice(0, 500) : null;
+  const safeSafety    = safetyEvents ? sanitiseInput(String(safetyEvents)).slice(0, 300) : null;
+  const safeBudget    = budgetStatus ? sanitiseInput(String(budgetStatus)).slice(0, 100) : null;
+  const safeSchedule  = scheduleStatus ? sanitiseInput(String(scheduleStatus)).slice(0, 100) : null;
+  const safeWorkforce = workforce ? Math.max(0, parseInt(workforce) || 0) : null;
+
+  const prompt = `You are a construction project manager writing a weekly progress report.
+
+Week ending: ${safeWeek}
+Project: ${safeProjectId}
+${safeWork ? `Work completed this week: ${safeWork}` : ""}
+${safePlanned ? `Planned next week: ${safePlanned}` : ""}
+${safeIssues ? `Issues/risks: ${safeIssues}` : ""}
+${safeSafety ? `Safety events: ${safeSafety}` : "No safety incidents"}
+${safeBudget ? `Budget status: ${safeBudget}` : ""}
+${safeSchedule ? `Schedule status: ${safeSchedule}` : ""}
+${safeWorkforce ? `Workforce on site: ${safeWorkforce} people` : ""}
+
+Write a professional weekly report in JSON:
+{
+  "executiveSummary": "2-3 sentence high-level summary",
+  "progressStatus": "ON_TRACK|SLIGHTLY_DELAYED|DELAYED|AHEAD",
+  "keyAchievements": ["achievement 1"],
+  "issuesAndRisks": ["issue 1"],
+  "nextWeekPriorities": ["priority 1"],
+  "safetyHighlights": "safety paragraph",
+  "lookaheadWeeks2to4": "brief 2-4 week outlook"
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 700 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      projectId: safeProjectId, siteId: safeSiteId, weekEnding: safeWeek,
+      executiveSummary:   parsed.executiveSummary || "",
+      progressStatus:     ["ON_TRACK", "SLIGHTLY_DELAYED", "DELAYED", "AHEAD"].includes(parsed.progressStatus) ? parsed.progressStatus : "ON_TRACK",
+      keyAchievements:    Array.isArray(parsed.keyAchievements) ? parsed.keyAchievements : [],
+      issuesAndRisks:     Array.isArray(parsed.issuesAndRisks) ? parsed.issuesAndRisks : [],
+      nextWeekPriorities: Array.isArray(parsed.nextWeekPriorities) ? parsed.nextWeekPriorities : [],
+      safetyHighlights:   parsed.safetyHighlights || null,
+      lookaheadWeeks2to4: parsed.lookaheadWeeks2to4 || null,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      projectId: safeProjectId, siteId: safeSiteId, weekEnding: safeWeek,
+      executiveSummary: "Weekly report generation temporarily unavailable.",
+      progressStatus: "ON_TRACK", keyAchievements: [], issuesAndRisks: [],
+      nextWeekPriorities: [], safetyHighlights: null, lookaheadWeeks2to4: null,
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// GET /contractor-summary/:contractorId  — Comprehensive dashboard summary for a contractor
+app.get("/contractor-summary/:contractorId", apiKeyAuth, async (req, res) => {
+  const contractorId = sanitiseInput(String(req.params.contractorId || "")).slice(0, 80);
+  if (!contractorId) return res.status(400).json({ error: "contractorId required." });
+
+  const summary = { contractorId, fetchedAt: new Date().toISOString(), components: {} };
+
+  if (supabaseAdmin) {
+    try {
+      const [jobs, ratings, breaches, insurance, warranties, training, cpd, completion] = await Promise.allSettled([
+        supabaseAdmin.from("jobs").select("status").eq("contractor_id", contractorId),
+        supabaseAdmin.from("contractor_ratings").select("overall").eq("contractor_id", contractorId),
+        supabaseAdmin.from("regulatory_breaches").select("severity, status").eq("contractor_id", contractorId).eq("status", "OPEN"),
+        supabaseAdmin.from("insurance_register").select("policy_type, expiry_date").eq("contractor_id", contractorId),
+        supabaseAdmin.from("warranty_register").select("status, warranty_expiry").eq("contractor_id", contractorId).eq("status", "ACTIVE"),
+        supabaseAdmin.from("training_records").select("training_type, completion_date").eq("contractor_id", contractorId),
+        supabaseAdmin.from("contractor_cpd").select("points, cpd_category").eq("contractor_id", contractorId),
+        supabaseAdmin.from("job_completion_log").select("all_passed").eq("contractor_id", contractorId),
+      ]);
+
+      const jobData = jobs.status === "fulfilled" ? jobs.value.data || [] : [];
+      summary.components.jobs = { total: jobData.length, active: jobData.filter(j => j.status === "IN_PROGRESS").length, completed: jobData.filter(j => j.status === "COMPLETED").length };
+
+      const ratingData = ratings.status === "fulfilled" ? ratings.value.data || [] : [];
+      summary.components.averageRating = ratingData.length > 0 ? parseFloat((ratingData.reduce((s, r) => s + (r.overall || 0), 0) / ratingData.length).toFixed(2)) : null;
+
+      const breachData = breaches.status === "fulfilled" ? breaches.value.data || [] : [];
+      summary.components.openBreaches = { total: breachData.length, critical: breachData.filter(b => b.severity === "CRITICAL").length };
+
+      const now = new Date().toISOString().split("T")[0];
+      const insurData = insurance.status === "fulfilled" ? insurance.value.data || [] : [];
+      summary.components.insurance = { total: insurData.length, expired: insurData.filter(i => i.expiry_date && i.expiry_date < now).length };
+
+      const warnData = warranties.status === "fulfilled" ? warranties.value.data || [] : [];
+      summary.components.activeWarranties = warnData.length;
+
+      summary.components.trainingRecords = training.status === "fulfilled" ? (training.value.data?.length || 0) : null;
+      summary.components.totalCpdPoints  = cpd.status === "fulfilled" ? parseFloat((cpd.value.data || []).reduce((s, r) => s + (r.points || 0), 0).toFixed(1)) : null;
+
+      const compData = completion.status === "fulfilled" ? completion.value.data || [] : [];
+      summary.components.completionRate  = compData.length > 0 ? parseFloat(((compData.filter(c => c.all_passed).length / compData.length) * 100).toFixed(1)) : null;
+    } catch (_) { /* ignore */ }
+  }
+
+  return res.json(summary);
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
