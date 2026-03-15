@@ -21968,6 +21968,167 @@ app.get("/contractor-rating/:contractorId", apiKeyAuth, async (req, res) => {
   });
 });
 
+// POST /job-tag  — Tag a job with custom labels
+app.post("/job-tag", apiKeyAuth, async (req, res) => {
+  const { jobId, tags = [] } = req.body || {};
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+  if (!Array.isArray(tags) || tags.length === 0) return res.status(400).json({ error: "tags array required." });
+
+  const safeJobId = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeTags  = [...new Set(tags.slice(0, 20).map(t => sanitiseInput(String(t)).toLowerCase().slice(0, 40).replace(/[^a-z0-9-_ ]/g, "")))].filter(Boolean);
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("job_tags").upsert(
+        safeTags.map(tag => ({ job_id: safeJobId, tag, created_at: new Date().toISOString() })),
+        { onConflict: "job_id,tag" }
+      );
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.json({ jobId: safeJobId, tagsApplied: safeTags, count: safeTags.length, savedAt: new Date().toISOString() });
+});
+
+// GET /jobs-by-tag/:tag  — List jobs with a specific tag
+app.get("/jobs-by-tag/:tag", apiKeyAuth, async (req, res) => {
+  const tag  = sanitiseInput(String(req.params.tag || "")).toLowerCase().slice(0, 40);
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  if (!tag) return res.status(400).json({ error: "tag required." });
+
+  let jobs = [];
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin
+        .from("job_tags")
+        .select("job_id, created_at")
+        .eq("tag", tag)
+        .order("created_at", { ascending: false })
+        .limit(limit);
+      jobs = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  return res.json({ tag, count: jobs.length, jobs: jobs.map(j => ({ jobId: j.job_id, taggedAt: j.created_at })), generatedAt: new Date().toISOString() });
+});
+
+// POST /training-record  — Log a CPD/training activity for a contractor
+app.post("/training-record", apiKeyAuth, async (req, res) => {
+  const { contractorId, trainingType, provider, completionDate, expiryDate, certNumber, hours, notes } = req.body || {};
+  if (!contractorId || !trainingType) return res.status(400).json({ error: "contractorId and trainingType required." });
+
+  const VALID_TRAINING_TYPES = ["first-aid", "white-card", "cpd", "licence-renewal", "asbestos-awareness", "confined-space", "working-at-heights", "forklift", "fire-safety", "manual-handling", "gas-fitting", "electrical-safety", "plumbing-update", "hvac-refresher", "other"];
+
+  const safeCId   = sanitiseInput(String(contractorId)).slice(0, 80);
+  const safeType  = sanitiseInput(String(trainingType)).toLowerCase().slice(0, 60);
+  const safeValid = VALID_TRAINING_TYPES.includes(safeType) ? safeType : "other";
+  const record = {
+    contractorId: safeCId,
+    trainingType: safeValid,
+    provider:        provider ? sanitiseInput(String(provider)).slice(0, 150) : null,
+    completionDate:  completionDate ? sanitiseInput(String(completionDate)).slice(0, 20) : new Date().toISOString().split("T")[0],
+    expiryDate:      expiryDate ? sanitiseInput(String(expiryDate)).slice(0, 20) : null,
+    certNumber:      certNumber ? sanitiseInput(String(certNumber)).slice(0, 80) : null,
+    hours:           hours ? Math.max(0, parseFloat(hours) || 0) : null,
+    notes:           notes ? sanitiseInput(String(notes)).slice(0, 300) : null,
+    createdAt:       new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("training_records").insert({
+        contractor_id: record.contractorId, training_type: record.trainingType,
+        provider: record.provider, completion_date: record.completionDate,
+        expiry_date: record.expiryDate, cert_number: record.certNumber,
+        hours: record.hours, notes: record.notes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// GET /training-record/:contractorId  — Get training history for a contractor
+app.get("/training-record/:contractorId", apiKeyAuth, async (req, res) => {
+  const contractorId = sanitiseInput(String(req.params.contractorId || "")).slice(0, 80);
+  if (!contractorId) return res.status(400).json({ error: "contractorId required." });
+
+  let records = [];
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin
+        .from("training_records")
+        .select("*")
+        .eq("contractor_id", contractorId)
+        .order("completion_date", { ascending: false })
+        .limit(100);
+      records = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const now = new Date();
+  const enriched = records.map(r => {
+    const expired = r.expiry_date && new Date(r.expiry_date) < now;
+    const daysLeft = r.expiry_date ? Math.round((new Date(r.expiry_date) - now) / 86400000) : null;
+    return { ...r, expired, daysLeft };
+  });
+
+  const totalHours = enriched.reduce((s, r) => s + (r.hours || 0), 0);
+
+  return res.json({
+    contractorId,
+    totalRecords: enriched.length,
+    totalCpdHours: parseFloat(totalHours.toFixed(1)),
+    expired: enriched.filter(r => r.expired).length,
+    records: enriched,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /site-induction  — Log a site induction record for a worker
+app.post("/site-induction", apiKeyAuth, async (req, res) => {
+  const { siteId, workerId, workerName, inductedBy, inductionTopics = [], acknowledgedAt, idVerified, licenceVerified } = req.body || {};
+  if (!siteId || !workerId) return res.status(400).json({ error: "siteId and workerId required." });
+
+  const DEFAULT_TOPICS = [
+    "Emergency evacuation procedures", "First aid kit location", "Hazard identification and reporting",
+    "PPE requirements on site", "Restricted access areas", "Permit to work requirements",
+    "Environmental controls (spill management)", "Site-specific hazards briefing",
+  ];
+
+  const safeSiteId  = sanitiseInput(String(siteId)).slice(0, 80);
+  const safeWorker  = sanitiseInput(String(workerId)).slice(0, 80);
+  const safeName    = workerName ? sanitiseInput(String(workerName)).slice(0, 100) : null;
+  const safeBy      = inductedBy ? sanitiseInput(String(inductedBy)).slice(0, 100) : null;
+  const safeTopics  = Array.isArray(inductionTopics) && inductionTopics.length > 0
+    ? inductionTopics.slice(0, 20).map(t => sanitiseInput(String(t)).slice(0, 150))
+    : DEFAULT_TOPICS;
+
+  const record = {
+    siteId: safeSiteId, workerId: safeWorker, workerName: safeName,
+    inductedBy: safeBy, inductionTopics: safeTopics,
+    topicCount: safeTopics.length,
+    idVerified:       idVerified === true,
+    licenceVerified:  licenceVerified === true,
+    acknowledgedAt:   acknowledgedAt ? sanitiseInput(String(acknowledgedAt)).slice(0, 30) : new Date().toISOString(),
+    inductionRef: `IND-${safeSiteId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("site_inductions").insert({
+        site_id: record.siteId, worker_id: record.workerId, worker_name: record.workerName,
+        inducted_by: record.inductedBy, induction_topics: record.inductionTopics,
+        id_verified: record.idVerified, licence_verified: record.licenceVerified,
+        acknowledged_at: record.acknowledgedAt, induction_ref: record.inductionRef,
+        created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
