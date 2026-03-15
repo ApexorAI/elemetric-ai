@@ -33175,6 +33175,226 @@ app.get("/api-metrics", apiKeyAuth, (req, res) => {
   });
 });
 
+// ── Round 123: Solar PV commissioning, EV charger compliance, battery storage ─
+
+// POST /solar-pv-commissioning — Record solar PV system commissioning and compliance
+app.post("/solar-pv-commissioning", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, installerContractorId, installerLicence, cleanEnergyCouncilAccredited,
+    systemSize_kW, panelMake, panelModel, panelCount, panelWattage,
+    inverterMake, inverterModel, inverterCount,
+    batteryInstalled = false, batteryMake, batteryModel, batteryCapacity_kWh,
+    gridConnectionType, dnspApprovalNumber,
+    earthingCompliant, rcdInstalled, acIsolatorInstalled, dcIsolatorInstalled,
+    importMeterInstalled, exportMeterInstalled,
+    insulationResistancePassed, continuityTestPassed, voltageTestPassed,
+    clientName, propertyAddress, commissionDate, state = "VIC",
+    notes,
+  } = req.body;
+
+  if (!siteId || !systemSize_kW) return res.status(400).json({ error: "siteId and systemSize_kW required." });
+
+  const stcZones = { VIC: 3, NSW: 3, QLD: 2, SA: 3, WA: 4, TAS: 3, ACT: 3, NT: 1 };
+  const stcZone = stcZones[state] || 3;
+  // STC calculation (simplified — use CEC calculator for official)
+  const annualOutput_kWh = Number(systemSize_kW) * 1400; // rough VIC estimate
+  const stcYears = 15; // deeming period
+  const stcCount = Math.round(Number(systemSize_kW) * stcYears * (annualOutput_kWh / Number(systemSize_kW)) / 1000);
+
+  const allTestsPassed = Boolean(insulationResistancePassed) && Boolean(continuityTestPassed) && Boolean(voltageTestPassed);
+
+  const complianceItems = [
+    { item: "CEC Accredited Installer", compliant: Boolean(cleanEnergyCouncilAccredited) },
+    { item: "Earthing compliant AS/NZS 5033", compliant: Boolean(earthingCompliant) },
+    { item: "RCD installed", compliant: Boolean(rcdInstalled) },
+    { item: "AC Isolator installed", compliant: Boolean(acIsolatorInstalled) },
+    { item: "DC Isolator installed", compliant: Boolean(dcIsolatorInstalled) },
+    { item: "DNSP approval obtained", compliant: Boolean(dnspApprovalNumber) },
+    { item: "All electrical tests passed", compliant: allTestsPassed },
+  ];
+
+  const complianceScore = Math.round((complianceItems.filter(i => i.compliant).length / complianceItems.length) * 100);
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    installer_contractor_id: sanitiseInput(installerContractorId || ""),
+    installer_licence: sanitiseInput(installerLicence || ""),
+    cec_accredited: Boolean(cleanEnergyCouncilAccredited),
+    system_size_kw: Number(systemSize_kW),
+    panel_make: sanitiseInput(panelMake || ""),
+    panel_model: sanitiseInput(panelModel || ""),
+    panel_count: Number(panelCount) || null,
+    panel_wattage: Number(panelWattage) || null,
+    inverter_make: sanitiseInput(inverterMake || ""),
+    inverter_model: sanitiseInput(inverterModel || ""),
+    inverter_count: Number(inverterCount) || null,
+    battery_installed: Boolean(batteryInstalled),
+    battery_make: batteryInstalled ? sanitiseInput(batteryMake || "") : null,
+    battery_model: batteryInstalled ? sanitiseInput(batteryModel || "") : null,
+    battery_capacity_kwh: batteryInstalled ? Number(batteryCapacity_kWh) || null : null,
+    grid_connection_type: sanitiseInput(gridConnectionType || ""),
+    dnsp_approval_number: sanitiseInput(dnspApprovalNumber || ""),
+    compliance_items: complianceItems,
+    compliance_score: complianceScore,
+    all_tests_passed: allTestsPassed,
+    estimated_annual_output_kwh: annualOutput_kWh,
+    stc_zone: stcZone,
+    estimated_stc_count: stcCount,
+    client_name: sanitiseInput(clientName || ""),
+    property_address: sanitiseInput(propertyAddress || ""),
+    commission_date: commissionDate || new Date().toISOString().split("T")[0],
+    state: sanitiseInput(state),
+    applicable_standards: ["AS/NZS 5033", "AS/NZS 4777.1", "AS/NZS 4777.2", "AS 3000"],
+    status: complianceScore >= 85 ? "COMMISSIONED" : "CONDITIONAL",
+    notes: sanitiseInput(notes || ""),
+    commissioned_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("solar_pv_commissionings")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, commissionId: data.id, complianceScore, status: record.status, estimatedStcCount: stcCount, ...record });
+  }
+
+  res.json({ success: true, commissionId: null, complianceScore, status: record.status, estimatedStcCount: stcCount, ...record, saved: false });
+});
+
+// POST /ev-charger-compliance — Record EV charger installation compliance check
+app.post("/ev-charger-compliance", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, propertyAddress, installerLicence, chargerMake, chargerModel,
+    chargerType, outputKw, phases, circuitAmps,
+    rcboInstalled = false, earthingVerified = false, cableRatingVerified = false,
+    ipRatingVerified = false, loadCalculationCompleted = false,
+    smartMeteringCapable = false, dnspNotified = false,
+    clientName, installDate, state = "VIC",
+  } = req.body;
+
+  if (!siteId || !chargerType) return res.status(400).json({ error: "siteId and chargerType required." });
+
+  const validTypes = ["TYPE_1", "TYPE_2", "CCS", "CHADEMO", "WALLBOX", "RAPID", "OTHER"];
+  const charger = (chargerType || "TYPE_2").toUpperCase();
+
+  const complianceChecks = [
+    { check: "RCBO/RCD installed for EV circuit", passed: Boolean(rcboInstalled) },
+    { check: "Earthing verified per AS 3000", passed: Boolean(earthingVerified) },
+    { check: "Cable rating verified for load", passed: Boolean(cableRatingVerified) },
+    { check: "IP rating appropriate for location", passed: Boolean(ipRatingVerified) },
+    { check: "Load calculation completed", passed: Boolean(loadCalculationCompleted) },
+    { check: "DNSP notified (if required)", passed: Boolean(dnspNotified) || outputKw < 7 },
+  ];
+
+  const passedCount = complianceChecks.filter(c => c.passed).length;
+  const compliancePercent = Math.round((passedCount / complianceChecks.length) * 100);
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    property_address: sanitiseInput(propertyAddress || ""),
+    installer_licence: sanitiseInput(installerLicence || ""),
+    charger_make: sanitiseInput(chargerMake || ""),
+    charger_model: sanitiseInput(chargerModel || ""),
+    charger_type: validTypes.includes(charger) ? charger : "TYPE_2",
+    output_kw: Number(outputKw) || null,
+    phases: Number(phases) || 1,
+    circuit_amps: Number(circuitAmps) || null,
+    compliance_checks: complianceChecks,
+    compliance_percent: compliancePercent,
+    smart_metering_capable: Boolean(smartMeteringCapable),
+    client_name: sanitiseInput(clientName || ""),
+    install_date: installDate || new Date().toISOString().split("T")[0],
+    state: sanitiseInput(state),
+    applicable_standards: ["AS/NZS 3000", "AS/NZS 3112", "AS 62053"],
+    status: compliancePercent === 100 ? "COMPLIANT" : compliancePercent >= 83 ? "MINOR_ISSUES" : "NON_COMPLIANT",
+    recorded_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("ev_charger_compliance")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, recordId: data.id, compliancePercent, status: record.status, ...record });
+  }
+
+  res.json({ success: true, recordId: null, compliancePercent, status: record.status, ...record, saved: false });
+});
+
+// POST /battery-storage-compliance — Record battery energy storage system (BESS) compliance
+app.post("/battery-storage-compliance", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, propertyAddress, batteryMake, batteryModel, batteryCapacity_kWh,
+    maxContinuousPower_kW, chemistry, installLocation,
+    ventilationAdequate = false, fireRatedEnclosure = false,
+    bmsInstalled = false, isolatorInstalled = false,
+    clearancesMet = false, distanceFromOpenings,
+    cecApproved = false, installerAccredited = false,
+    networkApprovalObtained = false,
+    clientName, installDate, state = "VIC",
+  } = req.body;
+
+  if (!siteId || !batteryMake) return res.status(400).json({ error: "siteId and batteryMake required." });
+
+  const validChemistry = ["LITHIUM_ION", "LITHIUM_IRON_PHOSPHATE", "LEAD_ACID", "FLOW", "OTHER"];
+  const chem = (chemistry || "LITHIUM_IRON_PHOSPHATE").toUpperCase();
+
+  const complianceChecks = [
+    { check: "CEC approved battery product", passed: Boolean(cecApproved) },
+    { check: "CEC accredited installer", passed: Boolean(installerAccredited) },
+    { check: "Adequate ventilation/thermal management", passed: Boolean(ventilationAdequate) },
+    { check: "Battery Management System (BMS) installed", passed: Boolean(bmsInstalled) },
+    { check: "Isolator installed", passed: Boolean(isolatorInstalled) },
+    { check: "Required clearances met", passed: Boolean(clearancesMet) },
+    { check: "Network approval obtained", passed: Boolean(networkApprovalObtained) },
+  ];
+
+  const passedChecks = complianceChecks.filter(c => c.passed).length;
+  const compliancePercent = Math.round((passedChecks / complianceChecks.length) * 100);
+
+  // AS/NZS 5139 clearance requirements (indicative)
+  const requiredClearance = chem === "LITHIUM_ION" ? 600 : 300;
+  const clearanceAdequate = distanceFromOpenings ? Number(distanceFromOpenings) >= requiredClearance : null;
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    property_address: sanitiseInput(propertyAddress || ""),
+    battery_make: sanitiseInput(batteryMake),
+    battery_model: sanitiseInput(batteryModel || ""),
+    battery_capacity_kwh: Number(batteryCapacity_kWh) || null,
+    max_continuous_power_kw: Number(maxContinuousPower_kW) || null,
+    chemistry: validChemistry.includes(chem) ? chem : "OTHER",
+    install_location: sanitiseInput(installLocation || ""),
+    compliance_checks: complianceChecks,
+    compliance_percent: compliancePercent,
+    clearance_from_openings_mm: distanceFromOpenings ? Number(distanceFromOpenings) : null,
+    required_clearance_mm: requiredClearance,
+    clearance_adequate: clearanceAdequate,
+    client_name: sanitiseInput(clientName || ""),
+    install_date: installDate || new Date().toISOString().split("T")[0],
+    state: sanitiseInput(state),
+    applicable_standards: ["AS/NZS 5139", "AS/NZS 4777", "AS 3000"],
+    status: compliancePercent === 100 ? "COMPLIANT" : compliancePercent >= 71 ? "CONDITIONAL" : "NON_COMPLIANT",
+    recorded_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("battery_storage_compliance")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, recordId: data.id, compliancePercent, status: record.status, clearanceAdequate, ...record });
+  }
+
+  res.json({ success: true, recordId: null, compliancePercent, status: record.status, clearanceAdequate, ...record, saved: false });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
