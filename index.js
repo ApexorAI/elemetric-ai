@@ -22780,6 +22780,177 @@ app.get("/quality-inspection/:jobId", apiKeyAuth, async (req, res) => {
   });
 });
 
+// POST /ai-permit-guidance  — AI provides guidance on what permits are needed
+app.post("/ai-permit-guidance", apiKeyAuth, async (req, res) => {
+  const { jobType, workDescription, propertyType, state = "VIC", estimatedValue } = req.body || {};
+  if (!jobType || !workDescription) return res.status(400).json({ error: "jobType and workDescription required." });
+
+  const safeType    = sanitiseInput(String(jobType)).slice(0, 40);
+  const safeDesc    = sanitiseInput(String(workDescription)).slice(0, 1500);
+  const safeProp    = propertyType ? sanitiseInput(String(propertyType)).slice(0, 60) : null;
+  const safeState   = sanitiseInput(String(state)).toUpperCase().slice(0, 5);
+  const safeValue   = estimatedValue ? Math.max(0, parseFloat(estimatedValue) || 0) : null;
+
+  const prompt = `You are a building and compliance expert in ${safeState}, Australia.
+
+Based on the following job details, advise what permits and registrations are required:
+
+Trade: ${safeType}
+Work description: ${safeDesc}
+${safeProp ? `Property type: ${safeProp}` : ""}
+${safeValue ? `Estimated value: $${safeValue.toLocaleString()}` : ""}
+
+Respond with JSON:
+{
+  "permitsRequired": [{"name": "...", "authority": "...", "reason": "...", "required": true|false}],
+  "notificationsRequired": ["..."],
+  "licenceRequired": "description",
+  "thresholdNotes": "notes about value thresholds",
+  "summary": "2-sentence summary"
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 600 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      jobType: safeType, state: safeState,
+      permitsRequired:       Array.isArray(parsed.permitsRequired) ? parsed.permitsRequired : [],
+      notificationsRequired: Array.isArray(parsed.notificationsRequired) ? parsed.notificationsRequired : [],
+      licenceRequired:       parsed.licenceRequired || null,
+      thresholdNotes:        parsed.thresholdNotes || null,
+      summary:               parsed.summary || "",
+      disclaimer: "Always verify permit requirements with the relevant authority before commencing work.",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      jobType: safeType, state: safeState,
+      permitsRequired: [{ name: "Building permit", authority: "Local council / VBA", reason: "Required for most regulated work", required: true }],
+      notificationsRequired: [],
+      licenceRequired: `Current ${safeType} licence required in ${safeState}`,
+      thresholdNotes: null,
+      summary: "Permit guidance temporarily unavailable. Contact your local council or the VBA.",
+      disclaimer: "Always verify permit requirements with the relevant authority before commencing work.",
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /client-sign-off  — Log formal client sign-off on completed work
+app.post("/client-sign-off", apiKeyAuth, async (req, res) => {
+  const { jobId, contractorId, clientName, clientEmail, clientPhone, signOffType, satisfied, issues, notes } = req.body || {};
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  const VALID_TYPES = ["practical-completion", "defects-liability", "final-payment", "warranty-commencement", "general"];
+  const safeJobId   = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeCId     = contractorId ? sanitiseInput(String(contractorId)).slice(0, 80) : null;
+  const safeName    = clientName ? sanitiseInput(String(clientName)).slice(0, 100) : null;
+  const safeEmail   = clientEmail && isValidEmail(clientEmail) ? clientEmail.toLowerCase() : null;
+  const safePhone   = clientPhone ? sanitiseInput(String(clientPhone)).replace(/[^0-9+ ()-]/g, "").slice(0, 20) : null;
+  const safeType    = VALID_TYPES.includes(String(signOffType || "").toLowerCase().replace(/ /g, "-")) ? String(signOffType).toLowerCase().replace(/ /g, "-") : "general";
+  const safeIssues  = issues ? sanitiseInput(String(issues)).slice(0, 500) : null;
+  const safeNotes   = notes ? sanitiseInput(String(notes)).slice(0, 500) : null;
+
+  const record = {
+    jobId: safeJobId, contractorId: safeCId, signOffType: safeType,
+    clientName: safeName, clientEmail: safeEmail, clientPhone: safePhone,
+    satisfied: satisfied !== false,
+    issues: safeIssues, notes: safeNotes,
+    signOffRef: `CSO-${safeJobId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    signedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("client_sign_offs").insert({
+        job_id: record.jobId, contractor_id: record.contractorId, sign_off_type: record.signOffType,
+        client_name: record.clientName, client_email: record.clientEmail, client_phone: record.clientPhone,
+        satisfied: record.satisfied, issues: record.issues, notes: record.notes,
+        sign_off_ref: record.signOffRef, signed_at: record.signedAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// POST /job-completion  — Mark a job as complete with checklist validation
+app.post("/job-completion", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, contractorId, certFiled, permitClosed, clientSignedOff, allPhotosUploaded, punchListClear, invoiceSent, notes } = req.body || {};
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  const safeJobId = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeType  = jobType ? sanitiseInput(String(jobType)).toLowerCase().slice(0, 40) : null;
+  const safeCId   = contractorId ? sanitiseInput(String(contractorId)).slice(0, 80) : null;
+
+  const checklist = [
+    { item: "Certificate of compliance filed",   passed: certFiled === true },
+    { item: "Permits closed",                    passed: permitClosed === true },
+    { item: "Client signed off",                 passed: clientSignedOff === true },
+    { item: "All required photos uploaded",      passed: allPhotosUploaded === true },
+    { item: "Punch list cleared",                passed: punchListClear === true },
+    { item: "Invoice sent to client",            passed: invoiceSent === true },
+  ];
+
+  const passed = checklist.filter(c => c.passed).length;
+  const allPassed = passed === checklist.length;
+  const completedAt = new Date().toISOString();
+
+  if (supabaseAdmin) {
+    try {
+      if (allPassed) {
+        await supabaseAdmin.from("jobs").update({ status: "COMPLETED", completed_at: completedAt }).eq("id", safeJobId);
+      }
+      await supabaseAdmin.from("job_completion_log").insert({
+        job_id: safeJobId, job_type: safeType, contractor_id: safeCId,
+        checklist, passed_count: passed, all_passed: allPassed,
+        notes: notes ? sanitiseInput(String(notes)).slice(0, 300) : null,
+        created_at: completedAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.json({
+    jobId: safeJobId, jobType: safeType,
+    status: allPassed ? "COMPLETED" : "INCOMPLETE",
+    checklistPassed: passed, checklistTotal: checklist.length,
+    checklist,
+    blockers: checklist.filter(c => !c.passed).map(c => c.item),
+    completedAt: allPassed ? completedAt : null,
+    notes: notes ? sanitiseInput(String(notes)).slice(0, 300) : null,
+  });
+});
+
+// GET /completion-stats/:contractorId  — Completion rate and stats for a contractor
+app.get("/completion-stats/:contractorId", apiKeyAuth, async (req, res) => {
+  const contractorId = sanitiseInput(String(req.params.contractorId || "")).slice(0, 80);
+  if (!contractorId) return res.status(400).json({ error: "contractorId required." });
+
+  let logs = [];
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin
+        .from("job_completion_log")
+        .select("all_passed, passed_count, checklist_total, created_at, job_type")
+        .eq("contractor_id", contractorId)
+        .order("created_at", { ascending: false })
+        .limit(200);
+      logs = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  if (logs.length === 0) return res.json({ contractorId, jobsLogged: 0, message: "No completion data found." });
+
+  const completed   = logs.filter(l => l.all_passed).length;
+  const completionRate = parseFloat(((completed / logs.length) * 100).toFixed(1));
+  const avgChecklist   = parseFloat((logs.reduce((s, l) => s + (l.passed_count || 0), 0) / logs.length).toFixed(1));
+  const byType = {};
+  logs.forEach(l => { if (l.job_type) { byType[l.job_type] = (byType[l.job_type] || 0) + 1; } });
+
+  return res.json({ contractorId, jobsLogged: logs.length, completedCount: completed, completionRate, avgChecklistScore: avgChecklist, jobsByType: byType, generatedAt: new Date().toISOString() });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
