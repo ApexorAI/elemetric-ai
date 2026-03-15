@@ -2353,6 +2353,139 @@ app.post("/send-near-miss-alert", async (req, res) => {
   }
 });
 
+// ── Task 9: Regulatory Change Monitoring ─────────────────────────────────────
+// Tracks known changes to Australian trade standards relevant to Elemetric users.
+
+const REGULATORY_UPDATES = [
+  {
+    id: "RU-2025-001",
+    date: "2025-03-01",
+    standard: "AS/NZS 3000:2018 Amendment 2",
+    change: "Updated requirements for arc fault detection devices (AFDDs) in new residential dwellings — AFDDs now required on all final subcircuits in bedrooms of new Class 1a buildings.",
+    affectedJobTypes: ["electrical"],
+    severity: "high",
+    summary: "AFDD protection now mandatory in new residential bedroom circuits. Electricians must verify AFDD is installed on all bedroom final subcircuits for new builds.",
+  },
+  {
+    id: "RU-2025-002",
+    date: "2025-01-15",
+    standard: "NCC 2025 (National Construction Code)",
+    change: "Minimum energy efficiency requirements for hot water systems upgraded — electric resistance hot water heaters no longer permitted in new Class 1a buildings unless connected to off-peak tariff.",
+    affectedJobTypes: ["plumbing"],
+    severity: "high",
+    summary: "New hot water system energy efficiency requirements from NCC 2025 affect plumbing compliance for new builds. Heat pump or solar hot water now preferred.",
+  },
+  {
+    id: "RU-2024-011",
+    date: "2024-11-01",
+    standard: "AS/NZS 5601.1:2013 Amendment 4",
+    change: "Updated clearance requirements for gas appliances in outdoor installations — increased minimum clearance from combustible fencing from 500mm to 600mm for outdoor BBQ installations.",
+    affectedJobTypes: ["gas"],
+    severity: "medium",
+    summary: "Outdoor gas appliance clearance to combustible fencing increased to 600mm under Amendment 4. Review outdoor gas installations for compliance.",
+  },
+  {
+    id: "RU-2024-009",
+    date: "2024-09-15",
+    standard: "AS/NZS 3500.4:2021 Amendment 1",
+    change: "Clarification to tempering valve requirements — TMV must be installed as close as practicable to the point of use, maximum 5m of pipe between TMV and outlet. Confirmed 50°C maximum mixed water temperature.",
+    affectedJobTypes: ["plumbing"],
+    severity: "medium",
+    summary: "Tempering valve placement clarified: maximum 5m pipe run between TMV and outlet. 50°C maximum temperature limit unchanged.",
+  },
+  {
+    id: "RU-2024-007",
+    date: "2024-07-01",
+    standard: "Victorian Building Regulations 2018 (Amendment)",
+    change: "Mandatory smoke alarm interconnection required in all new and substantially renovated Class 1a buildings. All hardwired smoke alarms must be interconnected.",
+    affectedJobTypes: ["electrical"],
+    severity: "high",
+    summary: "All hardwired smoke alarms in new and renovated homes must be interconnected in Victoria from July 2024. Interconnection wiring must be visible in documentation.",
+  },
+  {
+    id: "RU-2024-005",
+    date: "2024-05-20",
+    standard: "AS/NZS 3500.1:2021 Amendment 2",
+    change: "Updated requirements for backflow prevention in commercial and multi-residential water systems — RPZ valves now mandatory where risk of high-hazard backflow exists.",
+    affectedJobTypes: ["plumbing"],
+    severity: "medium",
+    summary: "Backflow prevention requirements updated for commercial plumbing. RPZ valves now mandatory for high-hazard backflow risk situations.",
+  },
+  {
+    id: "RU-2024-003",
+    date: "2024-03-01",
+    standard: "AS/NZS 3000:2018 Amendment 1",
+    change: "Updated requirements for RCD protection — all new circuits in domestic installations must have RCD protection. Maximum 300ms trip time confirmed and now explicitly referenced in amendment.",
+    affectedJobTypes: ["electrical"],
+    severity: "high",
+    summary: "All new domestic circuits must have RCD protection. 300ms maximum trip time explicitly confirmed in amendment. Test certificates must show trip time reading.",
+  },
+  {
+    id: "RU-2024-001",
+    date: "2024-01-10",
+    standard: "AS/NZS 1684.2:2021",
+    change: "Revised timber framing span tables for engineered wood products. LVL and laminated timber beams have updated span limits based on new load testing. Previous span tables may under-specify some members.",
+    affectedJobTypes: ["carpentry"],
+    severity: "medium",
+    summary: "Timber framing span tables updated for engineered wood products. Review LVL beam sizing against new 2021 edition span tables for compliance.",
+  },
+  {
+    id: "RU-2023-012",
+    date: "2023-12-01",
+    standard: "AS/NZS 5601.1:2013 Amendment 3",
+    change: "Updated requirements for LPG cylinder installations at residential properties — minimum cylinder distance from building openings confirmed at 500mm, with new measurement methodology.",
+    affectedJobTypes: ["gas"],
+    severity: "low",
+    summary: "LPG cylinder placement requirements clarified with new measurement methodology. 500mm minimum distance from building openings unchanged but measurement must now be taken from the cylinder valve.",
+  },
+  {
+    id: "RU-2023-009",
+    date: "2023-09-15",
+    standard: "AS/NZS 3500.2:2021",
+    change: "Updated minimum drainage pipe gradient requirements for small diameter pipes. 65mm pipes now require minimum 1:40 gradient (previously 1:60) when serving multiple fixtures.",
+    affectedJobTypes: ["drainage"],
+    severity: "medium",
+    summary: "Minimum gradient for 65mm drainage pipes serving multiple fixtures increased to 1:40. Review small diameter drainage runs in multi-fixture installations.",
+  },
+  {
+    id: "RU-2023-006",
+    date: "2023-06-01",
+    standard: "Victorian Gas Safety Act 2019 (Regulation Update)",
+    change: "Updated certification requirements for gas fitters — compliance certificates must now include GPS coordinates of installation address and must be lodged within 7 days of completion.",
+    affectedJobTypes: ["gas"],
+    severity: "high",
+    summary: "Gas compliance certificates must now include GPS coordinates and be lodged within 7 days. Failure to lodge within timeframe attracts penalties.",
+  },
+  {
+    id: "RU-2023-003",
+    date: "2023-03-20",
+    standard: "AS/NZS 3000:2018",
+    change: "Clarification on EV charging point circuit requirements — dedicated 32A circuit required for Mode 3 EVSE, with RCD Type B protection required where DC current injection may occur.",
+    affectedJobTypes: ["electrical"],
+    severity: "medium",
+    summary: "EV charging points require dedicated circuit and Type B RCD where DC current injection risk exists. Standard household RCD (Type A) is insufficient for many modern EVSEs.",
+  },
+];
+
+app.get("/regulatory-updates", (req, res) => {
+  const twelveMonthsAgo = new Date();
+  twelveMonthsAgo.setFullYear(twelveMonthsAgo.getFullYear() - 1);
+
+  const jobType  = req.query.jobType;
+  const severity = req.query.severity;
+
+  let updates = REGULATORY_UPDATES.filter(u => new Date(u.date) >= twelveMonthsAgo);
+  if (jobType)  updates = updates.filter(u => u.affectedJobTypes.includes(jobType));
+  if (severity) updates = updates.filter(u => u.severity === severity);
+
+  return res.json({
+    updates,
+    total:     updates.length,
+    asOf:      new Date().toISOString(),
+    allCount:  REGULATORY_UPDATES.length,
+  });
+});
+
 // ── GET /stats ────────────────────────────────────────────────────────────────
 // Protected by API key middleware. Returns usage metrics and estimated costs.
 
