@@ -84858,6 +84858,463 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 293 ─────────────────────────────────────────────────────────────────
+
+// POST /school-facility-inspection — Record school/childcare facility safety inspection
+app.post("/school-facility-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      facilityId, facilityName, address, inspectionDate, inspectedBy,
+      facilityType, enrolmentCount, ageRangeLow, ageRangeHigh,
+      registrationCurrent, registrationAuthority, registrationExpiry,
+      fireSystemsOk, emergencyLightingOk, exitSignsOk, evacuationPlanCurrent,
+      fireDrillLastDate,
+      playgroundSafe, playgroundLastInspection,
+      fencePerimeter, fenceGatesSelfClosing, gateLockedWhenOccupied,
+      cctv, visitorManagementOk, signInSystemOk,
+      swimPoolBarrier, swimPoolCompliant,
+      kitchenFoodSafetyOk, allergenPolicyInPlace,
+      firstAidKitCount, firstAidOfficerOnSite,
+      handWashingFacilitiesOk, nappyChangeAreas,
+      asbestosRegisterCurrent, leadPaintSurveyed,
+      accessibilityCompliant, toiletToChildRatio,
+      sleepingAreasVentilated, cotSafetyOk,
+      outdoorShade, uvProtectionPolicy,
+      staffRatiosMet, wwccCheckedAllStaff,
+      childSafetyPolicyInPlace, childSafetyTrainingCurrent,
+      defectsFound, defectDetails, nextInspectionDue, certRef, notes
+    } = req.body;
+
+    if (!facilityId || !address || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "facilityId, address, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeFacilityId = sanitiseInput(String(facilityId));
+    const safeAddress = sanitiseInput(String(address));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const criticalIssues = [];
+    const warnings = [];
+
+    const fType = String(facilityType || "").toLowerCase();
+
+    // Education and Care Services National Law Act 2010 (Vic)
+    // Education and Care Services National Regulations 2011
+    // Child Wellbeing and Safety Act 2005 (Vic)
+    // NCC 2022 Class 9b — Schools / assembly buildings
+    if (!wwccCheckedAllStaff) {
+      criticalIssues.push("Working with Children Checks not confirmed for all staff — all staff and regular volunteers working with children must hold a valid WWCC (Child Wellbeing and Safety Act 2005 (Vic)).");
+    }
+
+    if (!childSafetyPolicyInPlace) {
+      criticalIssues.push("Child safety policy not confirmed in place — all organisations working with children must have a child safe policy under the Child Wellbeing and Safety Act 2005 (Vic) and Child Safe Standards.");
+    }
+
+    if (!fireSystemsOk) {
+      criticalIssues.push("Fire safety systems defective — children's evacuation requires fully operational fire detection and suppression systems (NCC 2022 / AS 1851).");
+    }
+
+    if (!emergencyLightingOk) {
+      criticalIssues.push("Emergency lighting not operational — required for safe child evacuation (NCC 2022 Spec E4.4).");
+    }
+
+    if (!evacuationPlanCurrent) {
+      criticalIssues.push("Evacuation plan not current — Education and Care Services National Regulations 2011 reg 97 requires current emergency and evacuation procedures.");
+    }
+
+    if (!fencePerimeter || !gateLockedWhenOccupied) {
+      criticalIssues.push("Perimeter security deficiency — childcare and school premises must have secure perimeter fencing with gates locked during care/school hours to prevent unauthorised entry and child departure (ECS National Regulations 2011 reg 104).");
+    }
+
+    if (!staffRatiosMet) {
+      criticalIssues.push("Educator-to-child ratios not confirmed met — ECS National Regulations 2011 mandate specific ratios by age group (reg 123). Non-compliance is a serious compliance matter.");
+    }
+
+    if (swimPoolBarrier === true || swimPoolBarrier === "true") {
+      if (!swimPoolCompliant) {
+        criticalIssues.push("Swimming pool/spa safety barrier non-compliant — building authority must be notified and access prevented until barrier is rectified (Building Regulations 2018 (Vic) Part 8 / AS 1926.1).");
+      }
+    }
+
+    if (!playgroundSafe) {
+      criticalIssues.push("Playground assessed unsafe — close playground to children immediately. Inspect and repair per AS 4685 before reopening.");
+    }
+
+    if (!registrationCurrent || registrationExpiry) {
+      const expiry = registrationExpiry ? new Date(registrationExpiry) : null;
+      if (expiry && expiry < new Date()) {
+        criticalIssues.push(`Service registration expired ${registrationExpiry} — operating an unregistered education and care service is an offence under ECS National Law.`);
+      }
+    }
+
+    if (!childSafetyTrainingCurrent) {
+      warnings.push("Child safety training not confirmed current — Child Safe Standards require regular child safety training for all staff (Child Wellbeing and Safety Act 2005 (Vic)).");
+    }
+
+    if (!visitorManagementOk || !signInSystemOk) {
+      warnings.push("Visitor management system inadequate — all visitors to schools and childcare facilities must be signed in and supervised (Child Safe Standards).");
+    }
+
+    if (!allergenPolicyInPlace) {
+      warnings.push("Allergen management policy not confirmed — anaphylaxis management policy required for all schools and early childhood services (Education and Training Reform Act 2006 (Vic)).");
+    }
+
+    if (!asbestosRegisterCurrent) {
+      warnings.push("Asbestos register not confirmed current — schools and childcare facilities built before 1990 must have current asbestos register and management plan (OHS Regulations 2017 (Vic)).");
+    }
+
+    if (!outdoorShade || !uvProtectionPolicy) {
+      warnings.push("UV/sun protection policy or outdoor shade not confirmed — Cancer Council guidelines recommend shade and UV protection policy for all children's services.");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "CONDITIONAL" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("school_facility_inspections")
+        .insert({
+          facility_id: safeFacilityId,
+          facility_name: facilityName ? sanitiseInput(String(facilityName)) : null,
+          address: safeAddress,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          facility_type: facilityType ? sanitiseInput(String(facilityType)) : null,
+          enrolment_count: parseInt(enrolmentCount) || null,
+          registration_current: registrationCurrent !== false && registrationCurrent !== "false",
+          registration_expiry: registrationExpiry || null,
+          fire_systems_ok: fireSystemsOk !== false && fireSystemsOk !== "false",
+          emergency_lighting_ok: emergencyLightingOk !== false && emergencyLightingOk !== "false",
+          evacuation_plan_current: evacuationPlanCurrent !== false && evacuationPlanCurrent !== "false",
+          fire_drill_last_date: fireDrillLastDate || null,
+          playground_safe: playgroundSafe !== false && playgroundSafe !== "false",
+          fence_perimeter: fencePerimeter !== false && fencePerimeter !== "false",
+          gate_locked: gateLockedWhenOccupied !== false && gateLockedWhenOccupied !== "false",
+          cctv_installed: cctv !== false && cctv !== "false",
+          visitor_management_ok: visitorManagementOk !== false && visitorManagementOk !== "false",
+          allergen_policy: allergenPolicyInPlace !== false && allergenPolicyInPlace !== "false",
+          first_aid_ok: firstAidOfficerOnSite !== false && firstAidOfficerOnSite !== "false",
+          asbestos_register_current: asbestosRegisterCurrent !== false && asbestosRegisterCurrent !== "false",
+          accessibility_compliant: accessibilityCompliant !== false && accessibilityCompliant !== "false",
+          staff_ratios_met: staffRatiosMet !== false && staffRatiosMet !== "false",
+          wwcc_checked: wwccCheckedAllStaff !== false && wwccCheckedAllStaff !== "false",
+          child_safety_policy: childSafetyPolicyInPlace !== false && childSafetyPolicyInPlace !== "false",
+          child_safety_training: childSafetyTrainingCurrent !== false && childSafetyTrainingCurrent !== "false",
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          next_inspection_due: nextInspectionDue || null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          defect_details: Array.isArray(defectDetails) ? defectDetails : [],
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "School/childcare facility compliance failures — child safety at risk. Notify regulatory authority immediately.",
+        standards: ["ECS National Law Act 2010 (Vic)", "ECS National Regulations 2011", "Child Safe Standards", "NCC 2022"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      facilityId: safeFacilityId,
+      nextInspectionDue: nextInspectionDue || null,
+      standards: ["ECS National Law Act 2010 (Vic)", "ECS National Regulations 2011", "Child Wellbeing and Safety Act 2005 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /school-facility-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record school facility inspection." });
+  }
+});
+
+// POST /disability-accommodation-inspection — Record SDA/NDIS supported accommodation inspection
+app.post("/disability-accommodation-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      facilityId, facilityName, address, inspectionDate, inspectedBy,
+      sdaDesignCategory, residentCount, registeredSdaProvider,
+      sdaRegistrationNumber, sdaRegistrationExpiry,
+      accessibilityStandardMet, as1428Compliant, wheelchairAccessThroughout,
+      doorWidthsMm, turningSpaceM, reachRangesOk,
+      hostileArchitectureAbsent, sensoryConsiderationsOk,
+      fireSystemsOk, emergencyLightingOk, evacuationPlanCurrent,
+      personEmergencyEvacPlanPerResident, peepReviewed,
+      callSystemFunctional, panicButtonsOk,
+      modificationsSuitable, assistiveTechCompatible,
+      bathroomAccessOk, kitchenAccessOk, bedroomAccessOk,
+      hoistingEquipmentOk, hoistingEquipmentCurrentCert,
+      outdoorAccessOk, communityAccessOk,
+      ndisQualityStandardsMet, lastNdisAuditDate,
+      defectsFound, defectDetails, nextInspectionDue, notes
+    } = req.body;
+
+    if (!facilityId || !address || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "facilityId, address, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeFacilityId = sanitiseInput(String(facilityId));
+    const safeAddress = sanitiseInput(String(address));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const criticalIssues = [];
+    const warnings = [];
+
+    const doorWidths = parseFloat(doorWidthsMm) || null;
+    const turningSpace = parseFloat(turningSpaceM) || null;
+
+    // NDIS Act 2013 (Cth) / NDIS Quality and Safeguards Commission
+    // Specialist Disability Accommodation Design Standard (NDIS SDA rules)
+    // AS 1428.1 — Design for access and mobility
+    // NCC 2022
+    if (!sdaDesignCategory) {
+      warnings.push("SDA design category not recorded — all registered SDA must be classified under the NDIS SDA Rules 2021 (Basic, Improved Liveability, Fully Accessible, Robust, High Physical Support).");
+    }
+
+    if (doorWidths !== null && doorWidths < 850) {
+      criticalIssues.push(`Door clear width ${doorWidths} mm below minimum 850 mm for wheelchair access (AS 1428.1 cl.12.1 / SDA Design Standard). May prevent wheelchair user access.`);
+    }
+
+    if (turningSpace !== null && turningSpace < 1.54) {
+      criticalIssues.push(`Wheelchair turning circle ${turningSpace} m below minimum 1540 mm required by AS 1428.1 — wheelchair users cannot turn. Modify space to meet standard.`);
+    }
+
+    if (!as1428Compliant) {
+      criticalIssues.push("AS 1428.1 access compliance not met — all SDA dwellings must comply with access and mobility standards relevant to their design category (NDIS SDA Design Standard).");
+    }
+
+    if (!fireSystemsOk) {
+      criticalIssues.push("Fire safety systems defective — residents with disability may require assisted evacuation. Full fire system compliance mandatory (AS 1851 / NCC 2022).");
+    }
+
+    if (!evacuationPlanCurrent || !personEmergencyEvacPlanPerResident) {
+      criticalIssues.push("Personal Emergency Evacuation Plans (PEEPs) not confirmed current for all residents — mandatory for occupants unable to self-evacuate (Building Regulations 2018 (Vic) / NDIS Practice Standards).");
+    }
+
+    if (!callSystemFunctional) {
+      criticalIssues.push("Emergency call/panic system not functional — residents with disability must have access to emergency assistance at all times (NDIS Practice Standards).");
+    }
+
+    if (!hoistingEquipmentCurrentCert) {
+      criticalIssues.push("Hoisting/ceiling hoist equipment certification not current — overhead hoists and mobile hoists require annual inspection per AS 3850.1 / AS 2550. This is life-critical equipment.");
+    }
+
+    if (!ndisQualityStandardsMet) {
+      criticalIssues.push("NDIS Practice Standards not confirmed met — NDIS Quality and Safeguards Commission may take compliance action against registered providers not meeting standards.");
+    }
+
+    if (!bathroomAccessOk) {
+      warnings.push("Bathroom accessibility concern — bathrooms must provide adequate maneuvering space, grab rails, and accessible fittings per AS 1428.1 and SDA Design Standard.");
+    }
+
+    if (!outdoorAccessOk) {
+      warnings.push("Outdoor access limitation — SDA residents should have accessible outdoor space where possible (NDIS SDA Design Standard).");
+    }
+
+    if (!assistiveTechCompatible) {
+      warnings.push("Assistive technology compatibility not confirmed — dwellings should support installation of assistive technology systems (powered door openers, bed sensors, environmental controls).");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "CONDITIONAL" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("disability_accommodation_inspections")
+        .insert({
+          facility_id: safeFacilityId,
+          facility_name: facilityName ? sanitiseInput(String(facilityName)) : null,
+          address: safeAddress,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          sda_design_category: sdaDesignCategory ? sanitiseInput(String(sdaDesignCategory)) : null,
+          resident_count: parseInt(residentCount) || null,
+          sda_registration: sdaRegistrationNumber ? sanitiseInput(String(sdaRegistrationNumber)) : null,
+          sda_registration_expiry: sdaRegistrationExpiry || null,
+          as1428_compliant: as1428Compliant !== false && as1428Compliant !== "false",
+          wheelchair_access: wheelchairAccessThroughout !== false && wheelchairAccessThroughout !== "false",
+          door_widths_mm: doorWidths,
+          turning_space_m: turningSpace,
+          fire_systems_ok: fireSystemsOk !== false && fireSystemsOk !== "false",
+          emergency_lighting_ok: emergencyLightingOk !== false && emergencyLightingOk !== "false",
+          evacuation_plan_current: evacuationPlanCurrent !== false && evacuationPlanCurrent !== "false",
+          peep_per_resident: personEmergencyEvacPlanPerResident !== false && personEmergencyEvacPlanPerResident !== "false",
+          call_system_ok: callSystemFunctional !== false && callSystemFunctional !== "false",
+          hoist_cert_current: hoistingEquipmentCurrentCert !== false && hoistingEquipmentCurrentCert !== "false",
+          ndis_standards_met: ndisQualityStandardsMet !== false && ndisQualityStandardsMet !== "false",
+          last_ndis_audit: lastNdisAuditDate || null,
+          next_inspection_due: nextInspectionDue || null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          defect_details: Array.isArray(defectDetails) ? defectDetails : [],
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Disability accommodation compliance failures — resident safety and NDIS registration at risk. Notify NDIS Quality and Safeguards Commission if required.",
+        standards: ["NDIS Act 2013 (Cth)", "NDIS SDA Design Standard", "AS 1428.1", "NDIS Practice Standards", "AS 3850.1"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      facilityId: safeFacilityId,
+      nextInspectionDue: nextInspectionDue || null,
+      standards: ["NDIS Act 2013 (Cth)", "NDIS SDA Design Standard", "AS 1428.1"],
+    });
+  } catch (err) {
+    console.error("POST /disability-accommodation-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record disability accommodation inspection." });
+  }
+});
+
+// POST /ai-social-infrastructure-assessment — AI assesses social infrastructure compliance across school/childcare/aged care/disability
+app.post("/ai-social-infrastructure-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      organisationId, organisationType, servicesCount, statesOperating,
+      totalResidentsClientsEnrolments,
+      fireCompliancePercent, accessibilityCompliancePercent,
+      safeguardingFrameworkInPlace, safeguardingAuditLastDate,
+      staffVettingComplete, staffTrainingCompliance,
+      regulatoryRegistrationsCurrent, regulatoryAuditsScheduled,
+      incidentReportingSystem, seriousIncidents12Months,
+      qualityImprovementPlanInPlace, lastQualityAudit,
+      buildingemergencyManagementCurrent, buildingMaintenanceCompliance,
+      deficienciesNoted, notes
+    } = req.body;
+
+    if (!organisationId) {
+      return res.status(400).json({ error: "organisationId is required." });
+    }
+
+    const safeOrgId = sanitiseInput(String(organisationId));
+    const deficiencies = Array.isArray(deficienciesNoted) ? deficienciesNoted : [];
+    const orgStates = Array.isArray(statesOperating) ? statesOperating : [];
+
+    const prompt = `You are an expert in social infrastructure compliance across aged care, disability, education, and healthcare sectors. Assess this organisation's compliance posture.
+
+Organisation ID: ${safeOrgId}
+Organisation type: ${organisationType || "Unknown"}
+Services/sites: ${servicesCount || 0}
+States operating: ${orgStates.join(", ") || "Not specified"}
+Total residents/clients/enrolments: ${totalResidentsClientsEnrolments || "Unknown"}
+
+PHYSICAL COMPLIANCE:
+- Fire compliance: ${fireCompliancePercent || "Unknown"}%
+- Accessibility compliance: ${accessibilityCompliancePercent || "Unknown"}%
+- Building emergency management current: ${buildingemergencyManagementCurrent ? "Yes" : "No"}
+- Building maintenance compliance: ${buildingMaintenanceCompliance || "Unknown"}
+
+SAFEGUARDING:
+- Safeguarding framework: ${safeguardingFrameworkInPlace ? "Yes (last audit: " + (safeguardingAuditLastDate || "unknown") + ")" : "No"}
+- Staff vetting complete: ${staffVettingComplete ? "Yes" : "No"}
+- Staff training compliance: ${staffTrainingCompliance || "Unknown"}%
+
+REGULATORY:
+- Registrations current: ${regulatoryRegistrationsCurrent ? "Yes" : "No"}
+- Regulatory audits scheduled: ${regulatoryAuditsScheduled ? "Yes" : "No"}
+
+QUALITY AND INCIDENTS:
+- Incident reporting system: ${incidentReportingSystem ? "Yes" : "No"}
+- Serious incidents (12 months): ${seriousIncidents12Months || 0}
+- Quality improvement plan: ${qualityImprovementPlanInPlace ? "Yes (last audit: " + (lastQualityAudit || "unknown") + ")" : "No"}
+
+Deficiencies: ${deficiencies.join("; ") || "None"}
+
+Assess under relevant frameworks based on organisation type:
+- Aged Care: Aged Care Quality Standards, Aged Care Quality and Safety Commission Act 2018 (Cth)
+- Disability: NDIS Practice Standards, NDIS Act 2013 (Cth), Child Safe Standards
+- Education/Childcare: ECS National Law 2010, ECS National Regulations 2011, Child Safe Standards
+- Healthcare: NSQHS Standards, Health Services Act 1988 (Vic)
+- All: NCC 2022, AS 1428.1, AS 1851, OHS Act 2004 (Vic), Building Regulations 2018 (Vic)
+
+Provide:
+1. Overall compliance risk rating
+2. Safeguarding risk
+3. Physical/building compliance risk
+4. Regulatory standing risk
+5. Quality and safety culture
+6. Cross-sector best practice recommendations
+
+Respond ONLY in JSON:
+{
+  "overallRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "safeguardingRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "physicalComplianceRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "regulatoryRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "qualityCultureRisk": "LOW|MODERATE|HIGH",
+  "immediateActions": ["string"],
+  "safeguardingFindings": ["string"],
+  "buildingComplianceFindings": ["string"],
+  "regulatoryFindings": ["string"],
+  "bestPracticeRecommendations": ["string"],
+  "applicableFrameworks": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 900,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallRisk: "MODERATE",
+        safeguardingRisk: "MODERATE",
+        physicalComplianceRisk: "MODERATE",
+        regulatoryRisk: "MODERATE",
+        qualityCultureRisk: "MODERATE",
+        immediateActions: ["Verify all staff vetting (WWCC/police checks) is current", "Confirm fire compliance at all sites"],
+        safeguardingFindings: ["AI assessment unavailable — conduct safeguarding audit against relevant national standards"],
+        buildingComplianceFindings: ["Review fire safety and accessibility compliance at all sites"],
+        regulatoryFindings: ["Confirm all service registrations are current with relevant regulatory authorities"],
+        bestPracticeRecommendations: ["Implement organisation-wide quality management system", "Schedule annual compliance self-assessment"],
+        applicableFrameworks: ["Aged Care Quality Standards", "NDIS Practice Standards", "ECS National Law 2010", "NSQHS Standards"],
+        summary: "AI social infrastructure assessment unavailable. Engage compliance consultants for formal cross-sector audit.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      organisationId: safeOrgId,
+      standards: ["Aged Care Quality Standards", "NDIS Practice Standards", "ECS National Law 2010", "NSQHS Standards", "Child Safe Standards"],
+    });
+  } catch (err) {
+    console.error("POST /ai-social-infrastructure-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess social infrastructure." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
