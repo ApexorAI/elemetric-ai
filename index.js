@@ -56955,6 +56955,304 @@ app.post("/hydraulic-pressure-test", apiKeyAuth, async (req, res) => {
   }
 });
 
+// POST /near-miss-report — Record a near miss or hazard observation
+app.post("/near-miss-report", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      reportRef,
+      reportDate,
+      reportTime,
+      reportedBy,
+      workerCompany,
+      location,
+      eventType,
+      description,
+      hazardCategory,
+      potentialConsequence,
+      potentialSeverity,
+      immediateActions,
+      rootCauses,
+      contributingFactors,
+      corrective_actions,
+      preventiveActions,
+      responsiblePerson,
+      dueDate,
+      closedOut,
+      closeOutDate,
+      supervisorNotified,
+      safetyRepresentativeNotified,
+      worksafeNotifiable,
+      worksafeRef,
+      lessons,
+      notes,
+    } = req.body;
+
+    if (!projectId || !reportDate || !reportedBy || !description || !hazardCategory) {
+      return res.status(400).json({ error: "projectId, reportDate, reportedBy, description, and hazardCategory are required" });
+    }
+
+    const flags = [];
+    if (worksafeNotifiable) flags.push("Event assessed as potentially notifiable to WorkSafe Victoria — notify immediately if serious injury occurred");
+    if (!immediateActions) flags.push("No immediate actions recorded — document what was done immediately to make the area safe");
+    if (!responsiblePerson || !dueDate) flags.push("Corrective action owner and due date not assigned — assign accountability before closing report");
+    if (["CRITICAL", "HIGH", "MAJOR"].includes(String(potentialSeverity || "").toUpperCase())) {
+      flags.push(`Potential severity assessed as ${potentialSeverity} — escalate to site manager and safety representative immediately`);
+    }
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      report_ref: sanitiseInput(reportRef || `NM-${Date.now()}`),
+      report_date: reportDate,
+      report_time: sanitiseInput(reportTime || ""),
+      reported_by: sanitiseInput(reportedBy),
+      worker_company: sanitiseInput(workerCompany || ""),
+      location: sanitiseInput(location || ""),
+      event_type: sanitiseInput(eventType || "near miss"),
+      description: sanitiseInput(description),
+      hazard_category: sanitiseInput(hazardCategory),
+      potential_consequence: sanitiseInput(potentialConsequence || ""),
+      potential_severity: sanitiseInput(potentialSeverity || ""),
+      immediate_actions: sanitiseInput(immediateActions || ""),
+      root_causes: Array.isArray(rootCauses) ? rootCauses.map(r => sanitiseInput(r)) : [],
+      contributing_factors: sanitiseInput(contributingFactors || ""),
+      corrective_actions: Array.isArray(corrective_actions) ? corrective_actions.map(a => sanitiseInput(a)) : [],
+      preventive_actions: sanitiseInput(preventiveActions || ""),
+      responsible_person: sanitiseInput(responsiblePerson || ""),
+      due_date: dueDate || null,
+      closed_out: !!closedOut,
+      close_out_date: closeOutDate || null,
+      supervisor_notified: !!supervisorNotified,
+      safety_representative_notified: !!safetyRepresentativeNotified,
+      worksafe_notifiable: !!worksafeNotifiable,
+      worksafe_ref: sanitiseInput(worksafeRef || ""),
+      lessons: sanitiseInput(lessons || ""),
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("near_miss_reports").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({ reportRef: record.report_ref, flags, record, saved });
+  } catch (err) {
+    console.error("/near-miss-report error:", err.message);
+    res.status(500).json({ error: "Failed to record near miss report" });
+  }
+});
+
+// POST /first-aid-register — Record a first aid incident and treatment
+app.post("/first-aid-register", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      incidentRef,
+      incidentDate,
+      incidentTime,
+      patientName,
+      patientCompany,
+      patientRole,
+      location,
+      description,
+      injuryType,
+      affectedBodyPart,
+      causeOfInjury,
+      firstAiderName,
+      firstAiderCertificationNumber,
+      firstAiderCertificationExpiry,
+      treatmentProvided,
+      treatmentDetails,
+      furtherMedicalAttentionRequired,
+      hospitalReferral,
+      hospitalName,
+      ambulanceCalled,
+      worksafeNotifiable,
+      worksafeNotificationTime,
+      worksafeRef,
+      supervisorNotified,
+      returnedToWork,
+      returnToWorkDate,
+      modifiedDutiesRequired,
+      notes,
+    } = req.body;
+
+    if (!projectId || !incidentDate || !patientName || !description || !firstAiderName) {
+      return res.status(400).json({ error: "projectId, incidentDate, patientName, description, and firstAiderName are required" });
+    }
+
+    const flags = [];
+    if (worksafeNotifiable) flags.push("Injury assessed as potentially notifiable to WorkSafe Victoria — must notify WorkSafe immediately if worker required medical treatment beyond first aid or was hospitalised");
+    if (!firstAiderCertificationNumber) flags.push("First aider certification not recorded — first aiders must hold current HLTAID003/HLTAID011 certification");
+    if (firstAiderCertificationExpiry) {
+      const expiry = new Date(firstAiderCertificationExpiry);
+      const today = new Date();
+      if (expiry < today) flags.push(`First aider certification expired on ${firstAiderCertificationExpiry} — must renew before providing first aid in a workplace`);
+    }
+    if (furtherMedicalAttentionRequired && !hospitalReferral) flags.push("Further medical attention required — document referral or GP appointment");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      incident_ref: sanitiseInput(incidentRef || `FA-${Date.now()}`),
+      incident_date: incidentDate,
+      incident_time: sanitiseInput(incidentTime || ""),
+      patient_name: sanitiseInput(patientName),
+      patient_company: sanitiseInput(patientCompany || ""),
+      patient_role: sanitiseInput(patientRole || ""),
+      location: sanitiseInput(location || ""),
+      description: sanitiseInput(description),
+      injury_type: sanitiseInput(injuryType || ""),
+      affected_body_part: sanitiseInput(affectedBodyPart || ""),
+      cause_of_injury: sanitiseInput(causeOfInjury || ""),
+      first_aider_name: sanitiseInput(firstAiderName),
+      first_aider_certification_number: sanitiseInput(firstAiderCertificationNumber || ""),
+      first_aider_certification_expiry: firstAiderCertificationExpiry || null,
+      treatment_provided: sanitiseInput(treatmentProvided || ""),
+      treatment_details: sanitiseInput(treatmentDetails || ""),
+      further_medical_attention_required: !!furtherMedicalAttentionRequired,
+      hospital_referral: !!hospitalReferral,
+      hospital_name: sanitiseInput(hospitalName || ""),
+      ambulance_called: !!ambulanceCalled,
+      worksafe_notifiable: !!worksafeNotifiable,
+      worksafe_notification_time: sanitiseInput(worksafeNotificationTime || ""),
+      worksafe_ref: sanitiseInput(worksafeRef || ""),
+      supervisor_notified: !!supervisorNotified,
+      returned_to_work: !!returnedToWork,
+      return_to_work_date: returnToWorkDate || null,
+      modified_duties_required: !!modifiedDutiesRequired,
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("first_aid_register").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({ incidentRef: record.incident_ref, flags, record, saved });
+  } catch (err) {
+    console.error("/first-aid-register error:", err.message);
+    res.status(500).json({ error: "Failed to record first aid incident" });
+  }
+});
+
+// POST /cctv-drainage-inspection — Record a CCTV drainage pipe inspection per AS 3500 / WSAA guidelines
+app.post("/cctv-drainage-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      inspectionRef,
+      date,
+      operator,
+      propertyAddress,
+      drainType,
+      pipeSize,
+      pipeMaterial,
+      pipeAge,
+      inspectionLength,
+      upstreamMhRef,
+      downstreamMhRef,
+      inspectionDirection,
+      cameraType,
+      defects,
+      structuralDefectCount,
+      serviceDefectCount,
+      constructionDefectCount,
+      roots,
+      deposits,
+      infiltration,
+      exfiltration,
+      offsetJoints,
+      crackedPipe,
+      collapsedPipe,
+      blockage,
+      overallGrade,
+      videoRef,
+      reportRef,
+      urgentRepairRequired,
+      urgentRepairDescription,
+      scheduledRepairType,
+      nextInspectionDue,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !operator || !drainType || !pipeSize) {
+      return res.status(400).json({ error: "projectId, date, operator, drainType, and pipeSize are required" });
+    }
+
+    const flags = [];
+    if (collapsedPipe) flags.push("Collapsed pipe section detected — immediate repair required, risk of sewer overflow or ground collapse");
+    if (blockage) flags.push("Blockage detected — jet clean and clear before re-inspection");
+    if (exfiltration) flags.push("Exfiltration observed — sewage leaking to ground, environmental and public health risk");
+    if (urgentRepairRequired) flags.push(`Urgent repair required: ${sanitiseInput(urgentRepairDescription || "details not specified")}`);
+    if (["E", "F"].includes(String(overallGrade || "").toUpperCase())) {
+      flags.push(`Overall grade ${overallGrade} — poor condition, structural integrity at risk. Schedule repair immediately.`);
+    }
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      inspection_ref: sanitiseInput(inspectionRef || `CCTV-${Date.now()}`),
+      date,
+      operator: sanitiseInput(operator),
+      property_address: sanitiseInput(propertyAddress || ""),
+      drain_type: sanitiseInput(drainType),
+      pipe_size: sanitiseInput(pipeSize),
+      pipe_material: sanitiseInput(pipeMaterial || ""),
+      pipe_age: pipeAge || null,
+      inspection_length: inspectionLength || null,
+      upstream_mh_ref: sanitiseInput(upstreamMhRef || ""),
+      downstream_mh_ref: sanitiseInput(downstreamMhRef || ""),
+      inspection_direction: sanitiseInput(inspectionDirection || "upstream to downstream"),
+      camera_type: sanitiseInput(cameraType || ""),
+      defects: Array.isArray(defects) ? defects.map(d => (typeof d === "string" ? sanitiseInput(d) : d)) : [],
+      structural_defect_count: structuralDefectCount || 0,
+      service_defect_count: serviceDefectCount || 0,
+      construction_defect_count: constructionDefectCount || 0,
+      roots: !!roots,
+      deposits: !!deposits,
+      infiltration: !!infiltration,
+      exfiltration: !!exfiltration,
+      offset_joints: !!offsetJoints,
+      cracked_pipe: !!crackedPipe,
+      collapsed_pipe: !!collapsedPipe,
+      blockage: !!blockage,
+      overall_grade: sanitiseInput(overallGrade || ""),
+      video_ref: sanitiseInput(videoRef || ""),
+      report_ref: sanitiseInput(reportRef || ""),
+      urgent_repair_required: !!urgentRepairRequired,
+      urgent_repair_description: sanitiseInput(urgentRepairDescription || ""),
+      scheduled_repair_type: sanitiseInput(scheduledRepairType || ""),
+      next_inspection_due: nextInspectionDue || null,
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("cctv_drainage_inspections").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      overallGrade,
+      urgentRepairRequired: !!urgentRepairRequired,
+      flags,
+      applicableStandards: ["AS 3500.2 Sanitary plumbing and drainage", "WSAA WS-03 CCTV inspection of sewers", "Melbourne Water drainage design guidelines"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/cctv-drainage-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record CCTV drainage inspection" });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
