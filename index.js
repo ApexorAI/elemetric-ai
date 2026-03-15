@@ -21138,6 +21138,192 @@ app.post("/occupancy-check", apiKeyAuth, (req, res) => {
   });
 });
 
+// ── Round 57 ──────────────────────────────────────────────────────────────────
+
+// POST /ai-incident-analysis  — AI analysis of an incident or near-miss description
+app.post("/ai-incident-analysis", apiKeyAuth, async (req, res) => {
+  const { description, jobType, location, severity } = req.body;
+
+  if (!description) return res.status(400).json({ error: "description is required." });
+
+  const safeDesc     = sanitiseInput(String(description)).slice(0, 1000);
+  const safeJobType  = sanitiseInput(String(jobType || "general")).toLowerCase();
+  const safeLocation = sanitiseInput(String(location || "Not specified"));
+  const safeSeverity = sanitiseInput(String(severity || "unknown")).toLowerCase();
+
+  const systemPrompt = `You are an Australian workplace safety analyst specialising in Victorian trade work. Analyse an incident description and provide structured safety analysis. Return JSON with: "incidentType" (string), "immediateHazards" (array), "rootCauses" (array), "controlMeasures" (array), "regulatoryObligation" (string), "preventionActions" (array, max 5), "severity" ("critical"|"high"|"medium"|"low"), "worksafeNotifiable" (boolean), "summary" (string, 2-3 sentences).`;
+
+  let analysis;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: `Trade: ${safeJobType}\nLocation: ${safeLocation}\nSeverity: ${safeSeverity}\nIncident: ${safeDesc}` },
+      ],
+      max_tokens: 500,
+      response_format: { type: "json_object" },
+    });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    analysis = {
+      incidentType:          sanitiseInput(String(parsed.incidentType || "Unknown")).slice(0, 100),
+      immediateHazards:      Array.isArray(parsed.immediateHazards)    ? parsed.immediateHazards.slice(0, 5).map(h => sanitiseInput(String(h)))    : [],
+      rootCauses:            Array.isArray(parsed.rootCauses)          ? parsed.rootCauses.slice(0, 5).map(c => sanitiseInput(String(c)))          : [],
+      controlMeasures:       Array.isArray(parsed.controlMeasures)     ? parsed.controlMeasures.slice(0, 5).map(m => sanitiseInput(String(m)))     : [],
+      preventionActions:     Array.isArray(parsed.preventionActions)   ? parsed.preventionActions.slice(0, 5).map(a => sanitiseInput(String(a)))   : [],
+      regulatoryObligation:  sanitiseInput(String(parsed.regulatoryObligation || "")).slice(0, 300),
+      severity:              ["critical", "high", "medium", "low"].includes(parsed.severity) ? parsed.severity : safeSeverity,
+      worksafeNotifiable:    !!parsed.worksafeNotifiable,
+      summary:               sanitiseInput(String(parsed.summary || "")).slice(0, 500),
+    };
+  } catch {
+    analysis = {
+      incidentType: "Unknown",
+      immediateHazards: [],
+      rootCauses: [],
+      controlMeasures: ["Secure the area", "Notify supervisor"],
+      preventionActions: ["Review SWMS", "Conduct safety briefing"],
+      regulatoryObligation: "Notify WorkSafe Victoria if serious injury, dangerous occurrence, or near-miss: 1800 136 089",
+      severity: safeSeverity,
+      worksafeNotifiable: safeSeverity === "critical",
+      summary: "Incident analysis unavailable. Manual review required.",
+    };
+  }
+
+  return res.json({
+    jobType:    safeJobType,
+    description: safeDesc,
+    location:   safeLocation,
+    ...analysis,
+    worksafeContact: "1800 136 089",
+    analysedAt: new Date().toISOString(),
+  });
+});
+
+// POST /compliance-badge  — Generate a compliance badge for a job record
+app.post("/compliance-badge", apiKeyAuth, (req, res) => {
+  const { complianceScore, grade, jobType, certificateFiled, issueDate } = req.body;
+
+  if (complianceScore === undefined) return res.status(400).json({ error: "complianceScore is required." });
+
+  const score   = parseFloat(complianceScore) || 0;
+  const safeGrade = grade || (score >= 90 ? "A" : score >= 80 ? "B" : score >= 70 ? "C" : score >= 60 ? "D" : "F");
+
+  const GRADE_COLORS = { A: "#2e7d32", B: "#388e3c", C: "#f9a825", D: "#e65100", F: "#b71c1c" };
+  const GRADE_LABELS = { A: "Excellent", B: "Good", C: "Satisfactory", D: "Below Standard", F: "Non-Compliant" };
+
+  const color = GRADE_COLORS[safeGrade] || "#757575";
+  const label = GRADE_LABELS[safeGrade] || "Unknown";
+
+  return res.json({
+    complianceScore: score,
+    grade:           safeGrade,
+    label,
+    certificateFiled: !!certificateFiled,
+    issueDate:       issueDate || new Date().toISOString().slice(0, 10),
+    jobType:         sanitiseInput(String(jobType || "trade")).toLowerCase(),
+    badge: {
+      primaryColor:  color,
+      title:         `Grade ${safeGrade}`,
+      subtitle:      label,
+      scoreText:     `${score}/100`,
+      certText:      certificateFiled ? "Certificate Filed" : "Certificate Pending",
+    },
+    svgHint: `Display as a ${color} badge with 'Grade ${safeGrade}' and '${score}/100' text.`,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /portfolio-summary  — Summarise a contractor's full job portfolio
+app.post("/portfolio-summary", apiKeyAuth, (req, res) => {
+  const { contractorId, contractorName, jobs, period } = req.body;
+
+  if (!jobs || !Array.isArray(jobs) || jobs.length === 0) {
+    return res.status(400).json({ error: "jobs array is required." });
+  }
+
+  const safeName   = sanitiseInput(String(contractorName || "Contractor"));
+  const safePeriod = sanitiseInput(String(period || "All time"));
+
+  const total  = jobs.length;
+  const scores = jobs.map(j => parseFloat(j.complianceScore) || 0).filter(s => s > 0);
+  const avg    = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+  const certs  = jobs.filter(j => j.certificateFiled).length;
+  const sigs   = jobs.filter(j => j.signatureObtained).length;
+  const gps    = jobs.filter(j => j.gpsRecorded).length;
+  const gradeA = scores.filter(s => s >= 90).length;
+  const gradeB = scores.filter(s => s >= 80 && s < 90).length;
+  const gradeC = scores.filter(s => s >= 70 && s < 80).length;
+  const gradeD = scores.filter(s => s >= 60 && s < 70).length;
+  const gradeF = scores.filter(s => s < 60).length;
+
+  const tradeBreakdown = {};
+  for (const j of jobs) {
+    const t = sanitiseInput(String(j.jobType || "unknown")).toLowerCase();
+    if (!tradeBreakdown[t]) tradeBreakdown[t] = { count: 0, scoreSum: 0 };
+    tradeBreakdown[t].count++;
+    tradeBreakdown[t].scoreSum += parseFloat(j.complianceScore) || 0;
+  }
+  for (const t of Object.keys(tradeBreakdown)) {
+    const d = tradeBreakdown[t];
+    tradeBreakdown[t].avgScore = Math.round(d.scoreSum / d.count);
+    delete tradeBreakdown[t].scoreSum;
+  }
+
+  const portfolioGrade = avg !== null ? (avg >= 90 ? "A" : avg >= 80 ? "B" : avg >= 70 ? "C" : avg >= 60 ? "D" : "F") : "N/A";
+
+  return res.json({
+    contractorId:    contractorId ? sanitiseInput(String(contractorId)) : null,
+    contractorName:  safeName,
+    period:          safePeriod,
+    portfolioGrade,
+    totalJobs:       total,
+    averageScore:    avg,
+    gradeDistribution: { A: gradeA, B: gradeB, C: gradeC, D: gradeD, F: gradeF },
+    documentationRates: {
+      certificationRate: `${Math.round((certs / total) * 100)}%`,
+      signatureRate:     `${Math.round((sigs  / total) * 100)}%`,
+      gpsRate:           `${Math.round((gps   / total) * 100)}%`,
+    },
+    tradeBreakdown,
+    topTrade: Object.entries(tradeBreakdown).sort((a, b) => b[1].count - a[1].count)[0]?.[0] || null,
+    bestTrade: Object.entries(tradeBreakdown).sort((a, b) => b[1].avgScore - a[1].avgScore)[0]?.[0] || null,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// GET /compliance-resources  — Return a curated list of compliance resource links for Victoria
+app.get("/compliance-resources", apiKeyAuth, (req, res) => {
+  const { trade } = req.query;
+
+  const RESOURCES = [
+    { title: "VBA Licence Search",            url: "my.vba.vic.gov.au/s/public-licence-search",  trades: ["plumbing", "gas", "drainage", "carpentry"], description: "Search and verify trade licences in Victoria" },
+    { title: "ESV Licence Search",            url: "esv.vic.gov.au/licence-search",               trades: ["electrical", "gas"],                        description: "Verify electrician and gasfitter licences" },
+    { title: "ARCtick Licence Verify",        url: "arctick.org/verify",                          trades: ["hvac"],                                      description: "Verify refrigerant handling licences" },
+    { title: "VBA Permit Apply",              url: "my.vba.vic.gov.au",                           trades: ["plumbing", "gas", "drainage", "carpentry"],  description: "Apply for and manage building/plumbing permits" },
+    { title: "Dial Before You Dig",           url: "1100.com.au",                                 trades: ["plumbing", "drainage", "electrical"],        description: "Locate underground services before excavation" },
+    { title: "WorkSafe Victoria",             url: "worksafe.vic.gov.au",                         trades: ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"], description: "Safety obligations, SWMS guidance, incident reporting" },
+    { title: "Consumer Affairs Vic",          url: "consumer.vic.gov.au",                         trades: ["carpentry"],                                 description: "Domestic building contracts, owner-builder, dispute resolution" },
+    { title: "Australian Standards (SAI)",    url: "standards.org.au",                            trades: ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"], description: "Purchase current AS/NZS standards" },
+    { title: "NCC ABCB Portal",               url: "abcb.gov.au/ncc",                             trades: ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"], description: "Access the National Construction Code online" },
+    { title: "Energy Safe Victoria Codes",    url: "esv.vic.gov.au/codes-standards",              trades: ["electrical", "gas"],                         description: "ESV codes of practice and safety standards" },
+    { title: "Clean Energy Regulator (STC)",  url: "cleanenergyregulator.gov.au",                 trades: ["hvac", "electrical"],                        description: "STCs for hot water, solar, and heat pumps" },
+    { title: "ARC Refrigerant Handling",      url: "arctick.org/handling",                        trades: ["hvac"],                                      description: "Refrigerant handling procedures and regulations" },
+  ];
+
+  const safeTradeFilter = trade ? sanitiseInput(String(trade)).toLowerCase() : null;
+  const filtered = safeTradeFilter
+    ? RESOURCES.filter(r => r.trades.includes(safeTradeFilter))
+    : RESOURCES;
+
+  return res.json({
+    trade:    safeTradeFilter || "all",
+    count:    filtered.length,
+    resources: filtered,
+    note:     "URLs are provided as reference only. Always verify currency with the relevant authority.",
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
