@@ -29629,6 +29629,193 @@ Return a JSON object with:
   }
 });
 
+// ── Round 104: Quality management plan, inspection test plan, audit log ───────
+
+// POST /quality-plan — Create a project Quality Management Plan (QMP)
+app.post("/quality-plan", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, projectManager, qualityManager,
+    trades = [], certificationRequired = [], qualityStandard = "ISO_9001",
+    inspectionFrequency = "weekly", holdPoints = [], witnessPoints = [],
+    nonConformanceProcess, documentControl,
+  } = req.body;
+
+  if (!projectId || !projectName) return res.status(400).json({ error: "projectId and projectName required." });
+
+  const processedHoldPoints = holdPoints.map(hp => ({
+    activity: sanitiseInput(hp.activity || ""),
+    trade: sanitiseInput(hp.trade || ""),
+    requirement: sanitiseInput(hp.requirement || ""),
+    approvalRequired: sanitiseInput(hp.approvalRequired || ""),
+  }));
+
+  const processedWitnessPoints = witnessPoints.map(wp => ({
+    activity: sanitiseInput(wp.activity || ""),
+    trade: sanitiseInput(wp.trade || ""),
+    witnessedBy: sanitiseInput(wp.witnessedBy || ""),
+  }));
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    project_manager: sanitiseInput(projectManager || ""),
+    quality_manager: sanitiseInput(qualityManager || ""),
+    trades: Array.isArray(trades) ? trades.map(t => sanitiseInput(t)) : [],
+    certification_required: Array.isArray(certificationRequired) ? certificationRequired.map(c => sanitiseInput(c)) : [],
+    quality_standard: sanitiseInput(qualityStandard),
+    inspection_frequency: sanitiseInput(inspectionFrequency),
+    hold_points: processedHoldPoints,
+    witness_points: processedWitnessPoints,
+    non_conformance_process: sanitiseInput(nonConformanceProcess || "Issue NCR → Root cause analysis → Corrective action → Close-out verification"),
+    document_control: sanitiseInput(documentControl || "All documents to be version controlled and maintained in project document management system."),
+    status: "ACTIVE",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("quality_plans")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, planId: data.id, ...record });
+  }
+
+  res.json({ success: true, planId: null, ...record, saved: false });
+});
+
+// POST /itp — Create an Inspection and Test Plan (ITP) entry
+app.post("/itp", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, itpNumber, trade, activity,
+    inspectionType, frequency, holdPoint = false, witnessPoint = false,
+    reviewPoint = false, applicableStandards = [], acceptanceCriteria,
+    inspectedBy, result, resultDate,
+  } = req.body;
+
+  if (!projectId || !itpNumber || !activity)
+    return res.status(400).json({ error: "projectId, itpNumber, activity required." });
+
+  const validTypes = ["VISUAL", "MEASUREMENT", "TESTING", "DOCUMENTATION", "WITNESS"];
+  const validResults = ["PASS", "FAIL", "CONDITIONAL", "NOT_INSPECTED"];
+  const type = (inspectionType || "VISUAL").toUpperCase();
+  const res_ = (result || "NOT_INSPECTED").toUpperCase();
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    itp_number: sanitiseInput(String(itpNumber)),
+    trade: sanitiseInput(trade || ""),
+    activity: sanitiseInput(activity),
+    inspection_type: validTypes.includes(type) ? type : "VISUAL",
+    frequency: sanitiseInput(frequency || "Per occurrence"),
+    hold_point: Boolean(holdPoint),
+    witness_point: Boolean(witnessPoint),
+    review_point: Boolean(reviewPoint),
+    applicable_standards: Array.isArray(applicableStandards) ? applicableStandards.map(s => sanitiseInput(s)) : [],
+    acceptance_criteria: sanitiseInput(acceptanceCriteria || ""),
+    inspected_by: sanitiseInput(inspectedBy || ""),
+    result: validResults.includes(res_) ? res_ : "NOT_INSPECTED",
+    result_date: resultDate || null,
+    status: result ? "COMPLETED" : "PENDING",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("itp_register")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, itpId: data.id, ...record });
+  }
+
+  res.json({ success: true, itpId: null, ...record, saved: false });
+});
+
+// GET /itp/:projectId — Get all ITP entries for a project
+app.get("/itp/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { trade, result } = req.query;
+
+  if (supabaseAdmin) {
+    let query = supabaseAdmin
+      .from("itp_register")
+      .select("*")
+      .eq("project_id", projectId)
+      .order("itp_number", { ascending: true });
+
+    if (trade) query = query.eq("trade", trade);
+    if (result) query = query.eq("result", result.toUpperCase());
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "DB error." });
+
+    const holdPoints = (data || []).filter(i => i.hold_point && i.result === "NOT_INSPECTED").length;
+    return res.json({ projectId, itpEntries: data || [], pendingHoldPoints: holdPoints, count: (data || []).length });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /quality-audit — Record a quality audit finding
+app.post("/quality-audit", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, auditType, auditedBy, auditDate,
+    scope, findings = [], overallRating, followUpRequired = false,
+    followUpDate,
+  } = req.body;
+
+  if (!projectId || !auditType || !auditedBy)
+    return res.status(400).json({ error: "projectId, auditType, auditedBy required." });
+
+  const validTypes = ["INTERNAL", "EXTERNAL", "THIRD_PARTY", "CERTIFICATION", "SURVEILLANCE"];
+  const validRatings = ["SATISFACTORY", "MINOR_NONCONFORMANCES", "MAJOR_NONCONFORMANCES", "CRITICAL"];
+  const type = (auditType || "INTERNAL").toUpperCase();
+  const rating = (overallRating || "SATISFACTORY").toUpperCase();
+
+  const processedFindings = findings.map((f, idx) => ({
+    findingNumber: idx + 1,
+    type: ["NONCONFORMANCE", "OBSERVATION", "OPPORTUNITY"].includes((f.type || "").toUpperCase()) ? f.type.toUpperCase() : "OBSERVATION",
+    description: sanitiseInput(f.description || ""),
+    clause: sanitiseInput(f.clause || ""),
+    correctiveAction: sanitiseInput(f.correctiveAction || ""),
+    dueDate: f.dueDate || null,
+    status: "OPEN",
+  }));
+
+  const nonConformances = processedFindings.filter(f => f.type === "NONCONFORMANCE").length;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    audit_type: validTypes.includes(type) ? type : "INTERNAL",
+    audited_by: sanitiseInput(auditedBy),
+    audit_date: auditDate || new Date().toISOString().split("T")[0],
+    scope: sanitiseInput(scope || ""),
+    findings: processedFindings,
+    finding_count: processedFindings.length,
+    non_conformance_count: nonConformances,
+    overall_rating: validRatings.includes(rating) ? rating : "SATISFACTORY",
+    follow_up_required: Boolean(followUpRequired) || nonConformances > 0,
+    follow_up_date: followUpDate || null,
+    status: "COMPLETED",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("quality_audits")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, auditId: data.id, ...record });
+  }
+
+  res.json({ success: true, auditId: null, ...record, saved: false });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
