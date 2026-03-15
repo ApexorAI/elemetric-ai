@@ -45423,6 +45423,271 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /silica-dust-monitoring — Log an airborne silica dust measurement
+app.post("/silica-dust-monitoring", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, workerName, workerId,
+    sampleDate, sampleDurationHours, task, material,
+    silicaContentPercent, samplingMethod,
+    measuredConcentrationMgM3, twa8hMgM3,
+    controlMeasures, respiratorType, respiratorFitTested,
+    sampledBy, labRef, notes,
+  } = req.body;
+
+  if (!projectId || !sampleDate || !task || measuredConcentrationMgM3 === undefined) {
+    return res.status(400).json({ error: "projectId, sampleDate, task, and measuredConcentrationMgM3 are required." });
+  }
+
+  const concentration = Number(measuredConcentrationMgM3);
+  if (isNaN(concentration) || concentration < 0) {
+    return res.status(400).json({ error: "measuredConcentrationMgM3 must be a non-negative number." });
+  }
+
+  // Australian WES (Workplace Exposure Standards) for crystalline silica (respirable):
+  // WES-TWA = 0.05 mg/m³ (revised 1 July 2020 — Safe Work Australia)
+  // Action level = 50% of WES = 0.025 mg/m³
+  const WES_TWA = 0.05;   // mg/m³
+  const ACTION_LEVEL = 0.025; // mg/m³
+
+  // Normalise to 8-hour TWA if measured over different duration
+  const duration = sampleDurationHours || 8;
+  const twa8h = twa8hMgM3 !== undefined ? Number(twa8hMgM3) : Math.round((concentration * duration / 8) * 10000) / 10000;
+
+  const wesExceedance = twa8h / WES_TWA;
+  const aboveActionLevel = twa8h >= ACTION_LEVEL;
+  const aboveWes = twa8h >= WES_TWA;
+
+  const complianceStatus = aboveWes ? "WES_EXCEEDED" : aboveActionLevel ? "ACTION_LEVEL_EXCEEDED" : "COMPLIANT";
+
+  const requiredActions = [];
+  if (aboveWes) {
+    requiredActions.push("STOP task — WES exceeded. Immediately implement higher-order controls (wet methods, isolation, LEV).");
+    requiredActions.push("Health monitoring required for all exposed workers — refer to registered medical practitioner.");
+    requiredActions.push("Notify WorkSafe Victoria if exposure exceeds 3× WES (0.15 mg/m³).");
+    requiredActions.push("Review and update Silica Dust Control Plan before resuming task.");
+  } else if (aboveActionLevel) {
+    requiredActions.push("Action level exceeded — review and improve existing controls.");
+    requiredActions.push("Implement health monitoring program for regularly exposed workers.");
+    requiredActions.push("Provide P2/N95 minimum respiratory protection — confirm fit testing on record.");
+  }
+
+  // Engineered stone check (banned in Australia from 1 July 2024)
+  const engineeredStoneKeywords = ["engineered stone", "reconstituted stone", "silestone", "caesarstone", "quantum quartz", "benchtop"];
+  const isEngineeredStone = engineeredStoneKeywords.some(kw => (material || "").toLowerCase().includes(kw));
+  if (isEngineeredStone) {
+    requiredActions.unshift("ENGINEERED STONE IS PROHIBITED in Australia from 1 July 2024 — Confirm this is not engineered stone. If it is, work must cease immediately.");
+  }
+
+  const ref = `SILICA-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectName: sanitiseInput(projectName || "", 200),
+    workerName: sanitiseInput(workerName || "", 120),
+    workerId: sanitiseInput(workerId || "", 60),
+    sampleDate,
+    sampleDurationHours: duration,
+    task: sanitiseInput(task, 200),
+    material: sanitiseInput(material || "", 150),
+    silicaContentPercent: silicaContentPercent || null,
+    samplingMethod: sanitiseInput(samplingMethod || "", 80),
+    measuredConcentrationMgM3: concentration,
+    twa8hMgM3: twa8h,
+    wesLimit: WES_TWA,
+    wesExceedanceRatio: Math.round(wesExceedance * 100) / 100,
+    complianceStatus,
+    controlMeasures: (controlMeasures || []).map(c => sanitiseInput(String(c), 100)).slice(0, 10),
+    respirator: {
+      type: sanitiseInput(respiratorType || "", 80),
+      fitTested: respiratorFitTested ?? null,
+    },
+    requiredActions,
+    sampledBy: sanitiseInput(sampledBy || "", 120),
+    labRef: sanitiseInput(labRef || "", 60),
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("silica_dust_monitoring").insert(record);
+      if (error) console.error("Silica monitoring insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Silica monitoring DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    twa8hMgM3: twa8h,
+    wesLimit: WES_TWA,
+    wesExceedanceRatio: Math.round(wesExceedance * 100) / 100,
+    complianceStatus,
+    requiredActions,
+    isEngineeredStoneAlert: isEngineeredStone,
+    message: aboveWes
+      ? `WES EXCEEDED (${Math.round(wesExceedance * 10) / 10}× limit) — immediate action required.`
+      : aboveActionLevel
+        ? `Action level exceeded — improve controls and begin health monitoring.`
+        : `Silica exposure within acceptable limits (${Math.round(wesExceedance * 100)}% of WES).`,
+    saved,
+    record,
+  });
+});
+
+// GET /silica-dust-monitoring/:projectId — List silica dust records with exceedance summary
+app.get("/silica-dust-monitoring/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { from, to } = req.query;
+
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  try {
+    let query = supabaseAdmin
+      .from("silica_dust_monitoring")
+      .select("*")
+      .eq("projectId", sanitiseInput(String(projectId), 80))
+      .order("sampleDate", { ascending: false });
+
+    if (from) query = query.gte("sampleDate", from);
+    if (to) query = query.lte("sampleDate", to);
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const records = data || [];
+    const wesExceedances = records.filter(r => r.complianceStatus === "WES_EXCEEDED").length;
+    const actionLevelExceedances = records.filter(r => r.complianceStatus === "ACTION_LEVEL_EXCEEDED").length;
+    const maxTwa = records.length > 0 ? Math.max(...records.map(r => r.twa8hMgM3 || 0)) : 0;
+
+    return res.json({
+      projectId,
+      total: records.length,
+      wesExceedances,
+      actionLevelExceedances,
+      maxTwa8hMgM3: Math.round(maxTwa * 10000) / 10000,
+      wesLimit: 0.05,
+      records,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to retrieve silica monitoring records.", detail: e.message });
+  }
+});
+
+// POST /ai-silica-risk-assessment — AI assesses silica dust risk for a given task/material
+app.post("/ai-silica-risk-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    task, material, silicaContentPercent, toolType,
+    dustGenerationLevel, controlsInPlace, workerExposureHoursPerDay,
+    frequencyPerWeek, enclosedSpace, wetMethodUsed, notes,
+  } = req.body;
+
+  if (!task || !material) {
+    return res.status(400).json({ error: "task and material are required." });
+  }
+
+  const sanitisedTask = sanitiseInput(task, 200);
+  const sanitisedMaterial = sanitiseInput(material, 150);
+  const sanitisedControls = Array.isArray(controlsInPlace)
+    ? controlsInPlace.map(c => sanitiseInput(String(c), 100)).slice(0, 10)
+    : [];
+
+  const prompt = `You are a workplace health and safety specialist with expertise in silica dust and respiratory hazards in the Australian construction industry.
+
+Assess the silica dust risk for the following task:
+- Task: ${sanitisedTask}
+- Material: ${sanitisedMaterial}
+- Silica content: ${silicaContentPercent !== undefined ? `${silicaContentPercent}%` : "Unknown"}
+- Tool type: ${sanitiseInput(toolType || "Unknown", 80)}
+- Dust generation: ${sanitiseInput(dustGenerationLevel || "Medium", 40)}
+- Controls in place: ${sanitisedControls.join(", ") || "None specified"}
+- Exposure hours/day: ${workerExposureHoursPerDay || "8"}
+- Frequency: ${frequencyPerWeek ? `${frequencyPerWeek} days/week` : "Not specified"}
+- Enclosed space: ${enclosedSpace ? "Yes" : "No"}
+- Wet methods used: ${wetMethodUsed ? "Yes" : "No"}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Australian WES for crystalline silica (respirable): 0.05 mg/m³ (TWA-8h).
+Engineered stone is prohibited in Australia from 1 July 2024.
+
+Respond ONLY with a JSON object:
+{
+  "riskLevel": "LOW|MEDIUM|HIGH|CRITICAL",
+  "estimatedTwa8hMgM3": number,
+  "wesExceedanceLikely": boolean,
+  "isHighRiskTask": boolean,
+  "healthMonitoringRequired": boolean,
+  "controlHierarchy": [{"level": "ELIMINATION|SUBSTITUTION|ISOLATION|ENGINEERING|ADMINISTRATIVE|PPE", "measure": string, "priority": "IMMEDIATE|RECOMMENDED|OPTIONAL"}],
+  "respiratorRecommendation": string,
+  "airMonitoringRequired": boolean,
+  "airMonitoringFrequency": string,
+  "regulatoryRequirements": [string],
+  "trainingSuggested": [string],
+  "summary": string (2 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1000,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      riskLevel: parsed.riskLevel || "MEDIUM",
+      estimatedTwa8hMgM3: parsed.estimatedTwa8hMgM3 ?? null,
+      wesLimit: 0.05,
+      wesExceedanceLikely: parsed.wesExceedanceLikely ?? false,
+      isHighRiskTask: parsed.isHighRiskTask ?? false,
+      healthMonitoringRequired: parsed.healthMonitoringRequired ?? false,
+      controlHierarchy: parsed.controlHierarchy || [],
+      respiratorRecommendation: parsed.respiratorRecommendation || "",
+      airMonitoringRequired: parsed.airMonitoringRequired ?? false,
+      airMonitoringFrequency: parsed.airMonitoringFrequency || "",
+      regulatoryRequirements: parsed.regulatoryRequirements || [],
+      trainingSuggested: parsed.trainingSuggested || [],
+      summary: parsed.summary || "Silica risk assessment complete.",
+    });
+  } catch (e) {
+    console.error("AI silica risk error:", e.message);
+    return res.json({
+      success: true,
+      riskLevel: "MEDIUM",
+      estimatedTwa8hMgM3: null,
+      wesLimit: 0.05,
+      wesExceedanceLikely: false,
+      isHighRiskTask: true,
+      healthMonitoringRequired: true,
+      controlHierarchy: [
+        { level: "ENGINEERING", measure: "Use on-tool dust extraction (LEV) with H-class vacuum", priority: "IMMEDIATE" },
+        { level: "ENGINEERING", measure: "Apply wet methods where compatible with task", priority: "IMMEDIATE" },
+        { level: "ADMINISTRATIVE", measure: "Limit exposure duration — rotate workers", priority: "RECOMMENDED" },
+        { level: "PPE", measure: "P2 filtering facepiece respirator (fit-tested)", priority: "IMMEDIATE" },
+      ],
+      respiratorRecommendation: "Minimum P2/N95 fit-tested respirator. Full-face air-purifying respirator for high exposure tasks.",
+      airMonitoringRequired: true,
+      airMonitoringFrequency: "Initial baseline monitoring, then 6-monthly for regularly exposed workers.",
+      regulatoryRequirements: [
+        "WHS Regulations 2017 r419 — manage risks from hazardous substances",
+        "Safe Work Australia WES: 0.05 mg/m³ crystalline silica (respirable)",
+        "Silica Dust Control Plan required if task involves silica-containing materials",
+      ],
+      trainingSuggested: ["Silica dust awareness training", "Correct use and fit-testing of respiratory protection"],
+      summary: "Manual assessment required. Implement engineering controls before relying on PPE. Conduct air monitoring to verify control effectiveness.",
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
