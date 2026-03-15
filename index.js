@@ -29424,6 +29424,211 @@ app.post("/visitor-management", apiKeyAuth, async (req, res) => {
   res.json({ success: true, visitorId: null, accessCode, ...record, saved: false });
 });
 
+// ── Round 103: Project programme, milestone tracking, AI schedule review ──────
+
+// POST /project-programme — Create or update a project programme/schedule
+app.post("/project-programme", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, programmeName, startDate, endDate,
+    activities = [], programmeType = "CONSTRUCTION",
+    basedOnMethod = "BAR_CHART",
+  } = req.body;
+
+  if (!projectId || !startDate || !endDate)
+    return res.status(400).json({ error: "projectId, startDate, endDate required." });
+
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  if (isNaN(start) || isNaN(end) || end <= start)
+    return res.status(400).json({ error: "Invalid date range." });
+
+  const totalDays = Math.ceil((end - start) / (1000 * 60 * 60 * 24));
+
+  const processedActivities = activities.map((a, idx) => ({
+    activityId: a.activityId || `ACT-${String(idx + 1).padStart(3, "0")}`,
+    name: sanitiseInput(a.name || ""),
+    trade: sanitiseInput(a.trade || ""),
+    plannedStart: a.plannedStart || null,
+    plannedEnd: a.plannedEnd || null,
+    duration: a.duration || null,
+    percentComplete: Math.min(100, Math.max(0, Number(a.percentComplete) || 0)),
+    isCritical: Boolean(a.isCritical),
+    dependencies: Array.isArray(a.dependencies) ? a.dependencies : [],
+    status: a.status || "NOT_STARTED",
+  }));
+
+  const criticalActivities = processedActivities.filter(a => a.isCritical).length;
+  const completedActivities = processedActivities.filter(a => a.percentComplete === 100).length;
+  const overallProgress = processedActivities.length > 0
+    ? Math.round(processedActivities.reduce((s, a) => s + a.percentComplete, 0) / processedActivities.length)
+    : 0;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    programme_name: sanitiseInput(programmeName || "Construction Programme"),
+    start_date: startDate,
+    end_date: endDate,
+    total_calendar_days: totalDays,
+    programme_type: sanitiseInput(programmeType),
+    based_on_method: sanitiseInput(basedOnMethod),
+    activities: processedActivities,
+    activity_count: processedActivities.length,
+    critical_activities: criticalActivities,
+    completed_activities: completedActivities,
+    overall_progress: overallProgress,
+    status: "CURRENT",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("project_programmes")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, programmeId: data.id, ...record });
+  }
+
+  res.json({ success: true, programmeId: null, ...record, saved: false });
+});
+
+// POST /milestone — Record a project milestone and its achievement status
+app.post("/milestone", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, milestoneName, plannedDate, actualDate,
+    milestoneType, achievedBy, liquidatedDamagesApply = false,
+    liquidatedDamagesRate, notes,
+  } = req.body;
+
+  if (!projectId || !milestoneName || !plannedDate)
+    return res.status(400).json({ error: "projectId, milestoneName, plannedDate required." });
+
+  const validTypes = ["PRACTICAL_COMPLETION", "STAGE_COMPLETION", "HOLD_POINT", "KEY_DATE", "CONTRACTUAL", "INTERNAL"];
+  const type = (milestoneType || "KEY_DATE").toUpperCase();
+
+  const planned = new Date(plannedDate);
+  const actual = actualDate ? new Date(actualDate) : null;
+  const daysVariance = actual ? Math.ceil((actual - planned) / (1000 * 60 * 60 * 24)) : null;
+  const status = actual ? (daysVariance <= 0 ? "ACHIEVED_ON_TIME" : "ACHIEVED_LATE") : new Date() > planned ? "OVERDUE" : "PENDING";
+
+  let ldExposure = null;
+  if (liquidatedDamagesApply && liquidatedDamagesRate && daysVariance > 0) {
+    ldExposure = Number(liquidatedDamagesRate) * daysVariance;
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    milestone_name: sanitiseInput(milestoneName),
+    planned_date: plannedDate,
+    actual_date: actualDate || null,
+    days_variance: daysVariance,
+    milestone_type: validTypes.includes(type) ? type : "KEY_DATE",
+    achieved_by: sanitiseInput(achievedBy || ""),
+    liquidated_damages_apply: Boolean(liquidatedDamagesApply),
+    liquidated_damages_rate: liquidatedDamagesRate ? Number(liquidatedDamagesRate) : null,
+    ld_exposure: ldExposure,
+    status,
+    notes: sanitiseInput(notes || ""),
+    recorded_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("project_milestones")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, milestoneId: data.id, ...record });
+  }
+
+  res.json({ success: true, milestoneId: null, ...record, saved: false });
+});
+
+// GET /milestones/:projectId — Get milestones for a project
+app.get("/milestones/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("project_milestones")
+      .select("*")
+      .eq("project_id", projectId)
+      .order("planned_date", { ascending: true });
+
+    if (error) return res.status(500).json({ error: "DB error." });
+
+    const overdue = (data || []).filter(m => m.status === "OVERDUE").length;
+    const achieved = (data || []).filter(m => m.status?.startsWith("ACHIEVED")).length;
+    const totalLD = (data || []).reduce((s, m) => s + (m.ld_exposure || 0), 0);
+
+    return res.json({ projectId, milestones: data || [], overdueCount: overdue, achievedCount: achieved, totalLdExposure: totalLD });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /ai-schedule-review — AI reviews a project schedule description and identifies risks
+app.post("/ai-schedule-review", apiKeyAuth, async (req, res) => {
+  const {
+    projectDescription, projectType, totalDuration, trade,
+    keyActivities = [], constraintsList = [], state = "VIC",
+  } = req.body;
+
+  if (!projectDescription || !totalDuration)
+    return res.status(400).json({ error: "projectDescription and totalDuration required." });
+
+  const sanitisedActivities = keyActivities.map(a => sanitiseInput(a)).join("; ");
+  const sanitisedConstraints = constraintsList.map(c => sanitiseInput(c)).join("; ");
+
+  const prompt = `You are a senior Australian construction programme planner and project controls expert. Review the following project schedule and identify schedule risks, critical path concerns, and opportunities.
+
+Project: ${sanitiseInput(projectDescription)}
+Project type: ${sanitiseInput(projectType || "Commercial construction")}
+Total duration: ${sanitiseInput(String(totalDuration))} days
+Trade: ${sanitiseInput(trade || "Multi-trade")}
+State: ${sanitiseInput(state)}
+Key activities: ${sanitisedActivities || "Not specified"}
+Constraints: ${sanitisedConstraints || "None specified"}
+
+Return a JSON object with:
+- "scheduleRisk": "LOW"|"MEDIUM"|"HIGH"|"CRITICAL"
+- "riskSummary": string
+- "criticalPathRisks": array of { "risk": string, "impact": string, "likelihood": "LOW"|"MEDIUM"|"HIGH", "mitigation": string }
+- "weatherAllowance": recommended weather days to allow
+- "floatRecommendation": string (recommended contingency buffer)
+- "sequencingIssues": array of potential activity sequencing problems
+- "resourceConflicts": array of potential resource/trade clashes
+- "opportunities": array of schedule acceleration opportunities
+- "recommendations": array of programme improvement suggestions
+- "overallAssessment": string`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1800,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, projectType, totalDuration, state, reviewedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      scheduleRisk: "MEDIUM",
+      riskSummary: "Automated schedule review unavailable. Manual review by programme planner recommended.",
+      criticalPathRisks: [],
+      weatherAllowance: state === "QLD" ? 10 : 5,
+      floatRecommendation: "Allow 10% float on overall programme duration.",
+      sequencingIssues: [], resourceConflicts: [], opportunities: [],
+      recommendations: ["Engage a qualified programme planner to review schedule"],
+      overallAssessment: "Manual review required.",
+      projectType, totalDuration, state, reviewedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
