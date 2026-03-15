@@ -22951,6 +22951,171 @@ app.get("/completion-stats/:contractorId", apiKeyAuth, async (req, res) => {
   return res.json({ contractorId, jobsLogged: logs.length, completedCount: completed, completionRate, avgChecklistScore: avgChecklist, jobsByType: byType, generatedAt: new Date().toISOString() });
 });
 
+// POST /environment-check  — Log environmental site conditions
+app.post("/environment-check", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, temperature, humidity, windSpeed, precipitation, noiseLevelDb, airQuality, suitableForWork, notes } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const tempC     = temperature !== undefined ? parseFloat(temperature) : null;
+  const humidPct  = humidity !== undefined ? Math.min(100, Math.max(0, parseFloat(humidity) || 0)) : null;
+  const windKmh   = windSpeed !== undefined ? Math.max(0, parseFloat(windSpeed) || 0) : null;
+  const noiseDb   = noiseLevelDb !== undefined ? Math.max(0, parseFloat(noiseLevelDb) || 0) : null;
+
+  const risks = [];
+  if (tempC !== null && tempC > 35) risks.push("Extreme heat — implement heat management plan");
+  if (tempC !== null && tempC < 5)  risks.push("Near-freezing conditions — protect materials and workers");
+  if (windKmh !== null && windKmh > 45) risks.push("High winds — crane and working at heights restrictions may apply");
+  if (noiseDb !== null && noiseDb > 85)  risks.push("High noise levels — hearing protection required");
+  if (precipitation === "heavy") risks.push("Heavy rain — electrical work to cease, assess ground stability");
+
+  const suitable = suitableForWork !== undefined ? suitableForWork === true : risks.length === 0;
+
+  const record = {
+    siteId: safeSiteId, jobId: safeJobId,
+    temperature: tempC, humidity: humidPct, windSpeedKmh: windKmh,
+    precipitation: precipitation ? sanitiseInput(String(precipitation)).slice(0, 30) : null,
+    noiseLevelDb: noiseDb,
+    airQuality: airQuality ? sanitiseInput(String(airQuality)).slice(0, 50) : null,
+    suitableForWork: suitable,
+    risks,
+    notes: safeNotes,
+    recordedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("environment_checks").insert({
+        site_id: safeSiteId, job_id: safeJobId,
+        temperature: tempC, humidity: humidPct, wind_speed_kmh: windKmh,
+        precipitation: record.precipitation, noise_level_db: noiseDb, air_quality: record.airQuality,
+        suitable_for_work: suitable, risks, notes: safeNotes, recorded_at: record.recordedAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// POST /tool-calibration  — Log calibration record for a measuring/testing instrument
+app.post("/tool-calibration", apiKeyAuth, async (req, res) => {
+  const { toolId, toolName, contractorId, calibratedBy, calibrationDate, nextCalibrationDate, result, certNumber, notes } = req.body || {};
+  if (!toolId || !toolName) return res.status(400).json({ error: "toolId and toolName required." });
+
+  const VALID_RESULTS = ["PASS", "FAIL", "ADJUSTED"];
+  const safeToolId   = sanitiseInput(String(toolId)).slice(0, 80);
+  const safeName     = sanitiseInput(String(toolName)).slice(0, 100);
+  const safeCId      = contractorId ? sanitiseInput(String(contractorId)).slice(0, 80) : null;
+  const safeBy       = calibratedBy ? sanitiseInput(String(calibratedBy)).slice(0, 100) : null;
+  const safeResult   = VALID_RESULTS.includes(String(result || "").toUpperCase()) ? String(result).toUpperCase() : "PASS";
+  const safeCertNum  = certNumber ? sanitiseInput(String(certNumber)).slice(0, 80) : null;
+  const safeNotes    = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+  const calibDate    = calibrationDate ? sanitiseInput(String(calibrationDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const nextCalibDate = nextCalibrationDate ? sanitiseInput(String(nextCalibrationDate)).slice(0, 20) : null;
+
+  const record = { toolId: safeToolId, toolName: safeName, contractorId: safeCId, calibratedBy: safeBy, calibrationDate: calibDate, nextCalibrationDate: nextCalibDate, result: safeResult, certNumber: safeCertNum, notes: safeNotes, createdAt: new Date().toISOString() };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("tool_calibrations").insert({
+        tool_id: safeToolId, tool_name: safeName, contractor_id: safeCId,
+        calibrated_by: safeBy, calibration_date: calibDate, next_calibration_date: nextCalibDate,
+        result: safeResult, cert_number: safeCertNum, notes: safeNotes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// GET /tool-calibration/:toolId  — Get calibration history for a tool
+app.get("/tool-calibration/:toolId", apiKeyAuth, async (req, res) => {
+  const toolId = sanitiseInput(String(req.params.toolId || "")).slice(0, 80);
+  if (!toolId) return res.status(400).json({ error: "toolId required." });
+
+  let records = [];
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin
+        .from("tool_calibrations")
+        .select("*")
+        .eq("tool_id", toolId)
+        .order("calibration_date", { ascending: false })
+        .limit(50);
+      records = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const latest   = records[0] || null;
+  const now      = new Date();
+  const overdue  = latest?.next_calibration_date && new Date(latest.next_calibration_date) < now;
+  const daysLeft = latest?.next_calibration_date ? Math.round((new Date(latest.next_calibration_date) - now) / 86400000) : null;
+
+  return res.json({ toolId, calibrationCount: records.length, latestCalibration: latest, overdue, daysUntilNextCalibration: daysLeft, history: records, generatedAt: new Date().toISOString() });
+});
+
+// POST /job-note  — Add a note to a job
+app.post("/job-note", apiKeyAuth, async (req, res) => {
+  const { jobId, authorId, authorName, noteType, content, visibility = "internal", attachmentRef } = req.body || {};
+  if (!jobId || !content) return res.status(400).json({ error: "jobId and content required." });
+
+  const VALID_TYPES = ["general", "safety", "client", "compliance", "technical", "financial", "followup"];
+  const VALID_VIS   = ["internal", "client", "public"];
+  const safeJobId   = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeAuthorId = authorId ? sanitiseInput(String(authorId)).slice(0, 80) : null;
+  const safeName    = authorName ? sanitiseInput(String(authorName)).slice(0, 100) : null;
+  const safeType    = VALID_TYPES.includes(String(noteType || "").toLowerCase()) ? String(noteType).toLowerCase() : "general";
+  const safeContent = sanitiseInput(String(content)).slice(0, 2000);
+  const safeVis     = VALID_VIS.includes(String(visibility).toLowerCase()) ? String(visibility).toLowerCase() : "internal";
+  const safeAttach  = attachmentRef ? sanitiseInput(String(attachmentRef)).slice(0, 80) : null;
+
+  const note = {
+    noteId: `NOTE-${safeJobId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    jobId: safeJobId, authorId: safeAuthorId, authorName: safeName,
+    noteType: safeType, content: safeContent, visibility: safeVis, attachmentRef: safeAttach,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("job_notes").insert({
+        note_id: note.noteId, job_id: note.jobId, author_id: note.authorId, author_name: note.authorName,
+        note_type: note.noteType, content: note.content, visibility: note.visibility,
+        attachment_ref: note.attachmentRef, created_at: note.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...note, saved: !!supabaseAdmin });
+});
+
+// GET /job-notes/:jobId  — Get all notes for a job
+app.get("/job-notes/:jobId", apiKeyAuth, async (req, res) => {
+  const jobId      = sanitiseInput(String(req.params.jobId || "")).slice(0, 80);
+  const noteType   = req.query.type ? sanitiseInput(String(req.query.type)).toLowerCase() : null;
+  const visibility = req.query.visibility ? sanitiseInput(String(req.query.visibility)).toLowerCase() : null;
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  let notes = [];
+  if (supabaseAdmin) {
+    try {
+      let q = supabaseAdmin.from("job_notes").select("*").eq("job_id", jobId).order("created_at", { ascending: false }).limit(100);
+      if (noteType) q = q.eq("note_type", noteType);
+      if (visibility) q = q.eq("visibility", visibility);
+      const { data } = await q;
+      notes = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const byType = {};
+  notes.forEach(n => { byType[n.note_type] = (byType[n.note_type] || 0) + 1; });
+
+  return res.json({ jobId, totalNotes: notes.length, byType, notes, generatedAt: new Date().toISOString() });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
