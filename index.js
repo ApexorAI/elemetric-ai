@@ -24262,6 +24262,183 @@ app.post("/ai-photo-caption", apiKeyAuth, async (req, res) => {
   }
 });
 
+// POST /hazard-log  — Log a site hazard
+app.post("/hazard-log", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, hazardType, location, description, likelihood, consequence, riskRating, controlMeasures, reportedBy, status, notes } = req.body || {};
+  if ((!siteId && !jobId) || !description) return res.status(400).json({ error: "siteId or jobId, and description required." });
+
+  const HAZARD_TYPES = ["physical", "chemical", "biological", "ergonomic", "psychosocial", "electrical", "fire", "falling-objects", "working-at-height", "confined-space", "hot-work", "mechanical", "other"];
+  const RISK_MATRIX  = { "1-1": "LOW", "1-2": "LOW", "1-3": "MEDIUM", "2-1": "LOW", "2-2": "MEDIUM", "2-3": "HIGH", "3-1": "MEDIUM", "3-2": "HIGH", "3-3": "CRITICAL" };
+
+  const safeSiteId  = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId   = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeType    = HAZARD_TYPES.includes(String(hazardType || "").toLowerCase().replace(/ /g, "-")) ? String(hazardType).toLowerCase().replace(/ /g, "-") : "other";
+  const safeLoc     = location ? sanitiseInput(String(location)).slice(0, 150) : null;
+  const safeDesc    = sanitiseInput(String(description)).slice(0, 500);
+  const safeLikely  = Math.min(3, Math.max(1, parseInt(likelihood) || 2));
+  const safeConseq  = Math.min(3, Math.max(1, parseInt(consequence) || 2));
+  const autoRisk    = RISK_MATRIX[`${safeLikely}-${safeConseq}`] || "MEDIUM";
+  const safeRisk    = ["LOW", "MEDIUM", "HIGH", "CRITICAL"].includes(String(riskRating || "").toUpperCase()) ? String(riskRating).toUpperCase() : autoRisk;
+  const safeControls = controlMeasures ? sanitiseInput(String(controlMeasures)).slice(0, 500) : null;
+  const safeBy      = reportedBy ? sanitiseInput(String(reportedBy)).slice(0, 100) : null;
+  const safeStatus  = ["OPEN", "CONTROLLED", "ELIMINATED", "MONITORING"].includes(String(status || "").toUpperCase()) ? String(status).toUpperCase() : "OPEN";
+  const safeNotes   = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const record = {
+    hazardId: `HAZ-${(safeSiteId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId, jobId: safeJobId, hazardType: safeType, location: safeLoc,
+    description: safeDesc, likelihood: safeLikely, consequence: safeConseq,
+    riskRating: safeRisk, controlMeasures: safeControls,
+    reportedBy: safeBy, status: safeStatus, notes: safeNotes,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("hazard_log").insert({
+        hazard_id: record.hazardId, site_id: safeSiteId, job_id: safeJobId, hazard_type: safeType,
+        location: safeLoc, description: safeDesc, likelihood: safeLikely, consequence: safeConseq,
+        risk_rating: safeRisk, control_measures: safeControls, reported_by: safeBy,
+        status: safeStatus, notes: safeNotes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// GET /hazard-log/:siteId  — Get all hazards for a site
+app.get("/hazard-log/:siteId", apiKeyAuth, async (req, res) => {
+  const siteId    = sanitiseInput(String(req.params.siteId || "")).slice(0, 80);
+  const riskLevel = req.query.risk ? sanitiseInput(String(req.query.risk)).toUpperCase() : null;
+  if (!siteId) return res.status(400).json({ error: "siteId required." });
+
+  let hazards = [];
+  if (supabaseAdmin) {
+    try {
+      let q = supabaseAdmin.from("hazard_log").select("*").eq("site_id", siteId).order("created_at", { ascending: false }).limit(100);
+      if (riskLevel) q = q.eq("risk_rating", riskLevel);
+      const { data } = await q;
+      hazards = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+  hazards.forEach(h => { if (counts[h.risk_rating] !== undefined) counts[h.risk_rating]++; });
+
+  return res.json({ siteId, totalHazards: hazards.length, riskCounts: counts, openCount: hazards.filter(h => h.status === "OPEN").length, hazards, generatedAt: new Date().toISOString() });
+});
+
+// POST /corrective-action  — Log a corrective action required for a defect/non-conformance
+app.post("/corrective-action", apiKeyAuth, async (req, res) => {
+  const { jobId, siteId, rootCause, actionRequired, assignedTo, dueDate, priority, relatedDefectId, notes } = req.body || {};
+  if (!jobId && !siteId) return res.status(400).json({ error: "jobId or siteId required." });
+  if (!actionRequired) return res.status(400).json({ error: "actionRequired is required." });
+
+  const VALID_PRIORITIES = ["critical", "high", "medium", "low"];
+  const safeJobId   = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeSiteId  = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeRoot    = rootCause ? sanitiseInput(String(rootCause)).slice(0, 300) : null;
+  const safeAction  = sanitiseInput(String(actionRequired)).slice(0, 500);
+  const safeAssigned = assignedTo ? sanitiseInput(String(assignedTo)).slice(0, 100) : null;
+  const safeDue     = dueDate ? sanitiseInput(String(dueDate)).slice(0, 20) : null;
+  const safePriority = VALID_PRIORITIES.includes(String(priority || "").toLowerCase()) ? String(priority).toLowerCase() : "medium";
+  const safeDefectId = relatedDefectId ? sanitiseInput(String(relatedDefectId)).slice(0, 80) : null;
+  const safeNotes   = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const record = {
+    actionId: `CA-${(safeJobId || safeSiteId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    jobId: safeJobId, siteId: safeSiteId, rootCause: safeRoot, actionRequired: safeAction,
+    assignedTo: safeAssigned, dueDate: safeDue, priority: safePriority,
+    relatedDefectId: safeDefectId, status: "OPEN", notes: safeNotes,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("corrective_actions").insert({
+        action_id: record.actionId, job_id: safeJobId, site_id: safeSiteId,
+        root_cause: safeRoot, action_required: safeAction, assigned_to: safeAssigned,
+        due_date: safeDue, priority: safePriority, related_defect_id: safeDefectId,
+        status: "OPEN", notes: safeNotes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// GET /corrective-action/:jobId  — Get all corrective actions for a job
+app.get("/corrective-action/:jobId", apiKeyAuth, async (req, res) => {
+  const jobId  = sanitiseInput(String(req.params.jobId || "")).slice(0, 80);
+  const status = req.query.status ? sanitiseInput(String(req.query.status)).toUpperCase() : null;
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  let actions = [];
+  if (supabaseAdmin) {
+    try {
+      let q = supabaseAdmin.from("corrective_actions").select("*").eq("job_id", jobId).order("created_at", { ascending: false }).limit(100);
+      if (status) q = q.eq("status", status);
+      const { data } = await q;
+      actions = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const now = new Date().toISOString().split("T")[0];
+  const overdue = actions.filter(a => a.status === "OPEN" && a.due_date && a.due_date < now).length;
+
+  return res.json({ jobId, totalActions: actions.length, openCount: actions.filter(a => a.status === "OPEN").length, overdueCount: overdue, actions, generatedAt: new Date().toISOString() });
+});
+
+// POST /ai-defect-description  — AI generates a detailed defect description from keywords
+app.post("/ai-defect-description", apiKeyAuth, async (req, res) => {
+  const { jobType, keywords = [], location, severity } = req.body || {};
+  if (!jobType || !Array.isArray(keywords) || keywords.length === 0) return res.status(400).json({ error: "jobType and keywords array required." });
+
+  const safeType     = sanitiseInput(String(jobType)).slice(0, 40);
+  const safeKeywords = keywords.slice(0, 10).map(k => sanitiseInput(String(k)).slice(0, 50));
+  const safeLoc      = location ? sanitiseInput(String(location)).slice(0, 100) : null;
+  const safeSeverity = severity ? sanitiseInput(String(severity)).slice(0, 20) : null;
+
+  const prompt = `You are a trade compliance inspector for ${safeType} work.
+
+Write a formal defect description from these keywords:
+Keywords: ${safeKeywords.join(", ")}
+${safeLoc ? `Location: ${safeLoc}` : ""}
+${safeSeverity ? `Severity: ${safeSeverity}` : ""}
+
+Respond with JSON:
+{
+  "title": "short defect title",
+  "description": "formal 2-3 sentence technical description",
+  "technicalCode": "relevant Australian standard or code reference if applicable",
+  "rectificationAction": "specific corrective action required",
+  "urgency": "IMMEDIATE|URGENT|ROUTINE"
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 350 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      jobType: safeType, keywords: safeKeywords,
+      title:               parsed.title || "Defect identified",
+      description:         parsed.description || safeKeywords.join("; "),
+      technicalCode:       parsed.technicalCode || null,
+      rectificationAction: parsed.rectificationAction || "Inspect and rectify to code requirements",
+      urgency:             ["IMMEDIATE", "URGENT", "ROUTINE"].includes(parsed.urgency) ? parsed.urgency : "ROUTINE",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      jobType: safeType, keywords: safeKeywords,
+      title: "Defect identified", description: safeKeywords.join("; "),
+      technicalCode: null, rectificationAction: "Inspect and rectify to code requirements", urgency: "ROUTINE",
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
