@@ -50806,6 +50806,370 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /pre-purchase-inspection — Record a pre-purchase building inspection
+app.post("/pre-purchase-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, inspectionDate, inspectorName, inspectorLicence,
+    inspectorCompany, buyerName,
+    buildingAge, buildingType, buildingClass, storeys,
+    // Elements
+    roofCondition, roofMaterial, guttersCondition, roofVoidAccess,
+    wallsExternalCondition, wallsInternalCondition, wallMaterial,
+    floorCondition, floorMaterial, subfloorAccess, subfloorCondition,
+    ceilingsCondition, windowsCondition, doorsCondition,
+    // Structural
+    foundationEvidentCracking, wallCracking, slabCracking,
+    settlementEvident, structuralConcernsNotes,
+    // Services
+    electricalCondition, electricalRCDInstalled, electricalSmokeAlarms,
+    plumbingCondition, hotWaterSystemAge, hotWaterSystemCondition,
+    heatingCoolingCondition,
+    // Moisture / pests
+    dampness, dampnessLocations, leaks, leakLocations,
+    moldPresent, moldSeverity, drainageAdequate,
+    pestDamageEvident, pestType,
+    // Hazardous materials
+    asbestosRisk, asbestosLocations, leadPaintRisk,
+    // Overall
+    overallConditionRating, majorDefects, minorDefects,
+    urgentItems, estimatedRepairCost, notes,
+  } = req.body;
+
+  if (!propertyAddress || !inspectionDate || !inspectorName) {
+    return res.status(400).json({ error: "propertyAddress, inspectionDate, and inspectorName are required." });
+  }
+
+  const sanitisedAddress = sanitiseInput(propertyAddress, 300);
+  const sanitisedInspector = sanitiseInput(inspectorName, 120);
+
+  // Condition ratings scale
+  const validConditions = ["GOOD", "FAIR", "POOR", "DEFECTIVE"];
+
+  // Major defect detection
+  const autoMajorDefects = [];
+  if (overallConditionRating === "POOR" || overallConditionRating === "DEFECTIVE") {
+    autoMajorDefects.push("Overall building condition is poor — specialist investigations recommended.");
+  }
+  if (structuralConcernsNotes) autoMajorDefects.push(`Structural concerns: ${sanitiseInput(structuralConcernsNotes, 200)}`);
+  if (asbestosRisk === "HIGH") autoMajorDefects.push("Significant asbestos risk identified — engage licensed asbestos consultant.");
+  if (dampness === "MAJOR") autoMajorDefects.push("Major dampness/water ingress — investigate source and remediate.");
+  if (foundationEvidentCracking) autoMajorDefects.push("Foundation cracking evident — structural engineer assessment recommended.");
+  if (pestDamageEvident) autoMajorDefects.push(`Pest damage evident${pestType ? ` (${sanitiseInput(pestType, 40)})` : ""} — obtain pest inspection report.`);
+
+  const allMajorDefects = [
+    ...autoMajorDefects,
+    ...(Array.isArray(majorDefects) ? majorDefects.map(d => sanitiseInput(String(d), 200)).slice(0, 20) : []),
+  ];
+  const allMinorDefects = Array.isArray(minorDefects) ? minorDefects.map(d => sanitiseInput(String(d), 200)).slice(0, 30) : [];
+  const allUrgentItems = Array.isArray(urgentItems) ? urgentItems.map(i => sanitiseInput(String(i), 200)).slice(0, 10) : [];
+
+  const resolvedOverall = validConditions.includes((overallConditionRating || "").toUpperCase()) ? overallConditionRating.toUpperCase() : "FAIR";
+
+  const ref = `PPI-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    propertyAddress: sanitisedAddress,
+    inspectionDate,
+    inspector: {
+      name: sanitisedInspector,
+      licence: sanitiseInput(inspectorLicence || "", 60),
+      company: sanitiseInput(inspectorCompany || "", 150),
+    },
+    buyerName: sanitiseInput(buyerName || "", 120),
+    building: {
+      age: buildingAge || null,
+      type: sanitiseInput(buildingType || "", 60),
+      class: sanitiseInput(String(buildingClass || ""), 20),
+      storeys: storeys || null,
+    },
+    elements: {
+      roof: { condition: sanitiseInput(roofCondition || "", 20), material: sanitiseInput(roofMaterial || "", 60), gutters: sanitiseInput(guttersCondition || "", 20), voidAccess: roofVoidAccess ?? null },
+      walls: { external: sanitiseInput(wallsExternalCondition || "", 20), internal: sanitiseInput(wallsInternalCondition || "", 20), material: sanitiseInput(wallMaterial || "", 60) },
+      floors: { condition: sanitiseInput(floorCondition || "", 20), material: sanitiseInput(floorMaterial || "", 60), subfloorAccess: subfloorAccess ?? null, subfloorCondition: sanitiseInput(subfloorCondition || "", 20) },
+      ceilings: sanitiseInput(ceilingsCondition || "", 20),
+      windows: sanitiseInput(windowsCondition || "", 20),
+      doors: sanitiseInput(doorsCondition || "", 20),
+    },
+    structural: {
+      foundationCracking: !!foundationEvidentCracking,
+      wallCracking: !!wallCracking,
+      slabCracking: !!slabCracking,
+      settlementEvident: !!settlementEvident,
+      notes: sanitiseInput(structuralConcernsNotes || "", 300),
+    },
+    services: {
+      electrical: { condition: sanitiseInput(electricalCondition || "", 20), rcdInstalled: electricalRCDInstalled ?? null, smokeAlarms: electricalSmokeAlarms ?? null },
+      plumbing: { condition: sanitiseInput(plumbingCondition || "", 20) },
+      hotWater: { age: hotWaterSystemAge || null, condition: sanitiseInput(hotWaterSystemCondition || "", 20) },
+      hvac: sanitiseInput(heatingCoolingCondition || "", 20),
+    },
+    moisture: {
+      dampness: sanitiseInput(dampness || "NONE", 20),
+      dampnessLocations: (dampnessLocations || []).map(l => sanitiseInput(String(l), 100)).slice(0, 5),
+      leaks: !!leaks,
+      leakLocations: (leakLocations || []).map(l => sanitiseInput(String(l), 100)).slice(0, 5),
+      mold: { present: !!moldPresent, severity: sanitiseInput(moldSeverity || "", 20) },
+      drainageAdequate: drainageAdequate ?? null,
+    },
+    pests: {
+      damageEvident: !!pestDamageEvident,
+      type: sanitiseInput(pestType || "", 60),
+    },
+    hazardousMaterials: {
+      asbestosRisk: sanitiseInput(asbestosRisk || "LOW", 20),
+      asbestosLocations: (asbestosLocations || []).map(l => sanitiseInput(String(l), 100)).slice(0, 10),
+      leadPaintRisk: sanitiseInput(leadPaintRisk || "LOW", 20),
+    },
+    summary: {
+      overallConditionRating: resolvedOverall,
+      majorDefects: allMajorDefects,
+      minorDefects: allMinorDefects,
+      urgentItems: allUrgentItems,
+      estimatedRepairCost: estimatedRepairCost || null,
+    },
+    projectId: null, // pre-purchase inspections may not have a project ID
+    notes: sanitiseInput(notes || "", 500),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("pre_purchase_inspections").insert(record);
+      if (error) console.error("Pre-purchase inspection insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Pre-purchase inspection DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    overallConditionRating: resolvedOverall,
+    majorDefectCount: allMajorDefects.length,
+    urgentItemCount: allUrgentItems.length,
+    majorDefects: allMajorDefects,
+    urgentItems: allUrgentItems,
+    message: allMajorDefects.length > 0
+      ? `Inspection complete. ${allMajorDefects.length} major defect(s) found — review before proceeding with purchase.`
+      : `Inspection complete. No major defects identified. ${allMinorDefects.length} minor defect(s) noted.`,
+    saved,
+    record,
+  });
+});
+
+// POST /ai-pre-purchase-report — AI generates a pre-purchase building inspection narrative
+app.post("/ai-pre-purchase-report", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, buildingAge, buildingType, overallConditionRating,
+    majorDefects, minorDefects, urgentItems, estimatedRepairCost,
+    roofCondition, structuralConcerns, moistureConcerns,
+    asbestosRisk, pestDamage, servicesCondition, notes,
+  } = req.body;
+
+  if (!propertyAddress) {
+    return res.status(400).json({ error: "propertyAddress is required." });
+  }
+
+  const sanitisedAddress = sanitiseInput(propertyAddress, 300);
+  const sanitisedMajor = Array.isArray(majorDefects)
+    ? majorDefects.map(d => sanitiseInput(String(d), 200)).slice(0, 10).join("; ")
+    : sanitiseInput(String(majorDefects || "None identified"), 400);
+  const sanitisedMinor = Array.isArray(minorDefects)
+    ? minorDefects.map(d => sanitiseInput(String(d), 150)).slice(0, 15).join("; ")
+    : sanitiseInput(String(minorDefects || "None"), 400);
+
+  const prompt = `You are a licensed building inspector in Victoria, Australia preparing a formal pre-purchase inspection report for a buyer.
+
+Generate a professional inspection narrative for:
+- Property: ${sanitisedAddress}
+- Building age: ${buildingAge || "Unknown"} years
+- Building type: ${sanitiseInput(buildingType || "Residential", 60)}
+- Overall condition: ${sanitiseInput(overallConditionRating || "FAIR", 20)}
+- Major defects: ${sanitisedMajor || "None identified"}
+- Minor defects: ${sanitisedMinor || "None"}
+- Urgent items: ${sanitiseInput(String(urgentItems || "None"), 300)}
+- Estimated repair cost: ${estimatedRepairCost ? `$${estimatedRepairCost}` : "Not estimated"}
+- Roof: ${sanitiseInput(roofCondition || "Not assessed", 60)}
+- Structural: ${sanitiseInput(structuralConcerns || "No concerns", 150)}
+- Moisture/dampness: ${sanitiseInput(moistureConcerns || "None", 150)}
+- Asbestos risk: ${sanitiseInput(asbestosRisk || "Low", 20)}
+- Pest damage: ${sanitiseInput(String(pestDamage || "None"), 60)}
+- Services: ${sanitiseInput(servicesCondition || "Not assessed", 100)}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Respond ONLY with a JSON object:
+{
+  "executiveSummary": string (3-4 sentences formal paragraph),
+  "buyerRecommendation": "PROCEED_WITH_CONFIDENCE|PROCEED_WITH_CONDITIONS|PROCEED_WITH_CAUTION|SEEK_EXPERT_ADVICE|DO_NOT_PROCEED",
+  "keyFindingsByCategory": [{"category": string, "findings": string, "urgency": "IMMEDIATE|WITHIN_3_MONTHS|MONITOR|COSMETIC"}],
+  "priorityActions": [{"action": string, "estimatedCost": string, "urgency": "IMMEDIATE|SHORT_TERM|LONG_TERM"}],
+  "furtherInvestigations": [string],
+  "negotiationPoints": [string],
+  "lifeExpectancyAssessment": string,
+  "disclaimer": string
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1000,
+      temperature: 0.3,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      propertyAddress: sanitisedAddress,
+      buyerRecommendation: parsed.buyerRecommendation || "PROCEED_WITH_CONDITIONS",
+      executiveSummary: parsed.executiveSummary || "",
+      keyFindingsByCategory: parsed.keyFindingsByCategory || [],
+      priorityActions: parsed.priorityActions || [],
+      furtherInvestigations: parsed.furtherInvestigations || [],
+      negotiationPoints: parsed.negotiationPoints || [],
+      lifeExpectancyAssessment: parsed.lifeExpectancyAssessment || "",
+      disclaimer: parsed.disclaimer || "This report is based on a visual inspection only. Concealed defects may exist that cannot be identified without invasive investigation.",
+    });
+  } catch (e) {
+    console.error("AI pre-purchase report error:", e.message);
+    const hasSerious = (Array.isArray(majorDefects) ? majorDefects : [majorDefects]).some(d => d);
+    return res.json({
+      success: true,
+      propertyAddress: sanitisedAddress,
+      buyerRecommendation: hasSerious ? "PROCEED_WITH_CAUTION" : "PROCEED_WITH_CONDITIONS",
+      executiveSummary: `A pre-purchase building inspection was conducted at ${sanitisedAddress}. The building is approximately ${buildingAge || "unknown age"} years old and is a ${buildingType || "residential"} property. The overall condition is assessed as ${overallConditionRating || "fair"} with ${Array.isArray(majorDefects) && majorDefects.length > 0 ? majorDefects.length + " major defect(s)" : "no major defects"} identified.`,
+      keyFindingsByCategory: [
+        { category: "Roof", findings: sanitiseInput(roofCondition || "Not assessed", 100), urgency: "MONITOR" },
+        { category: "Structure", findings: sanitiseInput(structuralConcerns || "No major concerns identified", 150), urgency: "MONITOR" },
+        { category: "Moisture", findings: sanitiseInput(moistureConcerns || "No major moisture issues identified", 150), urgency: "MONITOR" },
+      ],
+      priorityActions: Array.isArray(urgentItems) ? urgentItems.slice(0, 5).map(i => ({ action: sanitiseInput(String(i), 150), estimatedCost: "TBC", urgency: "SHORT_TERM" })) : [],
+      furtherInvestigations: [
+        asbestosRisk && asbestosRisk !== "LOW" ? "Asbestos assessment by licensed consultant" : null,
+        pestDamage ? "Timber pest inspection" : null,
+        structuralConcerns ? "Structural engineer assessment" : null,
+      ].filter(Boolean),
+      negotiationPoints: estimatedRepairCost ? [`Estimated repair cost $${estimatedRepairCost} — consider negotiating price adjustment`] : [],
+      lifeExpectancyAssessment: "Building life expectancy assessment requires detailed structural review.",
+      disclaimer: "This report is based on a visual inspection only. Concealed defects may exist. This AI-generated narrative is indicative only — rely on the signed inspector's report for all decisions.",
+    });
+  }
+});
+
+// POST /thermal-performance-test — Log a thermal performance / air tightness test (NCC 2022 Section J)
+app.post("/thermal-performance-test", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectAddress, buildingClass, climateZone, testDate,
+    testedBy, testerAccreditation,
+    testMethod, blowerDoorPressurePa,
+    ach50, n50, q50, airLeakageRateLm2,
+    designNCC6StarTarget, designACH50Target, starRating,
+    envelopeAreaM2, conditionedVolumeM3,
+    testResult, failureLocations, remediationCompleted, postRemediationACH50,
+    buildingPermitRef, nccVersion, notes,
+  } = req.body;
+
+  if (!projectId || !testDate || !testedBy || !testMethod) {
+    return res.status(400).json({ error: "projectId, testDate, testedBy, and testMethod are required." });
+  }
+
+  // NCC 2022 air tightness requirements
+  // Section J1.5 — mandatory for Class 2, 3, 9a, and Class 1 (new)
+  // Target: ≤ 10 m³/(h·m²) at 50 Pa for Class 1, or NCC Section J compliance pathway specific target
+  const NCC_2022_CLASS1_LIMIT_QM2 = 10.0; // m³/(h·m²) at 50 Pa
+  const NCC_2022_ACH50_GUIDANCE = 10.0;    // typical guidance for residential
+
+  const measuredACH50 = ach50 !== undefined ? Number(ach50) : null;
+  const measuredAirLeakage = airLeakageRateLm2 !== undefined ? Number(airLeakageRateLm2) : null;
+  const targetACH50 = designACH50Target ? Number(designACH50Target) : NCC_2022_ACH50_GUIDANCE;
+
+  let passFailResult = "NOT_ASSESSED";
+  let exceedancePercent = null;
+  if (measuredACH50 !== null) {
+    passFailResult = measuredACH50 <= targetACH50 ? "PASS" : "FAIL";
+    exceedancePercent = measuredACH50 > targetACH50
+      ? Math.round(((measuredACH50 - targetACH50) / targetACH50) * 100)
+      : null;
+  } else if (measuredAirLeakage !== null) {
+    passFailResult = measuredAirLeakage <= NCC_2022_CLASS1_LIMIT_QM2 ? "PASS" : "FAIL";
+  }
+
+  const resolvedResult = testResult || passFailResult;
+  const allFailureLocations = (failureLocations || []).map(f => sanitiseInput(String(f), 150)).slice(0, 20);
+
+  const ref = `TPT-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectAddress: sanitiseInput(projectAddress || "", 300),
+    buildingClass: sanitiseInput(String(buildingClass || ""), 20),
+    climateZone: sanitiseInput(String(climateZone || ""), 10),
+    testDate,
+    tester: { name: sanitiseInput(testedBy, 120), accreditation: sanitiseInput(testerAccreditation || "", 80) },
+    testMethod: sanitiseInput(testMethod, 60),
+    blowerDoorPressurePa: blowerDoorPressurePa || 50,
+    measurements: {
+      ach50: measuredACH50,
+      n50: n50 ? Number(n50) : null,
+      q50: q50 ? Number(q50) : null,
+      airLeakageRateLm2: measuredAirLeakage,
+    },
+    design: {
+      ncc6StarTarget: designNCC6StarTarget || null,
+      ach50Target: targetACH50,
+      starRating: starRating || null,
+      envelopeAreaM2: envelopeAreaM2 || null,
+      conditionedVolumeM3: conditionedVolumeM3 || null,
+    },
+    result: {
+      status: resolvedResult,
+      exceedancePercent,
+      failureLocations: allFailureLocations,
+      remediationCompleted: !!remediationCompleted,
+      postRemediationACH50: postRemediationACH50 ? Number(postRemediationACH50) : null,
+    },
+    buildingPermitRef: sanitiseInput(buildingPermitRef || "", 60),
+    nccVersion: sanitiseInput(nccVersion || "NCC 2022", 20),
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("thermal_performance_tests").insert(record);
+      if (error) console.error("Thermal test insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Thermal test DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    result: resolvedResult,
+    measuredACH50,
+    targetACH50,
+    exceedancePercent,
+    message: resolvedResult === "PASS"
+      ? `Thermal performance test PASSED — ACH50: ${measuredACH50 || "N/A"} (target ≤ ${targetACH50}).`
+      : resolvedResult === "FAIL"
+        ? `Thermal performance test FAILED — ACH50: ${measuredACH50} exceeds target of ${targetACH50} by ${exceedancePercent}%. Remediate and retest.`
+        : "Thermal performance test recorded — result not assessed.",
+    nccReference: "NCC 2022 Section J1.5 — Air infiltration requirements for Class 1 and 2 buildings.",
+    saved,
+    record,
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
