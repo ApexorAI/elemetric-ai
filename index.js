@@ -63518,6 +63518,436 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /chemical-storage-inspection — Hazardous chemical storage per OHS Regulations 2017 (Vic) / AS 3780
+app.post("/chemical-storage-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    storageLocation,
+    inspectionDate,
+    inspector,
+    chemicals,            // array of { name, unNumber, hazardClass, quantity, unit, sdsPresent, sdsCurrentDate }
+    totalFlammableLiquid_L,
+    totalOxidiser_kg,
+    totalToxicSubstance_kg,
+    totalCorrosive_L,
+    storageType,          // bunded-cabinet | dedicated-room | outdoor-bund | drum-store | gas-cylinder-cage
+    bunded,               // true | false
+    bungCapacity_L,       // must hold 110% of largest container or 25% of total stored
+    bungIntact,
+    ventilationAdequate,
+    signsPosted,          // GHS hazard signs
+    fireExtinguisherPresent,
+    fireExtinguisherType, // DCP | CO2 | foam
+    eyewashPresent,
+    spillKitPresent,
+    spillKitContents,
+    incompatiblesSegregated, // e.g. oxidisers away from flammables
+    sdsRegisterCurrent,
+    wasteDisposalCompliant,
+    emergencyContactPosted,
+    notifiableQuantityExceeded, // true | false — triggers MSDS lodgement with EPA
+    criticalDefects,      // array of strings
+    photos,
+    notes,
+  } = req.body;
+
+  const failures = [];
+
+  // Flammable liquid thresholds — OHS Regs 2017 (Vic): >250 L requires bunded storage
+  const totalFlam = parseFloat(totalFlammableLiquid_L) || 0;
+  if (totalFlam > 250 && !bunded) {
+    failures.push(`${totalFlam} L flammable liquid stored — bunded storage required for >250 L`);
+  }
+
+  // Bund capacity check — must hold 110% of largest container OR 25% total
+  if (bunded && !bungIntact) {
+    failures.push("Bund is damaged or not intact — spill containment compromised");
+  }
+
+  // Incompatibles segregation
+  if (incompatiblesSegregated === false || incompatiblesSegregated === "false") {
+    failures.push("Incompatible chemicals not segregated — fire, explosion, or toxic reaction risk");
+  }
+
+  // SDS register
+  if (sdsRegisterCurrent === false || sdsRegisterCurrent === "false") {
+    failures.push("SDS register not current — OHS Regulations 2017 (Vic) r.337 requires current SDS for all hazardous chemicals");
+  }
+
+  // Fire extinguisher
+  if (!fireExtinguisherPresent) {
+    failures.push("Fire extinguisher not present at chemical storage area");
+  }
+
+  // Emergency contact
+  if (!emergencyContactPosted) {
+    failures.push("Emergency contact details not posted at storage area");
+  }
+
+  // Custom critical defects
+  if (Array.isArray(criticalDefects)) criticalDefects.forEach((d) => failures.push(d));
+
+  const passed = failures.length === 0;
+  const overallResult = passed ? "COMPLIANT" : "NON-COMPLIANT";
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    storage_location: sanitiseInput(storageLocation),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    chemicals: chemicals || [],
+    total_flammable_liquid_l: totalFlammableLiquid_L,
+    total_oxidiser_kg: totalOxidiser_kg,
+    total_toxic_substance_kg: totalToxicSubstance_kg,
+    total_corrosive_l: totalCorrosive_L,
+    storage_type: sanitiseInput(storageType),
+    bunded,
+    bung_capacity_l: bungCapacity_L,
+    bung_intact: bungIntact,
+    ventilation_adequate: ventilationAdequate,
+    signs_posted: signsPosted,
+    fire_extinguisher_present: fireExtinguisherPresent,
+    fire_extinguisher_type: sanitiseInput(fireExtinguisherType),
+    eyewash_present: eyewashPresent,
+    spill_kit_present: spillKitPresent,
+    incompatibles_segregated: incompatiblesSegregated,
+    sds_register_current: sdsRegisterCurrent,
+    waste_disposal_compliant: wasteDisposalCompliant,
+    emergency_contact_posted: emergencyContactPosted,
+    notifiable_quantity_exceeded: notifiableQuantityExceeded,
+    critical_defects: criticalDefects || [],
+    failures,
+    overall_result: overallResult,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("chemical_storage_inspections")
+      .insert(record);
+    if (dbErr) console.error("DB error /chemical-storage-inspection:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  if (!passed) {
+    return res.status(422).json({
+      error: "Chemical storage inspection — non-compliance identified",
+      failures,
+      overallResult,
+      immediateActions: [
+        "Rectify critical defects immediately",
+        "Segregate incompatible chemicals",
+        "Ensure bund integrity restored before use",
+      ],
+      applicableStandards: [
+        "OHS Regulations 2017 (Vic) Chapter 7",
+        "AS 3780",
+        "AS 1940 (flammable liquids)",
+        "GHS (Globally Harmonised System)",
+      ],
+      saved,
+    });
+  }
+
+  res.json({
+    message: "Chemical storage inspection completed — compliant",
+    overallResult,
+    totalFlammableLiquid_L: totalFlam,
+    bunded,
+    applicableStandards: [
+      "OHS Regulations 2017 (Vic) Chapter 7",
+      "AS 3780",
+      "AS 1940",
+      "GHS",
+    ],
+    saved,
+  });
+});
+
+// POST /traffic-management-inspection — Site traffic management plan inspection per AS 1742.3
+app.post("/traffic-management-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    inspectionDate,
+    inspector,
+    tmcId,               // Traffic Management Certificate holder ID
+    tmcName,
+    roadType,            // arterial | collector | local | private | highway
+    speedLimit_kmh,
+    workZoneLength_m,
+    inspectionType,      // initial-setup | routine | post-incident | end-of-day
+    signsInstalled,      // array of { type, position, condition }
+    barrierType,         // water-filled | concrete | delineator | traffic-cones | witches-hat
+    barrierCondition,
+    workersInRoadway,
+    workerHighVisCompliant, // true | false
+    pedestrianProtection, // path-maintained | temporary-path | none-required
+    trafficControllerPresent, // true | false
+    trafficControllerTicket,  // licence/ticket number
+    flaggerCompliant,
+    taper_length_m,
+    designTaperLength_m,  // required by AS 1742.3 based on speed
+    bufferZone_m,
+    clearanceToWork_m,    // distance from live traffic to workers
+    minimumClearance_m,   // from TMP
+    nightWorkApproved,
+    lightingAdequate,
+    criticalIssues,       // array of strings
+    photos,
+    notes,
+  } = req.body;
+
+  const failures = [];
+
+  // Worker hi-vis
+  if (workerHighVisCompliant === false || workerHighVisCompliant === "false") {
+    failures.push("Workers in roadway not wearing compliant hi-visibility vests (Class D or E)");
+  }
+
+  // Traffic controller ticket
+  if (trafficControllerPresent && !trafficControllerTicket) {
+    failures.push("Traffic controller present but licence/ticket not recorded");
+  }
+
+  // Taper length check
+  const actualTaper = parseFloat(taper_length_m) || 0;
+  const reqTaper = parseFloat(designTaperLength_m) || 0;
+  if (reqTaper > 0 && actualTaper < reqTaper * 0.85) {
+    failures.push(`Taper length ${actualTaper} m is less than 85% of required ${reqTaper} m`);
+  }
+
+  // Clearance to work check
+  const clearance = parseFloat(clearanceToWork_m) || 0;
+  const minClearance = parseFloat(minimumClearance_m) || 0;
+  if (minClearance > 0 && clearance < minClearance) {
+    failures.push(`Clearance to work ${clearance} m is below minimum ${minClearance} m from TMP`);
+  }
+
+  // Night work lighting
+  if (nightWorkApproved && !lightingAdequate) {
+    failures.push("Night work — inadequate lighting for safe operations");
+  }
+
+  // Custom critical issues
+  if (Array.isArray(criticalIssues)) criticalIssues.forEach((i) => failures.push(i));
+
+  const passed = failures.length === 0;
+  const overallResult = passed ? "COMPLIANT" : "NON-COMPLIANT";
+
+  if (!passed) {
+    return res.status(422).json({
+      error: "Traffic management inspection — non-compliance identified",
+      failures,
+      overallResult,
+      immediateActions: [
+        "Stop work in roadway until deficiencies rectified",
+        "Notify traffic management supervisor and principal contractor",
+        "Do not permit workers in roadway without compliant hi-vis and correct clearances",
+      ],
+      applicableStandards: [
+        "AS 1742.3",
+        "VicRoads Traffic Management for Works on Roads Specification",
+        "OHS Regulations 2017 (Vic)",
+        "Code of Practice for Workplace Traffic Management (Vic)",
+      ],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    tmc_id: sanitiseInput(tmcId),
+    tmc_name: sanitiseInput(tmcName),
+    road_type: sanitiseInput(roadType),
+    speed_limit_kmh: speedLimit_kmh,
+    work_zone_length_m: workZoneLength_m,
+    inspection_type: sanitiseInput(inspectionType),
+    signs_installed: signsInstalled || [],
+    barrier_type: sanitiseInput(barrierType),
+    barrier_condition: sanitiseInput(barrierCondition),
+    workers_in_roadway: workersInRoadway,
+    worker_high_vis_compliant: workerHighVisCompliant,
+    pedestrian_protection: sanitiseInput(pedestrianProtection),
+    traffic_controller_present: trafficControllerPresent,
+    traffic_controller_ticket: sanitiseInput(trafficControllerTicket),
+    flagger_compliant: flaggerCompliant,
+    taper_length_m,
+    design_taper_length_m: designTaperLength_m,
+    buffer_zone_m: bufferZone_m,
+    clearance_to_work_m: clearanceToWork_m,
+    minimum_clearance_m: minimumClearance_m,
+    night_work_approved: nightWorkApproved,
+    lighting_adequate: lightingAdequate,
+    overall_result: overallResult,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("traffic_management_inspections")
+      .insert(record);
+    if (dbErr) console.error("DB error /traffic-management-inspection:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Traffic management inspection completed — compliant",
+    overallResult,
+    clearanceToWork_m: clearanceToWork_m || null,
+    taperLength_m: taper_length_m || null,
+    applicableStandards: [
+      "AS 1742.3",
+      "VicRoads Works on Roads Specification",
+      "OHS Regulations 2017 (Vic)",
+    ],
+    saved,
+  });
+});
+
+// POST /ai-chemical-risk-assessment — AI assesses chemical storage hazards, incompatibilities, and exposure controls
+app.post("/ai-chemical-risk-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    chemicals,            // array of { name, hazardClass, quantity }
+    storageType,
+    bunded,
+    ventilationAdequate,
+    workplaceType,        // construction | workshop | laboratory | warehouse | industrial
+    numberOfWorkers,
+    nearbyIgnitionSources,
+    drainageToSewer,
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are an occupational hygienist and chemical safety specialist with 20 years experience on Australian construction and industrial sites. Assess hazardous chemical storage risks per OHS Regulations 2017 (Vic) Chapter 7, AS 3780, AS 1940, and GHS.
+
+Assess:
+1. Incompatible chemical combinations — fire, explosion, toxic gas generation risks
+2. Flammable liquid storage compliance — thresholds, bunding, ventilation
+3. Inhalation, skin, and ingestion exposure risks in the workplace
+4. Emergency response requirements — spill containment, eyewash, fire suppression
+5. Environmental risk — drainage to waterways, soil contamination
+6. Notifiable quantity thresholds (OHS Regs 2017 Vic Schedule 11)
+7. SDS compliance — currency, accessibility
+
+Respond with JSON: { "overallRisk": "low|medium|high|critical", "incompatiblePairs": [], "fireExplosionRisk": "low|medium|high|critical", "inhalationRisk": "low|medium|high", "environmentalRisk": "low|medium|high", "notifiableQuantityRisk": boolean, "immediateHazards": [], "requiredControls": [], "storageImprovements": [], "ppeRequired": [], "emergencyProcedures": [], "environmentalControls": [], "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const chemicalSummary = Array.isArray(chemicals)
+    ? chemicals.map((c) => `${c.name} — Class ${c.hazardClass || "?"}, ${c.quantity || "?"}`).join("\n")
+    : "Not specified";
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Chemicals stored:\n${chemicalSummary}
+Storage type: ${storageType || "not specified"}
+Bunded: ${bunded || "not specified"}
+Ventilation adequate: ${ventilationAdequate || "not specified"}
+Workplace type: ${workplaceType || "construction"}
+Number of workers: ${numberOfWorkers || "not specified"}
+Nearby ignition sources: ${nearbyIgnitionSources || "none identified"}
+Drainage to sewer: ${drainageToSewer || "no"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-chemical-risk-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        overallRisk: "medium",
+        incompatiblePairs: [
+          "Acids and bases — exothermic reaction and toxic gas",
+          "Oxidisers and flammable liquids — fire and explosion risk",
+          "Chlorine-based products and ammonia — toxic chloramine gas",
+        ],
+        fireExplosionRisk: "medium",
+        inhalationRisk: "medium",
+        environmentalRisk: "medium",
+        notifiableQuantityRisk: false,
+        immediateHazards: [
+          "Flammable vapours from solvent storage in unventilated areas",
+          "Incompatible chemical proximity in shared storage",
+        ],
+        requiredControls: [
+          "Segregate oxidisers from flammables with minimum 3 m separation or fire-rated partition",
+          "Bund all liquid chemical storage to hold 110% of largest container",
+          "Ensure mechanical ventilation in enclosed storage areas (10 air changes/hr minimum)",
+          "Post GHS hazard placards on all containers and storage areas",
+        ],
+        storageImprovements: [
+          "Install bunded flammable liquids cabinet for quantities >250 L",
+          "Provide dedicated colour-coded segregated storage areas",
+          "Install eyewash station within 10 seconds travel of chemical use area",
+        ],
+        ppeRequired: [
+          "Chemical-resistant gloves (nitrile or neoprene)",
+          "Safety glasses or face shield for splashing risk",
+          "Chemical-resistant apron where splash risk exists",
+        ],
+        emergencyProcedures: [
+          "Spill kit sized for largest single container volume",
+          "DCP fire extinguisher for flammable liquids",
+          "Emergency contact list including Poisons Information Centre 13 11 26",
+        ],
+        environmentalControls: [
+          "Bunding prevents spill reaching stormwater drainage",
+          "Incompatible waste streams collected separately",
+          "Chemical waste disposed via licensed contractor",
+        ],
+        applicableStandards: [
+          "OHS Regulations 2017 (Vic) Chapter 7",
+          "AS 3780",
+          "AS 1940",
+          "GHS",
+          "Environment Protection Act 2017 (Vic)",
+        ],
+        recommendation:
+          "Segregate incompatible chemicals, install bunded storage for flammables >250 L, improve ventilation, and update SDS register. Review notifiable quantity thresholds annually.",
+        summary:
+          "Chemical storage presents medium risk manageable with proper segregation, bunding, ventilation, and emergency response provisions. Maintain current SDS register and train workers in chemical hazards.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
