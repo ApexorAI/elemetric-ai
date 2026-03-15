@@ -41223,6 +41223,194 @@ Return JSON with:
   }
 });
 
+// POST /material-takeoff — Store and manage a material quantity takeoff
+app.post("/material-takeoff", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, trade, takeoffDate, preparedBy,
+    items = [], wastePercentage = 10, notes,
+  } = req.body;
+  if (!projectId || !trade || !items.length) {
+    return res.status(400).json({ error: "projectId, trade, and at least one item are required." });
+  }
+  const takeoffRef = `MTO-${Date.now().toString(36).toUpperCase()}`;
+  const processedItems = Array.isArray(items) ? items.map((item, i) => {
+    const baseQty = Number(item.quantity) || 0;
+    const waste = baseQty * (Number(wastePercentage) / 100);
+    const orderQty = +(baseQty + waste).toFixed(2);
+    const itemCost = orderQty * (Number(item.unitCostAud) || 0);
+    return {
+      lineNo: i + 1,
+      description: sanitiseInput(item.description || ""),
+      specification: sanitiseInput(item.specification || ""),
+      unit: sanitiseInput(item.unit || ""),
+      netQuantity: +baseQty.toFixed(3),
+      wasteAllowance: +waste.toFixed(3),
+      orderQuantity: orderQty,
+      unitCostAud: Number(item.unitCostAud) || null,
+      itemCostAud: itemCost > 0 ? +itemCost.toFixed(2) : null,
+      supplier: sanitiseInput(item.supplier || ""),
+    };
+  }) : [];
+  const totalNetQty = processedItems.length;
+  const totalCostAud = processedItems.reduce((s, i) => s + (i.itemCostAud || 0), 0);
+  const record = {
+    takeoff_ref: takeoffRef,
+    project_id: projectId,
+    project_name: sanitiseInput(projectName || ""),
+    trade: sanitiseInput(trade),
+    takeoff_date: takeoffDate || new Date().toISOString().split("T")[0],
+    prepared_by: sanitiseInput(preparedBy || ""),
+    items: processedItems,
+    item_count: processedItems.length,
+    waste_percentage: Number(wastePercentage),
+    total_cost_aud: totalCostAud > 0 ? +totalCostAud.toFixed(2) : null,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("material_takeoffs").insert(record);
+    if (error) console.error("material-takeoff DB error:", error.message);
+  }
+  res.json({
+    takeoffRef, trade, itemCount: processedItems.length, wastePercentage: Number(wastePercentage),
+    totalCostAud: totalCostAud > 0 ? +totalCostAud.toFixed(2) : null,
+    items: processedItems, saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-material-estimator — AI estimates material quantities from a project description
+app.post("/ai-material-estimator", apiKeyAuth, async (req, res) => {
+  const {
+    trade, projectDescription, projectType = "residential",
+    floorAreaM2, wallLinearM, heightM, state = "VIC",
+    qualityLevel = "STANDARD", includeAllowances = true,
+  } = req.body;
+  if (!trade || !projectDescription) {
+    return res.status(400).json({ error: "trade and projectDescription are required." });
+  }
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedDesc = sanitiseInput(projectDescription);
+  const sanitisedType = sanitiseInput(projectType);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian quantity surveyor and estimating specialist. Generate material quantity estimates for construction projects.`;
+  const userPrompt = `Estimate materials for this ${sanitisedTrade} project:
+Description: ${sanitisedDesc}
+Project type: ${sanitisedType}
+State: ${sanitisedState}
+Floor area: ${floorAreaM2 ? `${floorAreaM2} m²` : "Not specified"}
+Wall linear metres: ${wallLinearM ? `${wallLinearM} LM` : "Not specified"}
+Height: ${heightM ? `${heightM} m` : "Standard 2.7m"}
+Quality level: ${qualityLevel}
+Include waste/allowances: ${includeAllowances}
+
+Return JSON with:
+{
+  "disclaimer": "...",
+  "estimateItems": [
+    {
+      "description": "...",
+      "specification": "...",
+      "unit": "m2|LM|each|m3|kg|L",
+      "quantity": 0,
+      "wastePercentage": 10,
+      "orderQuantity": 0,
+      "estimatedUnitCostAud": 0,
+      "estimatedTotalCostAud": 0,
+      "notes": "...",
+      "supplier_category": "..."
+    }
+  ],
+  "totalEstimatedCostAud": 0,
+  "costPerM2": 0,
+  "assumptions": ["...", "..."],
+  "exclusions": ["...", "..."],
+  "confidenceLevel": "HIGH|MEDIUM|LOW"
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 3000,
+    });
+    usageStats.openaiCalls++;
+    const estimate = JSON.parse(aiRes.choices[0].message.content);
+    const estimateRef = `AIE-${Date.now().toString(36).toUpperCase()}`;
+    res.json({ estimateRef, trade: sanitisedTrade, projectType: sanitisedType, state: sanitisedState, floorAreaM2, estimate });
+  } catch (err) {
+    console.error("ai-material-estimator error:", err.message);
+    res.json({
+      estimateRef: "AIE-FALLBACK", trade: sanitisedTrade, projectType: sanitisedType, state: sanitisedState, floorAreaM2,
+      estimate: {
+        disclaimer: "AI estimation is unavailable. This is a placeholder — engage a quantity surveyor for accurate estimates.",
+        estimateItems: [],
+        totalEstimatedCostAud: null, costPerM2: null,
+        assumptions: ["Site inspection required", "Material prices subject to market conditions"],
+        exclusions: ["All preliminary costs", "Equipment hire", "Professional fees"],
+        confidenceLevel: "LOW",
+      },
+    });
+  }
+});
+
+// POST /waste-reduction-plan — Create a construction waste reduction plan
+app.post("/waste-reduction-plan", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, trade, projectType = "residential",
+    floorAreaM2, constructionType, targetWasteReductionPercent = 30,
+    recyclingTargetPercent = 60, wasteTypes = [],
+    wasterCollector, state = "VIC", notes,
+  } = req.body;
+  if (!projectId || !trade) {
+    return res.status(400).json({ error: "projectId and trade are required." });
+  }
+  const planRef = `WRP-${Date.now().toString(36).toUpperCase()}`;
+  // Standard waste estimates by project type (tonnes per 100m² of floor area)
+  const baseWasteFactor = constructionType === "DEMOLITION" ? 8 : projectType === "commercial" ? 2.5 : 1.8;
+  const estimatedWasteTonnes = floorAreaM2 ? +(Number(floorAreaM2) / 100 * baseWasteFactor).toFixed(1) : null;
+  const targetDiversionTonnes = estimatedWasteTonnes
+    ? +(estimatedWasteTonnes * Number(recyclingTargetPercent) / 100).toFixed(1)
+    : null;
+  const wasteStreams = [
+    { type: "TIMBER", targetAction: "Reuse or recycle — bulk timber accepted at most recyclers", targetPercentage: 80 },
+    { type: "CONCRETE_MASONRY", targetAction: "Crush for fill or aggregate — recycled concrete facilities available", targetPercentage: 90 },
+    { type: "STEEL_METAL", targetAction: "Scrap metal recycler — highest value waste stream", targetPercentage: 95 },
+    { type: "PLASTERBOARD", targetAction: "Separate collection — plasterboard recyclers accept off-cuts", targetPercentage: 70 },
+    { type: "CARDBOARD_PACKAGING", targetAction: "Flatten and recycle — minimise packaging on delivery", targetPercentage: 90 },
+    { type: "GENERAL_WASTE", targetAction: "Minimise by separating all other streams", targetPercentage: 20 },
+  ].filter(ws => !wasteTypes.length || wasteTypes.includes(ws.type));
+  const record = {
+    plan_ref: planRef,
+    project_id: projectId,
+    project_name: sanitiseInput(projectName || ""),
+    trade: sanitiseInput(trade),
+    project_type: sanitiseInput(projectType),
+    floor_area_m2: Number(floorAreaM2) || null,
+    construction_type: sanitiseInput(constructionType || ""),
+    target_waste_reduction_pct: Number(targetWasteReductionPercent),
+    recycling_target_pct: Number(recyclingTargetPercent),
+    estimated_waste_tonnes: estimatedWasteTonnes,
+    target_diversion_tonnes: targetDiversionTonnes,
+    waste_streams: wasteStreams,
+    waste_collector: sanitiseInput(wasterCollector || ""),
+    state: sanitiseInput(state),
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("waste_reduction_plans").insert(record);
+    if (error) console.error("waste-reduction-plan DB error:", error.message);
+  }
+  res.json({
+    planRef, trade, projectType, floorAreaM2: Number(floorAreaM2) || null,
+    estimatedWasteTonnes, targetDiversionTonnes, recyclingTargetPercent: Number(recyclingTargetPercent),
+    wasteStreamCount: wasteStreams.length, saved: !!supabaseAdmin,
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
