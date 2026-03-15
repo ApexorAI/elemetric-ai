@@ -31865,6 +31865,240 @@ app.post("/emergency-drill", apiKeyAuth, async (req, res) => {
   res.json({ success: true, drillId: null, performanceRating, outcome: record.outcome, ...record, saved: false });
 });
 
+// ── Round 116: Noise/vibration monitoring, dust log, AI site conditions ───────
+
+// POST /noise-monitoring — Log noise level readings for environmental compliance
+app.post("/noise-monitoring", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, projectId, location, recordedBy,
+    readings = [], maxPermittedLA90, measurementPeriod = "daytime",
+    weatherConditions, receiverType, notes,
+  } = req.body;
+
+  if (!siteId || !readings.length) return res.status(400).json({ error: "siteId and readings required." });
+
+  const validPeriods = ["DAYTIME", "EVENING", "NIGHT", "WEEKEND"];
+  const period = (measurementPeriod || "DAYTIME").toUpperCase();
+
+  // EPA VIC limits (dB(A)) — approximate indicative only
+  const epaLimits = { DAYTIME: 65, EVENING: 60, NIGHT: 55, WEEKEND: 65 };
+  const limit = Number(maxPermittedLA90) || epaLimits[period] || 65;
+
+  const processedReadings = readings.map(r => ({
+    time: r.time || new Date().toISOString(),
+    laeq: Number(r.laeq) || null,
+    la90: Number(r.la90) || null,
+    lamax: Number(r.lamax) || null,
+    exceeds: r.la90 !== undefined ? Number(r.la90) > limit : null,
+  }));
+
+  const exceedances = processedReadings.filter(r => r.exceeds === true).length;
+  const maxLA90 = Math.max(...processedReadings.map(r => r.la90 || 0));
+  const avgLaeq = processedReadings.filter(r => r.laeq !== null).length > 0
+    ? Math.round(processedReadings.reduce((s, r) => s + (r.laeq || 0), 0) / processedReadings.filter(r => r.laeq !== null).length * 10) / 10
+    : null;
+
+  const complianceStatus = exceedances === 0 ? "COMPLIANT" : exceedances <= 2 ? "MINOR_EXCEEDANCE" : "NON_COMPLIANT";
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    project_id: sanitiseInput(projectId || ""),
+    location: sanitiseInput(location || ""),
+    recorded_by: sanitiseInput(recordedBy || ""),
+    readings: processedReadings,
+    measurement_period: validPeriods.includes(period) ? period : "DAYTIME",
+    permitted_limit_la90: limit,
+    max_la90_recorded: maxLA90,
+    avg_laeq: avgLaeq,
+    exceedance_count: exceedances,
+    compliance_status: complianceStatus,
+    weather_conditions: sanitiseInput(weatherConditions || ""),
+    receiver_type: sanitiseInput(receiverType || ""),
+    notes: sanitiseInput(notes || ""),
+    recorded_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("noise_monitoring")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, logId: data.id, complianceStatus, exceedances, ...record });
+  }
+
+  res.json({ success: true, logId: null, complianceStatus, exceedances, ...record, saved: false });
+});
+
+// POST /vibration-monitoring — Log vibration readings for structure protection
+app.post("/vibration-monitoring", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, projectId, monitoringLocation, source,
+    ppvMms, dominantFrequencyHz, measuredBy, measurementDate,
+    nearbyStructure, structureType, permittedPpvMms, notes,
+  } = req.body;
+
+  if (!siteId || ppvMms === undefined) return res.status(400).json({ error: "siteId and ppvMms required." });
+
+  // AS 2187.2 peak particle velocity limits (indicative)
+  const defaultLimits = { residential: 5, commercial: 10, heritage: 2, industrial: 15 };
+  const strType = (structureType || "residential").toLowerCase();
+  const limit = Number(permittedPpvMms) || defaultLimits[strType] || 5;
+  const ppv = Number(ppvMms);
+  const exceedsLimit = ppv > limit;
+  const warningThreshold = limit * 0.8;
+  const nearWarning = ppv > warningThreshold && !exceedsLimit;
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    project_id: sanitiseInput(projectId || ""),
+    monitoring_location: sanitiseInput(monitoringLocation || ""),
+    source: sanitiseInput(source || ""),
+    ppv_mms: ppv,
+    dominant_frequency_hz: Number(dominantFrequencyHz) || null,
+    measured_by: sanitiseInput(measuredBy || ""),
+    measurement_date: measurementDate || new Date().toISOString().split("T")[0],
+    nearby_structure: sanitiseInput(nearbyStructure || ""),
+    structure_type: sanitiseInput(structureType || ""),
+    permitted_ppv_mms: limit,
+    exceeds_limit: exceedsLimit,
+    near_warning: nearWarning,
+    compliance_status: exceedsLimit ? "NON_COMPLIANT" : nearWarning ? "WARNING" : "COMPLIANT",
+    applicable_standard: "AS 2187.2",
+    notes: sanitiseInput(notes || ""),
+    recorded_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("vibration_monitoring")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, logId: data.id, exceedsLimit, complianceStatus: record.compliance_status, ...record });
+  }
+
+  res.json({ success: true, logId: null, exceedsLimit, complianceStatus: record.compliance_status, ...record, saved: false });
+});
+
+// POST /dust-monitoring — Log dust (TSP/PM10) monitoring readings
+app.post("/dust-monitoring", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, projectId, monitorLocation, measurementDate,
+    tspUgM3, pm10UgM3, pm25UgM3, windSpeedKmh, windDirection,
+    humidityPercent, dustControlsInPlace = [], measuredBy, notes,
+  } = req.body;
+
+  if (!siteId || !measurementDate) return res.status(400).json({ error: "siteId and measurementDate required." });
+
+  // EPA indicative limits (ug/m3) — 24-hour average
+  const limits = { tsp: 120, pm10: 50, pm25: 25 };
+
+  const tsp = Number(tspUgM3) || null;
+  const pm10 = Number(pm10UgM3) || null;
+  const pm25 = Number(pm25UgM3) || null;
+
+  const exceedances = [];
+  if (tsp !== null && tsp > limits.tsp) exceedances.push(`TSP ${tsp} µg/m³ > ${limits.tsp} µg/m³ limit`);
+  if (pm10 !== null && pm10 > limits.pm10) exceedances.push(`PM10 ${pm10} µg/m³ > ${limits.pm10} µg/m³ limit`);
+  if (pm25 !== null && pm25 > limits.pm25) exceedances.push(`PM2.5 ${pm25} µg/m³ > ${limits.pm25} µg/m³ limit`);
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    project_id: sanitiseInput(projectId || ""),
+    monitor_location: sanitiseInput(monitorLocation || ""),
+    measurement_date: measurementDate,
+    tsp_ug_m3: tsp, pm10_ug_m3: pm10, pm25_ug_m3: pm25,
+    wind_speed_km_h: Number(windSpeedKmh) || null,
+    wind_direction: sanitiseInput(windDirection || ""),
+    humidity_percent: Number(humidityPercent) || null,
+    dust_controls_in_place: dustControlsInPlace.map(c => sanitiseInput(c)),
+    measured_by: sanitiseInput(measuredBy || ""),
+    exceedances,
+    compliance_status: exceedances.length > 0 ? "NON_COMPLIANT" : "COMPLIANT",
+    notes: sanitiseInput(notes || ""),
+    recorded_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("dust_monitoring")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, logId: data.id, complianceStatus: record.compliance_status, exceedances, ...record });
+  }
+
+  res.json({ success: true, logId: null, complianceStatus: record.compliance_status, exceedances, ...record, saved: false });
+});
+
+// POST /ai-site-conditions-brief — AI generates a daily site conditions brief from weather/environmental inputs
+app.post("/ai-site-conditions-brief", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, date, temperatureC, windSpeedKmh, windDirection,
+    humidity, uvIndex, precipitationMm, forecastDescription,
+    activeTrades = [], plannedActivities = [],
+  } = req.body;
+
+  if (!siteId) return res.status(400).json({ error: "siteId required." });
+
+  const prompt = `You are a senior Australian construction site manager writing a daily site conditions brief. Assess the weather conditions and advise on any impacts to planned work.
+
+Site: ${sanitiseInput(siteId)}
+Date: ${sanitiseInput(date || new Date().toISOString().split("T")[0])}
+Temperature: ${temperatureC !== undefined ? `${temperatureC}°C` : "Unknown"}
+Wind: ${windSpeedKmh ? `${windSpeedKmh} km/h from ${windDirection || "Unknown"}` : "Unknown"}
+Humidity: ${humidity ? `${humidity}%` : "Unknown"}
+UV Index: ${uvIndex || "Unknown"}
+Rainfall: ${precipitationMm !== undefined ? `${precipitationMm}mm` : "Unknown"}
+Forecast: ${sanitiseInput(forecastDescription || "Not provided")}
+Active trades: ${activeTrades.map(t => sanitiseInput(t)).join(", ") || "Not specified"}
+Planned activities: ${plannedActivities.map(a => sanitiseInput(a)).join(", ") || "Not specified"}
+
+Return a JSON object with:
+- "riskLevel": "LOW"|"MEDIUM"|"HIGH"|"EXTREME"
+- "workableConditions": boolean
+- "weatherImpact": string summary
+- "tradeImpacts": array of { "trade": string, "impact": "NIL"|"MINOR"|"SIGNIFICANT"|"STOP_WORK", "reason": string }
+- "heatAlerts": array of heat-related warnings if applicable
+- "windAlerts": array of wind-related warnings (crane, scaffolding)
+- "lightningRisk": boolean
+- "uvAdvice": string
+- "recommendedActions": array of specific actions to take today
+- "stopWorkThreshold": string describing conditions that would halt work
+- "briefSummary": 2-3 sentence summary for toolbox talk`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1200,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, siteId, date, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      riskLevel: temperatureC > 35 ? "HIGH" : "MEDIUM",
+      workableConditions: precipitationMm > 20 ? false : true,
+      weatherImpact: "Automated conditions brief unavailable. Review weather independently.",
+      tradeImpacts: [],
+      heatAlerts: temperatureC > 35 ? [`Temperature ${temperatureC}°C — implement heat management plan`] : [],
+      windAlerts: windSpeedKmh > 45 ? [`Wind ${windSpeedKmh} km/h — check crane/scaffold limits`] : [],
+      lightningRisk: false,
+      uvAdvice: "Apply SPF50+, wear sun-protective clothing, seek shade during breaks.",
+      recommendedActions: ["Review conditions with supervisor before commencing work"],
+      stopWorkThreshold: "Sustained winds > 45 km/h for crane/scaffold; sustained rainfall > 25mm/hr; lightning within 5km; temperature > 39°C.",
+      briefSummary: "Conditions brief unavailable. Proceed with caution and review weather forecast.",
+      siteId, date, generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
