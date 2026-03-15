@@ -9648,6 +9648,281 @@ Return ONLY valid JSON in this format:
   }
 });
 
+// ── POST /generate-swms ──────────────────────────────────────────────────────
+// Generates a Safe Work Method Statement (SWMS) framework for a job.
+// Returns a structured SWMS document compliant with OHS Regulations 2017 (Vic).
+app.post("/generate-swms", (req, res) => {
+  const {
+    jobType,
+    siteAddress,
+    scope = [],
+    traderName,
+    supervisorName,
+    companyName,
+    startDate,
+    estimatedDuration,
+  } = req.body || {};
+
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+  if (!jobType || !SUPPORTED.includes(jobType.toLowerCase())) {
+    return res.status(400).json({ error: `jobType required. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+
+  const HIGH_RISK_CONSTRUCTION_TRIGGERS = {
+    plumbing:   ["roof", "elevated", "confined space", "asbestos", "high voltage", "hot work"],
+    gas:        ["underground", "confined", "commercial kitchen", "high pressure", "lpg bulk"],
+    electrical: ["switchboard", "live work", "high voltage", "roof", "suspended", "mcc"],
+    drainage:   ["excavation", "trench", "confined space", "sewer", "underground"],
+    carpentry:  ["scaffold", "roof work", "tilt-up", "demolition", "structural removal", "height"],
+    hvac:       ["rooftop", "crane", "confined space", "ammonia", "large refrigerant charge"],
+  };
+
+  const scopeLower = scope.map(s => String(s).toLowerCase());
+  const triggers   = HIGH_RISK_CONSTRUCTION_TRIGGERS[jobType.toLowerCase()] || [];
+  const isHighRisk = triggers.some(t => scopeLower.some(s => s.includes(t)));
+
+  const TRADE_TASKS = {
+    plumbing: [
+      { task: "Site set-up and isolation of water supply", hazards: ["Slip from water spills", "Manual handling injury from tools"], controls: ["Dry site before work", "Use mechanical aids for heavy items", "Non-slip footwear"] },
+      { task: "Installation of pipework and fittings", hazards: ["Cuts from pipe cutting", "Eye injury from swarf", "Burns from soldering"], controls: ["Safety glasses worn at all times", "Leather gloves for hot work", "Fire blanket accessible"] },
+      { task: "Pressure testing and commissioning", hazards: ["Pressurised system failure", "Scalding from hot water"], controls: ["Stay clear of fittings during pressurisation", "Cold-test before hot-commissioning", "Relief valve installed before pressure test"] },
+      { task: "Reinstatement and site clean-up", hazards: ["Slipping on wet surfaces", "Sharp debris"], controls: ["Clean up water immediately", "Dispose of pipe offcuts in designated bin"] },
+    ],
+    gas: [
+      { task: "Isolation of gas supply", hazards: ["Gas ignition during isolation", "Asphyxiation in confined areas"], controls: ["No ignition sources within 3 m", "Gas detector in use", "Ventilate area before work"] },
+      { task: "Installation and connection of gas appliances", hazards: ["Gas leak", "Manual handling — heavy appliances"], controls: ["Mechanical aids for appliances >20 kg", "Continuous leak detection monitoring", "Buddy system for confined space entry"] },
+      { task: "Pressure and tightness testing", hazards: ["Pressurised fitting failure", "Unignited gas accumulation"], controls: ["Calibrated test equipment only", "All ignition sources removed", "Pressure test gauge facing away from body"] },
+      { task: "Commissioning and lighting appliances", hazards: ["Flashback or delayed ignition", "Carbon monoxide exposure"], controls: ["Verify ventilation before lighting", "CO detector in use", "Follow manufacturer lighting procedure"] },
+    ],
+    electrical: [
+      { task: "LOTO — isolation of electrical supply", hazards: ["Electrocution from live conductors", "Arc flash"], controls: ["Test dead before touching", "Multi-lock LOTO station used", "PPE: insulated gloves and face shield for switchboard"] },
+      { task: "Cable installation and termination", hazards: ["Cuts and abrasions from cable pulling", "Strain injury"], controls: ["Cable rollers and cable guides used", "Team lift for large cable drums", "Gloves worn throughout"] },
+      { task: "Switchboard work", hazards: ["Arc flash", "Electrocution", "Falling tools"], controls: ["HRC fuses and MCBs rated to AIC", "Exposed bus bars shielded", "Tools tethered when working at height"] },
+      { task: "Testing, commissioning, and RCD verification", hazards: ["Electric shock during testing", "Unexpected energisation"], controls: ["RCD tester used per AS/NZS 3017", "Testing performed single-handed where possible", "Bystanders kept clear"] },
+    ],
+    drainage: [
+      { task: "Excavation and trenching", hazards: ["Trench collapse", "Underground service strike", "Falls into excavation"], controls: ["Dial Before You Dig confirmation", "Trench shoring or battering to 1:1.5", "Barriers and signage around all excavations"] },
+      { task: "Pipe laying and bedding", hazards: ["Manual handling — pipe segments", "Cuts from pipe ends"], controls: ["Team lift for pipes > 20 kg", "Pipe caps on cut ends", "Non-slip footwear in trench"] },
+      { task: "Hydraulic testing", hazards: ["Pressurised test water release", "Collapse of unsupported trench"], controls: ["Shore all sections before test", "Test gauge facing away from body", "All personnel clear before pressurisation"] },
+      { task: "Backfilling and reinstatement", hazards: ["Compactor vibration injury", "Carbon monoxide from petrol compactor"], controls: ["Anti-vibration handles on compactor", "Petrol equipment used in ventilated area only", "Ear protection worn"] },
+    ],
+    carpentry: [
+      { task: "Site set-up, delivery, and manual handling", hazards: ["Strain injury from lifting timber", "Struck by falling materials"], controls: ["Team lifts for members >20 kg", "Hard hat in lift zones", "Stack materials at ground level"] },
+      { task: "Framing and structural work", hazards: ["Fall from height", "Power saw kickback", "Nail gun injury"], controls: ["Edge protection or harness above 2 m", "Anti-kickback blade guard on saw", "Anti-sequential trigger confirmed on nail gun"] },
+      { task: "Cutting sheet products (fibre cement, ply)", hazards: ["Silica dust inhalation", "Noise-induced hearing loss"], controls: ["Wet-cutting method used", "P2 respirator worn at all times during cutting", "Hearing protection above 85 dB"] },
+      { task: "Roofing and elevated work", hazards: ["Fall from roof edge or through fragile material", "Dropped tools"], controls: ["Working at heights plan documented", "Safety mesh or catch platform under fragile areas", "Tool lanyards used above 2 m"] },
+    ],
+    hvac: [
+      { task: "Recovery and handling of refrigerant", hazards: ["Refrigerant release — asphyxiation or combustion (A2L/A3)", "Skin contact — cryogenic burns"], controls: ["ARC-licensed technician only", "Refrigerant recovery cylinder weighed before and after", "PPE: safety glasses, cryogenic gloves"] },
+      { task: "Electrical isolation before refrigerant work", hazards: ["Electrocution", "Unexpected energisation"], controls: ["LOTO applied and tested", "RCD in use on all leads", "Second person during isolation"] },
+      { task: "Installation of equipment (outdoor unit, AHU)", hazards: ["Manual handling injury", "Falls from roof during installation"], controls: ["Lift plan for units >20 kg", "Rigging by licenced rigger if crane required", "Roof edge protection"] },
+      { task: "Commissioning and refrigerant charge", hazards: ["Overcharge → high-pressure rupture", "Refrigerant leak on combustion risk A2L"], controls: ["Charge by weight — calibrated scales only", "No ignition sources within 5 m for A2L refrigerants", "Service gauges vented safely before disconnecting"] },
+    ],
+  };
+
+  const tasks = TRADE_TASKS[jobType.toLowerCase()] || [];
+  const ppeRequirements = {
+    plumbing:   ["Safety boots (steel cap)", "Safety glasses", "Gloves", "Hi-visibility vest"],
+    gas:        ["Safety boots", "Safety glasses", "Gas detector", "Leather gloves (hot work)", "Hi-visibility vest"],
+    electrical: ["Insulated safety boots", "Safety glasses", "Insulated gloves (1000V)", "Arc flash PPE (switchboard)", "Hi-visibility vest"],
+    drainage:   ["Safety boots", "Safety glasses", "Nitrile gloves", "Hi-visibility vest", "Hard hat"],
+    carpentry:  ["Safety boots", "Safety glasses", "Hearing protection", "P2 respirator (fibre cement)", "Hi-visibility vest", "Hard hat"],
+    hvac:       ["Safety boots", "Safety glasses", "Cryogenic gloves", "P2 respirator (refrigerant)", "Hi-visibility vest"],
+  };
+
+  return res.json({
+    documentType:    "Safe Work Method Statement (SWMS)",
+    revision:        "1.0",
+    regulatoryRef:   "OHS Regulations 2017 (Vic) Part 5.1",
+    isHighRiskConstruction: isHighRisk,
+    highRiskNote:    isHighRisk ? "This work is classified as HIGH RISK CONSTRUCTION — a SWMS is mandatory before commencing. Worker acknowledgement signatures required." : "A SWMS is best practice for this work type.",
+
+    project: {
+      siteAddress:       siteAddress       || null,
+      jobType:           jobType,
+      scope:             scope,
+      startDate:         startDate         || null,
+      estimatedDuration: estimatedDuration || null,
+    },
+
+    personnel: {
+      companyName:    companyName    || null,
+      traderName:     traderName     || null,
+      supervisorName: supervisorName || null,
+    },
+
+    ppe:             ppeRequirements[jobType.toLowerCase()] || [],
+    tasks,
+
+    emergencyProcedures: [
+      "In case of serious injury: call 000 immediately",
+      "Gas emergency (leak/explosion risk): evacuate and call 13 67 07 (Gas Emergency)",
+      "Electrical emergency: call 000 and do not touch victim until supply is isolated",
+      "Trenching collapse: do not enter — call 000 immediately",
+      "First aid kit location: [to be completed on site]",
+      "Nearest hospital: [to be completed on site]",
+    ],
+
+    signatureBlock: {
+      note: "All workers must sign this SWMS before commencing work. Worker signature confirms understanding of all hazards and controls.",
+      signatoryFields: ["Worker name", "Licence number", "Signature", "Date"],
+    },
+
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// ── GET /checklists ───────────────────────────────────────────────────────────
+// Returns all trade checklists in a single reference document.
+// Useful for building in-app checklist views or exporting reference cards.
+app.get("/checklists", (req, res) => {
+  const { jobType } = req.query;
+
+  if (jobType) {
+    const lower = jobType.toLowerCase();
+    if (!CHECKLISTS[lower]) {
+      return res.status(400).json({ error: `Unknown jobType. Available: ${Object.keys(CHECKLISTS).join(", ")}` });
+    }
+    return res.json({ jobType: lower, checklist: CHECKLISTS[lower], retrievedAt: new Date().toISOString() });
+  }
+
+  const summary = {};
+  for (const [type, items] of Object.entries(CHECKLISTS)) {
+    summary[type] = {
+      itemCount:     items.length,
+      requiredCount: items.filter(i => i.required).length,
+      items,
+    };
+  }
+  return res.json({ allChecklists: summary, totalTrades: Object.keys(CHECKLISTS).length, retrievedAt: new Date().toISOString() });
+});
+
+// ── POST /photo-sequence-check ────────────────────────────────────────────────
+// Verifies that a job's photo sequence is logical: site arrival → before work
+// → during work → after work → certificate. Flags missing sequence stages.
+app.post("/photo-sequence-check", (req, res) => {
+  const { photos = [], jobType } = req.body || {};
+
+  if (!Array.isArray(photos) || photos.length === 0) {
+    return res.status(400).json({ error: "photos array is required." });
+  }
+
+  const SEQUENCE_STAGES = [
+    { stage: "site_arrival",    keywords: ["arrival", "site", "gps", "address", "street"],       required: true,  description: "Site arrival / GPS photo" },
+    { stage: "before_work",     keywords: ["before", "existing", "original", "pre-work", "old"], required: true,  description: "Before work commenced" },
+    { stage: "during_work",     keywords: ["during", "install", "in progress", "mid", "open"],   required: false, description: "Work in progress" },
+    { stage: "concealed_work",  keywords: ["concealed", "before cover", "before lining", "pre-backfill", "pre-sheet"], required: false, description: "Concealed work before covering" },
+    { stage: "test_results",    keywords: ["test", "gauge", "reading", "pressure", "insulation", "rcd"], required: true, description: "Test/inspection results" },
+    { stage: "completed_work",  keywords: ["complete", "after", "finished", "final", "done"],    required: true,  description: "Completed work overview" },
+    { stage: "certificate",     keywords: ["certificate", "coc", "coes", "lodged", "cert"],      required: false, description: "Compliance certificate" },
+  ];
+
+  const photoLabels = photos.map(p => (typeof p === "string" ? p : p.label || "").toLowerCase());
+
+  const stageResults = SEQUENCE_STAGES.map(stage => {
+    const covered = photoLabels.some(label => stage.keywords.some(kw => label.includes(kw)));
+    return { ...stage, covered };
+  });
+
+  const missingRequired  = stageResults.filter(s => s.required && !s.covered);
+  const missingOptional  = stageResults.filter(s => !s.required && !s.covered);
+  const covered          = stageResults.filter(s => s.covered).length;
+  const sequenceComplete = missingRequired.length === 0;
+
+  return res.json({
+    jobType:          jobType || null,
+    photoCount:       photos.length,
+    stagesCovered:    covered,
+    totalStages:      SEQUENCE_STAGES.length,
+    sequenceComplete,
+    stageResults,
+    missingRequiredStages: missingRequired.map(s => s.description),
+    missingOptionalStages: missingOptional.map(s => s.description),
+    recommendation: sequenceComplete
+      ? "Photo sequence is complete. All required stages are covered."
+      : `Add photos for: ${missingRequired.map(s => s.description).join(", ")}`,
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /job-handover-email ──────────────────────────────────────────────────
+// Generates professional email content (subject + body) for job handover.
+// Content can be copied directly to an email client — no sending occurs.
+app.post("/job-handover-email", (req, res) => {
+  const {
+    jobType,
+    traderName,
+    traderPhone,
+    traderEmail,
+    companyName,
+    ownerName,
+    siteAddress,
+    jobDate,
+    complianceScore,
+    certificateNumber,
+    missingItems        = [],
+    warrantyPeriodYears,
+    maintenanceSummary,
+    includeCompliance   = true,
+  } = req.body || {};
+
+  if (!ownerName || !jobType) {
+    return res.status(400).json({ error: "ownerName and jobType are required." });
+  }
+
+  const tradeLabel = {
+    plumbing: "Plumbing", gas: "Gas Fitting", electrical: "Electrical",
+    drainage: "Drainage", carpentry: "Carpentry / Building", hvac: "HVAC / Refrigeration",
+  }[jobType?.toLowerCase()] || jobType;
+
+  const liability = LIABILITY_PERIODS[jobType?.toLowerCase()] || { defects: 7 };
+  const warrantyYears = warrantyPeriodYears || liability.defects;
+
+  const dateStr = jobDate ? new Date(jobDate).toLocaleDateString("en-AU", { day: "numeric", month: "long", year: "numeric" }) : "recently";
+
+  const complianceSection = includeCompliance && complianceScore !== undefined
+    ? `\nCompliance Result: ${complianceScore >= 70 ? "PASS" : "REQUIRES ATTENTION"} (Score: ${complianceScore}%)`
+    + (certificateNumber ? `\nCertificate Reference: ${certificateNumber}` : "")
+    + (missingItems.length > 0 ? `\n\nOutstanding Items:\n${missingItems.map(i => `  • ${i}`).join("\n")}` : "")
+    : "";
+
+  const subject = `${tradeLabel} Work Completion — ${siteAddress || "your property"} (${dateStr})`;
+
+  const body = `Dear ${ownerName},
+
+I am writing to confirm the completion of ${tradeLabel.toLowerCase()} work at ${siteAddress || "your property"} on ${dateStr}.
+${complianceSection}
+${maintenanceSummary ? `\nMaintenance Notes:\n${maintenanceSummary}` : ""}
+
+Warranty and Liability:
+Under the ${liability.statute || "Domestic Building Contracts Act 1995 (Vic)"}, you have ${warrantyYears} years to notify us of any defects in the work. Please contact us promptly if you notice any issues.
+
+Contact Details:
+${traderName ? `Tradesperson: ${traderName}` : ""}
+${companyName ? `Company: ${companyName}` : ""}
+${traderPhone ? `Phone: ${traderPhone}` : ""}
+${traderEmail ? `Email: ${traderEmail}` : ""}
+
+Please retain this correspondence and any compliance certificates as part of your property records.
+
+${traderName ? `Kind regards,\n${traderName}` : "Kind regards,"}
+${companyName || ""}
+
+---
+This email was generated by Elemetric AI Compliance Platform.
+All compliance data is accurate as of the date of analysis.`.trim();
+
+  return res.json({
+    subject,
+    body,
+    recipientName: ownerName,
+    jobType:       tradeLabel,
+    siteAddress:   siteAddress || null,
+    generatedAt:   new Date().toISOString(),
+    note: "Review and personalise this email before sending. Attach relevant compliance certificates and test records.",
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
