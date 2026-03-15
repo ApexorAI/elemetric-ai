@@ -28427,6 +28427,196 @@ app.get("/superintendent-instructions/:projectId", apiKeyAuth, async (req, res) 
   res.status(503).json({ error: "Database not configured." });
 });
 
+// ── Round 98: NCR, commissioning sign-off, AI contract review ─────────────────
+
+// POST /ncr — Issue a Non-Conformance Report (NCR)
+app.post("/ncr", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, ncrNumber, issuedBy, issuedTo, trade,
+    description, location, severity, correctiveActionRequired,
+    correctiveAction, dueDate, rootCause,
+  } = req.body;
+
+  if (!projectId || !ncrNumber || !description)
+    return res.status(400).json({ error: "projectId, ncrNumber, description required." });
+
+  const validSeverities = ["MINOR", "MAJOR", "CRITICAL"];
+  const sev = (severity || "MINOR").toUpperCase();
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    ncr_number: sanitiseInput(String(ncrNumber)),
+    issued_by: sanitiseInput(issuedBy || ""),
+    issued_to: sanitiseInput(issuedTo || ""),
+    trade: sanitiseInput(trade || ""),
+    description: sanitiseInput(description),
+    location: sanitiseInput(location || ""),
+    severity: validSeverities.includes(sev) ? sev : "MINOR",
+    corrective_action_required: Boolean(correctiveActionRequired !== false),
+    corrective_action: sanitiseInput(correctiveAction || ""),
+    due_date: dueDate || null,
+    root_cause: sanitiseInput(rootCause || ""),
+    status: "OPEN",
+    issued_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("ncr_register")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, ncrId: data.id, ...record });
+  }
+
+  res.json({ success: true, ncrId: null, ...record, saved: false });
+});
+
+// PATCH /ncr/:ncrId/close — Close an NCR with resolution details
+app.patch("/ncr/:ncrId/close", apiKeyAuth, async (req, res) => {
+  const { ncrId } = req.params;
+  const { closedBy, resolutionDetails, verifiedBy } = req.body;
+
+  if (!closedBy) return res.status(400).json({ error: "closedBy required." });
+
+  const update = {
+    status: "CLOSED",
+    closed_by: sanitiseInput(closedBy),
+    resolution_details: sanitiseInput(resolutionDetails || ""),
+    verified_by: sanitiseInput(verifiedBy || ""),
+    closed_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("ncr_register")
+      .update(update)
+      .eq("id", ncrId)
+      .select()
+      .single();
+    if (error) return res.status(404).json({ error: "NCR not found." });
+    return res.json({ success: true, ncrId, ...update });
+  }
+
+  res.json({ success: true, ncrId, ...update, saved: false });
+});
+
+// POST /commissioning-sign-off — Record final commissioning and sign-off for a system
+app.post("/commissioning-sign-off", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, systemName, trade, commissionedBy,
+    clientRepresentative, commissionDate,
+    testResults = [], allTestsPassed = false,
+    operationalManualProvided = false, trainingProvided = false,
+    warrantyCertProvided = false, notes,
+  } = req.body;
+
+  if (!projectId || !systemName) return res.status(400).json({ error: "projectId and systemName required." });
+
+  const passedTests = testResults.filter(t => t.result === "PASS" || t.passed === true).length;
+  const failedTests = testResults.filter(t => t.result === "FAIL" || t.passed === false).length;
+  const processedTests = testResults.map(t => ({
+    testName: sanitiseInput(t.testName || ""),
+    result: t.result || (t.passed ? "PASS" : "FAIL"),
+    measuredValue: t.measuredValue || null,
+    acceptanceCriteria: sanitiseInput(t.acceptanceCriteria || ""),
+    notes: sanitiseInput(t.notes || ""),
+  }));
+
+  const overallStatus = allTestsPassed && passedTests === testResults.length && testResults.length > 0
+    ? "COMMISSIONED"
+    : failedTests > 0 ? "CONDITIONAL" : "COMMISSIONED";
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    system_name: sanitiseInput(systemName),
+    trade: sanitiseInput(trade || ""),
+    commissioned_by: sanitiseInput(commissionedBy || ""),
+    client_representative: sanitiseInput(clientRepresentative || ""),
+    commission_date: commissionDate || new Date().toISOString().split("T")[0],
+    test_results: processedTests,
+    passed_tests: passedTests,
+    failed_tests: failedTests,
+    overall_status: overallStatus,
+    operational_manual_provided: Boolean(operationalManualProvided),
+    training_provided: Boolean(trainingProvided),
+    warranty_cert_provided: Boolean(warrantyCertProvided),
+    notes: sanitiseInput(notes || ""),
+    signed_off_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("commissioning_signoffs")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, signOffId: data.id, ...record });
+  }
+
+  res.json({ success: true, signOffId: null, ...record, saved: false });
+});
+
+// POST /ai-contract-review — AI reviews a construction contract clause and flags risks
+app.post("/ai-contract-review", apiKeyAuth, async (req, res) => {
+  const {
+    contractType, clauses = [], contractValue, state = "VIC", isSubcontract = false,
+  } = req.body;
+
+  if (!clauses.length) return res.status(400).json({ error: "At least one clause required." });
+
+  const sanitisedClauses = clauses.map((c, i) => `Clause ${i + 1}: ${sanitiseInput(c)}`).join("\n\n");
+
+  const prompt = `You are a specialist Australian construction law advisor. Review the following contract clauses and identify risks, red flags, and recommended amendments.
+
+Contract type: ${sanitiseInput(contractType || "General")}
+Contract value: ${contractValue ? `AUD $${contractValue}` : "Not specified"}
+State: ${sanitiseInput(state)}
+Is subcontract: ${isSubcontract}
+
+CLAUSES TO REVIEW:
+${sanitisedClauses}
+
+Return a JSON object with:
+- "overallRisk": "LOW"|"MEDIUM"|"HIGH"|"VERY_HIGH"
+- "riskSummary": brief summary string
+- "clauseReviews": array of { "clauseNumber": number, "riskLevel": "LOW"|"MEDIUM"|"HIGH", "issues": string[], "recommendation": string, "suggestedAmendment": string }
+- "redFlags": array of specific red flag strings
+- "missingClauses": array of clauses that should be present but are missing
+- "relevantLegislation": array of applicable Acts/Regulations
+- "disclaimer": string`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, contractType, state, clauseCount: clauses.length, reviewedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      overallRisk: "MEDIUM",
+      riskSummary: "Automated contract review is temporarily unavailable. Please review manually.",
+      clauseReviews: clauses.map((_, i) => ({
+        clauseNumber: i + 1, riskLevel: "MEDIUM",
+        issues: ["Manual review required"],
+        recommendation: "Seek legal advice from a construction law specialist.",
+        suggestedAmendment: "N/A — manual review required.",
+      })),
+      redFlags: ["Automated analysis unavailable — manual review required"],
+      missingClauses: [],
+      relevantLegislation: ["Building and Construction Industry Security of Payment Act (Vic)", "Domestic Building Contracts Act 1995 (Vic)"],
+      disclaimer: "This is not legal advice. Always engage a qualified construction lawyer for contract review.",
+      contractType, state, clauseCount: clauses.length, reviewedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
