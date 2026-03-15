@@ -37275,6 +37275,221 @@ Return JSON with:
   }
 });
 
+// POST /permit-to-work — Issue a permit to work
+app.post("/permit-to-work", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, permitType, workDescription, workLocation,
+    startDateTime, endDateTime, authorisedBy, workersListed = [],
+    hazardsIdentified = [], controlMeasures = [], ppeRequired = [],
+    isolationsRequired = [], emergencyProcedure, worksiteContact,
+    status = "ACTIVE",
+  } = req.body;
+  if (!permitType || !workDescription || !startDateTime || !authorisedBy) {
+    return res.status(400).json({ error: "permitType, workDescription, startDateTime, and authorisedBy are required." });
+  }
+  const validPermitTypes = ["HOT_WORK", "CONFINED_SPACE", "WORKING_AT_HEIGHT", "ELECTRICAL_ISOLATION",
+    "EXCAVATION", "ASBESTOS", "CHEMICAL_HANDLING", "GENERAL_HIGH_RISK"];
+  if (!validPermitTypes.includes(permitType)) {
+    return res.status(400).json({ error: `permitType must be one of: ${validPermitTypes.join(", ")}` });
+  }
+  const permitRef = `PTW-${Date.now().toString(36).toUpperCase()}`;
+  const expiresAt = endDateTime || new Date(new Date(startDateTime).getTime() + 8 * 3600000).toISOString();
+  const record = {
+    permit_ref: permitRef,
+    project_id: projectId || null,
+    permit_type: permitType,
+    work_description: sanitiseInput(workDescription),
+    work_location: sanitiseInput(workLocation || ""),
+    start_date_time: startDateTime,
+    end_date_time: expiresAt,
+    authorised_by: sanitiseInput(authorisedBy),
+    workers_listed: Array.isArray(workersListed) ? workersListed.map(w => sanitiseInput(w)) : [],
+    hazards_identified: Array.isArray(hazardsIdentified) ? hazardsIdentified.map(h => sanitiseInput(h)) : [],
+    control_measures: Array.isArray(controlMeasures) ? controlMeasures.map(c => sanitiseInput(c)) : [],
+    ppe_required: Array.isArray(ppeRequired) ? ppeRequired.map(p => sanitiseInput(p)) : [],
+    isolations_required: Array.isArray(isolationsRequired) ? isolationsRequired.map(i => sanitiseInput(i)) : [],
+    emergency_procedure: sanitiseInput(emergencyProcedure || ""),
+    worksite_contact: sanitiseInput(worksiteContact || ""),
+    status,
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("permits_to_work").insert(record);
+    if (error) console.error("permit-to-work DB error:", error.message);
+  }
+  res.json({
+    permitRef, permitType, workDescription: record.work_description,
+    authorisedBy, status, startDateTime, expiresAt,
+    workerCount: record.workers_listed.length,
+    hazardCount: record.hazards_identified.length,
+    saved: !!supabaseAdmin,
+  });
+});
+
+// PATCH /permit-to-work/:permitRef/close — Close a permit to work
+app.patch("/permit-to-work/:permitRef/close", apiKeyAuth, async (req, res) => {
+  const { permitRef } = req.params;
+  const { closedBy, workCompleted, outstandingIssues, closedAt } = req.body;
+  if (!closedBy) return res.status(400).json({ error: "closedBy is required." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  const { error } = await supabaseAdmin.from("permits_to_work")
+    .update({
+      status: "CLOSED",
+      closed_by: sanitiseInput(closedBy),
+      work_completed: workCompleted !== undefined ? Boolean(workCompleted) : true,
+      outstanding_issues: sanitiseInput(outstandingIssues || ""),
+      closed_at: closedAt || new Date().toISOString(),
+    })
+    .eq("permit_ref", permitRef);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ permitRef, status: "CLOSED", closedBy, closedAt: closedAt || new Date().toISOString() });
+});
+
+// POST /confined-space-entry — Record a confined space entry permit
+app.post("/confined-space-entry", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, spaceDescription, spaceLocation, entryDate,
+    entrantNames = [], standbySupervisor, atmosphericTestResults = {},
+    ventilationProvided = false, rescuePlanInPlace = false,
+    communicationMethod, entryStartTime, entryEndTime, notes,
+  } = req.body;
+  if (!spaceDescription || !entryDate || !standbySupervisor) {
+    return res.status(400).json({ error: "spaceDescription, entryDate, and standbySupervisor are required." });
+  }
+  if (!rescuePlanInPlace) {
+    return res.status(400).json({ error: "A rescue plan must be in place before confined space entry is permitted." });
+  }
+  const entryRef = `CSE-${Date.now().toString(36).toUpperCase()}`;
+  const oxygenOk = atmosphericTestResults.oxygenPercent === undefined
+    || (atmosphericTestResults.oxygenPercent >= 19.5 && atmosphericTestResults.oxygenPercent <= 23.5);
+  const lflOk = atmosphericTestResults.lflPercent === undefined || atmosphericTestResults.lflPercent < 10;
+  const atmosphericSafe = oxygenOk && lflOk;
+  if (!atmosphericSafe) {
+    return res.status(422).json({
+      error: "Atmospheric test results indicate unsafe entry conditions.",
+      details: {
+        oxygenPercent: atmosphericTestResults.oxygenPercent,
+        oxygenSafe: oxygenOk,
+        lflSafe: lflOk,
+        recommendation: "Do not enter. Ventilate and retest before entry.",
+      },
+    });
+  }
+  const record = {
+    entry_ref: entryRef,
+    project_id: projectId || null,
+    space_description: sanitiseInput(spaceDescription),
+    space_location: sanitiseInput(spaceLocation || ""),
+    entry_date: entryDate,
+    entrant_names: Array.isArray(entrantNames) ? entrantNames.map(n => sanitiseInput(n)) : [],
+    standby_supervisor: sanitiseInput(standbySupervisor),
+    atmospheric_test_results: atmosphericTestResults,
+    ventilation_provided: Boolean(ventilationProvided),
+    rescue_plan_in_place: true,
+    communication_method: sanitiseInput(communicationMethod || ""),
+    entry_start_time: entryStartTime || null,
+    entry_end_time: entryEndTime || null,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("confined_space_entries").insert(record);
+    if (error) console.error("confined-space-entry DB error:", error.message);
+  }
+  res.json({
+    entryRef, spaceDescription: record.space_description, entryDate,
+    entrantCount: record.entrant_names.length, standbySupervisor,
+    atmosphericSafe, ventilationProvided, rescuePlanInPlace: true,
+    saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-jsa-generator — AI generates a Job Safety Analysis
+app.post("/ai-jsa-generator", apiKeyAuth, async (req, res) => {
+  const {
+    trade, taskDescription, workEnvironment = "construction site",
+    tools = [], materials = [], numberOfWorkers = 1, state = "VIC",
+  } = req.body;
+  if (!trade || !taskDescription) {
+    return res.status(400).json({ error: "trade and taskDescription are required." });
+  }
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedTask = sanitiseInput(taskDescription);
+  const sanitisedEnv = sanitiseInput(workEnvironment);
+  const systemPrompt = `You are an Australian WHS expert. Generate detailed Job Safety Analyses (JSA) compliant with ${sanitiseInput(state)} WHS legislation.`;
+  const userPrompt = `Generate a Job Safety Analysis for:
+Trade: ${sanitisedTrade}
+Task: ${sanitisedTask}
+Work environment: ${sanitisedEnv}
+Tools: ${tools.map(t => sanitiseInput(t)).join(", ") || "Standard trade tools"}
+Materials: ${materials.map(m => sanitiseInput(m)).join(", ") || "Standard materials"}
+Workers: ${numberOfWorkers}
+
+Return JSON with:
+{
+  "jsaTitle": "...",
+  "taskSteps": [
+    {
+      "stepNumber": 1,
+      "stepDescription": "...",
+      "hazards": ["...", "..."],
+      "riskRating": "HIGH|MEDIUM|LOW",
+      "controlMeasures": ["...", "..."],
+      "residualRisk": "MEDIUM|LOW",
+      "responsiblePerson": "..."
+    }
+  ],
+  "requiredPPE": ["...", "..."],
+  "requiredLicences": ["...", "..."],
+  "emergencyProcedures": "...",
+  "firstAidRequirements": "...",
+  "supervisorSignOff": true,
+  "regulatoryReferences": ["...", "..."],
+  "reviewDate": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 3000,
+    });
+    usageStats.openaiCalls++;
+    const jsa = JSON.parse(aiRes.choices[0].message.content);
+    const jsaRef = `JSA-${Date.now().toString(36).toUpperCase()}`;
+    res.json({ jsaRef, trade: sanitisedTrade, taskDescription: sanitisedTask, state, jsa });
+  } catch (err) {
+    console.error("ai-jsa-generator error:", err.message);
+    res.json({
+      jsaRef: `JSA-FALLBACK`, trade: sanitisedTrade, taskDescription: sanitisedTask, state,
+      jsa: {
+        jsaTitle: `JSA — ${sanitisedTrade}: ${sanitisedTask}`,
+        taskSteps: [
+          {
+            stepNumber: 1,
+            stepDescription: sanitisedTask,
+            hazards: ["Identify all hazards before commencing work"],
+            riskRating: "MEDIUM",
+            controlMeasures: ["Stop and assess hazards", "Consult supervisor", "Do not proceed until safe"],
+            residualRisk: "LOW",
+            responsiblePerson: "Supervising tradesperson",
+          },
+        ],
+        requiredPPE: ["Hard hat", "Safety boots", "Hi-vis vest", "Safety glasses", "Gloves"],
+        requiredLicences: ["Appropriate trade licence for the work being performed"],
+        emergencyProcedures: "Call 000 in an emergency. First aid kit located at site office.",
+        firstAidRequirements: "Qualified first aider must be available on site.",
+        supervisorSignOff: true,
+        regulatoryReferences: ["Work Health and Safety Act 2011", "Work Health and Safety Regulation 2017"],
+        reviewDate: new Date(Date.now() + 180 * 86400000).toISOString().split("T")[0],
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
