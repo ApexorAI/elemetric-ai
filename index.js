@@ -52155,6 +52155,281 @@ Return a JSON object with:
   }
 });
 
+// POST /vibration-monitoring-record — Record occupational vibration exposure per AS 2670 and Vic OHS Regs
+app.post("/vibration-monitoring-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      monitoringRef,
+      dateMonitored,
+      monitoredBy,
+      workerName,
+      exposureType,
+      toolOrEquipment,
+      taskDescription,
+      dailyExposureDuration,
+      ahv_daily,
+      awv_daily,
+      aw_dominant,
+      crestFactor,
+      vibrationMagnitude,
+      controlsInPlace,
+      antivibrationGlovesWorn,
+      result,
+      followUpRequired,
+      notes,
+    } = req.body;
+
+    if (!projectId || !exposureType || !dateMonitored || !result) {
+      return res.status(400).json({ error: "projectId, exposureType, dateMonitored, and result are required" });
+    }
+
+    const exceedances = [];
+    // EU Physical Agents Directive (adopted by Safe Work Australia) thresholds used as best practice:
+    // HAV: Action value 2.5 m/s², Limit 5.0 m/s²
+    // WBV: Action value 0.5 m/s², Limit 1.15 m/s²
+    if (exposureType === "HAV" || exposureType === "hand-arm") {
+      if (ahv_daily && Number(ahv_daily) >= 2.5) exceedances.push(`HAV daily exposure A(8) ${ahv_daily} m/s² — at or above action value 2.5 m/s²`);
+      if (ahv_daily && Number(ahv_daily) >= 5.0) exceedances.push(`HAV daily exposure A(8) ${ahv_daily} m/s² — exceeds limit value 5.0 m/s²: immediate engineering controls required`);
+    }
+    if (exposureType === "WBV" || exposureType === "whole-body") {
+      if (awv_daily && Number(awv_daily) >= 0.5) exceedances.push(`WBV daily exposure A(8) ${awv_daily} m/s² — at or above action value 0.5 m/s²`);
+      if (awv_daily && Number(awv_daily) >= 1.15) exceedances.push(`WBV daily exposure A(8) ${awv_daily} m/s² — exceeds limit value 1.15 m/s²`);
+    }
+
+    if (exceedances.length > 0) console.warn(`[VIBRATION] ${workerName || "worker"} at ${projectId} — ${exceedances.join("; ")}`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      monitoring_ref: sanitiseInput(monitoringRef || `VM-${Date.now()}`),
+      date_monitored: dateMonitored,
+      monitored_by: sanitiseInput(monitoredBy || ""),
+      worker_name: sanitiseInput(workerName || ""),
+      exposure_type: sanitiseInput(exposureType),
+      tool_or_equipment: sanitiseInput(toolOrEquipment || ""),
+      task_description: sanitiseInput(taskDescription || ""),
+      daily_exposure_duration: sanitiseInput(dailyExposureDuration || ""),
+      ahv_daily: ahv_daily || null,
+      awv_daily: awv_daily || null,
+      aw_dominant: aw_dominant || null,
+      crest_factor: crestFactor || null,
+      vibration_magnitude: vibrationMagnitude || null,
+      controls_in_place: sanitiseInput(controlsInPlace || ""),
+      antivibration_gloves_worn: !!antivibrationGlovesWorn,
+      exceedances,
+      result: sanitiseInput(result),
+      follow_up_required: !!followUpRequired,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("vibration_monitoring_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      exceedances,
+      actionLevelBreached: exceedances.length > 0,
+      thresholds: {
+        HAV: { actionValue: "2.5 m/s²", limitValue: "5.0 m/s²" },
+        WBV: { actionValue: "0.5 m/s²", limitValue: "1.15 m/s²" },
+      },
+      applicableStandards: ["AS 2670.1 Evaluation of human exposure to whole-body vibration", "AS 2763 Vibration and shock — hand-transmitted vibration", "Safe Work Australia Vibration Code of Practice 2022"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/vibration-monitoring-record error:", err.message);
+    res.status(500).json({ error: "Failed to record vibration monitoring" });
+  }
+});
+
+// POST /test-and-tag-record — Record electrical test and tag per AS/NZS 3760
+app.post("/test-and-tag-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      assetId,
+      assetDescription,
+      location,
+      testDate,
+      testedBy,
+      testerLicenceNumber,
+      testInstrumentRef,
+      instrumentCalibrationDate,
+      environment,
+      earthContinuityResult,
+      earthContinuityOhms,
+      insulationResistanceMohms,
+      leakageCurrentMa,
+      polarityCorrect,
+      overallResult,
+      tagColour,
+      nextTestDue,
+      faultDescription,
+      dispositionIfFailed,
+      notes,
+    } = req.body;
+
+    if (!assetId || !assetDescription || !testDate || !testedBy || !overallResult) {
+      return res.status(400).json({ error: "assetId, assetDescription, testDate, testedBy, and overallResult are required" });
+    }
+
+    const failures = [];
+    if (earthContinuityResult === "FAIL") failures.push("Earth continuity test failed — equipment must be taken out of service immediately");
+    if (insulationResistanceMohms && Number(insulationResistanceMohms) < 1) failures.push(`Insulation resistance ${insulationResistanceMohms} MΩ — below 1 MΩ minimum (AS/NZS 3760)`);
+    if (leakageCurrentMa && Number(leakageCurrentMa) > 5) failures.push(`Leakage current ${leakageCurrentMa} mA — exceeds 5 mA limit`);
+    if (!polarityCorrect) failures.push("Polarity incorrect — live/neutral reversal detected, do not use");
+    if (overallResult === "FAIL") failures.push("Equipment FAILED test and tag — must be quarantined and removed from service");
+
+    if (failures.length > 0) console.warn(`[TEST & TAG] Asset ${assetId} at ${projectId} — ${failures.join("; ")}`);
+
+    // AS/NZS 3760 retesting intervals by environment
+    const retestIntervals = { construction: "3 months", outdoor: "6 months", workshop: "12 months", office: "5 years" };
+
+    const record = {
+      project_id: sanitiseInput(projectId || ""),
+      asset_id: sanitiseInput(assetId),
+      asset_description: sanitiseInput(assetDescription),
+      location: sanitiseInput(location || ""),
+      test_date: testDate,
+      tested_by: sanitiseInput(testedBy),
+      tester_licence_number: sanitiseInput(testerLicenceNumber || ""),
+      test_instrument_ref: sanitiseInput(testInstrumentRef || ""),
+      instrument_calibration_date: instrumentCalibrationDate || null,
+      environment: sanitiseInput(environment || "construction"),
+      earth_continuity_result: sanitiseInput(earthContinuityResult || ""),
+      earth_continuity_ohms: earthContinuityOhms || null,
+      insulation_resistance_mohms: insulationResistanceMohms || null,
+      leakage_current_ma: leakageCurrentMa || null,
+      polarity_correct: !!polarityCorrect,
+      overall_result: sanitiseInput(overallResult),
+      tag_colour: sanitiseInput(tagColour || ""),
+      next_test_due: nextTestDue || null,
+      recommended_retest_interval: retestIntervals[environment] || retestIntervals.construction,
+      failures,
+      fault_description: sanitiseInput(faultDescription || ""),
+      disposition_if_failed: sanitiseInput(dispositionIfFailed || ""),
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("test_and_tag_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (failures.length > 0) {
+      return res.status(422).json({
+        passed: false,
+        failures,
+        message: "Equipment failed electrical testing. Remove from service, tag as FAILED/QUARANTINED, and arrange repair or disposal.",
+        record,
+        saved,
+      });
+    }
+
+    res.json({
+      passed: true,
+      assetId,
+      nextTestDue: nextTestDue || null,
+      recommendedRetestInterval: retestIntervals[environment] || retestIntervals.construction,
+      applicableStandard: "AS/NZS 3760 In-service safety inspection and testing of electrical equipment",
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/test-and-tag-record error:", err.message);
+    res.status(500).json({ error: "Failed to record test and tag" });
+  }
+});
+
+// POST /ai-vibration-risk-assessment — AI assesses vibration exposure risk and recommends controls
+app.post("/ai-vibration-risk-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      exposureType,
+      toolsOrEquipment,
+      dailyUsageDuration,
+      vibrationMagnitude,
+      workPattern,
+      existingControls,
+      workerHealthHistory,
+    } = req.body;
+
+    if (!exposureType || !toolsOrEquipment) {
+      return res.status(400).json({ error: "exposureType and toolsOrEquipment are required" });
+    }
+
+    const prompt = `You are an occupational hygienist expert in vibration risk under AS 2670, AS 2763, and Safe Work Australia guidance.
+
+Assess vibration exposure risk for:
+- Exposure type: ${sanitiseInput(exposureType)} (HAV = hand-arm, WBV = whole-body)
+- Tools/equipment: ${sanitiseInput(toolsOrEquipment)}
+- Daily usage duration: ${sanitiseInput(dailyUsageDuration || "not specified")}
+- Vibration magnitude: ${sanitiseInput(String(vibrationMagnitude || "not measured"))} m/s²
+- Work pattern: ${sanitiseInput(workPattern || "continuous")}
+- Existing controls: ${sanitiseInput(existingControls || "none")}
+- Worker health history: ${sanitiseInput(workerHealthHistory || "not specified")}
+
+Return a JSON object with:
+{
+  "riskRating": "NEGLIGIBLE|LOW|MEDIUM|HIGH|EXTREME",
+  "actionLevelLikelyExceeded": boolean,
+  "limitValueLikelyExceeded": boolean,
+  "estimatedDailyExposure": string,
+  "healthRisks": [string],
+  "engineeringControls": [string],
+  "administrativeControls": [string],
+  "ppe": [string],
+  "healthSurveillanceRequired": boolean,
+  "healthSurveillanceFrequency": string,
+  "toolSubstitutionRecommended": boolean,
+  "toolSubstitutionSuggestions": [string],
+  "applicableStandards": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ exposureType, toolsOrEquipment, assessment });
+  } catch (err) {
+    console.error("/ai-vibration-risk-assessment error:", err.message);
+    res.json({
+      exposureType: req.body.exposureType || "",
+      toolsOrEquipment: req.body.toolsOrEquipment || "",
+      assessment: {
+        riskRating: "HIGH",
+        actionLevelLikelyExceeded: true,
+        limitValueLikelyExceeded: false,
+        estimatedDailyExposure: "Estimated A(8) 3–5 m/s² for typical construction power tool use > 4 hours daily",
+        healthRisks: ["Hand-arm vibration syndrome (HAVS)", "Carpal tunnel syndrome", "Raynaud's phenomenon (vibration white finger)", "Peripheral neuropathy"],
+        engineeringControls: ["Use low-vibration tool alternatives where available", "Anti-vibration tool handles or inserts", "Regular tool maintenance to minimise excess vibration"],
+        administrativeControls: ["Limit continuous tool use to 2-hour blocks with rest breaks", "Job rotation among workers", "Warm tools and work areas in cold weather", "Pre-employment health screening"],
+        ppe: ["Anti-vibration gloves (note: limited effectiveness, not a substitute for engineering controls)", "Warm gloves to maintain circulation"],
+        healthSurveillanceRequired: true,
+        healthSurveillanceFrequency: "Baseline assessment on engagement, annual thereafter for exposed workers",
+        toolSubstitutionRecommended: true,
+        toolSubstitutionSuggestions: ["Hydraulic breaker instead of electric jack hammer", "Orbital sander instead of reciprocating sander", "Battery-powered tools with vibration reduction technology"],
+        applicableStandards: ["AS 2763 Vibration and shock — hand-transmitted", "AS 2670.1 Whole-body vibration", "Safe Work Australia Vibration Hazards Code of Practice 2022"],
+        recommendation: "Implement an anti-vibration programme including tool assessment, worker rotation, health surveillance, and substitution where practicable. Measure actual tool vibration magnitudes to determine accurate A(8) exposure.",
+        summary: "Prolonged use of vibrating tools presents a high risk of HAVS and musculoskeletal disorders. Engineering controls and health surveillance are required under the OHS Regulations.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
