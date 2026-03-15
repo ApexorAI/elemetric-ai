@@ -72789,6 +72789,388 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 263 ─────────────────────────────────────────────────────────────────
+
+// POST /welding-inspection-record — Record welding inspection and NDT results per AS/NZS 2980
+app.post("/welding-inspection-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, weldId, structureElement, inspectionDate, inspectedBy,
+      welderQualificationRef, weldProcess, weldJointType, weldCategory,
+      visualInspectionResult, visualDefects,
+      ndtMethod, ndtResult, ndtDefectsFound, ndtDefectDetails,
+      thicknessBaseMaterialMm, heatInputKjMm,
+      preheatRequired, preheatTempDegC, preheatAchievedDegC,
+      pwhtRequired, pwhtCompleted,
+      defectType, repairRequired, repairCompleted, notes
+    } = req.body;
+
+    if (!weldId || !structureElement || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "weldId, structureElement, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeWeldId = sanitiseInput(String(weldId));
+    const safeElement = sanitiseInput(String(structureElement));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+
+    const visDefects = Array.isArray(visualDefects) ? visualDefects : [];
+    const ndtDefects = Array.isArray(ndtDefectDetails) ? ndtDefectDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    // AS/NZS 2980 — Quality of welding, AS 4100 — Steel structures
+    if (!welderQualificationRef) {
+      criticalIssues.push("Welder qualification reference not recorded — welds performed by unverified personnel may not comply with AS/NZS 2980.");
+    }
+
+    const visResult = String(visualInspectionResult || "").toUpperCase();
+    if (visResult === "FAIL" || visResult === "REJECT") {
+      criticalIssues.push(`Visual inspection FAILED — weld does not meet acceptance criteria. Repair required before any NDT (AS/NZS 2980).`);
+    } else if (visDefects.length > 0) {
+      const critVisDefects = visDefects.filter(d => /crack|undercut|overlap|incomplet/i.test(String(d)));
+      if (critVisDefects.length > 0) {
+        criticalIssues.push(`Critical visual defects: ${critVisDefects.join(", ")} — weld must be repaired.`);
+      } else {
+        warnings.push(`Visual defects noted: ${visDefects.join(", ")} — assess against acceptance criteria.`);
+      }
+    }
+
+    const ndtRes = String(ndtResult || "").toUpperCase();
+    if (ndtRes === "FAIL" || ndtRes === "REJECT") {
+      criticalIssues.push(`NDT (${ndtMethod || "method not stated"}) result FAIL — internal defects detected. Weld must be repaired or replaced.`);
+    }
+    if (ndtDefectsFound === true || ndtDefectsFound === "true") {
+      if (ndtDefects.length > 0) {
+        const critNdt = ndtDefects.filter(d => /crack|porosity|lack of fusion|incomplete penetration/i.test(String(d)));
+        if (critNdt.length > 0) {
+          criticalIssues.push(`Critical NDT defects: ${critNdt.join(", ")} — assess for fitness for purpose per AS 4100.`);
+        } else {
+          warnings.push(`NDT defects: ${ndtDefects.join(", ")} — engineer to assess acceptance per AS 4100.`);
+        }
+      }
+    }
+
+    // Preheat compliance
+    const preheatReqd = preheatRequired === true || preheatRequired === "true";
+    if (preheatReqd) {
+      const preheatSpec = parseFloat(preheatTempDegC) || null;
+      const preheatAch = parseFloat(preheatAchievedDegC) || null;
+      if (preheatSpec !== null && preheatAch !== null && preheatAch < preheatSpec) {
+        criticalIssues.push(`Preheat temperature ${preheatAch}°C below required ${preheatSpec}°C — cold cracking risk. Weld requires review (AS/NZS 2980).`);
+      }
+    }
+
+    // PWHT
+    if ((pwhtRequired === true || pwhtRequired === "true") && !(pwhtCompleted === true || pwhtCompleted === "true")) {
+      criticalIssues.push("PWHT required but not completed — weld joint may not meet stress-relief and hardness requirements.");
+    }
+
+    if (repairRequired === true || repairRequired === "true") {
+      if (!(repairCompleted === true || repairCompleted === "true")) {
+        warnings.push("Weld repair required — track completion and re-inspect after repair.");
+      }
+    }
+
+    const category = String(weldCategory || "").toUpperCase();
+    if ((category === "CATEGORY_1" || category === "SP") && criticalIssues.length > 0) {
+      criticalIssues.push("Category SP (structural primary) weld failure — structural engineer assessment required before loading.");
+    }
+
+    const weldStatus = criticalIssues.length > 0 ? "REJECT" : warnings.length > 0 ? "CONDITIONAL_ACCEPT" : "ACCEPT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("welding_inspection_records")
+        .insert({
+          project_id: safeProject,
+          weld_id: safeWeldId,
+          structure_element: safeElement,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          welder_qualification_ref: welderQualificationRef ? sanitiseInput(String(welderQualificationRef)) : null,
+          weld_process: weldProcess ? sanitiseInput(String(weldProcess)) : null,
+          weld_joint_type: weldJointType ? sanitiseInput(String(weldJointType)) : null,
+          weld_category: weldCategory || null,
+          visual_inspection_result: visualInspectionResult || null,
+          visual_defects: visDefects,
+          ndt_method: ndtMethod || null,
+          ndt_result: ndtResult || null,
+          ndt_defects_found: ndtDefectsFound || false,
+          ndt_defect_details: ndtDefects,
+          preheat_required: preheatReqd,
+          preheat_temp_deg_c: preheatTempDegC || null,
+          preheat_achieved_deg_c: preheatAchievedDegC || null,
+          pwht_required: pwhtRequired || false,
+          pwht_completed: pwhtCompleted || false,
+          repair_required: repairRequired || false,
+          repair_completed: repairCompleted || false,
+          weld_status: weldStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        weldStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Weld rejected — repair required before structural loading.",
+        standards: ["AS/NZS 2980", "AS 4100", "AS 1554.1"],
+      });
+    }
+
+    res.json({
+      weldStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      weldId: safeWeldId,
+      ndtMethod: ndtMethod || null,
+      standards: ["AS/NZS 2980", "AS 4100", "AS 1554.1"],
+    });
+  } catch (err) {
+    console.error("POST /welding-inspection-record error:", err.message);
+    res.status(500).json({ error: "Failed to record welding inspection." });
+  }
+});
+
+// POST /structural-steel-erection-record — Record structural steel erection and connection checks
+app.post("/structural-steel-erection-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, gridLine, level, inspectionDate, inspectedBy,
+      steelGrade, memberIds, connectionType,
+      boltGrade, boltSize, boltCount, boltsTightened, torqueWrenchUsed,
+      torqueSpecNm, torqueMeasuredNm,
+      plumbAndLevelChecked, plumbToleranceMm, levelToleranceMm,
+      shopDrawingRevision, fabricationMarkingMatch,
+      fieldWeldsRequired, fieldWeldsInspected,
+      fireProtectionApplied, corrosionProtectionApplied,
+      holdsRequired, notes
+    } = req.body;
+
+    if (!projectId || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "projectId, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const members = Array.isArray(memberIds) ? memberIds : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    // AS 4100 — Steel structures, AS 1418.10
+    const torqueSpec = parseFloat(torqueSpecNm) || null;
+    const torqueMeas = parseFloat(torqueMeasuredNm) || null;
+    const plumbTol = parseFloat(plumbToleranceMm) || null;
+    const levelTol = parseFloat(levelToleranceMm) || null;
+
+    if (!boltsTightened) {
+      criticalIssues.push("Bolts not confirmed tightened — structural connections must be fully tensioned per AS 4100 cl.15.2.");
+    }
+
+    if (torqueSpec !== null && torqueMeas !== null) {
+      if (torqueMeas < torqueSpec * 0.9) {
+        criticalIssues.push(`Measured torque ${torqueMeas} Nm — below 90% of specified ${torqueSpec} Nm. Re-tighten bolts to specified value.`);
+      } else if (torqueMeas < torqueSpec) {
+        warnings.push(`Torque ${torqueMeas} Nm slightly below specified ${torqueSpec} Nm — verify friction-grip or snug-tight requirements.`);
+      }
+    }
+
+    if (plumbAndLevelChecked) {
+      if (plumbTol !== null && plumbTol > 10) {
+        criticalIssues.push(`Plumb tolerance ${plumbTol}mm exceeds 10mm — out-of-plumb condition. Structural engineer to assess.`);
+      }
+      if (levelTol !== null && levelTol > 5) {
+        warnings.push(`Level tolerance ${levelTol}mm — check against AS 4100 erection tolerances.`);
+      }
+    }
+
+    if (!fabricationMarkingMatch) {
+      criticalIssues.push("Fabrication marking does not match shop drawings — verify member identity before connecting.");
+    }
+
+    if (fieldWeldsRequired === true || fieldWeldsRequired === "true") {
+      if (!(fieldWeldsInspected === true || fieldWeldsInspected === "true")) {
+        criticalIssues.push("Field welds required but not confirmed inspected — mandatory QA hold point per AS 1554.1.");
+      }
+    }
+
+    if (!corrosionProtectionApplied) {
+      warnings.push("Corrosion protection (paint/galvanising) not confirmed applied — required before handover.");
+    }
+
+    if (holdsRequired === true || holdsRequired === "true") {
+      criticalIssues.push("Hold point flagged by inspector — work on this connection must not proceed until cleared.");
+    }
+
+    if (!torqueWrenchUsed && connectionType && /friction|grade 8|hsfg/i.test(String(connectionType))) {
+      criticalIssues.push("Friction-grip connection requires calibrated torque wrench — manual tightening insufficient (AS 4100).");
+    }
+
+    const erectionStatus = criticalIssues.length > 0 ? "HOLD" : warnings.length > 0 ? "CONDITIONAL_ACCEPT" : "ACCEPT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("structural_steel_erection_records")
+        .insert({
+          project_id: safeProject,
+          grid_line: gridLine ? sanitiseInput(String(gridLine)) : null,
+          level: level ? sanitiseInput(String(level)) : null,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          steel_grade: steelGrade || null,
+          member_ids: members,
+          connection_type: connectionType ? sanitiseInput(String(connectionType)) : null,
+          bolt_grade: boltGrade || null,
+          bolt_size: boltSize || null,
+          bolt_count: boltCount || null,
+          bolts_tightened: boltsTightened || false,
+          torque_wrench_used: torqueWrenchUsed || false,
+          torque_spec_nm: torqueSpec,
+          torque_measured_nm: torqueMeas,
+          plumb_tolerance_mm: plumbTol,
+          level_tolerance_mm: levelTol,
+          shop_drawing_revision: shopDrawingRevision ? sanitiseInput(String(shopDrawingRevision)) : null,
+          fabrication_marking_match: fabricationMarkingMatch !== false && fabricationMarkingMatch !== "false",
+          field_welds_required: fieldWeldsRequired || false,
+          field_welds_inspected: fieldWeldsInspected || false,
+          fire_protection_applied: fireProtectionApplied || false,
+          corrosion_protection_applied: corrosionProtectionApplied || false,
+          erection_status: erectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        erectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Structural steel erection hold — resolve critical issues before proceeding.",
+        standards: ["AS 4100", "AS 1554.1", "AS/NZS 2980"],
+      });
+    }
+
+    res.json({
+      erectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      memberCount: members.length,
+      standards: ["AS 4100", "AS 1554.1"],
+    });
+  } catch (err) {
+    console.error("POST /structural-steel-erection-record error:", err.message);
+    res.status(500).json({ error: "Failed to record structural steel erection." });
+  }
+});
+
+// POST /ai-steel-connection-assessment — AI assesses structural steel connection adequacy
+app.post("/ai-steel-connection-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      connectionType, steelGrade, boltGrade, designLoad, memberSize,
+      visualCondition, corrosionLevel, weldVisualResult,
+      ageYears, maintenanceHistory, siteContext
+    } = req.body;
+
+    if (!connectionType) {
+      return res.status(400).json({ error: "connectionType is required." });
+    }
+
+    const safeConnType = sanitiseInput(String(connectionType));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+
+    const prompt = `You are a structural engineer assessing the adequacy and safety of a structural steel connection.
+
+Connection type: ${safeConnType}
+Steel grade: ${steelGrade || "Unknown"}
+Bolt grade: ${boltGrade || "Unknown"}
+Design load: ${designLoad || "Not stated"}
+Member size: ${memberSize || "Not stated"}
+Visual condition: ${visualCondition || "Not assessed"}
+Corrosion level: ${corrosionLevel || "Not stated"}
+Weld visual result: ${weldVisualResult || "Not assessed"}
+Age: ${ageYears ? ageYears + " years" : "Unknown"}
+Maintenance history: ${maintenanceHistory || "Unknown"}
+Location: ${safeSite}
+
+Assess under AS 4100 and AS 4600:
+1. Connection structural adequacy — is it fit for purpose?
+2. Corrosion/deterioration impact on load capacity
+3. Failure risk (probability of sudden failure)
+4. Remaining service life estimate
+5. Recommended immediate actions
+6. Maintenance/remediation schedule
+
+Respond ONLY in JSON:
+{
+  "connectionAdequate": true|false|null,
+  "failureRisk": "LOW|MODERATE|HIGH|IMMINENT",
+  "estimatedServiceLifeYears": number or null,
+  "corrosionImpact": "NEGLIGIBLE|MINOR|MODERATE|SEVERE",
+  "immediateActions": ["string"],
+  "maintenanceSchedule": ["string"],
+  "loadCapacityReduction": "string",
+  "applicableStandards": ["string"],
+  "takeOutOfServiceRecommended": true|false,
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 700,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        connectionAdequate: null,
+        failureRisk: "MODERATE",
+        estimatedServiceLifeYears: null,
+        corrosionImpact: "MINOR",
+        immediateActions: ["Engage structural engineer for physical assessment"],
+        maintenanceSchedule: ["Schedule detailed inspection within 3 months"],
+        loadCapacityReduction: "Cannot estimate without physical assessment.",
+        applicableStandards: ["AS 4100", "AS 4600", "AS 1554.1"],
+        takeOutOfServiceRecommended: false,
+        summary: "AI assessment unavailable. Structural engineer inspection required.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      connectionType: safeConnType,
+      standards: ["AS 4100", "AS 4600", "AS 1554.1"],
+    });
+  } catch (err) {
+    console.error("POST /ai-steel-connection-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess steel connection." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
