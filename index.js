@@ -27073,6 +27073,175 @@ app.post("/scaffolding-inspection", apiKeyAuth, async (req, res) => {
   return res.status(201).json({ ...record, saved: !!supabaseAdmin });
 });
 
+// POST /jsa-record  — Log a Job Safety Analysis / JSEA
+app.post("/jsa-record", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, taskName, preparedBy, reviewedBy, date, steps = [], emergencyProcedures, notes } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+  if (!taskName) return res.status(400).json({ error: "taskName required." });
+
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeTask   = sanitiseInput(String(taskName)).slice(0, 150);
+  const safeBy     = preparedBy ? sanitiseInput(String(preparedBy)).slice(0, 100) : null;
+  const safeReview = reviewedBy ? sanitiseInput(String(reviewedBy)).slice(0, 100) : null;
+  const safeDate   = date ? sanitiseInput(String(date)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeEmerg  = emergencyProcedures ? sanitiseInput(String(emergencyProcedures)).slice(0, 500) : "Call 000 for any emergency. Evacuate to muster point.";
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const jsaSteps = Array.isArray(steps) ? steps.slice(0, 30).map((s, idx) => ({
+    stepNumber: idx + 1,
+    step:        sanitiseInput(String(s.step || s || "")).slice(0, 200),
+    hazards:     Array.isArray(s.hazards) ? s.hazards.slice(0, 10).map(h => sanitiseInput(String(h)).slice(0, 150)) : [],
+    controls:    Array.isArray(s.controls) ? s.controls.slice(0, 10).map(c => sanitiseInput(String(c)).slice(0, 150)) : [],
+    residualRisk: ["LOW", "MEDIUM", "HIGH", "CRITICAL"].includes(String(s.residualRisk || "").toUpperCase()) ? String(s.residualRisk).toUpperCase() : "MEDIUM",
+  })) : [];
+
+  const highRiskSteps = jsaSteps.filter(s => s.residualRisk === "HIGH" || s.residualRisk === "CRITICAL").length;
+
+  const record = {
+    jsaId: `JSA-${(safeSiteId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId, jobId: safeJobId, taskName: safeTask,
+    preparedBy: safeBy, reviewedBy: safeReview, date: safeDate,
+    stepCount: jsaSteps.length, highRiskSteps, steps: jsaSteps,
+    emergencyProcedures: safeEmerg, notes: safeNotes,
+    status: "CURRENT", createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("jsa_records").insert({
+        jsa_id: record.jsaId, site_id: safeSiteId, job_id: safeJobId, task_name: safeTask,
+        prepared_by: safeBy, reviewed_by: safeReview, date: safeDate,
+        steps: jsaSteps, high_risk_steps: highRiskSteps, emergency_procedures: safeEmerg,
+        status: "CURRENT", notes: safeNotes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// GET /jsa-record/:siteId  — Get JSA records for a site
+app.get("/jsa-record/:siteId", apiKeyAuth, async (req, res) => {
+  const siteId = sanitiseInput(String(req.params.siteId || "")).slice(0, 80);
+  if (!siteId) return res.status(400).json({ error: "siteId required." });
+
+  let records = [];
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin.from("jsa_records").select("jsa_id, task_name, date, prepared_by, high_risk_steps, status, created_at").eq("site_id", siteId).order("date", { ascending: false }).limit(50);
+      records = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  return res.json({ siteId, jsaCount: records.length, records, generatedAt: new Date().toISOString() });
+});
+
+// POST /ai-whs-plan  — AI generates a WHS management plan summary
+app.post("/ai-whs-plan", apiKeyAuth, async (req, res) => {
+  const { projectId, projectName, jobType, scope, contractorCount, state = "VIC" } = req.body || {};
+  if (!projectId || !jobType || !scope) return res.status(400).json({ error: "projectId, jobType, and scope required." });
+
+  const safeProjectId = sanitiseInput(String(projectId)).slice(0, 80);
+  const safeName      = projectName ? sanitiseInput(String(projectName)).slice(0, 100) : `Project ${safeProjectId}`;
+  const safeType      = sanitiseInput(String(jobType)).slice(0, 40);
+  const safeScope     = sanitiseInput(String(scope)).slice(0, 1500);
+  const safeContractors = contractorCount ? Math.max(1, parseInt(contractorCount) || 1) : null;
+  const safeState     = sanitiseInput(String(state)).toUpperCase().slice(0, 5);
+
+  const prompt = `You are a WHS (Work Health and Safety) consultant for ${safeType} construction in ${safeState}, Australia.
+
+Create a WHS Management Plan summary for:
+Project: ${safeName}
+Scope: ${safeScope}
+${safeContractors ? `Number of contractors: ${safeContractors}` : ""}
+
+Respond with JSON:
+{
+  "principalContractorObligations": ["obligation 1"],
+  "highRiskConstructionWork": ["HRCW item if applicable"],
+  "safeWorkMethodStatements": ["SWMS required for"],
+  "trafficManagement": "brief note",
+  "emergencyManagement": "brief note",
+  "consultationRequirements": ["consultation required with"],
+  "notificationRequired": ["WorkSafe notification trigger"],
+  "keyDocuments": ["document required"],
+  "summary": "2-sentence executive summary"
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 700 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      projectId: safeProjectId, projectName: safeName, jobType: safeType, state: safeState,
+      principalContractorObligations: Array.isArray(parsed.principalContractorObligations) ? parsed.principalContractorObligations : [],
+      highRiskConstructionWork:        Array.isArray(parsed.highRiskConstructionWork) ? parsed.highRiskConstructionWork : [],
+      safeWorkMethodStatements:        Array.isArray(parsed.safeWorkMethodStatements) ? parsed.safeWorkMethodStatements : [],
+      trafficManagement:               parsed.trafficManagement || null,
+      emergencyManagement:             parsed.emergencyManagement || null,
+      consultationRequirements:        Array.isArray(parsed.consultationRequirements) ? parsed.consultationRequirements : [],
+      notificationRequired:            Array.isArray(parsed.notificationRequired) ? parsed.notificationRequired : [],
+      keyDocuments:                    Array.isArray(parsed.keyDocuments) ? parsed.keyDocuments : [],
+      summary:                         parsed.summary || "",
+      disclaimer: "This is an AI-generated guide only. Engage a qualified WHS consultant for formal WHS Management Plans.",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      projectId: safeProjectId, projectName: safeName, jobType: safeType, state: safeState,
+      principalContractorObligations: [], highRiskConstructionWork: [], safeWorkMethodStatements: [],
+      trafficManagement: null, emergencyManagement: null, consultationRequirements: [],
+      notificationRequired: [], keyDocuments: [], summary: "WHS plan generation temporarily unavailable.",
+      disclaimer: "Engage a qualified WHS consultant for formal WHS Management Plans.",
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /safety-alert  — Issue a safety alert to site personnel
+app.post("/safety-alert", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, alertType, title, description, severity, actionRequired, issuedBy, affectedTrades, notes } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+  if (!title || !description) return res.status(400).json({ error: "title and description required." });
+
+  const ALERT_TYPES  = ["hazard-identified", "near-miss", "procedure-change", "weather-warning", "equipment-failure", "regulatory-update", "incident-learnings", "other"];
+  const VALID_SEV    = ["CRITICAL", "HIGH", "MEDIUM", "LOW"];
+
+  const safeSiteId  = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId   = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeType    = ALERT_TYPES.includes(String(alertType || "").toLowerCase().replace(/ /g, "-")) ? String(alertType).toLowerCase().replace(/ /g, "-") : "other";
+  const safeTitle   = sanitiseInput(String(title)).slice(0, 150);
+  const safeDesc    = sanitiseInput(String(description)).slice(0, 1000);
+  const safeSev     = VALID_SEV.includes(String(severity || "").toUpperCase()) ? String(severity).toUpperCase() : "HIGH";
+  const safeAction  = actionRequired ? sanitiseInput(String(actionRequired)).slice(0, 500) : null;
+  const safeIssuedBy = issuedBy ? sanitiseInput(String(issuedBy)).slice(0, 100) : null;
+  const safeTrades  = Array.isArray(affectedTrades) ? affectedTrades.slice(0, 10).map(t => sanitiseInput(String(t)).slice(0, 50)) : [];
+  const safeNotes   = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const alert = {
+    alertId: `SAL-${(safeSiteId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId, jobId: safeJobId, alertType: safeType,
+    title: safeTitle, description: safeDesc, severity: safeSev,
+    actionRequired: safeAction, issuedBy: safeIssuedBy,
+    affectedTrades: safeTrades, notes: safeNotes, status: "ACTIVE",
+    issuedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("safety_alerts").insert({
+        alert_id: alert.alertId, site_id: safeSiteId, job_id: safeJobId, alert_type: safeType,
+        title: safeTitle, description: safeDesc, severity: safeSev, action_required: safeAction,
+        issued_by: safeIssuedBy, affected_trades: safeTrades, notes: safeNotes, status: "ACTIVE",
+        issued_at: alert.issuedAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...alert, saved: !!supabaseAdmin });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
