@@ -28225,6 +28225,208 @@ app.post("/snagging-list", apiKeyAuth, async (req, res) => {
   res.json({ success: true, snagId: null, ...record, saved: false });
 });
 
+// ── Round 97: Progress claim, retention tracking, superintendent instructions ──
+
+// POST /progress-claim — Submit a contractor progress payment claim
+app.post("/progress-claim", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, contractorId, claimNumber, claimDate,
+    claimPeriodStart, claimPeriodEnd,
+    contractSum, previouslyCertified = 0,
+    claimItems = [], retentionPercent = 5,
+    notes,
+  } = req.body;
+
+  if (!projectId || !contractorId || !claimNumber)
+    return res.status(400).json({ error: "projectId, contractorId, claimNumber required." });
+
+  const processedItems = claimItems.map(item => {
+    const scheduled = Number(item.scheduledAmount) || 0;
+    const prevClaimed = Number(item.previouslyClaimed) || 0;
+    const thisClaim = Number(item.thisClaimPercent)
+      ? scheduled * (Number(item.thisClaimPercent) / 100) - prevClaimed
+      : Number(item.thisClaimAmount) || 0;
+    return {
+      description: sanitiseInput(item.description || ""),
+      scheduledAmount: scheduled,
+      previouslyClaimed: prevClaimed,
+      thisClaimAmount: Math.max(0, thisClaim),
+      cumulativeClaimed: prevClaimed + Math.max(0, thisClaim),
+      percentComplete: scheduled > 0 ? Math.round(((prevClaimed + Math.max(0, thisClaim)) / scheduled) * 100) : 0,
+    };
+  });
+
+  const thisClaimSubtotal = processedItems.reduce((s, i) => s + i.thisClaimAmount, 0);
+  const retentionAmount = thisClaimSubtotal * (Number(retentionPercent) / 100);
+  const netClaim = thisClaimSubtotal - retentionAmount;
+  const gst = netClaim * 0.1;
+  const totalPayable = netClaim + gst;
+  const cumulativeCertified = Number(previouslyCertified) + netClaim;
+  const balance = Number(contractSum || 0) - cumulativeCertified;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    contractor_id: sanitiseInput(contractorId),
+    claim_number: Number(claimNumber),
+    claim_date: claimDate || new Date().toISOString().split("T")[0],
+    claim_period_start: claimPeriodStart || null,
+    claim_period_end: claimPeriodEnd || null,
+    contract_sum: Number(contractSum) || null,
+    claim_items: processedItems,
+    this_claim_subtotal: thisClaimSubtotal,
+    retention_percent: Number(retentionPercent),
+    retention_amount: retentionAmount,
+    net_claim: netClaim,
+    gst,
+    total_payable: totalPayable,
+    cumulative_certified: cumulativeCertified,
+    balance_to_complete: balance,
+    status: "SUBMITTED",
+    notes: sanitiseInput(notes || ""),
+    submitted_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("progress_claims")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, claimId: data.id, ...record });
+  }
+
+  res.json({ success: true, claimId: null, ...record, saved: false });
+});
+
+// GET /progress-claims/:projectId — List progress claims for a project
+app.get("/progress-claims/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("progress_claims")
+      .select("*")
+      .eq("project_id", projectId)
+      .order("claim_number", { ascending: true });
+    if (error) return res.status(500).json({ error: "DB error." });
+    return res.json({ projectId, claims: data || [], claimCount: (data || []).length });
+  }
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /retention-release — Record a retention release against a project
+app.post("/retention-release", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, contractorId, releaseType,
+    retentionHeld, releaseAmount, releaseDate, authorisedBy, notes,
+  } = req.body;
+
+  if (!projectId || !releaseAmount)
+    return res.status(400).json({ error: "projectId and releaseAmount required." });
+
+  const validTypes = ["PRACTICAL_COMPLETION", "FINAL_COMPLETION", "PARTIAL", "DEFECT_RECTIFICATION"];
+  const type = (releaseType || "PARTIAL").toUpperCase();
+
+  const held = Number(retentionHeld) || 0;
+  const releasing = Number(releaseAmount);
+  const remaining = Math.max(0, held - releasing);
+  const gst = releasing * 0.1;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    contractor_id: sanitiseInput(contractorId || ""),
+    release_type: validTypes.includes(type) ? type : "PARTIAL",
+    retention_held: held,
+    release_amount: releasing,
+    gst_on_release: gst,
+    total_release: releasing + gst,
+    remaining_retention: remaining,
+    release_date: releaseDate || new Date().toISOString().split("T")[0],
+    authorised_by: sanitiseInput(authorisedBy || ""),
+    notes: sanitiseInput(notes || ""),
+    status: "APPROVED",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("retention_releases")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, releaseId: data.id, ...record });
+  }
+
+  res.json({ success: true, releaseId: null, ...record, saved: false });
+});
+
+// POST /superintendent-instruction — Issue a formal superintendent's instruction (SI)
+app.post("/superintendent-instruction", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, siNumber, issuedBy, instructionType,
+    description, affectedTrade, estimatedVariation = 0,
+    urgency = "NORMAL", responseRequired = false, responseDueDate,
+  } = req.body;
+
+  if (!projectId || !siNumber || !description)
+    return res.status(400).json({ error: "projectId, siNumber, description required." });
+
+  const validTypes = ["VARIATION", "DIRECTION", "CLARIFICATION", "REJECTION", "RECTIFICATION", "SUSPENSION", "OTHER"];
+  const validUrgency = ["ROUTINE", "NORMAL", "URGENT", "IMMEDIATE"];
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    si_number: sanitiseInput(String(siNumber)),
+    issued_by: sanitiseInput(issuedBy || ""),
+    issued_date: new Date().toISOString().split("T")[0],
+    instruction_type: validTypes.includes((instructionType || "").toUpperCase()) ? instructionType.toUpperCase() : "DIRECTION",
+    description: sanitiseInput(description),
+    affected_trade: sanitiseInput(affectedTrade || ""),
+    estimated_variation: Number(estimatedVariation),
+    urgency: validUrgency.includes((urgency || "").toUpperCase()) ? urgency.toUpperCase() : "NORMAL",
+    response_required: Boolean(responseRequired),
+    response_due_date: responseDueDate || null,
+    status: "ISSUED",
+    issued_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("superintendent_instructions")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, instructionId: data.id, ...record });
+  }
+
+  res.json({ success: true, instructionId: null, ...record, saved: false });
+});
+
+// GET /superintendent-instructions/:projectId — List SIs for a project
+app.get("/superintendent-instructions/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { type, urgency } = req.query;
+
+  if (supabaseAdmin) {
+    let query = supabaseAdmin
+      .from("superintendent_instructions")
+      .select("*")
+      .eq("project_id", projectId)
+      .order("issued_at", { ascending: false });
+
+    if (type) query = query.eq("instruction_type", type.toUpperCase());
+    if (urgency) query = query.eq("urgency", urgency.toUpperCase());
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "DB error." });
+    return res.json({ projectId, instructions: data || [], count: (data || []).length });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
