@@ -61677,6 +61677,402 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /curtain-wall-inspection — Glazing and curtain wall inspection per AS 1288 / AS 4284
+app.post("/curtain-wall-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    location,             // floor/elevation reference
+    inspectionDate,
+    inspector,
+    systemManufacturer,
+    systemType,           // unitised | stick | structural-glazing | spandrel | point-fixed
+    glassType,            // monolithic | laminated | IGU | toughened | heat-strengthened
+    glassThickness_mm,
+    paneWidth_mm,
+    paneHeight_mm,
+    designWindPressure_Pa,
+    testWindPressure_Pa,
+    airInfiltrationResult, // pass | fail | not-tested
+    waterInfiltrationResult,
+    structuralTestResult,
+    sealantCondition,     // good | deteriorated | failed | not-inspected
+    gasketCondition,
+    drainageWeepholes,    // open | blocked | absent
+    thermalBreaksPresent,
+    condensationObserved,
+    glassCracked,
+    sealFailures,         // array of { location, description }
+    anchorageInspected,
+    anchorageCondition,   // good | corroded | loose | failed
+    deflectionMeasured_mm,
+    allowableDeflection_mm, // span/200 or as specified
+    fireRatingRequired,
+    fireRatingAchieved,
+    safetyGlazingZones,   // array of zone references
+    safetyGlazingCompliant,
+    photos,
+    notes,
+  } = req.body;
+
+  const failures = [];
+
+  // Infiltration test failures
+  if (airInfiltrationResult === "fail") failures.push("Air infiltration test FAILED");
+  if (waterInfiltrationResult === "fail") failures.push("Water infiltration test FAILED");
+  if (structuralTestResult === "fail") failures.push("Structural (wind load) test FAILED");
+
+  // Sealant/gasket failures
+  if (sealantCondition === "failed") failures.push("Sealant failed — weatherproofing compromised");
+  if (drainageWeepholes === "blocked") failures.push("Drainage weepholes blocked — water ponding risk");
+  if (drainageWeepholes === "absent") failures.push("Drainage weepholes absent — AS 4284 requirement");
+
+  // Glass breakage
+  if (glassCracked === true || glassCracked === "true") {
+    failures.push("Cracked glass pane(s) identified — replace immediately");
+  }
+
+  // Anchorage
+  if (anchorageCondition === "failed" || anchorageCondition === "loose") {
+    failures.push(`Curtain wall anchorage is ${anchorageCondition} — structural safety risk`);
+  }
+
+  // Deflection check
+  const measuredDef = parseFloat(deflectionMeasured_mm) || 0;
+  const allowableDef = parseFloat(allowableDeflection_mm) || 0;
+  if (allowableDef > 0 && measuredDef > allowableDef) {
+    failures.push(
+      `Deflection ${measuredDef} mm exceeds allowable ${allowableDef} mm — glass breakage risk`
+    );
+  }
+
+  // Safety glazing compliance
+  if (safetyGlazingCompliant === false || safetyGlazingCompliant === "false") {
+    failures.push("Safety glazing zones non-compliant — AS 1288 critical location requirements not met");
+  }
+
+  // Fire rating shortfall
+  if (fireRatingRequired && !fireRatingAchieved) {
+    failures.push("Fire rating required but not achieved — building permit non-compliance");
+  }
+
+  const passed = failures.length === 0;
+
+  if (!passed) {
+    return res.status(422).json({
+      error: "Curtain wall inspection identifies significant defects",
+      failures,
+      immediateActions: [
+        "Restrict public access below/adjacent to failed panels",
+        "Notify façade engineer and principal contractor",
+        "Schedule urgent repairs for water infiltration and cracked glass",
+      ],
+      applicableStandards: ["AS 1288", "AS 4284", "NCC 2022 FP1.4", "AS 1170.2"],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    location: sanitiseInput(location),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    system_manufacturer: sanitiseInput(systemManufacturer),
+    system_type: sanitiseInput(systemType),
+    glass_type: sanitiseInput(glassType),
+    glass_thickness_mm: glassThickness_mm,
+    pane_width_mm: paneWidth_mm,
+    pane_height_mm: paneHeight_mm,
+    design_wind_pressure_pa: designWindPressure_Pa,
+    test_wind_pressure_pa: testWindPressure_Pa,
+    air_infiltration_result: sanitiseInput(airInfiltrationResult),
+    water_infiltration_result: sanitiseInput(waterInfiltrationResult),
+    structural_test_result: sanitiseInput(structuralTestResult),
+    sealant_condition: sanitiseInput(sealantCondition),
+    gasket_condition: sanitiseInput(gasketCondition),
+    drainage_weepholes: sanitiseInput(drainageWeepholes),
+    thermal_breaks_present: thermalBreaksPresent,
+    condensation_observed: condensationObserved,
+    glass_cracked: glassCracked,
+    seal_failures: sealFailures || [],
+    anchorage_inspected: anchorageInspected,
+    anchorage_condition: sanitiseInput(anchorageCondition),
+    deflection_measured_mm: deflectionMeasured_mm,
+    allowable_deflection_mm: allowableDeflection_mm,
+    fire_rating_required: fireRatingRequired,
+    fire_rating_achieved: fireRatingAchieved,
+    safety_glazing_zones: safetyGlazingZones || [],
+    safety_glazing_compliant: safetyGlazingCompliant,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    result: "PASSED",
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("curtain_wall_inspections")
+      .insert(record);
+    if (dbErr) console.error("DB error /curtain-wall-inspection:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Curtain wall inspection recorded — passed",
+    failureCount: 0,
+    result: "PASSED",
+    applicableStandards: ["AS 1288", "AS 4284", "NCC 2022", "AS 1170.2"],
+    saved,
+  });
+});
+
+// POST /indoor-air-quality-record — Indoor air quality monitoring per AS 1668.2 / NHMRC / AIRAH
+app.post("/indoor-air-quality-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    buildingName,
+    buildingAddress,
+    sampleLocation,
+    testDate,
+    tester,
+    co2_ppm,             // CO2 — NHMRC guideline 1000 ppm
+    co_ppm,              // CO — NHMRC 9 ppm 8h
+    tvoc_ug_m3,          // Total VOC — NHMRC 500 µg/m³
+    pm25_ug_m3,          // PM2.5 — WHO guideline 25 µg/m³ 24h
+    pm10_ug_m3,          // PM10 — WHO guideline 50 µg/m³ 24h
+    temperature_C,       // ASHRAE 55: 20–26°C
+    relativeHumidity_pct, // 30–60% per ASHRAE 62
+    formaldehyde_ug_m3,  // NHMRC guideline 100 µg/m³
+    radon_Bq_m3,         // EPA recommended action level 200 Bq/m³ (Aus)
+    ventilationRate_L_s_person, // AS 1668.2 minimum 10 L/s/person
+    occupancyCount,
+    measurementInstruments,
+    buildingType,        // office | school | healthcare | retail | residential
+    hvacOperating,
+    windowsOpen,
+    exceedances,         // array of parameters that exceeded limits
+    notes,
+  } = req.body;
+
+  // Define limits
+  const limits = {
+    co2: 1000,           // ppm
+    co: 9,               // ppm
+    tvoc: 500,           // µg/m³
+    pm25: 25,            // µg/m³
+    pm10: 50,            // µg/m³
+    formaldehyde: 100,   // µg/m³
+    radon: 200,          // Bq/m³
+    tempMin: 20,
+    tempMax: 26,
+    humidityMin: 30,
+    humidityMax: 60,
+    ventilation: 10,     // L/s/person
+  };
+
+  const detectedExceedances = [];
+
+  if (parseFloat(co2_ppm) > limits.co2) detectedExceedances.push(`CO2 ${co2_ppm} ppm > ${limits.co2} ppm`);
+  if (parseFloat(co_ppm) > limits.co) detectedExceedances.push(`CO ${co_ppm} ppm > ${limits.co} ppm (8h)`);
+  if (parseFloat(tvoc_ug_m3) > limits.tvoc) detectedExceedances.push(`TVOC ${tvoc_ug_m3} µg/m³ > ${limits.tvoc} µg/m³`);
+  if (parseFloat(pm25_ug_m3) > limits.pm25) detectedExceedances.push(`PM2.5 ${pm25_ug_m3} µg/m³ > ${limits.pm25} µg/m³`);
+  if (parseFloat(pm10_ug_m3) > limits.pm10) detectedExceedances.push(`PM10 ${pm10_ug_m3} µg/m³ > ${limits.pm10} µg/m³`);
+  if (parseFloat(formaldehyde_ug_m3) > limits.formaldehyde)
+    detectedExceedances.push(`Formaldehyde ${formaldehyde_ug_m3} µg/m³ > ${limits.formaldehyde} µg/m³`);
+  if (parseFloat(radon_Bq_m3) > limits.radon) detectedExceedances.push(`Radon ${radon_Bq_m3} Bq/m³ > ${limits.radon} Bq/m³`);
+  if (parseFloat(temperature_C) < limits.tempMin || parseFloat(temperature_C) > limits.tempMax)
+    detectedExceedances.push(`Temperature ${temperature_C}°C outside comfort range ${limits.tempMin}–${limits.tempMax}°C`);
+  if (parseFloat(relativeHumidity_pct) < limits.humidityMin || parseFloat(relativeHumidity_pct) > limits.humidityMax)
+    detectedExceedances.push(`Humidity ${relativeHumidity_pct}% outside range ${limits.humidityMin}–${limits.humidityMax}%`);
+  if (parseFloat(ventilationRate_L_s_person) < limits.ventilation)
+    detectedExceedances.push(`Ventilation ${ventilationRate_L_s_person} L/s/person < minimum ${limits.ventilation} L/s/person (AS 1668.2)`);
+
+  const overallStatus =
+    detectedExceedances.length === 0
+      ? "COMPLIANT"
+      : detectedExceedances.length <= 2
+      ? "MARGINAL"
+      : "NON-COMPLIANT";
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    building_name: sanitiseInput(buildingName),
+    building_address: sanitiseInput(buildingAddress),
+    sample_location: sanitiseInput(sampleLocation),
+    test_date: testDate,
+    tester: sanitiseInput(tester),
+    co2_ppm,
+    co_ppm,
+    tvoc_ug_m3,
+    pm25_ug_m3,
+    pm10_ug_m3,
+    temperature_c: temperature_C,
+    relative_humidity_pct: relativeHumidity_pct,
+    formaldehyde_ug_m3,
+    radon_bq_m3: radon_Bq_m3,
+    ventilation_rate_l_s_person: ventilationRate_L_s_person,
+    occupancy_count: occupancyCount,
+    measurement_instruments: sanitiseInput(measurementInstruments),
+    building_type: sanitiseInput(buildingType),
+    hvac_operating: hvacOperating,
+    windows_open: windowsOpen,
+    exceedances: detectedExceedances,
+    notes: sanitiseInput(notes),
+    overall_status: overallStatus,
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("indoor_air_quality_records")
+      .insert(record);
+    if (dbErr) console.error("DB error /indoor-air-quality-record:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Indoor air quality record saved",
+    overallStatus,
+    exceedancesCount: detectedExceedances.length,
+    exceedances: detectedExceedances,
+    guidelines: {
+      co2_limit_ppm: limits.co2,
+      tvoc_limit_ug_m3: limits.tvoc,
+      pm25_limit_ug_m3: limits.pm25,
+      ventilation_min_L_s_person: limits.ventilation,
+    },
+    applicableStandards: [
+      "AS 1668.2",
+      "NHMRC IAQ Guidelines",
+      "ASHRAE 62.1",
+      "ASHRAE 55",
+      "WHO Air Quality Guidelines",
+    ],
+    saved,
+  });
+});
+
+// POST /ai-curtain-wall-assessment — AI assesses façade integrity, weatherproofing, and remediation
+app.post("/ai-curtain-wall-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    systemType,
+    buildingHeight_m,
+    designWindPressure_Pa,
+    sealantCondition,
+    infiltrationResults,
+    glassType,
+    paneArea_m2,
+    anchorageCondition,
+    condensationObserved,
+    buildingAge_years,
+    environment,          // coastal | urban | industrial | alpine
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are a façade engineer and building envelope specialist with 20 years experience on Australian commercial and high-rise projects. Assess curtain wall and glazed façade systems for compliance with AS 1288, AS 4284, AS 1170.2, and NCC 2022.
+
+Assess:
+1. Weatherproofing integrity — air and water infiltration risk points
+2. Structural adequacy — wind load path to primary structure
+3. Glass selection appropriateness — thermal stress, safety glazing zones per AS 1288
+4. Thermal performance — condensation risk, NCC glazing energy requirements
+5. Sealant and gasket condition — likely remaining service life
+6. Anchorage corrosion risk especially in coastal environments
+7. Façade inspection and maintenance programme requirements
+8. Fall hazard risk from failed glass or panel
+
+Respond with JSON: { "weatherproofingRisk": "low|medium|high|critical", "structuralAdequacy": "adequate|marginal|inadequate", "glassFailureRisk": "low|medium|high", "thermalPerformance": "good|adequate|poor", "sealantRemainingLife_years": number, "anchorageCorrosionRisk": "low|medium|high", "condensationRisk": "low|medium|high", "immediateRisks": [], "maintenanceActions": [], "remedialWorks": [], "inspectionFrequency": "string", "fallHazardAssessment": "string", "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const userContent = [
+    {
+      type: "text",
+      text: `System type: ${systemType || "not specified"}
+Building height: ${buildingHeight_m || "not specified"} m
+Design wind pressure: ${designWindPressure_Pa || "not specified"} Pa
+Sealant condition: ${sealantCondition || "not specified"}
+Infiltration test results: ${infiltrationResults || "not tested"}
+Glass type: ${glassType || "not specified"}
+Pane area: ${paneArea_m2 || "not specified"} m²
+Anchorage condition: ${anchorageCondition || "not specified"}
+Condensation observed: ${condensationObserved || "no"}
+Building age: ${buildingAge_years || "not specified"} years
+Environment: ${environment || "urban"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-curtain-wall-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        weatherproofingRisk: "medium",
+        structuralAdequacy: "adequate",
+        glassFailureRisk: "low",
+        thermalPerformance: "adequate",
+        sealantRemainingLife_years: 8,
+        anchorageCorrosionRisk: "medium",
+        condensationRisk: "low",
+        immediateRisks: [
+          "Inspect all sealant joints for cracking, adhesion failure, or UV degradation",
+          "Check drainage weepholes are clear and functioning",
+        ],
+        maintenanceActions: [
+          "Biennial sealant inspection and proactive re-sealing of deteriorated joints",
+          "Annual anchorage corrosion inspection on coastal-facing elevations",
+          "Clean drainage channels and weepholes annually",
+        ],
+        remedialWorks: [
+          "Re-seal failed joints with compatible neutral-cure silicone",
+          "Replace any glass with edge defects or seal failure in IGUs",
+        ],
+        inspectionFrequency: "Annual rope-access or EWP façade inspection recommended for buildings >25 m",
+        fallHazardAssessment:
+          "Low fall hazard risk from glass — ensure safety glazing in critical locations per AS 1288 Table 1",
+        applicableStandards: [
+          "AS 1288",
+          "AS 4284",
+          "AS 1170.2",
+          "NCC 2022 Section J",
+          "AIRAH DA07",
+        ],
+        recommendation:
+          "Implement biennial façade inspection programme including sealant, anchorage, and drainage inspections. Prioritise coastal-facing elevations for corrosion assessment.",
+        summary:
+          "Curtain wall system is structurally adequate with medium weatherproofing maintenance risk. Proactive sealant maintenance and drainage management will prevent water ingress and extend façade service life.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
