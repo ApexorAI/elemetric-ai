@@ -17208,6 +17208,241 @@ app.post("/client-notification", apiKeyAuth, async (req, res) => {
   });
 });
 
+// ── Round 39 ──────────────────────────────────────────────────────────────────
+
+// POST /job-expense  — Log a job expense entry
+app.post("/job-expense", apiKeyAuth, async (req, res) => {
+  const { jobId, contractorId, category, description, amount, gstIncluded,
+          receiptDate, supplier, notes } = req.body;
+
+  if (!jobId || amount === undefined) {
+    return res.status(400).json({ error: "jobId and amount are required." });
+  }
+
+  const numAmount    = parseFloat(amount);
+  if (isNaN(numAmount) || numAmount < 0) return res.status(400).json({ error: "amount must be a positive number." });
+
+  const VALID_CATEGORIES = ["materials", "labour", "plant_hire", "travel", "permit", "inspection", "disposal", "subcontractor", "other"];
+  const safeCategory = sanitiseInput(String(category || "other")).toLowerCase().replace(/\s/g, "_");
+  const resolvedCat  = VALID_CATEGORIES.includes(safeCategory) ? safeCategory : "other";
+
+  const safeDesc     = sanitiseInput(String(description || "Job expense"));
+  const safeSupplier = sanitiseInput(String(supplier || ""));
+  const safeNotes    = sanitiseInput(String(notes || ""));
+
+  const gstAmount  = gstIncluded ? Math.round(numAmount / 11 * 100) / 100 : Math.round(numAmount * 0.1 * 100) / 100;
+  const exclGst    = gstIncluded ? Math.round((numAmount - gstAmount) * 100) / 100 : numAmount;
+  const inclGst    = gstIncluded ? numAmount : Math.round((numAmount + gstAmount) * 100) / 100;
+
+  const expenseId = `EXP-${Date.now().toString(36).toUpperCase()}`;
+
+  const expense = {
+    expenseId,
+    jobId:       sanitiseInput(String(jobId)),
+    category:    resolvedCat,
+    description: safeDesc,
+    supplier:    safeSupplier || null,
+    amount: {
+      exclGst,
+      gst:     gstAmount,
+      inclGst,
+    },
+    receiptDate: sanitiseInput(String(receiptDate || new Date().toISOString().slice(0, 10))),
+    notes:       safeNotes || null,
+    loggedAt:    new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("job_expenses").insert({
+      expense_id:   expenseId,
+      job_id:       expense.jobId,
+      contractor_id: contractorId ? sanitiseInput(String(contractorId)) : null,
+      category:     resolvedCat,
+      description:  safeDesc,
+      amount_excl_gst: exclGst,
+      gst_amount:   gstAmount,
+      amount_incl_gst: inclGst,
+      receipt_date: expense.receiptDate,
+      created_at:   new Date().toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...expense, saved });
+});
+
+// GET /job-expenses/:jobId  — Retrieve all expenses for a job
+app.get("/job-expenses/:jobId", apiKeyAuth, async (req, res) => {
+  const jobId = sanitiseInput(String(req.params.jobId || ""));
+  if (!jobId) return res.status(400).json({ error: "jobId is required." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  const { data, error } = await supabaseAdmin
+    .from("job_expenses")
+    .select("*")
+    .eq("job_id", jobId)
+    .order("created_at", { ascending: true });
+
+  if (error) return res.status(500).json({ error: "Failed to retrieve expenses." });
+
+  const expenses    = data || [];
+  const totalExcl   = Math.round(expenses.reduce((s, e) => s + (parseFloat(e.amount_excl_gst) || 0), 0) * 100) / 100;
+  const totalGst    = Math.round(expenses.reduce((s, e) => s + (parseFloat(e.gst_amount) || 0), 0) * 100) / 100;
+  const totalIncl   = Math.round(expenses.reduce((s, e) => s + (parseFloat(e.amount_incl_gst) || 0), 0) * 100) / 100;
+
+  const byCategory  = {};
+  for (const e of expenses) {
+    const cat = e.category || "other";
+    if (!byCategory[cat]) byCategory[cat] = 0;
+    byCategory[cat] = Math.round((byCategory[cat] + (parseFloat(e.amount_incl_gst) || 0)) * 100) / 100;
+  }
+
+  return res.json({
+    jobId,
+    expenseCount: expenses.length,
+    totals: { exclGst: totalExcl, gst: totalGst, inclGst: totalIncl },
+    byCategory,
+    expenses,
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
+// POST /job-variation  — Record a change in scope (variation) for a job
+app.post("/job-variation", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, variationDescription, requestedBy, additionalCost,
+          additionalDays, status, approvedBy, notes } = req.body;
+
+  if (!jobId || !variationDescription) {
+    return res.status(400).json({ error: "jobId and variationDescription are required." });
+  }
+
+  const safeJobId   = sanitiseInput(String(jobId));
+  const safeJobType = sanitiseInput(String(jobType || "general")).toLowerCase();
+  const safeDesc    = sanitiseInput(String(variationDescription));
+  const safeReqBy   = sanitiseInput(String(requestedBy || "Client"));
+  const safeApprBy  = sanitiseInput(String(approvedBy  || ""));
+  const safeNotes   = sanitiseInput(String(notes || ""));
+  const safeStatus  = sanitiseInput(String(status || "pending")).toUpperCase();
+
+  const VALID_STATUSES = ["PENDING", "APPROVED", "REJECTED", "DEFERRED"];
+  const resolvedStatus = VALID_STATUSES.includes(safeStatus) ? safeStatus : "PENDING";
+
+  const addCost = parseFloat(additionalCost) || 0;
+  const addDays = parseInt(additionalDays) || 0;
+
+  const variationId = `VAR-${Date.now().toString(36).toUpperCase()}`;
+
+  const variation = {
+    variationId,
+    jobId:                safeJobId,
+    jobType:              safeJobType,
+    variationDescription: safeDesc,
+    requestedBy:          safeReqBy,
+    additionalCost:       addCost,
+    additionalCostGst:    Math.round(addCost * 0.1 * 100) / 100,
+    additionalCostInclGst: Math.round(addCost * 1.1 * 100) / 100,
+    additionalDays:       addDays,
+    status:               resolvedStatus,
+    approvedBy:           safeApprBy || null,
+    notes:                safeNotes || null,
+    warning:              resolvedStatus === "PENDING" ? "Variation must be approved in writing before work commences. Verbal approvals are not enforceable under DBCA 1995." : null,
+    createdAt:            new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("job_variations").insert({
+      variation_id:         variationId,
+      job_id:               safeJobId,
+      job_type:             safeJobType,
+      description:          safeDesc,
+      requested_by:         safeReqBy,
+      additional_cost:      addCost,
+      additional_days:      addDays,
+      status:               resolvedStatus,
+      approved_by:          safeApprBy || null,
+      created_at:           new Date().toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...variation, saved });
+});
+
+// POST /compliance-gap-report  — Detailed gap analysis comparing job to a full trade checklist
+app.post("/compliance-gap-report", apiKeyAuth, (req, res) => {
+  const { jobType, itemsDetected, itemsMissing, itemsUnclear,
+          complianceScore, grade, certificateFiled, gpsRecorded,
+          signatureObtained, photoCount } = req.body;
+
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+
+  const safeJobType   = sanitiseInput(String(jobType)).toLowerCase();
+  const detected      = Array.isArray(itemsDetected)  ? itemsDetected.map(i  => sanitiseInput(String(i))) : [];
+  const missing       = Array.isArray(itemsMissing)   ? itemsMissing.map(i   => sanitiseInput(String(i))) : [];
+  const unclear       = Array.isArray(itemsUnclear)   ? itemsUnclear.map(i   => sanitiseInput(String(i))) : [];
+
+  const totalItems    = detected.length + missing.length + unclear.length;
+  const coverageRate  = totalItems > 0 ? Math.round((detected.length / totalItems) * 100) : 0;
+  const score         = parseFloat(complianceScore) || 0;
+
+  const CRITICAL_MISSING = {
+    plumbing:   ["isolation valve", "tempering valve", "tpr valve", "inspection point"],
+    gas:        ["gas certificate", "pressure test", "isolation valve", "combustion analysis"],
+    electrical: ["rcd", "escc", "circuit schedule", "earth"],
+    drainage:   ["inspection opening", "water test", "gradient verification"],
+    carpentry:  ["structural connection", "permit", "engineer certificate"],
+    hvac:       ["arctick certificate", "refrigerant record", "commissioning report"],
+  };
+
+  const criticalKeywords  = CRITICAL_MISSING[safeJobType] || [];
+  const criticalGaps      = missing.filter(item =>
+    criticalKeywords.some(kw => item.toLowerCase().includes(kw))
+  );
+
+  const docGaps = [
+    !certificateFiled  ? "Certificate of Compliance not filed" : null,
+    !gpsRecorded       ? "GPS location not recorded on photos" : null,
+    !signatureObtained ? "Client signature not obtained"        : null,
+    (parseInt(photoCount) || 0) < 4 ? `Only ${parseInt(photoCount) || 0} photos — minimum 4 recommended` : null,
+  ].filter(Boolean);
+
+  const REMEDIATION = {
+    low:    { effort: "Low",    timeline: "< 1 hour", costEst: "$0–$50" },
+    medium: { effort: "Medium", timeline: "1–4 hours", costEst: "$50–$300" },
+    high:   { effort: "High",   timeline: "Return visit required", costEst: "$300+" },
+  };
+
+  const remediationLevel = criticalGaps.length > 2 || score < 50 ? "high" : missing.length > 3 || score < 70 ? "medium" : "low";
+  const remediation = REMEDIATION[remediationLevel];
+
+  return res.json({
+    jobType:      safeJobType,
+    complianceScore: score,
+    grade:        grade || null,
+    coverage: {
+      detected:     detected.length,
+      missing:      missing.length,
+      unclear:      unclear.length,
+      total:        totalItems,
+      coverageRate: `${coverageRate}%`,
+    },
+    criticalGaps,
+    allMissingItems: missing,
+    unclearItems:    unclear,
+    documentationGaps: docGaps,
+    remediationEstimate: remediation,
+    remediationLevel,
+    priorityActions: [
+      ...criticalGaps.map(g => `CRITICAL: Rectify — ${g}`),
+      ...docGaps.map(d => `DOCUMENTATION: ${d}`),
+      ...missing.filter(m => !criticalGaps.includes(m)).slice(0, 5).map(m => `RECOMMENDED: Address — ${m}`),
+    ].slice(0, 10),
+    generatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
