@@ -37894,6 +37894,217 @@ Return JSON with:
   }
 });
 
+// POST /service-level-agreement — Create and track a service level agreement
+app.post("/service-level-agreement", apiKeyAuth, async (req, res) => {
+  const {
+    clientName, providerName, serviceDescription, trade,
+    startDate, endDate, responseTimeHours = 4, rectificationTimeHours = 24,
+    calloutFeeAud, hourlyRateAud, afterHoursMultiplier = 1.5,
+    coveredEquipment = [], penaltyClause = false,
+    penaltyAmountPerBreach = 0, reviewFrequencyMonths = 12, notes,
+  } = req.body;
+  if (!clientName || !providerName || !serviceDescription) {
+    return res.status(400).json({ error: "clientName, providerName, and serviceDescription are required." });
+  }
+  const slaRef = `SLA-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    sla_ref: slaRef,
+    client_name: sanitiseInput(clientName),
+    provider_name: sanitiseInput(providerName),
+    service_description: sanitiseInput(serviceDescription),
+    trade: sanitiseInput(trade || ""),
+    start_date: startDate || null,
+    end_date: endDate || null,
+    response_time_hours: Number(responseTimeHours),
+    rectification_time_hours: Number(rectificationTimeHours),
+    callout_fee_aud: Number(calloutFeeAud) || null,
+    hourly_rate_aud: Number(hourlyRateAud) || null,
+    after_hours_multiplier: Number(afterHoursMultiplier),
+    covered_equipment: Array.isArray(coveredEquipment) ? coveredEquipment.map(e => sanitiseInput(e)) : [],
+    penalty_clause: Boolean(penaltyClause),
+    penalty_amount_per_breach: Number(penaltyAmountPerBreach) || 0,
+    review_frequency_months: Number(reviewFrequencyMonths),
+    status: "ACTIVE",
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("service_level_agreements").insert(record);
+    if (error) console.error("service-level-agreement DB error:", error.message);
+  }
+  res.json({
+    slaRef, clientName, providerName, trade,
+    responseTimeHours: Number(responseTimeHours),
+    rectificationTimeHours: Number(rectificationTimeHours),
+    penaltyClause, saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-contract-drafter — AI drafts key clauses for a trade services agreement
+app.post("/ai-contract-drafter", apiKeyAuth, async (req, res) => {
+  const {
+    contractType = "TRADE_SERVICES", trade, scope, clientName, providerName,
+    contractValueAud, startDate, completionDate, paymentTermsDays = 14,
+    retentionPercent = 0, liquidatedDamagesPerDay = 0, state = "VIC",
+    additionalClauses = [],
+  } = req.body;
+  if (!trade || !scope) {
+    return res.status(400).json({ error: "trade and scope are required." });
+  }
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedScope = sanitiseInput(scope);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian construction law specialist. Draft plain-English but legally sound contract clauses governed by ${sanitisedState} law.`;
+  const userPrompt = `Draft key contract clauses for:
+Contract type: ${sanitiseInput(contractType)}
+Trade: ${sanitisedTrade}
+Client: ${sanitiseInput(clientName || "The Client")}
+Provider: ${sanitiseInput(providerName || "The Contractor")}
+Scope: ${sanitisedScope}
+Value: ${contractValueAud ? `$${contractValueAud} AUD` : "TBD"}
+Start: ${startDate || "TBD"} | Completion: ${completionDate || "TBD"}
+Payment terms: ${paymentTermsDays} days
+Retention: ${retentionPercent}%
+Liquidated damages: $${liquidatedDamagesPerDay}/day
+State: ${sanitisedState}
+Additional requirements: ${additionalClauses.map(c => sanitiseInput(c)).join("; ")}
+
+Return JSON with:
+{
+  "contractTitle": "...",
+  "parties": "...",
+  "scopeOfWorks": "...",
+  "paymentTerms": "...",
+  "variationsClause": "...",
+  "defectsLiabilityClause": "...",
+  "extensionOfTimeClause": "...",
+  "liquidatedDamagesClause": "...",
+  "retentionClause": "...",
+  "terminationClause": "...",
+  "disputeResolutionClause": "...",
+  "warrantiesClause": "...",
+  "insuranceRequirements": "...",
+  "governingLaw": "...",
+  "signatoryBlock": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 3000,
+    });
+    usageStats.openaiCalls++;
+    const clauses = JSON.parse(aiRes.choices[0].message.content);
+    const draftRef = `CTR-${Date.now().toString(36).toUpperCase()}`;
+    res.json({ draftRef, trade: sanitisedTrade, contractType, state: sanitisedState, clauses });
+  } catch (err) {
+    console.error("ai-contract-drafter error:", err.message);
+    res.json({
+      draftRef: `CTR-FALLBACK`, trade: sanitisedTrade, contractType, state: sanitisedState,
+      clauses: {
+        contractTitle: `${sanitisedTrade} Services Agreement`,
+        parties: `This agreement is between ${sanitiseInput(clientName || "The Client")} and ${sanitiseInput(providerName || "The Contractor")}.`,
+        scopeOfWorks: sanitisedScope,
+        paymentTerms: `Payment is due within ${paymentTermsDays} days of invoice.`,
+        variationsClause: "Any variations must be agreed in writing before commencement.",
+        defectsLiabilityClause: "A defects liability period of 12 months applies from the date of practical completion.",
+        extensionOfTimeClause: "Extensions of time may be granted for qualifying causes of delay as notified in writing.",
+        liquidatedDamagesClause: liquidatedDamagesPerDay > 0 ? `Liquidated damages of $${liquidatedDamagesPerDay} per day apply for delay beyond the agreed completion date.` : "No liquidated damages apply.",
+        retentionClause: retentionPercent > 0 ? `Retention of ${retentionPercent}% is held and released at practical completion.` : "No retention applies.",
+        terminationClause: "Either party may terminate for cause with 14 days written notice.",
+        disputeResolutionClause: `Disputes are to be resolved under the ${sanitisedState} Building and Construction Industry Security of Payment Act.`,
+        warrantiesClause: "All workmanship is warranted for 12 months from practical completion.",
+        insuranceRequirements: "The Contractor must hold public liability insurance of no less than $20 million.",
+        governingLaw: `This agreement is governed by the laws of ${sanitisedState}.`,
+        signatoryBlock: "Executed as an agreement by the parties.",
+      },
+    });
+  }
+});
+
+// POST /ai-dispute-letter — AI drafts a formal dispute or claim letter
+app.post("/ai-dispute-letter", apiKeyAuth, async (req, res) => {
+  const {
+    letterType = "PAYMENT_DISPUTE", trade, senderName, recipientName,
+    disputeAmount, disputeDescription, contractReference, dateOfWork,
+    previousCorrespondence = [], requestedAction, deadlineDays = 10,
+    state = "VIC",
+  } = req.body;
+  if (!disputeDescription || !senderName || !recipientName) {
+    return res.status(400).json({ error: "disputeDescription, senderName, and recipientName are required." });
+  }
+  const validTypes = ["PAYMENT_DISPUTE", "DEFECTIVE_WORK", "VARIATION_CLAIM", "EOT_CLAIM", "CONTRACT_BREACH", "SECURITY_OF_PAYMENT"];
+  if (!validTypes.includes(letterType)) {
+    return res.status(400).json({ error: `letterType must be one of: ${validTypes.join(", ")}` });
+  }
+  const sanitisedSender = sanitiseInput(senderName);
+  const sanitisedRecipient = sanitiseInput(recipientName);
+  const sanitisedDesc = sanitiseInput(disputeDescription);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian construction law specialist. Draft firm but professional formal dispute letters compliant with ${sanitisedState} legislation.`;
+  const userPrompt = `Draft a formal ${letterType.replace(/_/g, " ")} letter:
+Sender: ${sanitisedSender}
+Recipient: ${sanitisedRecipient}
+Trade: ${sanitiseInput(trade || "construction")}
+Dispute amount: ${disputeAmount ? `$${disputeAmount} AUD` : "TBD"}
+Description: ${sanitisedDesc}
+Contract reference: ${sanitiseInput(contractReference || "As per agreement")}
+Date of works: ${sanitiseInput(dateOfWork || "As carried out")}
+Previous correspondence: ${previousCorrespondence.map(c => sanitiseInput(c)).join("; ") || "None"}
+Requested action: ${sanitiseInput(requestedAction || "Settlement of the disputed amount")}
+Deadline: ${deadlineDays} days
+State: ${sanitisedState}
+
+Return JSON with:
+{
+  "subject": "...",
+  "openingParagraph": "...",
+  "factualBackground": "...",
+  "legalBasis": "...",
+  "demandParagraph": "...",
+  "consequencesParagraph": "...",
+  "closingParagraph": "...",
+  "enclosuresList": ["...", "..."],
+  "recommendedSendMethod": "...",
+  "followUpActions": ["...", "..."]
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const letter = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ letterType, senderName: sanitisedSender, recipientName: sanitisedRecipient, state: sanitisedState, deadlineDays, letter });
+  } catch (err) {
+    console.error("ai-dispute-letter error:", err.message);
+    res.json({
+      letterType, senderName: sanitisedSender, recipientName: sanitisedRecipient, state: sanitisedState, deadlineDays,
+      letter: {
+        subject: `FORMAL NOTICE — ${letterType.replace(/_/g, " ")}`,
+        openingParagraph: `We write to formally notify you of a dispute regarding the matter described below.`,
+        factualBackground: sanitisedDesc,
+        legalBasis: `Under the ${sanitisedState} Building and Construction Industry Security of Payment Act and applicable contract terms.`,
+        demandParagraph: `We require ${sanitiseInput(requestedAction || "resolution of this matter")} within ${deadlineDays} days of this notice.`,
+        consequencesParagraph: "Failure to respond within the stated timeframe may result in further action including adjudication or legal proceedings.",
+        closingParagraph: "We trust you will treat this matter with the urgency it requires.",
+        enclosuresList: ["Copy of relevant contract/agreement", "Supporting documentation"],
+        recommendedSendMethod: "Registered post and email with read receipt",
+        followUpActions: ["File copy in contract management system", "Diary note for response deadline", "Engage legal counsel if no response received"],
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
