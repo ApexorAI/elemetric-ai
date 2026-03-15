@@ -62765,6 +62765,370 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /retaining-wall-inspection — Retaining wall condition assessment per AS 4678 / AS 4100
+app.post("/retaining-wall-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    wallId,
+    location,
+    inspectionDate,
+    inspector,
+    wallType,             // concrete | masonry | gabion | timber | sheet-pile | soldier-pile | crib | reinforced-earth
+    height_m,
+    length_m,
+    constructionYear,
+    soilType,             // clay | sand | gravel | rock | fill
+    surchargePresent,
+    surchargekPa,
+    drainageCondition,    // good | blocked | absent | failed
+    weepHolesPresent,
+    weepHolesBlocked,
+    deflectionMeasured_mm,
+    deflectionAlarmLevel_mm,
+    crackPresent,
+    maxCrackWidth_mm,
+    cracksDescription,
+    tiltAngle_deg,        // measured tilt from vertical
+    tiltAlarmLevel_deg,   // typically 1° alarm for retained structures
+    baseErosion,
+    foundationSettlement,
+    tieback_present,
+    tiebackCondition,     // good | corroded | loose | failed | unknown
+    vegetationOnWall,
+    waterSeepage,
+    overallCondition,     // good | fair | poor | critical
+    immediateSafetyRisk,
+    photos,
+    notes,
+  } = req.body;
+
+  const failures = [];
+
+  // Deflection check
+  const measuredDef = parseFloat(deflectionMeasured_mm) || 0;
+  const alarmDef = parseFloat(deflectionAlarmLevel_mm) || (parseFloat(height_m) * 1000 * 0.005); // H/200
+  if (measuredDef > alarmDef) {
+    failures.push(`Deflection ${measuredDef} mm exceeds alarm level ${alarmDef.toFixed(0)} mm`);
+  }
+
+  // Tilt check — 1° is typical alarm for walls
+  const measuredTilt = parseFloat(tiltAngle_deg) || 0;
+  const alarmTilt = parseFloat(tiltAlarmLevel_deg) || 1;
+  if (measuredTilt > alarmTilt) {
+    failures.push(`Tilt ${measuredTilt}° exceeds alarm level ${alarmTilt}°`);
+  }
+
+  // Critical crack width
+  const crackWidth = parseFloat(maxCrackWidth_mm) || 0;
+  if (crackWidth > 3) {
+    failures.push(`Crack width ${crackWidth} mm is structural (>3 mm threshold)`);
+  }
+
+  // Tieback failures
+  if (tieback_present && (tiebackCondition === "failed" || tiebackCondition === "loose")) {
+    failures.push(`Tieback anchor is ${tiebackCondition} — structural integrity compromised`);
+  }
+
+  // Drainage failure
+  if (drainageCondition === "failed" || drainageCondition === "blocked") {
+    failures.push(`Drainage ${drainageCondition} — hydrostatic pressure build-up increases failure risk`);
+  }
+
+  // Immediate safety risk flag
+  if (immediateSafetyRisk === true || immediateSafetyRisk === "true") {
+    failures.push("Immediate safety risk identified — exclusion zone required");
+  }
+
+  if (failures.length > 0 || overallCondition === "critical") {
+    return res.status(422).json({
+      error: "Retaining wall inspection identifies structural safety concerns",
+      failures,
+      immediateActions: [
+        "Establish exclusion zone on both sides of wall",
+        "Notify geotechnical/structural engineer immediately",
+        "Restrict surcharge loading on retained soil",
+        "Monitor continuously — install targets if not in place",
+      ],
+      applicableStandards: ["AS 4678", "AS 4100", "AS 3600", "OHS Regulations 2017 (Vic)"],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    wall_id: sanitiseInput(wallId),
+    location: sanitiseInput(location),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    wall_type: sanitiseInput(wallType),
+    height_m,
+    length_m,
+    construction_year: constructionYear,
+    soil_type: sanitiseInput(soilType),
+    surcharge_present: surchargePresent,
+    surcharge_kpa: surchargekPa,
+    drainage_condition: sanitiseInput(drainageCondition),
+    weep_holes_present: weepHolesPresent,
+    weep_holes_blocked: weepHolesBlocked,
+    deflection_measured_mm: deflectionMeasured_mm,
+    deflection_alarm_level_mm: deflectionAlarmLevel_mm,
+    crack_present: crackPresent,
+    max_crack_width_mm: maxCrackWidth_mm,
+    cracks_description: sanitiseInput(cracksDescription),
+    tilt_angle_deg: tiltAngle_deg,
+    tilt_alarm_level_deg: tiltAlarmLevel_deg,
+    base_erosion: baseErosion,
+    foundation_settlement: foundationSettlement,
+    tieback_present: tieback_present,
+    tieback_condition: sanitiseInput(tiebackCondition),
+    vegetation_on_wall: vegetationOnWall,
+    water_seepage: waterSeepage,
+    overall_condition: sanitiseInput(overallCondition),
+    immediate_safety_risk: false,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    result: "PASSED",
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("retaining_wall_inspections")
+      .insert(record);
+    if (dbErr) console.error("DB error /retaining-wall-inspection:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Retaining wall inspection recorded — within acceptable limits",
+    overallCondition: sanitiseInput(overallCondition),
+    deflectionMeasured_mm: measuredDef,
+    tiltAngle_deg: measuredTilt,
+    crackWidth_mm: crackWidth,
+    result: "PASSED",
+    applicableStandards: ["AS 4678", "AS 4100", "AS 3600"],
+    saved,
+  });
+});
+
+// POST /dilapidation-survey — Pre/post construction dilapidation survey record
+app.post("/dilapidation-survey", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    surveyType,           // pre-construction | post-construction | interim
+    surveyDate,
+    surveyor,
+    surveyorLicence,
+    propertyAddress,
+    ownerName,
+    ownerContact,
+    adjacentToProject,    // true | false
+    separationDistance_m,
+    structures,           // array of { type, description, existingCondition, defects[] }
+    existingCracks,       // array of { location, width_mm, length_mm, orientation, description }
+    existingDefects,      // array of { location, type, description, severity }
+    settlementMonuments,  // array of { id, installed, reading_mm }
+    vibrationMonitorInstalled,
+    vibrationThreshold_mm_s, // typical 5 mm/s for residential
+    photos,               // array of URLs (extensive documentation required)
+    ownerAcknowledged,    // true | false
+    notes,
+  } = req.body;
+
+  // Warn if pre-construction and owner hasn't acknowledged
+  const ownerWarning =
+    surveyType === "pre-construction" && !ownerAcknowledged
+      ? "Owner has not acknowledged pre-construction dilapidation survey — obtain signature before commencing works"
+      : null;
+
+  // Count existing defects by severity
+  const criticalExisting = Array.isArray(existingDefects)
+    ? existingDefects.filter((d) => d.severity === "critical" || d.severity === "major")
+    : [];
+
+  // Crack count
+  const crackCount = Array.isArray(existingCracks) ? existingCracks.length : 0;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    survey_type: sanitiseInput(surveyType),
+    survey_date: surveyDate,
+    surveyor: sanitiseInput(surveyor),
+    surveyor_licence: sanitiseInput(surveyorLicence),
+    property_address: sanitiseInput(propertyAddress),
+    owner_name: sanitiseInput(ownerName),
+    owner_contact: sanitiseInput(ownerContact),
+    adjacent_to_project: adjacentToProject,
+    separation_distance_m: separationDistance_m,
+    structures: structures || [],
+    existing_cracks: existingCracks || [],
+    existing_defects: existingDefects || [],
+    settlement_monuments: settlementMonuments || [],
+    vibration_monitor_installed: vibrationMonitorInstalled,
+    vibration_threshold_mm_s: vibrationThreshold_mm_s || 5,
+    photos: photos || [],
+    owner_acknowledged: ownerAcknowledged,
+    critical_existing_defect_count: criticalExisting.length,
+    crack_count: crackCount,
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("dilapidation_surveys")
+      .insert(record);
+    if (dbErr) console.error("DB error /dilapidation-survey:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: `${sanitiseInput(surveyType) || "Dilapidation"} survey recorded`,
+    surveyType: sanitiseInput(surveyType),
+    propertyAddress: sanitiseInput(propertyAddress),
+    crackCount,
+    existingDefectCount: (existingDefects || []).length,
+    criticalExistingDefectCount: criticalExisting.length,
+    ownerWarning,
+    vibrationMonitorInstalled: vibrationMonitorInstalled || false,
+    applicableGuidance: [
+      "MBAV Dilapidation Survey Practice Note",
+      "AS 2870",
+      "AS 3600",
+      "SOPA Victoria (Vic Building Act 1993)",
+    ],
+    saved,
+  });
+});
+
+// POST /ai-retaining-wall-assessment — AI assesses retaining wall failure risk, drainage, and maintenance
+app.post("/ai-retaining-wall-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    wallType,
+    height_m,
+    soilType,
+    drainageCondition,
+    deflection_mm,
+    crackWidth_mm,
+    tiltAngle_deg,
+    surchargePresent,
+    waterSeepage,
+    constructionYear,
+    environment,           // coastal | inland | flood-prone | alpine
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are a geotechnical engineer specialising in earth retention structures with 25 years experience on Australian projects. Assess retaining wall failure risk and maintenance requirements per AS 4678, AS 4100, and geotechnical engineering principles.
+
+Assess:
+1. Failure mode likelihood — overturning, sliding, bearing failure, global slope failure, wall material failure
+2. Drainage adequacy — hydrostatic pressure risk
+3. Surcharge sensitivity — is the wall designed for current loads?
+4. Monitoring programme adequacy — targets, survey frequency, trigger levels
+5. Maintenance requirements — drainage clearing, crack sealing, vegetation management
+6. Long-term durability — corrosion of steel anchors, timber decay, concrete carbonation
+7. AS 4678 consequence category and inspection frequency
+
+Respond with JSON: { "failureRisk": "low|medium|high|critical", "primaryFailureMode": "string", "failureModes": [], "drainageRisk": "low|medium|high", "surchargeSensitivity": "low|medium|high", "monitoringAdequate": boolean, "recommendedMonitoringFrequency": "string", "triggerLevels": { "alert": "string", "alarm": "string", "action": "string" }, "maintenanceActions": [], "durabilityRisks": [], "engineerInspectionFrequency": "string", "consequenceCategory": "string", "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Wall type: ${wallType || "not specified"}
+Height: ${height_m || "not specified"} m
+Soil type: ${soilType || "not specified"}
+Drainage condition: ${drainageCondition || "not specified"}
+Measured deflection: ${deflection_mm || "not measured"} mm
+Maximum crack width: ${crackWidth_mm || "none"} mm
+Tilt angle: ${tiltAngle_deg || "not measured"}°
+Surcharge present: ${surchargePresent || "no"}
+Water seepage: ${waterSeepage || "no"}
+Construction year: ${constructionYear || "unknown"}
+Environment: ${environment || "inland"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-retaining-wall-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        failureRisk: "medium",
+        primaryFailureMode: "Sliding failure due to inadequate drainage",
+        failureModes: [
+          "Hydrostatic pressure increase from blocked drainage",
+          "Overturning under saturated soil conditions",
+          "Bearing capacity failure at wall toe in soft ground",
+        ],
+        drainageRisk: "high",
+        surchargeSensitivity: "medium",
+        monitoringAdequate: false,
+        recommendedMonitoringFrequency: "Monthly survey monitoring; weekly visual inspection",
+        triggerLevels: {
+          alert: "Deflection >H/300 or crack width >0.5 mm increase",
+          alarm: "Deflection >H/200 or crack width >1 mm increase",
+          action: "Deflection >H/100, tilt >1°, or sudden movement",
+        },
+        maintenanceActions: [
+          "Clear weep holes and drainage aggregate annually",
+          "Remove vegetation from wall face and within 500 mm",
+          "Seal cracks >0.3 mm with appropriate grout",
+          "Check and clear subdrain outlets",
+        ],
+        durabilityRisks: [
+          "Steel tieback corrosion in aggressive soils",
+          "Concrete carbonation exposing rebar to corrosion",
+          "Timber decay in crib walls or soldier piles",
+        ],
+        engineerInspectionFrequency: "Annual engineer inspection; post-heavy rain inspection",
+        consequenceCategory: "CC2 — moderate consequence per AS 4678",
+        applicableStandards: [
+          "AS 4678",
+          "AS 4100",
+          "AS 3600",
+          "AS 1289 (soil testing)",
+        ],
+        recommendation:
+          "Improve drainage immediately — clear weepholes, inspect subdrain. Install monitoring targets and establish trigger/alarm/action levels. Annual geotechnical engineer inspection.",
+        summary:
+          "Retaining wall presents medium failure risk primarily due to drainage concerns. Proactive drainage maintenance, crack monitoring, and periodic geotechnical review will manage risk within acceptable limits.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
