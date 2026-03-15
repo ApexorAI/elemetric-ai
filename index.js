@@ -9923,6 +9923,383 @@ All compliance data is accurate as of the date of analysis.`.trim();
   });
 });
 
+// ── POST /defect-notice ───────────────────────────────────────────────────────
+// Generates a formal defect notice letter (property owner → contractor) based
+// on the Domestic Building Contracts Act 1995 (Vic) requirements.
+app.post("/defect-notice", (req, res) => {
+  const {
+    jobType,
+    ownerName,
+    ownerAddress,
+    contractorName,
+    contractorLicence,
+    contractorAddress,
+    siteAddress,
+    completionDate,
+    defects = [],
+    noticeDate,
+    ownerContact,
+  } = req.body || {};
+
+  if (!ownerName || !contractorName || defects.length === 0) {
+    return res.status(400).json({ error: "ownerName, contractorName, and at least one defect are required." });
+  }
+
+  const liabilityPeriod = LIABILITY_PERIODS[jobType?.toLowerCase()] || { defects: 7, statute: "Domestic Building Contracts Act 1995 (Vic)" };
+  const noticeDateStr = noticeDate
+    ? new Date(noticeDate).toLocaleDateString("en-AU", { day: "numeric", month: "long", year: "numeric" })
+    : new Date().toLocaleDateString("en-AU", { day: "numeric", month: "long", year: "numeric" });
+
+  const completionDateStr = completionDate
+    ? new Date(completionDate).toLocaleDateString("en-AU", { day: "numeric", month: "long", year: "numeric" })
+    : "[date of completion]";
+
+  const defectsList = defects.map((d, i) => `  ${i + 1}. ${typeof d === "string" ? d : d.description || String(d)}`).join("\n");
+
+  const letter = `${noticeDateStr}
+
+${contractorName}
+${contractorLicence ? `VBA Licence No: ${contractorLicence}` : ""}
+${contractorAddress || "[Contractor address]"}
+
+RE: NOTICE OF DEFECTS — ${siteAddress || "Work Site"}
+
+Dear ${contractorName},
+
+I, ${ownerName}, write to formally notify you of defects in the building work carried out at ${siteAddress || "[site address]"}, completed on ${completionDateStr}.
+
+IDENTIFIED DEFECTS:
+
+${defectsList}
+
+Pursuant to the ${liabilityPeriod.statute}, you are responsible for rectifying the above defects at your cost within a reasonable timeframe.
+
+Please contact me within 10 business days to arrange inspection and remediation of the identified defects.
+
+Failure to respond may result in the engagement of an alternative contractor to rectify the defects, with costs to be recovered from you.
+
+Yours sincerely,
+
+${ownerName}
+${ownerAddress || ""}
+${ownerContact || ""}
+
+---
+NOTE: This is a formal defect notice under Victorian building law. Retain a signed copy for your records.
+Both parties are encouraged to seek independent legal advice before proceeding to dispute resolution.
+Victorian Building Authority: 1300 815 127 | Domestic Building Dispute Resolution Victoria (DBDRV): 1300 557 559`;
+
+  return res.json({
+    documentType:   "Formal Defect Notice",
+    regulatoryRef:  liabilityPeriod.statute,
+    liabilityYears: liabilityPeriod.defects,
+    letter,
+    defectCount:    defects.length,
+    parties: {
+      owner:      ownerName,
+      contractor: contractorName,
+    },
+    generatedAt:  new Date().toISOString(),
+    note: "This document is a template only. Consult a legal professional before sending. For formal disputes use DBDRV: 1300 557 559.",
+  });
+});
+
+// ── POST /insurance-summary ───────────────────────────────────────────────────
+// Generates an insurance-ready compliance summary report for a completed job.
+// Suitable for submission to public liability or professional indemnity insurers.
+app.post("/insurance-summary", (req, res) => {
+  const {
+    jobType,
+    traderName,
+    companyName,
+    traderLicence,
+    policyNumber,
+    insurer,
+    siteAddress,
+    jobDate,
+    jobValue,
+    complianceScore,
+    confidence,
+    certificateFiled,
+    certificateNumber,
+    itemsDetected    = [],
+    itemsMissing     = [],
+    gpsRecorded,
+    signatureObtained,
+    testRecorded,
+    incidentOccurred = false,
+    analysisId,
+  } = req.body || {};
+
+  if (!jobType || !traderName) {
+    return res.status(400).json({ error: "jobType and traderName are required." });
+  }
+
+  const tradeLabel = {
+    plumbing: "Plumbing", gas: "Gas Fitting", electrical: "Electrical",
+    drainage: "Drainage", carpentry: "Carpentry / Building", hvac: "HVAC / Refrigeration",
+  }[jobType?.toLowerCase()] || jobType;
+
+  const liability = LIABILITY_PERIODS[jobType?.toLowerCase()] || { defects: 7, statute: "Domestic Building Contracts Act 1995 (Vic)" };
+  const score     = complianceScore ?? confidence ?? null;
+  const riskTier  = score === null ? "undetermined"
+    : score >= 85 ? "low"
+    : score >= 70 ? "moderate"
+    : score >= 55 ? "elevated"
+    : "high";
+
+  const complianceGaps = itemsMissing.length;
+  const criticalGaps   = itemsMissing.filter(i =>
+    ["certificate", "rcd", "ptr", "backflow", "earth", "gas compliance"].some(k => i.toLowerCase().includes(k))
+  ).length;
+
+  return res.json({
+    documentType:   "Insurance Compliance Summary",
+    platform:       "Elemetric AI Compliance Platform",
+    jurisdiction:   "Victoria, Australia",
+    generatedAt:    new Date().toISOString(),
+    analysisId:     analysisId || null,
+
+    insuredParty: {
+      name:          traderName,
+      company:       companyName     || null,
+      licenceNumber: traderLicence   || null,
+    },
+
+    insuranceDetails: {
+      policyNumber:  policyNumber || null,
+      insurer:       insurer      || null,
+    },
+
+    workDetails: {
+      tradeType:    tradeLabel,
+      siteAddress:  siteAddress || null,
+      jobDate:      jobDate     || null,
+      estimatedValue: jobValue  || null,
+    },
+
+    complianceProfile: {
+      aiComplianceScore:   score,
+      riskTier,
+      certificateFiled:    certificateFiled     ?? null,
+      certificateNumber:   certificateNumber    || null,
+      complianceGaps,
+      criticalGaps,
+      itemsDetectedCount:  itemsDetected.length,
+      gpsRecorded:         gpsRecorded          ?? null,
+      signatureObtained:   signatureObtained    ?? null,
+      testRecorded:        testRecorded         ?? null,
+      incidentOccurred,
+    },
+
+    liabilityExposure: {
+      defectsLiabilityYears:     liability.defects,
+      structuralDefectsLiability: liability.structuralDefects || liability.defects,
+      statute:                    liability.statute,
+    },
+
+    riskSummary: {
+      overallRisk:   riskTier,
+      criticalIssues: criticalGaps,
+      recommendation: riskTier === "low"
+        ? "Job is well-documented with a low compliance risk profile."
+        : riskTier === "moderate"
+        ? "Some documentation gaps present. Recommend resolution before closing the job."
+        : `Elevated risk — ${criticalGaps} critical compliance gap(s). Insurer notification may be required.`,
+    },
+
+    attestation: `This compliance summary was generated by Elemetric AI on ${new Date().toLocaleDateString("en-AU")}. It represents the automated AI analysis of submitted photographic evidence. It does not constitute a formal inspection or replace mandatory compliance certificates.`,
+  });
+});
+
+// ── GET /endpoints ────────────────────────────────────────────────────────────
+// Self-documenting endpoint registry. Returns all registered routes with
+// descriptions, request schemas, and response summaries.
+app.get("/endpoints", (_req, res) => {
+  const registry = [
+    // Core analysis
+    { method: "POST", path: "/review",                  category: "AI Analysis",    description: "AI compliance photo analysis — main endpoint" },
+    { method: "POST", path: "/visualise",               category: "AI Analysis",    description: "Stable Diffusion AC unit visualiser" },
+    { method: "POST", path: "/stamp-photo",             category: "AI Analysis",    description: "GPS + timestamp watermark on photo" },
+    { method: "POST", path: "/property-passport",       category: "AI Analysis",    description: "Property compliance history (paginated)" },
+    { method: "POST", path: "/before-after",            category: "AI Analysis",    description: "Before/after photo comparison" },
+    { method: "POST", path: "/bulk-review",             category: "AI Analysis",    description: "Batch compliance analysis (up to 5 jobs)" },
+    // Compliance tools
+    { method: "POST", path: "/risk-assessment",         category: "Compliance",     description: "Job risk profile (6-dimension scoring)" },
+    { method: "POST", path: "/compliance-check",        category: "Compliance",     description: "Victorian regulation checker" },
+    { method: "POST", path: "/compliance-forecast",     category: "Compliance",     description: "Compliance score forecast if items unresolved" },
+    { method: "POST", path: "/gap-analysis",            category: "Compliance",     description: "Before/after compliance gap analysis" },
+    { method: "POST", path: "/quality-assurance",       category: "Compliance",     description: "Multi-point QA gate check" },
+    { method: "POST", path: "/job-audit",               category: "Compliance",     description: "Comprehensive multi-dimensional job audit" },
+    { method: "POST", path: "/check-integrity",         category: "Compliance",     description: "9-point data integrity validator" },
+    { method: "POST", path: "/validate-certificate",    category: "Compliance",     description: "Compliance certificate integrity check" },
+    { method: "POST", path: "/escalation-check",        category: "Compliance",     description: "VBA/ESV/WorkSafe escalation determination" },
+    { method: "POST", path: "/quality-assurance",       category: "Compliance",     description: "Job QA gate check" },
+    // AI tools
+    { method: "POST", path: "/generate-description",    category: "AI Tools",       description: "GPT-4o job description generator" },
+    { method: "POST", path: "/summarise-report",        category: "AI Tools",       description: "Plain-English AI report summary" },
+    { method: "POST", path: "/training-mode",           category: "AI Tools",       description: "Educational photo feedback for apprentices" },
+    { method: "POST", path: "/auto-classify",           category: "AI Tools",       description: "GPT job type classifier from description" },
+    { method: "POST", path: "/apprentice-guide",        category: "AI Tools",       description: "Educational breakdown for apprentices" },
+    { method: "POST", path: "/interpret-notes",         category: "AI Tools",       description: "GPT extraction of compliance insights from notes" },
+    // Analytics
+    { method: "GET",  path: "/analytics",               category: "Analytics",      description: "Business analytics dashboard" },
+    { method: "GET",  path: "/stats",                   category: "Analytics",      description: "Server usage + cost metrics" },
+    { method: "POST", path: "/benchmark",               category: "Analytics",      description: "Percentile ranking vs Victorian tradespeople" },
+    { method: "POST", path: "/analyse-trends",          category: "Analytics",      description: "Linear regression compliance trend analyser" },
+    { method: "GET",  path: "/industry-insights",       category: "Analytics",      description: "Aggregate anonymised insights (24h cache)" },
+    { method: "GET",  path: "/industry-benchmarks",     category: "Analytics",      description: "Static industry performance benchmarks" },
+    { method: "GET",  path: "/performance-summary/:userId", category: "Analytics",  description: "Personal performance summary for a user" },
+    { method: "POST", path: "/compare-periods",         category: "Analytics",      description: "Compliance metrics between two date ranges" },
+    { method: "POST", path: "/training-assessment",     category: "Analytics",      description: "Knowledge gap identification from job history" },
+    // Documents
+    { method: "POST", path: "/export-report",           category: "Documents",      description: "Structured job export from Supabase" },
+    { method: "POST", path: "/generate-permit-checklist", category: "Documents",   description: "Permit application document checklist" },
+    { method: "POST", path: "/document-checklist",      category: "Documents",      description: "Complete handover document checklist" },
+    { method: "POST", path: "/work-order",              category: "Documents",      description: "Structured work order generator" },
+    { method: "POST", path: "/digital-handover",        category: "Documents",      description: "Complete digital handover package" },
+    { method: "POST", path: "/job-handover-email",      category: "Documents",      description: "Professional handover email content generator" },
+    { method: "POST", path: "/defect-notice",           category: "Documents",      description: "Formal defect notice letter (DBCA 1995)" },
+    { method: "POST", path: "/insurance-summary",       category: "Documents",      description: "Insurance-ready compliance summary" },
+    { method: "POST", path: "/job-score-card",          category: "Documents",      description: "Printable A4 compliance score card" },
+    { method: "POST", path: "/generate-swms",           category: "Documents",      description: "Safe Work Method Statement framework" },
+    { method: "POST", path: "/incident-report",         category: "Documents",      description: "WorkSafe-style incident report" },
+    // Reference data
+    { method: "GET",  path: "/regulatory-updates",      category: "Reference",      description: "Regulatory change feed (filterable)" },
+    { method: "GET",  path: "/compliance-calendar",     category: "Reference",      description: "12 VIC regulatory calendar items" },
+    { method: "GET",  path: "/supported-standards",     category: "Reference",      description: "All AS/NZS standards referenced by platform" },
+    { method: "GET",  path: "/job-types",               category: "Reference",      description: "All supported job types with metadata" },
+    { method: "GET",  path: "/vba-requirements/:jobType", category: "Reference",    description: "Detailed VBA/ESV compliance requirements" },
+    { method: "GET",  path: "/compliance-tips/:jobType", category: "Reference",     description: "Trade-specific compliance tips" },
+    { method: "GET",  path: "/award-rates",             category: "Reference",      description: "Victorian Award rates for all trades" },
+    { method: "GET",  path: "/translations",            category: "Reference",      description: "English + Vietnamese UI translations" },
+    { method: "GET",  path: "/checklists",              category: "Reference",      description: "All trade checklists" },
+    { method: "GET",  path: "/prompts",                 category: "Reference",      description: "Prompt version registry" },
+    // Photo tools
+    { method: "POST", path: "/photo-brief",             category: "Photos",         description: "Pre-job photo brief with framing instructions" },
+    { method: "POST", path: "/photo-tags",              category: "Photos",         description: "Auto-tag photo labels into compliance categories" },
+    { method: "POST", path: "/photo-count-check",       category: "Photos",         description: "Validate photo count before /review submission" },
+    { method: "POST", path: "/photo-sequence-check",    category: "Photos",         description: "Verify photo sequence is logical" },
+    { method: "POST", path: "/validate-photo-metadata", category: "Photos",         description: "Detect GPS spoofing / timestamp anomalies" },
+    { method: "POST", path: "/photo-tips",              category: "Photos",         description: "Trade-specific photo tips" },
+    // Financial
+    { method: "POST", path: "/analyse-cost",            category: "Financial",      description: "Labour + materials + profit margin analysis" },
+    { method: "POST", path: "/price-estimate",          category: "Financial",      description: "Rough price estimate by complexity" },
+    { method: "POST", path: "/materials-estimate",      category: "Financial",      description: "Victorian material pricing estimate" },
+    { method: "POST", path: "/estimate-time",           category: "Financial",      description: "Job time estimate by complexity" },
+    // Safety
+    { method: "POST", path: "/site-safety-check",       category: "Safety",         description: "WorkSafe-aligned site safety checklist" },
+    { method: "POST", path: "/risk-matrix",             category: "Safety",         description: "5×5 ISO 31000 risk matrix for a job" },
+    { method: "POST", path: "/near-miss-log",           category: "Safety",         description: "Log a near-miss safety incident" },
+    { method: "GET",  path: "/near-miss-log",           category: "Safety",         description: "Retrieve all logged near-miss incidents" },
+    // Notifications
+    { method: "POST", path: "/schedule-notification",   category: "Notifications",  description: "Schedule an in-app notification" },
+    { method: "GET",  path: "/notifications/:userId",   category: "Notifications",  description: "Get pending notifications for a user" },
+    // Fraud detection
+    { method: "POST", path: "/fraud-check",             category: "Fraud",          description: "Fraud detection for a job submission" },
+    { method: "GET",  path: "/fraud-flags",             category: "Fraud",          description: "Retrieve active fraud flags" },
+    // Webhooks
+    { method: "POST", path: "/webhook",                 category: "Webhooks",       description: "Stripe billing events webhook" },
+    { method: "POST", path: "/webhook/user-created",    category: "Webhooks",       description: "Supabase auth signup webhook" },
+    // Email
+    { method: "POST", path: "/send-invoice-email",      category: "Email",          description: "Send invoice via Resend" },
+    { method: "POST", path: "/send-near-miss-alert",    category: "Email",          description: "Send near-miss alert via Resend" },
+    { method: "POST", path: "/send-welcome-email",      category: "Email",          description: "Send welcome email via Resend" },
+    // Health / meta
+    { method: "GET",  path: "/health",                  category: "Health",         description: "Service connectivity health check" },
+    { method: "GET",  path: "/timestamp",               category: "Health",         description: "Server UTC timestamp" },
+    { method: "GET",  path: "/server-info",             category: "Health",         description: "Server version and config info" },
+    { method: "GET",  path: "/endpoints",               category: "Health",         description: "This endpoint — self-documenting registry" },
+    { method: "GET",  path: "/",                        category: "Health",         description: "Heartbeat" },
+  ];
+
+  const categories = [...new Set(registry.map(e => e.category))];
+  const byCategory = {};
+  for (const cat of categories) {
+    byCategory[cat] = registry.filter(e => e.category === cat);
+  }
+
+  return res.json({
+    totalEndpoints: registry.length,
+    categories:     categories.length,
+    byCategory,
+    retrievedAt:    new Date().toISOString(),
+  });
+});
+
+// ── POST /batch-compliance-check ──────────────────────────────────────────────
+// Runs the Victorian compliance checklist against multiple jobs simultaneously.
+// Returns a compliance status for each job with an aggregate summary.
+app.post("/batch-compliance-check", (req, res) => {
+  const { jobs = [] } = req.body || {};
+
+  if (!Array.isArray(jobs) || jobs.length === 0) {
+    return res.status(400).json({ error: "jobs array is required." });
+  }
+  if (jobs.length > 20) {
+    return res.status(400).json({ error: "Maximum 20 jobs per batch compliance check." });
+  }
+
+  const results = jobs.map((job, idx) => {
+    const {
+      jobType,
+      itemsDetected   = [],
+      itemsMissing    = [],
+      certificateFiled,
+      permitObtained,
+      testRecorded,
+    } = job;
+
+    if (!jobType) {
+      return { jobIndex: idx, error: "jobType is required" };
+    }
+
+    const victorianChecklist = VICTORIAN_CHECKLISTS?.[jobType?.toLowerCase()] || [];
+    const checkResults = victorianChecklist.map(req_item => {
+      const detected = itemsDetected.some(d => d.toLowerCase().includes(req_item.requirement.toLowerCase().substring(0, 15)));
+      const missing  = itemsMissing.some(m  => m.toLowerCase().includes(req_item.requirement.toLowerCase().substring(0, 15)));
+      return {
+        requirement: req_item.requirement,
+        category:    req_item.category,
+        status:      detected ? "pass" : missing ? "fail" : "unknown",
+      };
+    });
+
+    const passes  = checkResults.filter(r => r.status === "pass").length;
+    const fails   = checkResults.filter(r => r.status === "fail").length;
+    const score   = checkResults.length > 0 ? Math.round((passes / checkResults.length) * 100) : null;
+
+    return {
+      jobIndex:         idx,
+      jobType,
+      jobLabel:         job.label || `Job ${idx + 1}`,
+      complianceStatus: score === null ? "unknown" : score >= 70 ? "compliant" : "non-compliant",
+      score,
+      passCount:        passes,
+      failCount:        fails,
+      totalChecks:      checkResults.length,
+      certificateFiled: certificateFiled ?? null,
+    };
+  });
+
+  const validResults  = results.filter(r => !r.error);
+  const compliantCount   = validResults.filter(r => r.complianceStatus === "compliant").length;
+  const nonCompliantCount = validResults.filter(r => r.complianceStatus === "non-compliant").length;
+  const scores           = validResults.map(r => r.score).filter(s => s !== null);
+  const avgScore         = scores.length > 0 ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length * 10) / 10 : null;
+
+  return res.json({
+    batchSize:        jobs.length,
+    processedCount:   validResults.length,
+    compliantCount,
+    nonCompliantCount,
+    avgScore,
+    overallStatus:    nonCompliantCount === 0 ? "All compliant" : `${nonCompliantCount} non-compliant job(s) require attention`,
+    results,
+    checkedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
