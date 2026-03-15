@@ -30761,6 +30761,212 @@ Return a JSON object with:
   }
 });
 
+// ── Round 110: Financial reporting, EVM, AI budget forecast ──────────────────
+
+// POST /earned-value — Calculate Earned Value Management (EVM) metrics for a project
+app.post("/earned-value", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, reportDate,
+    budgetAtCompletion,    // BAC
+    plannedValue,          // PV — planned work to date
+    earnedValue,           // EV — value of completed work
+    actualCost,            // AC — actual cost to date
+  } = req.body;
+
+  if (!projectId || budgetAtCompletion === undefined || plannedValue === undefined || earnedValue === undefined || actualCost === undefined)
+    return res.status(400).json({ error: "projectId, budgetAtCompletion, plannedValue, earnedValue, actualCost required." });
+
+  const BAC = Number(budgetAtCompletion);
+  const PV = Number(plannedValue);
+  const EV = Number(earnedValue);
+  const AC = Number(actualCost);
+
+  // Core variances
+  const CV = EV - AC;         // Cost Variance
+  const SV = EV - PV;         // Schedule Variance
+
+  // Indices
+  const CPI = AC > 0 ? Math.round((EV / AC) * 1000) / 1000 : null;   // Cost Performance Index
+  const SPI = PV > 0 ? Math.round((EV / PV) * 1000) / 1000 : null;   // Schedule Performance Index
+
+  // Forecasts
+  const EAC = CPI && CPI > 0 ? Math.round(BAC / CPI) : null;         // Estimate At Completion
+  const ETC = EAC !== null ? EAC - AC : null;                          // Estimate To Complete
+  const VAC = EAC !== null ? BAC - EAC : null;                         // Variance At Completion
+  const TCPI = ETC !== null && ETC > 0 ? Math.round(((BAC - EV) / ETC) * 1000) / 1000 : null; // To Complete Performance Index
+
+  const percentComplete = BAC > 0 ? Math.round((EV / BAC) * 100) : 0;
+  const percentSpent = BAC > 0 ? Math.round((AC / BAC) * 100) : 0;
+
+  const costStatus = CPI === null ? "UNKNOWN" : CPI >= 1.0 ? "UNDER_BUDGET" : CPI >= 0.9 ? "SLIGHTLY_OVER" : "OVER_BUDGET";
+  const scheduleStatus = SPI === null ? "UNKNOWN" : SPI >= 1.0 ? "AHEAD_OF_SCHEDULE" : SPI >= 0.9 ? "SLIGHTLY_BEHIND" : "BEHIND_SCHEDULE";
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    report_date: reportDate || new Date().toISOString().split("T")[0],
+    bac: BAC, pv: PV, ev: EV, ac: AC,
+    cv: Math.round(CV), sv: Math.round(SV),
+    cpi, spi: SPI, eac: EAC, etc: ETC, vac: VAC, tcpi: TCPI,
+    percent_complete: percentComplete,
+    percent_spent: percentSpent,
+    cost_status: costStatus,
+    schedule_status: scheduleStatus,
+    calculated_at: new Date().toISOString(),
+  };
+
+  // Fix: use CPI not cpi typo
+  record.cpi = CPI;
+
+  if (supabaseAdmin) {
+    await supabaseAdmin.from("evm_reports").insert(record);
+  }
+
+  res.json({
+    projectId, reportDate: record.report_date,
+    metrics: { BAC, PV, EV, AC, CV: Math.round(CV), SV: Math.round(SV), CPI, SPI, EAC, ETC, VAC, TCPI },
+    percentComplete, percentSpent,
+    costStatus, scheduleStatus,
+    interpretation: {
+      cost: CV >= 0 ? `Under budget by $${Math.abs(Math.round(CV)).toLocaleString()}` : `Over budget by $${Math.abs(Math.round(CV)).toLocaleString()}`,
+      schedule: SV >= 0 ? `Ahead of schedule by $${Math.abs(Math.round(SV)).toLocaleString()} in value` : `Behind schedule by $${Math.abs(Math.round(SV)).toLocaleString()} in value`,
+      forecast: EAC ? `Estimated final cost: $${EAC.toLocaleString()} vs budget $${BAC.toLocaleString()}` : "Insufficient data for forecast.",
+    },
+    calculatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /project-financial-summary — Record a project financial snapshot
+app.post("/project-financial-summary", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, reportingPeriod,
+    contractSum, approvedVariations = 0, revisedContractSum,
+    certifiedToDate = 0, retentionHeld = 0, paidToDate = 0,
+    forecastFinalCost, contingencyBudget = 0, contingencyUsed = 0,
+    notes,
+  } = req.body;
+
+  if (!projectId || contractSum === undefined)
+    return res.status(400).json({ error: "projectId and contractSum required." });
+
+  const cs = Number(contractSum);
+  const vars = Number(approvedVariations);
+  const revised = revisedContractSum !== undefined ? Number(revisedContractSum) : cs + vars;
+  const certified = Number(certifiedToDate);
+  const retention = Number(retentionHeld);
+  const paid = Number(paidToDate);
+  const forecast = Number(forecastFinalCost) || revised;
+  const contingencyBudg = Number(contingencyBudget);
+  const contingencyUsed_ = Number(contingencyUsed);
+
+  const uncertified = revised - certified;
+  const outstanding = certified - retention - paid;
+  const contingencyRemaining = contingencyBudg - contingencyUsed_;
+  const projectedVariance = revised - forecast;
+  const percentComplete = revised > 0 ? Math.round((certified / revised) * 100) : 0;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName || ""),
+    reporting_period: sanitiseInput(reportingPeriod || new Date().toISOString().slice(0, 7)),
+    contract_sum: cs, approved_variations: vars, revised_contract_sum: revised,
+    certified_to_date: certified, retention_held: retention, paid_to_date: paid,
+    uncertified_work: uncertified, outstanding_payment: outstanding,
+    forecast_final_cost: forecast, projected_variance: projectedVariance,
+    contingency_budget: contingencyBudg, contingency_used: contingencyUsed_, contingency_remaining: contingencyRemaining,
+    percent_complete: percentComplete,
+    financial_health: projectedVariance >= 0 ? "ON_BUDGET" : Math.abs(projectedVariance) / revised < 0.05 ? "MINOR_OVERRUN" : "SIGNIFICANT_OVERRUN",
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("project_financial_summaries")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, summaryId: data.id, ...record });
+  }
+
+  res.json({ success: true, summaryId: null, ...record, saved: false });
+});
+
+// POST /ai-budget-forecast — AI analyses project financial data and forecasts cost-to-complete
+app.post("/ai-budget-forecast", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, projectType, percentComplete,
+    originalBudget, spentToDate, commitments = 0,
+    knownRisks = [], remainingScope, state = "VIC",
+  } = req.body;
+
+  if (!originalBudget || percentComplete === undefined)
+    return res.status(400).json({ error: "originalBudget and percentComplete required." });
+
+  const spent = Number(spentToDate);
+  const budget = Number(originalBudget);
+  const commit = Number(commitments);
+  const totalExposed = spent + commit;
+  const burnRate = percentComplete > 0 ? totalExposed / (percentComplete / 100) : null;
+  const simpleEAC = burnRate || budget;
+
+  const prompt = `You are a senior Australian construction cost manager. Analyse the following project financials and provide a cost-to-complete forecast.
+
+Project: ${sanitiseInput(projectName || "Not specified")}
+Type: ${sanitiseInput(projectType || "Construction")}
+Progress: ${percentComplete}% complete
+Original budget: AUD $${budget.toLocaleString()}
+Spent to date: AUD $${spent.toLocaleString()}
+Commitments: AUD $${commit.toLocaleString()}
+Total exposed: AUD $${totalExposed.toLocaleString()}
+Simple EAC (extrapolated): AUD $${Math.round(simpleEAC).toLocaleString()}
+Remaining scope: ${sanitiseInput(remainingScope || "Not detailed")}
+Known risks: ${knownRisks.map(r => sanitiseInput(r)).join("; ") || "None specified"}
+State: ${sanitiseInput(state)}
+
+Provide a realistic cost forecast. Return a JSON object with:
+- "forecastAtCompletion": number
+- "forecastVariance": number (positive = under budget)
+- "costToComplete": number
+- "confidenceLevel": "LOW"|"MEDIUM"|"HIGH"
+- "scenarioLow": lowest realistic EAC
+- "scenarioMid": most likely EAC
+- "scenarioHigh": worst-case EAC
+- "costDrivers": array of { "driver": string, "impact": "POSITIVE"|"NEGATIVE", "estimatedImpact": string }
+- "risks": array of cost risks
+- "opportunities": array of cost saving opportunities
+- "recommendations": array of action items
+- "executiveSummary": string`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, projectId, originalBudget: budget, spentToDate: spent, percentComplete, simpleEAC: Math.round(simpleEAC), forecastedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      forecastAtCompletion: Math.round(simpleEAC),
+      forecastVariance: Math.round(budget - simpleEAC),
+      costToComplete: Math.round(simpleEAC - spent),
+      confidenceLevel: "LOW",
+      scenarioLow: Math.round(simpleEAC * 0.95),
+      scenarioMid: Math.round(simpleEAC),
+      scenarioHigh: Math.round(simpleEAC * 1.1),
+      costDrivers: [],
+      risks: ["Automated forecast unavailable — engage cost manager"],
+      opportunities: [],
+      recommendations: ["Engage a quantity surveyor for detailed cost-to-complete review"],
+      executiveSummary: "Automated budget forecast temporarily unavailable.",
+      projectId, originalBudget: budget, spentToDate: spent, percentComplete, simpleEAC: Math.round(simpleEAC), forecastedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
