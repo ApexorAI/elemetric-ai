@@ -10639,6 +10639,377 @@ app.post("/skill-assessment", (req, res) => {
   });
 });
 
+// ── POST /project-plan ────────────────────────────────────────────────────────
+// Generates a milestone-based project plan for a trade job. Returns phases,
+// estimated durations, and compliance checkpoints for each stage.
+app.post("/project-plan", (req, res) => {
+  const {
+    jobType,
+    complexity  = "medium",
+    startDate,
+    siteAddress,
+    scope       = [],
+    traderName,
+  } = req.body || {};
+
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+  if (!jobType || !SUPPORTED.includes(jobType.toLowerCase())) {
+    return res.status(400).json({ error: `jobType required. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+
+  const COMPLEXITY_DURATIONS = { simple: 1, medium: 3, complex: 7 }; // days
+  const base     = COMPLEXITY_DURATIONS[complexity] || 3;
+  const start    = startDate ? new Date(startDate) : new Date();
+  const addDays  = (d, n) => { const nd = new Date(d); nd.setDate(nd.getDate() + n); return nd.toISOString().split("T")[0]; };
+
+  const PHASES = {
+    plumbing: [
+      { phase: 1, name: "Pre-work Preparation",         duration: 1, milestones: ["Confirm site access and isolation points", "Verify WaterMark product certifications", "Review permit requirements (if applicable)", "Photograph existing installation"] },
+      { phase: 2, name: "Installation",                 duration: base, milestones: ["Install pipework and fittings", "Connect fixtures and appliances", "Photograph all concealed work before covering"] },
+      { phase: 3, name: "Testing and Commissioning",    duration: 1, milestones: ["Pressure test installation", "Commission hot water system", "Photograph test gauge readings", "Verify all outlets and fixtures"] },
+      { phase: 4, name: "Documentation and Handover",   duration: 1, milestones: ["Complete CoC on VBA portal", "Lodge CoC within 2 business days", "Provide owner with CoC copy", "Hand over warranty documents"] },
+    ],
+    gas: [
+      { phase: 1, name: "Pre-work Preparation",         duration: 1, milestones: ["Verify appliance AGA certification", "Confirm ventilation requirements", "Review flue clearances", "Isolate gas supply"] },
+      { phase: 2, name: "Installation",                 duration: base, milestones: ["Install pipework and fittings", "Connect appliances per manufacturer spec", "Photograph all installation stages"] },
+      { phase: 3, name: "Testing and Commissioning",    duration: 1, milestones: ["Working pressure test", "Tightness test", "Commission appliances", "Verify ventilation and flue clearances"] },
+      { phase: 4, name: "Documentation and Handover",   duration: 1, milestones: ["Complete Gas Compliance Certificate", "Lodge with ESV within 48 hours", "Advise owner of isolation valve location", "Provide appliance manuals"] },
+    ],
+    electrical: [
+      { phase: 1, name: "Pre-work Preparation",         duration: 1, milestones: ["Prepare LOTO plan", "Confirm circuit capacity", "Review AS/NZS 3000 requirements", "Isolate supply"] },
+      { phase: 2, name: "Installation",                 duration: base, milestones: ["Run cables and conduit", "Connect outlets, switches, and fittings", "Photograph all circuits before enclosing"] },
+      { phase: 3, name: "Testing and Commissioning",    duration: 1, milestones: ["Insulation resistance test (500V DC)", "Earth continuity test", "RCD test", "Full function check of all circuits"] },
+      { phase: 4, name: "Documentation and Handover",   duration: 1, milestones: ["Label all circuits on switchboard", "Lodge CoES with ESV", "Demonstrate RCD test to owner", "Provide test records"] },
+    ],
+    drainage: [
+      { phase: 1, name: "Pre-work Preparation",         duration: 1, milestones: ["Dial Before You Dig confirmation", "Site safety assessment", "Confirm permit requirements", "Mark out excavation"] },
+      { phase: 2, name: "Excavation and Installation",  duration: base, milestones: ["Excavate trench to required depth", "Install bedding material", "Lay pipe to 1:40 fall", "Install inspection openings"] },
+      { phase: 3, name: "Testing and Backfill",         duration: 1, milestones: ["Hydraulic or air test before backfilling", "Photograph test reading", "Backfill and compact in layers", "Reinstate surface"] },
+      { phase: 4, name: "Documentation and Handover",   duration: 1, milestones: ["Lodge CoC with VBA", "Provide owner with CoC copy", "Record as-installed drainage sketch"] },
+    ],
+    carpentry: [
+      { phase: 1, name: "Pre-work Preparation",         duration: 3, milestones: ["Obtain building permit from RBS", "Engage engineer for structural members", "Sign Domestic Building Contract", "Order structural materials"] },
+      { phase: 2, name: "Sub-structure (Footing/Slab)", duration: base * 2, milestones: ["Footing excavation and form-up", "RBS footing inspection", "Pour and cure concrete", "Damp-proof membrane installation"] },
+      { phase: 3, name: "Frame Construction",           duration: base * 3, milestones: ["Floor frame installation", "Wall frame erection", "Roof frame and bracing", "RBS frame inspection"] },
+      { phase: 4, name: "Lock-Up",                      duration: base * 2, milestones: ["Roofing installation", "External cladding", "Windows and doors", "RBS lock-up inspection"] },
+      { phase: 5, name: "Fit-Out",                      duration: base * 2, milestones: ["Internal linings", "Cabinetry and joinery", "Painting and finishes"] },
+      { phase: 6, name: "Completion",                   duration: 2, milestones: ["Final RBS inspection", "Certificate of Occupancy issued", "Practical completion inspection with owner", "Handover documentation"] },
+    ],
+    hvac: [
+      { phase: 1, name: "Pre-work Preparation",         duration: 1, milestones: ["Confirm ARC licence and service record current", "Survey site — clearances, structural supports, drainage", "Order equipment and refrigerant (log type and quantity)", "Isolate electrical supply"] },
+      { phase: 2, name: "Installation",                 duration: base, milestones: ["Install indoor and outdoor units", "Run refrigerant piping and electrical connections", "Connect condensate drain to compliant drainage", "Photograph all installed components"] },
+      { phase: 3, name: "Commissioning",                duration: 1, milestones: ["Pressure test refrigerant circuit with nitrogen", "Evacuate circuit (triple vacuum)", "Charge refrigerant by weight", "Record suction/discharge pressures and delta-T"] },
+      { phase: 4, name: "Documentation and Handover",   duration: 1, milestones: ["Update ARC service record within 24 hours", "Provide commissioning report to owner", "Demonstrate filter cleaning procedure", "Register product warranty"] },
+    ],
+  };
+
+  const phases = (PHASES[jobType.toLowerCase()] || []).map(phase => {
+    const phaseStart = addDays(start, phases ? phases.slice(0, phase.phase - 1).reduce((sum, p) => sum + (p.duration || 0), 0) : 0);
+    const phaseEnd   = addDays(phaseStart, phase.duration);
+    return { ...phase, startDate: phaseStart, endDate: phaseEnd };
+  });
+
+  // Recalculate cumulative start dates
+  let cumulative = 0;
+  const finalPhases = (PHASES[jobType.toLowerCase()] || []).map(phase => {
+    const phaseStart = addDays(start, cumulative);
+    cumulative += phase.duration;
+    const phaseEnd = addDays(start, cumulative);
+    return { ...phase, startDate: phaseStart, endDate: phaseEnd };
+  });
+
+  const projectEnd = finalPhases.length > 0 ? finalPhases[finalPhases.length - 1].endDate : null;
+  const totalDays  = finalPhases.reduce((sum, p) => sum + p.duration, 0);
+
+  return res.json({
+    jobType,
+    complexity,
+    traderName:  traderName  || null,
+    siteAddress: siteAddress || null,
+    projectStart: start.toISOString().split("T")[0],
+    projectEnd,
+    totalDays,
+    phaseCount:  finalPhases.length,
+    phases:      finalPhases,
+    note: "This is an indicative plan only. Actual durations depend on site conditions, weather, material availability, and inspection scheduling.",
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /photo-ai-caption ────────────────────────────────────────────────────
+// Uses GPT to suggest a compliance-appropriate caption for a photo based on
+// its label and job context. Helps tradespeople label photos consistently.
+app.post("/photo-ai-caption", async (req, res) => {
+  const { jobType, photoLabel, additionalContext } = req.body || {};
+
+  if (!jobType || !photoLabel) {
+    return res.status(400).json({ error: "jobType and photoLabel are required." });
+  }
+  if (!client) return res.status(503).json({ error: "AI service not configured." });
+
+  const sanitisedLabel   = sanitiseInput(String(photoLabel)).substring(0, 100);
+  const sanitisedContext = additionalContext ? sanitiseInput(String(additionalContext)).substring(0, 200) : "";
+
+  try {
+    const response = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        {
+          role: "system",
+          content: `You generate concise, professional compliance photo captions for Victorian trade photos. Each caption should:
+1. Clearly identify what the photo shows
+2. Reference the relevant compliance requirement in plain language
+3. Be 10-20 words
+
+Respond ONLY with JSON: {"caption":"...","complianceNote":"...","regulatoryRef":"..."}`,
+        },
+        {
+          role: "user",
+          content: `Job type: ${jobType}\nPhoto label: ${sanitisedLabel}\n${sanitisedContext ? `Context: ${sanitisedContext}` : ""}`,
+        },
+      ],
+      max_tokens: 150,
+      temperature: 0.2,
+    });
+
+    const raw = response.choices[0]?.message?.content?.trim() || "{}";
+    let parsed;
+    try {
+      const match = raw.match(/\{[\s\S]*\}/);
+      parsed = JSON.parse(match ? match[0] : raw);
+    } catch {
+      return res.status(502).json({ error: "AI returned unparseable response.", raw });
+    }
+
+    usageStats.openaiCalls++;
+
+    return res.json({
+      jobType,
+      inputLabel:    sanitisedLabel,
+      caption:       parsed.caption       || sanitisedLabel,
+      complianceNote: parsed.complianceNote || null,
+      regulatoryRef: parsed.regulatoryRef  || null,
+      generatedAt:   new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("photo-ai-caption error:", err);
+    return res.status(500).json({ error: "Caption generation failed." });
+  }
+});
+
+// ── GET /vba-fees ─────────────────────────────────────────────────────────────
+// Returns a reference fee schedule for VBA permits and certificates in Victoria.
+// Note: fees change annually — always verify at vba.vic.gov.au.
+app.get("/vba-fees", (_req, res) => {
+  return res.json({
+    disclaimer:   "Fee schedule is indicative only. Verify current fees at vba.vic.gov.au. Fees shown are approximate 2024-25 values.",
+    jurisdiction: "Victoria, Australia",
+    effectiveDate: "2024-07-01",
+
+    plumbingFees: [
+      { item: "Certificate of Compliance (CoC) — residential plumbing",      fee: "$47.40",   notes: "Lodged via VBA plumber portal" },
+      { item: "Certificate of Compliance (CoC) — commercial plumbing",       fee: "$110.00",  notes: "Commercial/industrial work" },
+      { item: "Plumbing permit — minor work",                                fee: "$180.00",  notes: "Work requiring a permit" },
+      { item: "Plumbing permit — major work",                                fee: "$360–$850",notes: "Based on estimated value of work" },
+    ],
+
+    electricalFees: [
+      { item: "Certificate of Electrical Safety (CoES) — residential",       fee: "$45.60",   notes: "Lodged via ESV e-licensing portal" },
+      { item: "Certificate of Electrical Safety (CoES) — commercial",        fee: "$102.00",  notes: "Commercial/industrial" },
+    ],
+
+    gasFees: [
+      { item: "Gas Compliance Certificate — domestic",                       fee: "No fee",   notes: "Lodged via ESV portal at no charge" },
+      { item: "Gas Compliance Certificate — commercial",                     fee: "No fee",   notes: "ESV portal submission" },
+    ],
+
+    buildingPermitFees: [
+      { item: "Building permit — work value < $10,000",                      fee: "$580–$900",    notes: "Via Registered Building Surveyor" },
+      { item: "Building permit — work value $10,001–$100,000",               fee: "1.5–2% of value", notes: "RBS discretion" },
+      { item: "Building permit — work value > $100,000",                     fee: "0.5–1.5% of value", notes: "RBS discretion" },
+      { item: "Certificate of Occupancy",                                    fee: "$250–$500",    notes: "Issued by RBS on final inspection" },
+    ],
+
+    vbaAnnualLicenceFees: [
+      { item: "Plumbing licence renewal",                                    fee: "$232.00",  notes: "Annual renewal" },
+      { item: "Domestic builder licence renewal",                            fee: "$468.00",  notes: "Annual renewal" },
+      { item: "Commercial builder licence renewal",                          fee: "$786.00",  notes: "Annual renewal" },
+    ],
+
+    arcFees: [
+      { item: "ARC RAC licence — new application",                           fee: "$200–$350",notes: "Via ARC — arclink.com.au" },
+      { item: "ARC RAC licence — renewal (3 years)",                         fee: "$180–$300",notes: "Via ARC portal" },
+    ],
+
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /compliance-letter ───────────────────────────────────────────────────
+// Generates a formal compliance cover letter from a tradesperson to their client.
+// Accompanies compliance certificates on job completion.
+app.post("/compliance-letter", (req, res) => {
+  const {
+    jobType,
+    traderName,
+    traderLicence,
+    traderPhone,
+    companyName,
+    ownerName,
+    siteAddress,
+    jobDate,
+    complianceScore,
+    certificateNumber,
+    itemsDetected = [],
+    testResultsSummary,
+  } = req.body || {};
+
+  if (!traderName || !ownerName || !jobType) {
+    return res.status(400).json({ error: "traderName, ownerName, and jobType are required." });
+  }
+
+  const tradeLabel = {
+    plumbing: "Plumbing", gas: "Gas Fitting", electrical: "Electrical",
+    drainage: "Drainage", carpentry: "Carpentry / Building", hvac: "HVAC / Refrigeration",
+  }[jobType?.toLowerCase()] || jobType;
+
+  const LIABILITY = LIABILITY_PERIODS[jobType?.toLowerCase()] || { defects: 7, statute: "Domestic Building Contracts Act 1995 (Vic)" };
+  const dateStr   = jobDate ? new Date(jobDate).toLocaleDateString("en-AU", { day: "numeric", month: "long", year: "numeric" }) : new Date().toLocaleDateString("en-AU", { day: "numeric", month: "long", year: "numeric" });
+
+  const detectedSummary = itemsDetected.length > 0
+    ? `\nKey Compliance Items Verified:\n${itemsDetected.slice(0, 8).map(i => `  • ${i}`).join("\n")}`
+    : "";
+
+  const letter = `${dateStr}
+
+${ownerName}
+${siteAddress || "[Site Address]"}
+
+RE: COMPLIANCE CONFIRMATION — ${tradeLabel} Work at ${siteAddress || "[Site Address]"}
+
+Dear ${ownerName},
+
+I am writing to confirm that ${tradeLabel.toLowerCase()} work completed at ${siteAddress || "your property"} on ${dateStr} has been carried out in accordance with all applicable Victorian regulations and Australian Standards.
+${detectedSummary}
+${testResultsSummary ? `\nTest Results: ${testResultsSummary}` : ""}
+${complianceScore !== undefined ? `\nAI Compliance Score: ${complianceScore}%${complianceScore >= 70 ? " — PASS" : " — ATTENTION REQUIRED"}` : ""}
+${certificateNumber ? `\nCompliance Certificate Reference: ${certificateNumber}` : ""}
+
+REGULATORY COMPLIANCE:
+All work has been completed in accordance with applicable Victorian legislation and the relevant Australian Standards. The required compliance certificate has been or will be lodged with the relevant authority within the required timeframe.
+
+DEFECTS LIABILITY:
+Under the ${LIABILITY.statute}, I remain liable for defects in the work for ${LIABILITY.defects} years from the date of completion. Please contact me promptly if any defects are identified.
+
+CONTACT DETAILS:
+${companyName ? `Company: ${companyName}` : ""}
+Tradesperson: ${traderName}
+${traderLicence ? `Licence: ${traderLicence}` : ""}
+${traderPhone ? `Phone: ${traderPhone}` : ""}
+
+Please retain this letter with your property records.
+
+Yours sincerely,
+
+${traderName}
+${companyName || ""}
+${traderLicence || ""}
+
+---
+This letter was generated by Elemetric AI Compliance Platform.`;
+
+  return res.json({
+    documentType:   "Compliance Cover Letter",
+    jobType:        tradeLabel,
+    traderName,
+    ownerName,
+    siteAddress:    siteAddress || null,
+    letter,
+    generatedAt:    new Date().toISOString(),
+    note: "Review and sign this letter before providing to the property owner. Attach the relevant compliance certificate.",
+  });
+});
+
+// ── POST /subcontractor-brief ─────────────────────────────────────────────────
+// Generates a structured brief for subcontractors detailing their scope,
+// documentation requirements, and compliance responsibilities on a job.
+app.post("/subcontractor-brief", (req, res) => {
+  const {
+    jobType,
+    siteAddress,
+    mainContractor,
+    subContractorTrade,
+    scopeOfWork     = [],
+    requiredDocuments = [],
+    siteSupervisor,
+    supervisorPhone,
+    startDate,
+    siteRules       = [],
+    ppeSite         = [],
+  } = req.body || {};
+
+  if (!jobType || !mainContractor) {
+    return res.status(400).json({ error: "jobType and mainContractor are required." });
+  }
+
+  const LIABILITY = LIABILITY_PERIODS[subContractorTrade?.toLowerCase() || jobType?.toLowerCase()] || { defects: 7 };
+
+  const DEFAULT_DOCS = {
+    plumbing:   ["Certificate of Compliance (CoC) — lodge within 2 business days", "Test results retained for 7 years", "WaterMark certification for all products"],
+    gas:        ["Gas Compliance Certificate — lodge with ESV within 48 hours", "Pressure test record", "Appliance AGA certification"],
+    electrical: ["Certificate of Electrical Safety (CoES) — lodge within 5 days (residential)", "Test results (insulation, earth, RCD)", "Circuit schedule for switchboard"],
+    drainage:   ["Certificate of Compliance (CoC) — lodge within 2 business days", "Hydraulic test record"],
+    carpentry:  ["Hold current VBA builder registration", "Building permit must be displayed on site at all times", "Mandatory inspection sign-offs from RBS"],
+    hvac:       ["ARC service record updated within 24 hours", "Commissioning report", "Refrigerant logbook entry"],
+  };
+
+  const docs = requiredDocuments.length > 0 ? requiredDocuments : (DEFAULT_DOCS[jobType.toLowerCase()] || []);
+
+  const brief = {
+    documentType:     "Subcontractor Brief",
+    generatedAt:      new Date().toISOString(),
+    jurisdiction:     "Victoria, Australia",
+
+    project: {
+      siteAddress:    siteAddress     || null,
+      mainContractor,
+      siteSupervisor: siteSupervisor  || null,
+      supervisorPhone: supervisorPhone || null,
+      startDate:      startDate       || null,
+    },
+
+    subContractorDetails: {
+      trade:          subContractorTrade || jobType,
+      jobType,
+      scopeOfWork,
+    },
+
+    documentationRequirements: docs,
+
+    complianceObligations: [
+      `All ${subContractorTrade || jobType} work must comply with applicable Victorian legislation and Australian Standards.`,
+      `You are responsible for lodging all required compliance certificates within the specified timeframes.`,
+      `A defects liability period of ${LIABILITY.defects} years applies to your work.`,
+      "Do not cover or conceal any work before it has been photographed and, where required, inspected.",
+      "All personnel must have current and appropriate licences for the work being performed.",
+    ],
+
+    siteRules: siteRules.length > 0 ? siteRules : [
+      "Site induction is mandatory for all personnel before commencing work",
+      "PPE must be worn at all times in designated areas",
+      "All visitors must sign in at the site office before entering the site",
+      "No work to commence before 7:00 AM or after 6:00 PM (unless approved by supervisor)",
+      "Any incidents must be reported to the site supervisor immediately",
+    ],
+
+    ppeSiteRequired: ppeSite.length > 0 ? ppeSite : ["Safety boots (steel cap)", "Hi-visibility vest", "Safety glasses", "Hard hat in designated zones"],
+
+    acknowledgement: "By commencing work on this project, the subcontractor acknowledges understanding and acceptance of the requirements outlined in this brief.",
+  };
+
+  return res.json(brief);
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
