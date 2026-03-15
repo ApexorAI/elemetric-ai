@@ -16265,6 +16265,241 @@ app.post("/after-hours-request", apiKeyAuth, (req, res) => {
   });
 });
 
+// ── Round 35 ──────────────────────────────────────────────────────────────────
+
+// POST /compliance-trend  — Analyse compliance score trend over a series of jobs
+app.post("/compliance-trend", apiKeyAuth, (req, res) => {
+  const { jobs, windowSize } = req.body;
+
+  if (!jobs || !Array.isArray(jobs) || jobs.length < 2) {
+    return res.status(400).json({ error: "jobs array with at least 2 entries is required." });
+  }
+
+  const window = Math.max(2, Math.min(parseInt(windowSize) || 5, 10));
+
+  const sortedJobs = jobs.slice(0, 100)
+    .filter(j => j.completionDate)
+    .sort((a, b) => new Date(a.completionDate) - new Date(b.completionDate))
+    .map(j => ({
+      date:  j.completionDate,
+      score: parseFloat(j.complianceScore) || 0,
+      jobId: j.jobId ? sanitiseInput(String(j.jobId)) : null,
+      jobType: sanitiseInput(String(j.jobType || "general")).toLowerCase(),
+    }));
+
+  if (sortedJobs.length < 2) {
+    return res.status(400).json({ error: "At least 2 jobs with valid completionDate are required." });
+  }
+
+  // Calculate rolling average
+  const dataPoints = sortedJobs.map((j, i) => {
+    const windowStart = Math.max(0, i - window + 1);
+    const windowSlice = sortedJobs.slice(windowStart, i + 1);
+    const avg = Math.round(windowSlice.reduce((s, x) => s + x.score, 0) / windowSlice.length);
+    return { ...j, rollingAvg: avg };
+  });
+
+  const scores = sortedJobs.map(j => j.score);
+  const first  = scores.slice(0, Math.ceil(scores.length / 2));
+  const second = scores.slice(Math.ceil(scores.length / 2));
+  const firstAvg  = first.reduce((s, v) => s + v, 0) / first.length;
+  const secondAvg = second.reduce((s, v) => s + v, 0) / second.length;
+
+  const trend      = secondAvg > firstAvg + 2 ? "IMPROVING" : secondAvg < firstAvg - 2 ? "DECLINING" : "STABLE";
+  const delta      = Math.round((secondAvg - firstAvg) * 10) / 10;
+
+  const overallAvg = Math.round(scores.reduce((s, v) => s + v, 0) / scores.length);
+  const best       = sortedJobs.reduce((a, b) => a.score > b.score ? a : b);
+  const worst      = sortedJobs.reduce((a, b) => a.score < b.score ? a : b);
+
+  return res.json({
+    jobsAnalysed: sortedJobs.length,
+    trend,
+    trendDelta:   delta,
+    trendSummary: `Scores are ${trend.toLowerCase()} (${delta > 0 ? "+" : ""}${delta} points half-over-half).`,
+    overallAverage: overallAvg,
+    bestJob:  { date: best.date,  score: best.score,  jobId: best.jobId  },
+    worstJob: { date: worst.date, score: worst.score, jobId: worst.jobId },
+    rollingWindow: window,
+    dataPoints,
+    recommendation: trend === "DECLINING"
+      ? "Compliance is trending down. Review recent jobs for recurring missing items and reinforce training."
+      : trend === "IMPROVING"
+        ? "Great work — compliance is improving. Keep maintaining current practices."
+        : "Compliance is stable. Look for opportunities to push scores above 85.",
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /ai-job-title  — Generate a professional job title/description from raw work notes
+app.post("/ai-job-title", apiKeyAuth, async (req, res) => {
+  const { jobType, rawNotes, address } = req.body;
+
+  if (!rawNotes) return res.status(400).json({ error: "rawNotes is required." });
+
+  const safeNotes   = sanitiseInput(String(rawNotes)).slice(0, 600);
+  const safeJobType = sanitiseInput(String(jobType || "general")).toLowerCase();
+  const safeAddress = address ? sanitiseInput(String(address)).slice(0, 100) : null;
+
+  const systemPrompt = `You are a trade job title generator. Given raw work notes, generate professional, concise job titles and descriptions suitable for invoices and compliance records. Return JSON with: "title" (max 8 words), "shortDescription" (max 25 words), "longDescription" (max 60 words), "invoiceLineItem" (max 12 words).`;
+
+  const userMsg = `Trade: ${safeJobType}\nNotes: ${safeNotes}${safeAddress ? `\nAddress: ${safeAddress}` : ""}`;
+
+  let title, shortDescription, longDescription, invoiceLineItem;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: userMsg },
+      ],
+      max_tokens: 250,
+      response_format: { type: "json_object" },
+    });
+    const parsed     = JSON.parse(aiRes.choices[0].message.content);
+    title            = sanitiseInput(String(parsed.title            || "")).slice(0, 80);
+    shortDescription = sanitiseInput(String(parsed.shortDescription || "")).slice(0, 200);
+    longDescription  = sanitiseInput(String(parsed.longDescription  || "")).slice(0, 400);
+    invoiceLineItem  = sanitiseInput(String(parsed.invoiceLineItem  || "")).slice(0, 100);
+  } catch {
+    const tradeLabel = { plumbing: "Plumbing", gas: "Gas Fitting", electrical: "Electrical", drainage: "Drainage", carpentry: "Carpentry", hvac: "HVAC" }[safeJobType] || "Trade";
+    title            = `${tradeLabel} Works`;
+    shortDescription = `${tradeLabel} work completed at specified address.`;
+    longDescription  = safeNotes;
+    invoiceLineItem  = `${tradeLabel} — labour and materials`;
+  }
+
+  return res.json({
+    jobType: safeJobType,
+    title,
+    shortDescription,
+    longDescription,
+    invoiceLineItem,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// GET /job-count/:contractorId  — Return job counts and compliance summary for a contractor
+app.get("/job-count/:contractorId", apiKeyAuth, async (req, res) => {
+  const contractorId = sanitiseInput(String(req.params.contractorId || ""));
+  if (!contractorId) return res.status(400).json({ error: "contractorId is required." });
+
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  const [jobsResult, feedbackResult] = await Promise.all([
+    supabaseAdmin
+      .from("jobs")
+      .select("job_type, compliance_score, certificate_filed, created_at")
+      .eq("contractor_id", contractorId)
+      .limit(1000),
+    supabaseAdmin
+      .from("job_feedback")
+      .select("rating")
+      .eq("contractor_id", contractorId)
+      .limit(500),
+  ]);
+
+  if (jobsResult.error) return res.status(500).json({ error: "Failed to retrieve jobs." });
+
+  const jobs      = jobsResult.data || [];
+  const feedback  = feedbackResult.data || [];
+  const total     = jobs.length;
+  const certified = jobs.filter(j => j.certificate_filed).length;
+
+  const tradeBreakdown = {};
+  for (const j of jobs) {
+    const t = j.job_type || "unknown";
+    tradeBreakdown[t] = (tradeBreakdown[t] || 0) + 1;
+  }
+
+  const scores    = jobs.map(j => parseFloat(j.compliance_score)).filter(s => !isNaN(s) && s > 0);
+  const avgScore  = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+
+  const ratings   = feedback.map(f => parseFloat(f.rating)).filter(r => !isNaN(r));
+  const avgRating = ratings.length ? Math.round((ratings.reduce((a, b) => a + b, 0) / ratings.length) * 10) / 10 : null;
+
+  const now = new Date();
+  const thirtyDays = new Date(now - 30 * 24 * 60 * 60 * 1000);
+  const recentJobs = jobs.filter(j => j.created_at && new Date(j.created_at) >= thirtyDays).length;
+
+  return res.json({
+    contractorId,
+    totalJobs:        total,
+    recentJobs30Days: recentJobs,
+    certifiedJobs:    certified,
+    certificationRate: total ? `${Math.round((certified / total) * 100)}%` : "N/A",
+    averageComplianceScore: avgScore,
+    averageFeedbackRating:  avgRating,
+    totalFeedbackReceived:  feedback.length,
+    tradeBreakdown,
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
+// POST /scope-of-works  — Generate a formatted Scope of Works document
+app.post("/scope-of-works", apiKeyAuth, async (req, res) => {
+  const { jobType, address, clientName, contractorName, scopeItems, exclusions,
+          estimatedDuration, startDate, includeAI } = req.body;
+
+  if (!jobType || !scopeItems || !Array.isArray(scopeItems) || scopeItems.length === 0) {
+    return res.status(400).json({ error: "jobType and scopeItems array are required." });
+  }
+
+  const safeJobType    = sanitiseInput(String(jobType)).toLowerCase();
+  const safeClient     = sanitiseInput(String(clientName    || "Property Owner"));
+  const safeContractor = sanitiseInput(String(contractorName|| "Contractor"));
+  const safeAddress    = sanitiseInput(String(address       || "Site address TBC"));
+  const safeStart      = sanitiseInput(String(startDate     || "TBC"));
+  const safeDuration   = sanitiseInput(String(estimatedDuration || "TBC"));
+
+  const safeScope    = scopeItems.slice(0, 30).map((i, n) => `${n + 1}. ${sanitiseInput(String(i))}`);
+  const safeExclusions = Array.isArray(exclusions) ? exclusions.slice(0, 15).map(e => sanitiseInput(String(e))) : [];
+
+  const tradeLabel = { plumbing: "Plumbing", gas: "Gas Fitting", electrical: "Electrical",
+    drainage: "Drainage", carpentry: "Carpentry", hvac: "HVAC/Refrigeration" }[safeJobType] || safeJobType;
+
+  let aiSummary = null;
+  if (includeAI) {
+    try {
+      const aiRes = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [
+          { role: "system", content: `You are a trade compliance specialist. Given a scope of works list, write a professional 2-3 sentence project overview for inclusion in a formal Scope of Works document. Be specific and technical. Return plain text only.` },
+          { role: "user",   content: `Trade: ${tradeLabel}\nClient: ${safeClient}\nAddress: ${safeAddress}\nScope:\n${safeScope.join("\n")}` },
+        ],
+        max_tokens: 150,
+      });
+      aiSummary = sanitiseInput(aiRes.choices[0].message.content.trim());
+    } catch { /* fall through */ }
+  }
+
+  const docDate  = new Date().toISOString().slice(0, 10);
+  const sowId    = `SOW-${Date.now().toString(36).toUpperCase()}`;
+
+  return res.json({
+    sowId,
+    jobType:          safeJobType,
+    tradeLabel,
+    client:           safeClient,
+    contractor:       safeContractor,
+    address:          safeAddress,
+    documentDate:     docDate,
+    startDate:        safeStart,
+    estimatedDuration: safeDuration,
+    projectOverview:  aiSummary || null,
+    scopeOfWorks:     safeScope,
+    exclusions:       safeExclusions,
+    standardExclusions: [
+      "Any works not explicitly listed in the scope above",
+      "Making good of any pre-existing defects unless specifically listed",
+      "Council or permit fees unless specifically included",
+      "Works uncovered after site investigation that differ materially from initial scope",
+    ],
+    terms: `All works will be completed in accordance with applicable Australian Standards and the National Construction Code. Variations to scope must be agreed in writing prior to commencement.`,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
