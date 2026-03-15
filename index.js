@@ -60546,6 +60546,358 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /safety-committee-minutes — Record WHS/OHS committee meeting minutes per OHS Act 2004 (Vic)
+app.post("/safety-committee-minutes", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    meetingDate,
+    meetingLocation,
+    chairperson,
+    meetingType,          // ordinary | extraordinary | inaugural
+    attendees,            // array of { name, role, company }
+    apologies,            // array of names
+    quorumMet,
+    previousMinutesConfirmed,
+    agenda,               // array of items
+    actionItemsFromPrevious, // array of { item, responsible, dueDate, status }
+    issuesRaised,         // array of { description, raisedBy, priority, resolution }
+    incidentsReviewed,    // array of incident IDs or descriptions
+    nearMissesReviewed,
+    inspectionFindings,
+    trainingItems,        // array of { topic, dueDate, affectedWorkers }
+    newActionItems,       // array of { item, responsible, dueDate }
+    nextMeetingDate,
+    meetingDurationMinutes,
+    minutesRecordedBy,
+    distributionList,     // array of emails
+    attachments,          // array of URLs
+    notes,
+  } = req.body;
+
+  // Quorum check — OHS Act 2004 (Vic) s.72 requires equal employee/employer rep
+  const quorumWarning = quorumMet === false || quorumMet === "false"
+    ? "Quorum not met — meeting may not satisfy OHS Act 2004 (Vic) s.72 requirements"
+    : null;
+
+  // Flag unresolved high-priority issues
+  const unresolvedHighPriority = Array.isArray(issuesRaised)
+    ? issuesRaised.filter(
+        (i) =>
+          (i.priority === "high" || i.priority === "critical") &&
+          (!i.resolution || i.resolution.trim() === "")
+      )
+    : [];
+
+  // Flag overdue action items
+  const now = new Date();
+  const overdueItems = Array.isArray(actionItemsFromPrevious)
+    ? actionItemsFromPrevious.filter(
+        (a) =>
+          a.status !== "completed" &&
+          a.dueDate &&
+          new Date(a.dueDate) < now
+      )
+    : [];
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    meeting_date: meetingDate,
+    meeting_location: sanitiseInput(meetingLocation),
+    chairperson: sanitiseInput(chairperson),
+    meeting_type: sanitiseInput(meetingType) || "ordinary",
+    attendees: attendees || [],
+    apologies: apologies || [],
+    quorum_met: quorumMet !== false && quorumMet !== "false",
+    previous_minutes_confirmed: previousMinutesConfirmed,
+    agenda: agenda || [],
+    action_items_from_previous: actionItemsFromPrevious || [],
+    issues_raised: issuesRaised || [],
+    incidents_reviewed: incidentsReviewed || [],
+    near_misses_reviewed: nearMissesReviewed || [],
+    inspection_findings: sanitiseInput(inspectionFindings),
+    training_items: trainingItems || [],
+    new_action_items: newActionItems || [],
+    next_meeting_date: nextMeetingDate,
+    meeting_duration_minutes: meetingDurationMinutes,
+    minutes_recorded_by: sanitiseInput(minutesRecordedBy),
+    distribution_list: distributionList || [],
+    attachments: attachments || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("safety_committee_minutes")
+      .insert(record);
+    if (dbErr) console.error("DB error /safety-committee-minutes:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Safety committee minutes recorded",
+    quorumWarning,
+    unresolvedHighPriorityCount: unresolvedHighPriority.length,
+    unresolvedHighPriorityItems: unresolvedHighPriority.map((i) => i.description),
+    overdueActionItemCount: overdueItems.length,
+    overdueActionItems: overdueItems.map((a) => a.item),
+    newActionItems: (newActionItems || []).length,
+    nextMeetingDate: nextMeetingDate || null,
+    applicableLegislation: [
+      "OHS Act 2004 (Vic) s.72",
+      "OHS Regulations 2017 (Vic)",
+      "AS/NZS 4801",
+      "ISO 45001",
+    ],
+    saved,
+  });
+});
+
+// POST /thermal-imaging-record — Record thermographic inspection per AS/NZS 4566 / IEC 60068
+app.post("/thermal-imaging-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    assetId,
+    assetDescription,
+    inspectionType,      // electrical | mechanical | building-envelope | roofing | hvac | plumbing
+    inspectionDate,
+    inspector,
+    cameraModel,
+    emissivitySetting,
+    ambientTemp,         // °C
+    loadCondition,       // percentage of full load (electrical)
+    windSpeed,           // m/s
+    humidity,            // %
+    findings,            // array of { id, location, maxTemp, refTemp, deltaT, severity, description }
+    criticalAnomalies,   // array of { location, maxTemp, component, immediateAction }
+    overallCondition,    // good | fair | poor | critical
+    immediateShutdownRequired,
+    maintenanceRecommendations, // array of strings
+    reinspectionPeriod,  // days
+    photos,              // array of URLs (visible light + thermal pairs)
+    notes,
+  } = req.body;
+
+  // Critical temperature delta thresholds (IEC 60068 / AS/NZS 3000 guidance)
+  const criticalDeltaT = 40; // °C — immediate shutdown recommended
+  const seriousDeltaT = 20;  // °C — urgent maintenance
+  const warningDeltaT = 10;  // °C — scheduled maintenance
+
+  let maxDetectedDeltaT = 0;
+  const criticalFromFindings = [];
+
+  if (Array.isArray(findings)) {
+    findings.forEach((f) => {
+      const deltaT = parseFloat(f.deltaT) || 0;
+      if (deltaT > maxDetectedDeltaT) maxDetectedDeltaT = deltaT;
+      if (deltaT >= criticalDeltaT) {
+        criticalFromFindings.push({
+          location: f.location,
+          deltaT,
+          severity: "CRITICAL",
+        });
+      }
+    });
+  }
+
+  const isImmediateShutdown =
+    immediateShutdownRequired === true ||
+    immediateShutdownRequired === "true" ||
+    criticalFromFindings.length > 0;
+
+  if (isImmediateShutdown) {
+    return res.status(422).json({
+      error: "Critical thermal anomaly requires immediate shutdown",
+      maxDetectedDeltaT,
+      criticalAnomalies: criticalFromFindings,
+      immediateActions: [
+        "De-energise or isolate affected equipment immediately",
+        "Do not restore power until repairs completed and re-inspected",
+        "Notify qualified electrician / engineer immediately",
+        "Document all findings and retain thermal images",
+      ],
+      applicableStandards: ["AS/NZS 3000", "IEC 60068", "AS/NZS 4566", "WorkSafe Victoria"],
+    });
+  }
+
+  const urgencyLevel =
+    maxDetectedDeltaT >= seriousDeltaT
+      ? "URGENT"
+      : maxDetectedDeltaT >= warningDeltaT
+      ? "SCHEDULED"
+      : "MONITOR";
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    asset_id: sanitiseInput(assetId),
+    asset_description: sanitiseInput(assetDescription),
+    inspection_type: sanitiseInput(inspectionType),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    camera_model: sanitiseInput(cameraModel),
+    emissivity_setting: emissivitySetting,
+    ambient_temp: ambientTemp,
+    load_condition: loadCondition,
+    wind_speed: windSpeed,
+    humidity,
+    findings: findings || [],
+    critical_anomalies: criticalAnomalies || [],
+    overall_condition: sanitiseInput(overallCondition) || "fair",
+    max_detected_delta_t: maxDetectedDeltaT,
+    urgency_level: urgencyLevel,
+    maintenance_recommendations: maintenanceRecommendations || [],
+    reinspection_period: reinspectionPeriod,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("thermal_imaging_records")
+      .insert(record);
+    if (dbErr) console.error("DB error /thermal-imaging-record:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Thermal imaging record saved",
+    overallCondition: sanitiseInput(overallCondition) || "fair",
+    maxDetectedDeltaT,
+    urgencyLevel,
+    criticalFindingsCount: criticalFromFindings.length,
+    maintenanceRecommendationCount: (maintenanceRecommendations || []).length,
+    reinspectionPeriod: reinspectionPeriod || null,
+    deltaTThresholds: {
+      warning: `≥${warningDeltaT}°C — scheduled maintenance`,
+      serious: `≥${seriousDeltaT}°C — urgent maintenance`,
+      critical: `≥${criticalDeltaT}°C — immediate shutdown`,
+    },
+    applicableStandards: ["AS/NZS 4566", "IEC 60068", "AS/NZS 3000", "AS/NZS 3017"],
+    saved,
+  });
+});
+
+// POST /ai-thermal-imaging-analysis — AI interprets thermal anomalies, failure modes, and maintenance strategy
+app.post("/ai-thermal-imaging-analysis", apiKeyAuth, async (req, res) => {
+  const {
+    inspectionType,
+    assetDescription,
+    findings,            // array of anomalies with deltaT
+    overallCondition,
+    ambientTemp,
+    loadCondition,
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are a Level 2 thermographer (ISO 18436-7) and predictive maintenance engineer with 20 years experience on Australian industrial and commercial sites. Analyse thermographic inspection data and thermal images to identify failure modes and maintenance strategies.
+
+For electrical assets: apply AS/NZS 3000, IEC TR 60068-5-2, NETA MTS, IEC 60364 criteria.
+For mechanical: AS 3788, ISO 10816, AS 4024.
+For building envelopes: AS 4654, AIRAH guidelines.
+For HVAC: AS 1668, AS 3666.
+
+Assess:
+1. Probable root cause of each thermal anomaly (loose connection, overloading, failing component, moisture ingress, insulation deficiency)
+2. Failure timeline (imminent | within 3 months | within 12 months | monitor)
+3. Recommended maintenance action with priority
+4. Risk to personnel and continuity of operations
+5. Cost-effective maintenance vs replacement decision
+
+Respond with JSON: { "primaryFailureMode": "string", "failureModes": [], "immediateRisk": "low|medium|high|critical", "failureTimeline": "string", "maintenanceActions": [], "replacementRecommended": boolean, "personnelRisk": "string", "operationalRisk": "string", "rootCauses": [], "contributingFactors": [], "reinspectionPeriod": "string", "predictiveMaintenance": [], "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const findingsSummary = Array.isArray(findings)
+    ? findings.map((f) => `${f.location}: ΔT=${f.deltaT}°C, max=${f.maxTemp}°C — ${f.description}`).join("\n")
+    : "No structured findings provided";
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Inspection type: ${inspectionType || "not specified"}
+Asset: ${assetDescription || "not specified"}
+Ambient temperature: ${ambientTemp || "not specified"}°C
+Load condition: ${loadCondition || "not specified"}%
+Overall condition: ${overallCondition || "not specified"}
+Findings:\n${findingsSummary}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", analysis: parsed });
+  } catch (err) {
+    console.error("/ai-thermal-imaging-analysis error:", err.message);
+    res.json({
+      source: "fallback",
+      analysis: {
+        primaryFailureMode: "Resistive heating at electrical connection",
+        failureModes: [
+          "Loose or corroded electrical connection",
+          "Overloaded circuit conductor",
+          "Failing capacitor or insulation breakdown",
+        ],
+        immediateRisk: "medium",
+        failureTimeline: "Within 3 months if untreated",
+        maintenanceActions: [
+          "Tighten all bolted connections to manufacturer torque spec",
+          "Clean contact surfaces and apply anti-oxidant compound",
+          "Megger test insulation resistance",
+          "Verify circuit loading against rated capacity",
+        ],
+        replacementRecommended: false,
+        personnelRisk: "Electric shock risk if component fails in service — exclude personnel from zone until inspected",
+        operationalRisk: "Potential nuisance tripping or fire risk if connection continues to deteriorate",
+        rootCauses: ["Vibration-induced connection loosening", "Corrosion from humidity ingress"],
+        contributingFactors: ["Age of installation", "Inadequate maintenance interval"],
+        reinspectionPeriod: "3 months or after maintenance",
+        predictiveMaintenance: [
+          "Schedule annual thermographic survey for all LV switchboards",
+          "Install online temperature monitoring on high-criticality assets",
+        ],
+        applicableStandards: [
+          "AS/NZS 4566",
+          "AS/NZS 3000",
+          "IEC TR 60068-5-2",
+          "AS/NZS 3017",
+          "NETA MTS",
+        ],
+        recommendation:
+          "De-energise circuit, tighten connections, conduct insulation resistance test, and re-inspect under load within 3 months.",
+        summary:
+          "Thermal anomaly consistent with resistive heating at electrical connection. Schedule maintenance promptly to prevent escalation to failure or fire. Re-inspect after rectification to confirm resolution.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
