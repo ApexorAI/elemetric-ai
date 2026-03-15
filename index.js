@@ -30554,6 +30554,213 @@ Write a formal performance assessment. Return a JSON object with:
   }
 });
 
+// ── Round 109: Supply chain, procurement plan, AI vendor evaluation ───────────
+
+// POST /procurement-plan — Record a project procurement plan
+app.post("/procurement-plan", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, procurementManager,
+    procurementItems = [], totalBudget,
+    preferredVendorPolicy, localContentTarget,
+    state = "VIC",
+  } = req.body;
+
+  if (!projectId || !projectName) return res.status(400).json({ error: "projectId and projectName required." });
+
+  const processedItems = procurementItems.map((item, idx) => ({
+    itemId: `PROC-${String(idx + 1).padStart(3, "0")}`,
+    description: sanitiseInput(item.description || ""),
+    category: sanitiseInput(item.category || ""),
+    estimatedValue: Number(item.estimatedValue) || 0,
+    requiredDate: item.requiredDate || null,
+    procurementMethod: ["DIRECT", "QUOTATION", "TENDER", "PANEL", "SOLE_SOURCE"].includes((item.procurementMethod || "").toUpperCase())
+      ? item.procurementMethod.toUpperCase() : "QUOTATION",
+    leadTimeDays: Number(item.leadTimeDays) || 0,
+    status: "PLANNED",
+    assignedBuyer: sanitiseInput(item.assignedBuyer || ""),
+  }));
+
+  const totalEstimated = processedItems.reduce((s, i) => s + i.estimatedValue, 0);
+  const tenderItems = processedItems.filter(i => i.procurementMethod === "TENDER").length;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    procurement_manager: sanitiseInput(procurementManager || ""),
+    procurement_items: processedItems,
+    item_count: processedItems.length,
+    total_estimated_value: totalEstimated,
+    total_budget: Number(totalBudget) || null,
+    tender_item_count: tenderItems,
+    preferred_vendor_policy: sanitiseInput(preferredVendorPolicy || ""),
+    local_content_target: localContentTarget ? Number(localContentTarget) : null,
+    state: sanitiseInput(state),
+    status: "ACTIVE",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("procurement_plans")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, planId: data.id, ...record });
+  }
+
+  res.json({ success: true, planId: null, ...record, saved: false });
+});
+
+// POST /vendor-register — Register a supplier or vendor in the approved vendor list
+app.post("/vendor-register", apiKeyAuth, async (req, res) => {
+  const {
+    vendorName, abn, category, contactName, contactEmail, contactPhone,
+    address, state, preferredStatus = false, insuranceExpiry,
+    paymentTerms = "30", currencyCode = "AUD", notes,
+  } = req.body;
+
+  if (!vendorName || !abn) return res.status(400).json({ error: "vendorName and abn required." });
+
+  const vendorCategories = ["MATERIALS", "PLANT_HIRE", "SUBCONTRACTOR", "PROFESSIONAL_SERVICES", "LABOUR_HIRE", "TECHNOLOGY", "OTHER"];
+  const cat = (category || "OTHER").toUpperCase();
+
+  const record = {
+    vendor_name: sanitiseInput(vendorName),
+    abn: sanitiseInput(abn),
+    category: vendorCategories.includes(cat) ? cat : "OTHER",
+    contact_name: sanitiseInput(contactName || ""),
+    contact_email: sanitiseInput(contactEmail || ""),
+    contact_phone: sanitiseInput(contactPhone || ""),
+    address: sanitiseInput(address || ""),
+    state: sanitiseInput(state || ""),
+    preferred_status: Boolean(preferredStatus),
+    insurance_expiry: insuranceExpiry || null,
+    insurance_expired: insuranceExpiry ? new Date(insuranceExpiry) < new Date() : false,
+    payment_terms_days: Number(paymentTerms),
+    currency_code: sanitiseInput(currencyCode),
+    notes: sanitiseInput(notes || ""),
+    status: "APPROVED",
+    registered_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("vendor_register")
+      .upsert({ ...record, abn: record.abn }, { onConflict: "abn" })
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, vendorId: data.id, ...record });
+  }
+
+  res.json({ success: true, vendorId: null, ...record, saved: false });
+});
+
+// POST /purchase-request — Create a purchase requisition
+app.post("/purchase-request", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, requestedBy, description, category,
+    quantity, unit, estimatedUnitCost, requiredDate,
+    preferredVendor, justification, priority = "NORMAL",
+  } = req.body;
+
+  if (!projectId || !description || !quantity)
+    return res.status(400).json({ error: "projectId, description, quantity required." });
+
+  const totalEstimated = Number(quantity) * (Number(estimatedUnitCost) || 0);
+  const prNumber = `PR-${Date.now().toString(36).toUpperCase().slice(-8)}`;
+
+  const record = {
+    pr_number: prNumber,
+    project_id: sanitiseInput(projectId),
+    requested_by: sanitiseInput(requestedBy || ""),
+    description: sanitiseInput(description),
+    category: sanitiseInput(category || ""),
+    quantity: Number(quantity),
+    unit: sanitiseInput(unit || ""),
+    estimated_unit_cost: Number(estimatedUnitCost) || null,
+    estimated_total: totalEstimated || null,
+    required_date: requiredDate || null,
+    preferred_vendor: sanitiseInput(preferredVendor || ""),
+    justification: sanitiseInput(justification || ""),
+    priority: ["LOW", "NORMAL", "HIGH", "URGENT"].includes((priority || "").toUpperCase()) ? priority.toUpperCase() : "NORMAL",
+    status: "PENDING_APPROVAL",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("purchase_requests")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, requestId: data.id, prNumber, estimatedTotal: totalEstimated, ...record });
+  }
+
+  res.json({ success: true, requestId: null, prNumber, estimatedTotal: totalEstimated, ...record, saved: false });
+});
+
+// POST /ai-vendor-evaluation — AI evaluates vendor quotes and recommends best value
+app.post("/ai-vendor-evaluation", apiKeyAuth, async (req, res) => {
+  const {
+    itemDescription, vendors = [], evaluationCriteria = {},
+    budgetLimit, mustMeetSpec = [], state = "VIC",
+  } = req.body;
+
+  if (!vendors.length || !itemDescription)
+    return res.status(400).json({ error: "itemDescription and vendors required." });
+
+  const sanitisedVendors = vendors.map((v, i) => `Vendor ${i + 1} (${sanitiseInput(v.name || "")}): Price $${v.price || "Unknown"}, Delivery ${v.deliveryDays || "Unknown"} days, Warranty ${v.warranty || "Unknown"}, Notes: ${sanitiseInput(v.notes || "None")}`).join("\n");
+  const sanitisedCriteria = Object.entries(evaluationCriteria).map(([k, v]) => `${k}: ${v}%`).join(", ");
+
+  const prompt = `You are a procurement specialist conducting a best-value vendor evaluation for an Australian construction project.
+
+Item: ${sanitiseInput(itemDescription)}
+Budget limit: ${budgetLimit ? `AUD $${budgetLimit}` : "Not specified"}
+Must meet specs: ${mustMeetSpec.map(s => sanitiseInput(s)).join("; ") || "Standard specs"}
+Evaluation criteria weights: ${sanitisedCriteria || "Price 50%, Delivery 25%, Quality 25%"}
+State: ${sanitiseInput(state)}
+
+VENDOR QUOTES:
+${sanitisedVendors}
+
+Return a JSON object with:
+- "recommendedVendor": vendor name
+- "recommendedReason": string
+- "vendorRankings": array of { "rank": number, "vendor": string, "overallScore": number, "priceScore": number, "deliveryScore": number, "qualityScore": number, "risks": string[], "notes": string }
+- "bestValue": vendor with best overall value
+- "lowestPrice": vendor with lowest price
+- "fastestDelivery": vendor with fastest delivery
+- "riskFlags": array of concerns
+- "negotiationSuggestions": array of items to negotiate
+- "recommendation": string`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, itemDescription, vendorCount: vendors.length, state, evaluatedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      recommendedVendor: vendors[0]?.name || "Vendor 1",
+      recommendedReason: "Automated evaluation temporarily unavailable. Manual review required.",
+      vendorRankings: vendors.map((v, i) => ({ rank: i + 1, vendor: v.name || `Vendor ${i + 1}`, overallScore: null, priceScore: null, deliveryScore: null, qualityScore: null, risks: [], notes: "Manual evaluation required." })),
+      bestValue: null, lowestPrice: null, fastestDelivery: null,
+      riskFlags: ["Manual evaluation required — automated analysis unavailable"],
+      negotiationSuggestions: [],
+      recommendation: "Conduct manual vendor evaluation.",
+      itemDescription, vendorCount: vendors.length, state, evaluatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
