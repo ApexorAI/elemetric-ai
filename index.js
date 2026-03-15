@@ -45688,6 +45688,303 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /pool-registration — Register a pool or spa (Building Regulations 2018 Vic)
+app.post("/pool-registration", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, councilArea, ownerName, ownerContact,
+    poolType, poolShape, poolVolumeLitres, poolLengthM, poolWidthM, poolDepthM,
+    constructionYear, permitNumber, registrationDate,
+    barrierType, barrierHeightMm, selfClosingGate, selfLatchingGate,
+    notes,
+  } = req.body;
+
+  if (!propertyAddress || !ownerName || !poolType) {
+    return res.status(400).json({ error: "propertyAddress, ownerName, and poolType are required." });
+  }
+
+  const validPoolTypes = ["IN_GROUND", "ABOVE_GROUND", "SPA", "PORTABLE_SPA", "WADING_POOL"];
+  const resolvedType = validPoolTypes.includes((poolType || "").toUpperCase()) ? poolType.toUpperCase() : "IN_GROUND";
+
+  // AS 1926.1 minimum barrier height: 1200mm for child-resistant barriers
+  const MIN_BARRIER_HEIGHT_MM = 1200;
+  const barrierHeightOk = barrierHeightMm ? Number(barrierHeightMm) >= MIN_BARRIER_HEIGHT_MM : null;
+
+  const complianceNotes = [];
+  if (barrierHeightMm && !barrierHeightOk) {
+    complianceNotes.push(`Barrier height ${barrierHeightMm}mm is below AS 1926.1 minimum of ${MIN_BARRIER_HEIGHT_MM}mm.`);
+  }
+  if (!selfClosingGate) complianceNotes.push("Gate must be self-closing per AS 1926.1 clause 2.3.");
+  if (!selfLatchingGate) complianceNotes.push("Gate must be self-latching and located above 1500mm per AS 1926.1.");
+
+  // Registration deadline — Vic pools/spas require registration with council
+  const regRef = `POOL-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    regRef,
+    propertyAddress: sanitiseInput(propertyAddress, 300),
+    councilArea: sanitiseInput(councilArea || "", 100),
+    ownerName: sanitiseInput(ownerName, 150),
+    ownerContact: sanitiseInput(ownerContact || "", 100),
+    poolType: resolvedType,
+    poolShape: sanitiseInput(poolShape || "", 60),
+    poolVolumeLitres: poolVolumeLitres || null,
+    dimensions: {
+      lengthM: poolLengthM || null,
+      widthM: poolWidthM || null,
+      depthM: poolDepthM || null,
+    },
+    constructionYear: constructionYear || null,
+    permitNumber: sanitiseInput(permitNumber || "", 60),
+    registrationDate: registrationDate || new Date().toISOString().split("T")[0],
+    barrier: {
+      type: sanitiseInput(barrierType || "", 80),
+      heightMm: barrierHeightMm || null,
+      heightCompliant: barrierHeightOk,
+      selfClosingGate: !!selfClosingGate,
+      selfLatchingGate: !!selfLatchingGate,
+    },
+    complianceNotes,
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("pool_registrations").insert(record);
+      if (error) console.error("Pool registration insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Pool registration DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    regRef,
+    complianceNotes,
+    message: complianceNotes.length > 0
+      ? `Pool registered with ${complianceNotes.length} compliance issue(s) — rectify before next inspection.`
+      : "Pool registered successfully.",
+    regulatoryNote: "Victorian pool/spa owners must register with their local council and have the pool barrier inspected within the required timeframe per Building Regulations 2018.",
+    saved,
+    record,
+  });
+});
+
+// POST /pool-safety-inspection — Log a pool barrier inspection (AS 1926.1, Building Regulations 2018 Vic)
+app.post("/pool-safety-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    poolRegRef, propertyAddress, inspectorName, inspectorLicence,
+    inspectionDate, poolType,
+    // Barrier checks
+    barrierHeightMm, barrierGoodCondition, noFootholds, noClimbingAids,
+    gapsBelowBarrierMm, horizontalRailsCompliant,
+    // Gate checks
+    gateHeightMm, gateSelfClosing, gateSelfLatching, latchHeightMm,
+    gateOpeningOutward, gateConditionOk,
+    // Boundary wall checks
+    boundaryWallUsed, boundaryWallHeightMm, windowsCompliant, doorsCompliant,
+    // Non-compliances
+    nonCompliances, rectificationRequired, rectificationDeadlineDays,
+    notes,
+  } = req.body;
+
+  if (!propertyAddress || !inspectorName || !inspectionDate) {
+    return res.status(400).json({ error: "propertyAddress, inspectorName, and inspectionDate are required." });
+  }
+
+  const sanitisedAddress = sanitiseInput(propertyAddress, 300);
+  const sanitisedInspector = sanitiseInput(inspectorName, 120);
+
+  // AS 1926.1:2012 key requirements
+  const MIN_BARRIER_HEIGHT = 1200;   // mm
+  const MAX_GAP_BELOW = 100;         // mm
+  const MIN_GATE_HEIGHT = 1200;      // mm
+  const MIN_LATCH_HEIGHT = 1500;     // mm
+
+  const failures = [];
+  if (barrierHeightMm && Number(barrierHeightMm) < MIN_BARRIER_HEIGHT) {
+    failures.push(`Barrier height ${barrierHeightMm}mm < ${MIN_BARRIER_HEIGHT}mm minimum (AS 1926.1 cl.2.2)`);
+  }
+  if (gapsBelowBarrierMm && Number(gapsBelowBarrierMm) > MAX_GAP_BELOW) {
+    failures.push(`Gap below barrier ${gapsBelowBarrierMm}mm > ${MAX_GAP_BELOW}mm maximum (AS 1926.1 cl.2.4)`);
+  }
+  if (!barrierGoodCondition) failures.push("Barrier not in good condition — repair or replace damaged sections.");
+  if (!gateSelfClosing) failures.push("Gate not self-closing (AS 1926.1 cl.2.3).");
+  if (!gateSelfLatching) failures.push("Gate not self-latching (AS 1926.1 cl.2.3).");
+  if (latchHeightMm && Number(latchHeightMm) < MIN_LATCH_HEIGHT) {
+    failures.push(`Latch height ${latchHeightMm}mm < ${MIN_LATCH_HEIGHT}mm minimum (AS 1926.1 cl.2.3)`);
+  }
+  if (gateHeightMm && Number(gateHeightMm) < MIN_GATE_HEIGHT) {
+    failures.push(`Gate height ${gateHeightMm}mm < ${MIN_GATE_HEIGHT}mm minimum.`);
+  }
+  if (!gateOpeningOutward) failures.push("Gate must open away from pool area (AS 1926.1 cl.2.3).");
+  if (!gateConditionOk) failures.push("Gate in poor condition — repair or replace.");
+  if (noFootholds === false) failures.push("Footholds present on barrier — remove or modify.");
+  if (noClimbingAids === false) failures.push("Climbing aids within 900mm of barrier — relocate.");
+
+  // Add any additional non-compliances passed in
+  const additionalNonCompliances = (nonCompliances || []).map(n => sanitiseInput(String(n), 200)).slice(0, 10);
+
+  const allFailures = [...failures, ...additionalNonCompliances];
+  const overallResult = allFailures.length === 0 ? "PASS" : "FAIL";
+
+  // Victorian Building Regulations 2018 — rectification timeframe for private pool inspections
+  const defaultRectificationDays = rectificationDeadlineDays || 60;
+
+  const ref = `PSI-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    poolRegRef: sanitiseInput(poolRegRef || "", 40),
+    propertyAddress: sanitisedAddress,
+    inspectorName: sanitisedInspector,
+    inspectorLicence: sanitiseInput(inspectorLicence || "", 60),
+    inspectionDate,
+    poolType: sanitiseInput(poolType || "", 40),
+    checks: {
+      barrierHeightMm: barrierHeightMm || null,
+      barrierGoodCondition: barrierGoodCondition ?? null,
+      noFootholds: noFootholds ?? null,
+      noClimbingAids: noClimbingAids ?? null,
+      gapsBelowBarrierMm: gapsBelowBarrierMm || null,
+      horizontalRailsCompliant: horizontalRailsCompliant ?? null,
+      gateHeightMm: gateHeightMm || null,
+      gateSelfClosing: gateSelfClosing ?? null,
+      gateSelfLatching: gateSelfLatching ?? null,
+      latchHeightMm: latchHeightMm || null,
+      gateOpeningOutward: gateOpeningOutward ?? null,
+      gateConditionOk: gateConditionOk ?? null,
+      boundaryWallUsed: boundaryWallUsed ?? null,
+      boundaryWallHeightMm: boundaryWallHeightMm || null,
+      windowsCompliant: windowsCompliant ?? null,
+      doorsCompliant: doorsCompliant ?? null,
+    },
+    overallResult,
+    failures: allFailures,
+    rectificationRequired: allFailures.length > 0 && (rectificationRequired !== false),
+    rectificationDeadlineDays: allFailures.length > 0 ? defaultRectificationDays : null,
+    notes: sanitiseInput(notes || "", 500),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("pool_safety_inspections").insert(record);
+      if (error) console.error("Pool inspection insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Pool inspection DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    overallResult,
+    failureCount: allFailures.length,
+    failures: allFailures,
+    rectificationDeadlineDays: allFailures.length > 0 ? defaultRectificationDays : null,
+    message: overallResult === "PASS"
+      ? "Pool barrier inspection PASSED — all AS 1926.1 requirements met."
+      : `Pool barrier inspection FAILED with ${allFailures.length} non-compliance(s). Rectification required within ${defaultRectificationDays} days.`,
+    saved,
+    record,
+  });
+});
+
+// POST /ai-pool-compliance-report — AI generates a pool barrier compliance summary report
+app.post("/ai-pool-compliance-report", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, poolType, inspectionRef, failures,
+    ownerName, councilArea, inspectionDate, notes,
+  } = req.body;
+
+  if (!propertyAddress || !poolType) {
+    return res.status(400).json({ error: "propertyAddress and poolType are required." });
+  }
+
+  const sanitisedAddress = sanitiseInput(propertyAddress, 300);
+  const sanitisedType = sanitiseInput(poolType, 60);
+  const sanitisedFailures = Array.isArray(failures)
+    ? failures.map(f => sanitiseInput(String(f), 200)).slice(0, 20)
+    : [];
+
+  const prompt = `You are a pool safety inspector in Victoria, Australia, qualified under the Building Regulations 2018.
+
+Generate a formal pool barrier compliance report for:
+- Property: ${sanitisedAddress}
+- Pool type: ${sanitisedType}
+- Council area: ${sanitiseInput(councilArea || "Not specified", 100)}
+- Owner: ${sanitiseInput(ownerName || "Not specified", 120)}
+- Inspection date: ${sanitiseInput(inspectionDate || "Not specified", 30)}
+- Non-compliances identified: ${sanitisedFailures.length > 0 ? sanitisedFailures.join("; ") : "None"}
+${notes ? `- Inspector notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Reference AS 1926.1:2012, AS 1926.2, and Victorian Building Regulations 2018 Part 11.
+
+Respond ONLY with a JSON object:
+{
+  "overallResult": "PASS|FAIL",
+  "riskLevel": "LOW|MEDIUM|HIGH",
+  "regulatoryReferences": [string],
+  "rectificationItems": [{"item": string, "regulation": string, "priority": "CRITICAL|MAJOR|MINOR", "rectification": string}],
+  "recommendedActions": [string],
+  "ownerObligations": [string],
+  "inspectorCertification": string,
+  "reportNarrative": string (formal 3-4 sentence paragraph),
+  "nextInspectionRecommendedMonths": number
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      inspectionRef: sanitiseInput(inspectionRef || "", 40),
+      propertyAddress: sanitisedAddress,
+      poolType: sanitisedType,
+      overallResult: parsed.overallResult || (sanitisedFailures.length === 0 ? "PASS" : "FAIL"),
+      riskLevel: parsed.riskLevel || "MEDIUM",
+      regulatoryReferences: parsed.regulatoryReferences || [],
+      rectificationItems: parsed.rectificationItems || [],
+      recommendedActions: parsed.recommendedActions || [],
+      ownerObligations: parsed.ownerObligations || [],
+      inspectorCertification: parsed.inspectorCertification || "",
+      reportNarrative: parsed.reportNarrative || "",
+      nextInspectionRecommendedMonths: parsed.nextInspectionRecommendedMonths || 12,
+    });
+  } catch (e) {
+    console.error("AI pool compliance report error:", e.message);
+    return res.json({
+      success: true,
+      inspectionRef: sanitiseInput(inspectionRef || "", 40),
+      propertyAddress: sanitisedAddress,
+      poolType: sanitisedType,
+      overallResult: sanitisedFailures.length === 0 ? "PASS" : "FAIL",
+      riskLevel: sanitisedFailures.length === 0 ? "LOW" : "HIGH",
+      regulatoryReferences: ["AS 1926.1:2012 — Swimming pool safety barriers", "Building Regulations 2018 (Vic) Part 11"],
+      rectificationItems: sanitisedFailures.map(f => ({ item: f, regulation: "AS 1926.1", priority: "MAJOR", rectification: "Engage a licensed builder to rectify." })),
+      recommendedActions: ["Rectify all identified non-compliances before allowing pool use", "Book re-inspection after rectification"],
+      ownerObligations: ["Pool/spa must be registered with local council", "Barrier must be maintained in compliant condition at all times"],
+      inspectorCertification: "Inspection conducted by a registered building inspector under the Building Act 1993 (Vic).",
+      reportNarrative: `A pool barrier inspection was conducted at ${sanitisedAddress}. ${sanitisedFailures.length} non-compliance(s) were identified. The owner is required to rectify all non-compliances within the required timeframe and arrange a re-inspection.`,
+      nextInspectionRecommendedMonths: sanitisedFailures.length === 0 ? 24 : 3,
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
