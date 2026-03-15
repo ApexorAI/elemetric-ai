@@ -46841,6 +46841,270 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /practical-completion-inspection — Create a PC inspection with defect list
+app.post("/practical-completion-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, contractRef,
+    inspectionDate, superintendentName, contractorRepresentative, clientRepresentative,
+    defects, outstandingWorks, specialConditions,
+    occupancyPermitIssued, buildingCertIssued, asBuiltsProvided,
+    keysHandedOver, o_andMDocumentationProvided, maintenanceScheduleProvided,
+    proposedPCDate, notes,
+  } = req.body;
+
+  if (!projectId || !inspectionDate || !superintendentName) {
+    return res.status(400).json({ error: "projectId, inspectionDate, and superintendentName are required." });
+  }
+
+  const sanitisedSuperintendent = sanitiseInput(superintendentName, 120);
+
+  // Process defects
+  const processedDefects = Array.isArray(defects)
+    ? defects.slice(0, 200).map((d, idx) => {
+        const priority = ["CRITICAL", "MAJOR", "MINOR"].includes((d.priority || "").toUpperCase())
+          ? d.priority.toUpperCase()
+          : "MINOR";
+        return {
+          defectNumber: idx + 1,
+          location: sanitiseInput(String(d.location || ""), 150),
+          description: sanitiseInput(String(d.description || ""), 300),
+          trade: sanitiseInput(String(d.trade || ""), 60),
+          priority,
+          rectificationPeriodDays: d.rectificationPeriodDays || (priority === "CRITICAL" ? 2 : priority === "MAJOR" ? 14 : 30),
+          status: "OPEN",
+          closedAt: null,
+          closedBy: null,
+          closingNotes: null,
+          photoRefs: (d.photoRefs || []).map(p => sanitiseInput(String(p), 60)).slice(0, 5),
+        };
+      })
+    : [];
+
+  const criticalCount = processedDefects.filter(d => d.priority === "CRITICAL").length;
+  const majorCount = processedDefects.filter(d => d.priority === "MAJOR").length;
+  const minorCount = processedDefects.filter(d => d.priority === "MINOR").length;
+
+  // PC cannot be issued if critical defects exist
+  const pcBlockers = [];
+  if (criticalCount > 0) pcBlockers.push(`${criticalCount} critical defect(s) must be rectified before PC is issued.`);
+  if (!occupancyPermitIssued) pcBlockers.push("Occupancy Permit (or Certificate of Final Inspection) not yet issued.");
+  if (Array.isArray(outstandingWorks) && outstandingWorks.length > 0) {
+    pcBlockers.push(`${outstandingWorks.length} outstanding works item(s) — negotiate carry-over or rectify.`);
+  }
+
+  const pcStatus = pcBlockers.length === 0 ? "RECOMMENDED" : "NOT_RECOMMENDED";
+
+  const ref = `PC-${sanitiseInput(String(projectId), 20)}-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectName: sanitiseInput(projectName || "", 200),
+    contractRef: sanitiseInput(contractRef || "", 80),
+    inspectionDate,
+    superintendentName: sanitisedSuperintendent,
+    contractorRepresentative: sanitiseInput(contractorRepresentative || "", 120),
+    clientRepresentative: sanitiseInput(clientRepresentative || "", 120),
+    defects: processedDefects,
+    defectSummary: { critical: criticalCount, major: majorCount, minor: minorCount, total: processedDefects.length, open: processedDefects.length, closed: 0 },
+    outstandingWorks: (outstandingWorks || []).map(w => sanitiseInput(String(w), 200)).slice(0, 20),
+    specialConditions: (specialConditions || []).map(c => sanitiseInput(String(c), 200)).slice(0, 10),
+    handover: {
+      occupancyPermitIssued: !!occupancyPermitIssued,
+      buildingCertIssued: !!buildingCertIssued,
+      asBuiltsProvided: !!asBuiltsProvided,
+      keysHandedOver: !!keysHandedOver,
+      o_andMDocumentationProvided: !!o_andMDocumentationProvided,
+      maintenanceScheduleProvided: !!maintenanceScheduleProvided,
+    },
+    pcStatus,
+    pcBlockers,
+    proposedPCDate: proposedPCDate || null,
+    notes: sanitiseInput(notes || "", 500),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("practical_completion_inspections").insert(record);
+      if (error) console.error("PC inspection insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("PC inspection DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    pcStatus,
+    pcBlockers,
+    defectSummary: record.defectSummary,
+    message: pcStatus === "RECOMMENDED"
+      ? `PC inspection complete. ${processedDefects.length} defect(s) listed — PC recommended.`
+      : `PC inspection complete. PC NOT RECOMMENDED — ${pcBlockers.length} blocker(s) outstanding.`,
+    saved,
+    record,
+  });
+});
+
+// PATCH /practical-completion-inspection/:pcRef/close-defect — Close out a defect item
+app.patch("/practical-completion-inspection/:pcRef/close-defect", apiKeyAuth, async (req, res) => {
+  const { pcRef } = req.params;
+  const { defectNumber, closedBy, closingNotes, status } = req.body;
+
+  if (!defectNumber || !closedBy) {
+    return res.status(400).json({ error: "defectNumber and closedBy are required." });
+  }
+
+  const validStatuses = ["CLOSED", "CLOSED_ACCEPTED", "CLOSED_DISPUTED", "DEFERRED"];
+  const resolvedStatus = validStatuses.includes((status || "").toUpperCase()) ? status.toUpperCase() : "CLOSED";
+
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  try {
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("practical_completion_inspections")
+      .select("defects, defectSummary")
+      .eq("ref", sanitiseInput(pcRef, 60))
+      .single();
+
+    if (fetchErr || !existing) return res.status(404).json({ error: "PC inspection not found." });
+
+    const defects = existing.defects || [];
+    const defectIdx = defects.findIndex(d => d.defectNumber === Number(defectNumber));
+    if (defectIdx === -1) return res.status(404).json({ error: "Defect not found." });
+
+    defects[defectIdx] = {
+      ...defects[defectIdx],
+      status: resolvedStatus,
+      closedAt: new Date().toISOString(),
+      closedBy: sanitiseInput(closedBy, 120),
+      closingNotes: sanitiseInput(closingNotes || "", 300),
+    };
+
+    const openCount = defects.filter(d => d.status === "OPEN").length;
+    const closedCount = defects.filter(d => d.status !== "OPEN").length;
+    const summary = {
+      ...(existing.defectSummary || {}),
+      open: openCount,
+      closed: closedCount,
+    };
+
+    const { error: updateErr } = await supabaseAdmin
+      .from("practical_completion_inspections")
+      .update({ defects, defectSummary: summary })
+      .eq("ref", sanitiseInput(pcRef, 60));
+
+    if (updateErr) throw updateErr;
+
+    return res.json({
+      success: true,
+      pcRef,
+      defectNumber: Number(defectNumber),
+      status: resolvedStatus,
+      openDefects: openCount,
+      closedDefects: closedCount,
+      message: `Defect #${defectNumber} closed as ${resolvedStatus}. ${openCount} defect(s) remaining open.`,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to close defect.", detail: e.message });
+  }
+});
+
+// POST /ai-practical-completion-report — AI generates a PC inspection report narrative
+app.post("/ai-practical-completion-report", apiKeyAuth, async (req, res) => {
+  const {
+    projectName, contractRef, contractType, projectDescription,
+    inspectionDate, defectSummary, outstandingWorks,
+    handoverStatus, pcStatus, superintendentName, notes,
+  } = req.body;
+
+  if (!projectName || !inspectionDate) {
+    return res.status(400).json({ error: "projectName and inspectionDate are required." });
+  }
+
+  const sanitisedProject = sanitiseInput(projectName, 200);
+  const sanitisedDefectSummary = sanitiseInput(String(defectSummary || "No defects recorded"), 400);
+  const sanitisedOutstandingWorks = Array.isArray(outstandingWorks)
+    ? outstandingWorks.map(w => sanitiseInput(String(w), 150)).slice(0, 10).join("; ")
+    : sanitiseInput(String(outstandingWorks || "None"), 300);
+
+  const prompt = `You are a superintendent preparing a formal Practical Completion inspection report under an Australian Standard (AS 4000 or AS 4902) construction contract.
+
+Generate a formal PC inspection report for:
+- Project: ${sanitisedProject}
+- Contract ref: ${sanitiseInput(contractRef || "Not specified", 80)}
+- Contract type: ${sanitiseInput(contractType || "Design & Construct", 60)}
+- Project description: ${sanitiseInput(projectDescription || "", 300)}
+- Inspection date: ${sanitiseInput(inspectionDate, 30)}
+- Superintendent: ${sanitiseInput(superintendentName || "Not specified", 120)}
+- Defect summary: ${sanitisedDefectSummary}
+- Outstanding works: ${sanitisedOutstandingWorks}
+- Handover status: ${sanitiseInput(String(handoverStatus || "Pending"), 200)}
+- PC status: ${sanitiseInput(pcStatus || "UNDER_REVIEW", 30)}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Respond ONLY with a JSON object:
+{
+  "reportTitle": string,
+  "executiveSummary": string (2-3 formal sentences),
+  "inspectionFindings": string (formal paragraph),
+  "defectObservations": string (formal paragraph),
+  "handoverReadinessAssessment": string,
+  "pcCertificateRecommendation": "GRANT|WITHHOLD|GRANT_WITH_CONDITIONS",
+  "conditions": [string],
+  "defectLiabilityPeriodRecommendationDays": number,
+  "superintendentDeclaration": string (formal 1-sentence declaration),
+  "nextSteps": [string]
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+      temperature: 0.3,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      projectName: sanitisedProject,
+      reportTitle: parsed.reportTitle || `Practical Completion Inspection Report — ${sanitisedProject}`,
+      executiveSummary: parsed.executiveSummary || "",
+      inspectionFindings: parsed.inspectionFindings || "",
+      defectObservations: parsed.defectObservations || "",
+      handoverReadinessAssessment: parsed.handoverReadinessAssessment || "",
+      pcCertificateRecommendation: parsed.pcCertificateRecommendation || "WITHHOLD",
+      conditions: parsed.conditions || [],
+      defectLiabilityPeriodRecommendationDays: parsed.defectLiabilityPeriodRecommendationDays || 365,
+      superintendentDeclaration: parsed.superintendentDeclaration || "",
+      nextSteps: parsed.nextSteps || [],
+    });
+  } catch (e) {
+    console.error("AI PC report error:", e.message);
+    return res.json({
+      success: true,
+      projectName: sanitisedProject,
+      reportTitle: `Practical Completion Inspection Report — ${sanitisedProject}`,
+      executiveSummary: `A Practical Completion inspection was conducted on ${inspectionDate} for ${sanitisedProject}. The inspection identified defects and/or outstanding works requiring attention prior to or as a condition of issuing the Practical Completion Certificate.`,
+      inspectionFindings: "The site inspection was carried out in accordance with the contract requirements. Refer to the attached defect schedule for detailed findings.",
+      defectObservations: sanitisedDefectSummary,
+      handoverReadinessAssessment: "Handover documentation to be confirmed as complete before PC certificate is issued.",
+      pcCertificateRecommendation: pcStatus === "RECOMMENDED" ? "GRANT" : "WITHHOLD",
+      conditions: ["Rectify all listed defects within the specified timeframes", "Provide all outstanding handover documentation"],
+      defectLiabilityPeriodRecommendationDays: 365,
+      superintendentDeclaration: "I certify that this inspection was carried out in accordance with the conditions of the contract.",
+      nextSteps: ["Issue defect schedule to contractor", "Monitor rectification progress", "Issue PC Certificate once all blockers are resolved"],
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
