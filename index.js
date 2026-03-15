@@ -24989,6 +24989,183 @@ app.post("/waterproofing-test", apiKeyAuth, async (req, res) => {
   return res.status(201).json({ ...record, saved: !!supabaseAdmin });
 });
 
+// POST /gas-pressure-test  — Log a gas installation pressure test result
+app.post("/gas-pressure-test", apiKeyAuth, async (req, res) => {
+  const { jobId, siteId, address, testDate, testPressureKpa, holdTimeMinutes, finalPressureKpa, pressureDropKpa, passedTest, testMedium, gasType, inspectedBy, notes } = req.body || {};
+  if (!jobId && !siteId) return res.status(400).json({ error: "jobId or siteId required." });
+
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeDate   = testDate ? sanitiseInput(String(testDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeBy     = inspectedBy ? sanitiseInput(String(inspectedBy)).slice(0, 100) : null;
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+  const safeMedium = ["air", "nitrogen", "gas"].includes(String(testMedium || "").toLowerCase()) ? String(testMedium).toLowerCase() : "air";
+  const safeGas    = gasType ? sanitiseInput(String(gasType)).slice(0, 40) : "natural gas";
+
+  const initPressure = Math.max(0, parseFloat(testPressureKpa) || 0);
+  const finalPressure = Math.max(0, parseFloat(finalPressureKpa) || initPressure);
+  const holdTime     = Math.max(0, parseFloat(holdTimeMinutes) || 30);
+  const drop         = parseFloat(Math.max(0, initPressure - finalPressure).toFixed(2));
+  const ALLOWABLE_DROP = initPressure * 0.01; // 1% allowable
+  const passed = passedTest !== undefined ? passedTest === true : (drop <= ALLOWABLE_DROP && drop === (parseFloat(pressureDropKpa) || drop));
+
+  const record = {
+    testId: `GPT-${(safeJobId || safeSiteId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    jobId: safeJobId, siteId: safeSiteId,
+    address: address ? sanitiseInput(String(address)).slice(0, 200) : null,
+    testDate: safeDate, gasType: safeGas, testMedium: safeMedium,
+    testPressureKpa: initPressure, holdTimeMinutes: holdTime,
+    finalPressureKpa: finalPressure, pressureDropKpa: drop,
+    allowableDropKpa: parseFloat(ALLOWABLE_DROP.toFixed(3)),
+    passedTest: passed, result: passed ? "PASS" : "FAIL",
+    failureReason: !passed ? `Pressure drop ${drop} kPa exceeds allowable ${ALLOWABLE_DROP.toFixed(3)} kPa` : null,
+    standard: "AS/NZS 5601.1 — Gas installations",
+    inspectedBy: safeBy, notes: safeNotes, testedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("gas_pressure_tests").insert({
+        test_id: record.testId, job_id: safeJobId, site_id: safeSiteId, address: record.address,
+        test_date: safeDate, gas_type: safeGas, test_medium: safeMedium,
+        test_pressure_kpa: initPressure, hold_time_minutes: holdTime,
+        final_pressure_kpa: finalPressure, pressure_drop_kpa: drop,
+        passed_test: passed, result: record.result, failure_reason: record.failureReason,
+        inspected_by: safeBy, notes: safeNotes, tested_at: record.testedAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// POST /electrical-test  — Log an electrical installation test (RCD, insulation, continuity)
+app.post("/electrical-test", apiKeyAuth, async (req, res) => {
+  const { jobId, siteId, address, testDate, circuitRef, rcdTripTimeMs, rcdPassThreshold, insulationResistanceMohm, continuityOhms, earthResistanceOhms, voltageV, overallResult, inspectedBy, notes } = req.body || {};
+  if (!jobId && !siteId) return res.status(400).json({ error: "jobId or siteId required." });
+
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeDate   = testDate ? sanitiseInput(String(testDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeCircuit = circuitRef ? sanitiseInput(String(circuitRef)).slice(0, 80) : null;
+  const safeBy     = inspectedBy ? sanitiseInput(String(inspectedBy)).slice(0, 100) : null;
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const rcdMs      = rcdTripTimeMs !== undefined ? parseFloat(rcdTripTimeMs) : null;
+  const rcdThresh  = rcdPassThreshold !== undefined ? parseFloat(rcdPassThreshold) : 300;
+  const insulation = insulationResistanceMohm !== undefined ? parseFloat(insulationResistanceMohm) : null;
+  const continuity = continuityOhms !== undefined ? parseFloat(continuityOhms) : null;
+  const earth      = earthResistanceOhms !== undefined ? parseFloat(earthResistanceOhms) : null;
+  const voltage    = voltageV !== undefined ? parseFloat(voltageV) : null;
+
+  const tests = [];
+  if (rcdMs !== null) tests.push({ test: "RCD trip time", value: `${rcdMs} ms`, threshold: `≤${rcdThresh} ms`, passed: rcdMs <= rcdThresh });
+  if (insulation !== null) tests.push({ test: "Insulation resistance", value: `${insulation} MΩ`, threshold: "≥1 MΩ", passed: insulation >= 1 });
+  if (continuity !== null) tests.push({ test: "Earth continuity", value: `${continuity} Ω`, threshold: "≤1 Ω", passed: continuity <= 1 });
+  if (earth !== null) tests.push({ test: "Earth electrode resistance", value: `${earth} Ω`, threshold: "≤100 Ω", passed: earth <= 100 });
+  if (voltage !== null) tests.push({ test: "Supply voltage", value: `${voltage} V`, threshold: "230 ±10%", passed: voltage >= 207 && voltage <= 253 });
+
+  const failedTests = tests.filter(t => !t.passed);
+  const passed      = overallResult !== undefined ? overallResult === true : failedTests.length === 0 && tests.length > 0;
+
+  const record = {
+    testId: `ET-${(safeJobId || safeSiteId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    jobId: safeJobId, siteId: safeSiteId,
+    address: address ? sanitiseInput(String(address)).slice(0, 200) : null,
+    testDate: safeDate, circuitRef: safeCircuit, tests,
+    overallResult: passed ? "PASS" : tests.length === 0 ? "NO_TESTS" : "FAIL",
+    failedTests: failedTests.map(t => t.test),
+    standard: "AS/NZS 3000:2018 — Wiring rules",
+    inspectedBy: safeBy, notes: safeNotes, testedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("electrical_tests").insert({
+        test_id: record.testId, job_id: safeJobId, site_id: safeSiteId, address: record.address,
+        test_date: safeDate, circuit_ref: safeCircuit, tests, overall_result: record.overallResult,
+        failed_tests: record.failedTests, inspected_by: safeBy, notes: safeNotes, tested_at: record.testedAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// POST /plumbing-pressure-test  — Log a hydraulic pressure test for water supply
+app.post("/plumbing-pressure-test", apiKeyAuth, async (req, res) => {
+  const { jobId, siteId, address, testDate, testPressureKpa, holdTimeMinutes, finalPressureKpa, systemType, inspectedBy, notes } = req.body || {};
+  if (!jobId && !siteId) return res.status(400).json({ error: "jobId or siteId required." });
+
+  const SYSTEM_TYPES = ["cold-water", "hot-water", "fire-sprinkler", "heating", "solar-thermal", "other"];
+  const WORKING_PRESSURES = { "cold-water": 500, "hot-water": 500, "fire-sprinkler": 1200, "heating": 400, "solar-thermal": 600, "other": 500 };
+
+  const safeJobId   = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeSiteId  = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeDate    = testDate ? sanitiseInput(String(testDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeSystem  = SYSTEM_TYPES.includes(String(systemType || "").toLowerCase().replace(/ /g, "-")) ? String(systemType).toLowerCase().replace(/ /g, "-") : "cold-water";
+  const safeBy      = inspectedBy ? sanitiseInput(String(inspectedBy)).slice(0, 100) : null;
+  const safeNotes   = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const initPressure  = Math.max(0, parseFloat(testPressureKpa) || WORKING_PRESSURES[safeSystem] * 1.5);
+  const finalPressure = Math.max(0, parseFloat(finalPressureKpa) || initPressure);
+  const holdTime      = Math.max(0, parseFloat(holdTimeMinutes) || 30);
+  const drop          = parseFloat(Math.max(0, initPressure - finalPressure).toFixed(2));
+  const passed        = drop <= initPressure * 0.02; // 2% allowable drop
+
+  const record = {
+    testId: `PPT-${(safeJobId || safeSiteId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    jobId: safeJobId, siteId: safeSiteId, address: address ? sanitiseInput(String(address)).slice(0, 200) : null,
+    testDate: safeDate, systemType: safeSystem,
+    testPressureKpa: initPressure, holdTimeMinutes: holdTime,
+    finalPressureKpa: finalPressure, pressureDropKpa: drop,
+    passedTest: passed, result: passed ? "PASS" : "FAIL",
+    standard: "AS/NZS 3500.1 — Plumbing and drainage",
+    inspectedBy: safeBy, notes: safeNotes, testedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("plumbing_pressure_tests").insert({
+        test_id: record.testId, job_id: safeJobId, site_id: safeSiteId, address: record.address,
+        test_date: safeDate, system_type: safeSystem, test_pressure_kpa: initPressure,
+        hold_time_minutes: holdTime, final_pressure_kpa: finalPressure, pressure_drop_kpa: drop,
+        passed_test: passed, result: record.result, inspected_by: safeBy, notes: safeNotes,
+        tested_at: record.testedAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// GET /trade-tests/:jobId  — Get all test records for a job across all trades
+app.get("/trade-tests/:jobId", apiKeyAuth, async (req, res) => {
+  const jobId = sanitiseInput(String(req.params.jobId || "")).slice(0, 80);
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  const tests = { gasTests: [], electricalTests: [], plumbingTests: [], waterproofingTests: [] };
+  if (supabaseAdmin) {
+    try {
+      const [g, e, p, w] = await Promise.allSettled([
+        supabaseAdmin.from("gas_pressure_tests").select("test_id, result, test_date, tested_at").eq("job_id", jobId).limit(20),
+        supabaseAdmin.from("electrical_tests").select("test_id, overall_result, test_date, tested_at").eq("job_id", jobId).limit(20),
+        supabaseAdmin.from("plumbing_pressure_tests").select("test_id, result, test_date, tested_at").eq("job_id", jobId).limit(20),
+        supabaseAdmin.from("waterproofing_tests").select("test_id, result, test_date, tested_at").eq("job_id", jobId).limit(20),
+      ]);
+      tests.gasTests           = g.status === "fulfilled" ? g.value.data || [] : [];
+      tests.electricalTests    = e.status === "fulfilled" ? e.value.data || [] : [];
+      tests.plumbingTests      = p.status === "fulfilled" ? p.value.data || [] : [];
+      tests.waterproofingTests = w.status === "fulfilled" ? w.value.data || [] : [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const allTests = [...tests.gasTests, ...tests.electricalTests, ...tests.plumbingTests, ...tests.waterproofingTests];
+  const failed   = allTests.filter(t => (t.result || t.overall_result) === "FAIL").length;
+
+  return res.json({ jobId, totalTests: allTests.length, failed, allPassed: failed === 0 && allTests.length > 0, ...tests, generatedAt: new Date().toISOString() });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
