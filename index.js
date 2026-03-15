@@ -72382,6 +72382,413 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 262 ─────────────────────────────────────────────────────────────────
+
+// POST /plant-pre-start-check — Daily pre-start inspection record for construction plant
+app.post("/plant-pre-start-check", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, plantId, plantType, registrationNumber, inspectionDate,
+      operatorName, operatorLicenceNumber,
+      engineOilLevel, coolantLevel, hydraulicFluidLevel, fuelLevel,
+      tyresCondition, tyresPressureOk, brakeTestPassed,
+      steeringOk, lightsHornOk, safetyDevicesOk, ropsOk, fopsOk,
+      seatbeltPresent, seatbeltOk, fireExtinguisherPresent, fireExtinguisherCharged,
+      reverseCameraOk, spottingRequired, leaksDetected, leakDetails,
+      defectsFound, defectDetails, plantFitForUse, operatorSignature, notes
+    } = req.body;
+
+    if (!plantId || !plantType || !inspectionDate || !operatorName) {
+      return res.status(400).json({ error: "plantId, plantType, inspectionDate, operatorName are required." });
+    }
+
+    const safePlant = sanitiseInput(String(plantId));
+    const safePlantType = sanitiseInput(String(plantType));
+    const safeOperator = sanitiseInput(String(operatorName));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+
+    const defects = Array.isArray(defectDetails) ? defectDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    // OHS Regulations 2017 (Vic) Part 5.1 — plant safety
+    if (brakeTestPassed === false || brakeTestPassed === "false") {
+      criticalIssues.push("Brake test failed — plant must not be operated until brakes are repaired and re-tested.");
+    }
+    if (steeringOk === false || steeringOk === "false") {
+      criticalIssues.push("Steering defective — plant must not be operated. Tag out and notify maintenance.");
+    }
+    if (ropsOk === false || ropsOk === "false") {
+      criticalIssues.push("ROPS (rollover protection) defective — plant must not be operated until rectified (OHS Regs 2017 Vic reg 5.1.10).");
+    }
+    if (fopsOk === false || fopsOk === "false") {
+      criticalIssues.push("FOPS (falling object protection) defective — plant must not be operated until rectified.");
+    }
+    if (!seatbeltPresent || seatbeltOk === false || seatbeltOk === "false") {
+      criticalIssues.push("Seatbelt absent or defective — plant must not be operated.");
+    }
+    if (safetyDevicesOk === false || safetyDevicesOk === "false") {
+      criticalIssues.push("Safety devices non-functional — plant must not be operated.");
+    }
+
+    if (leaksDetected === true || leaksDetected === "true") {
+      const leakInfo = leakDetails ? sanitiseInput(String(leakDetails)) : "unspecified";
+      if (/fuel|diesel|petrol/i.test(leakInfo)) {
+        criticalIssues.push(`Fuel leak detected (${leakInfo}) — fire risk. Plant must not operate.`);
+      } else {
+        warnings.push(`Fluid leak detected: ${leakInfo}. Investigate and repair before continued use.`);
+      }
+    }
+
+    if (!fireExtinguisherPresent || fireExtinguisherCharged === false || fireExtinguisherCharged === "false") {
+      criticalIssues.push("Fire extinguisher absent or uncharged — mandatory on all earthmoving plant (OHS Regs 2017 Vic).");
+    }
+
+    if (reverseCameraOk === false || reverseCameraOk === "false") {
+      if (spottingRequired === false || spottingRequired === "false") {
+        warnings.push("Reverse camera not operational and no spotter assigned — reverse-travel risk.");
+      } else {
+        warnings.push("Reverse camera not operational — spotter required for all reversing movements.");
+      }
+    }
+
+    if (tyresCondition === "WORN" || tyresCondition === "DAMAGED") {
+      criticalIssues.push(`Tyre condition rated ${tyresCondition} — plant must not operate until tyres replaced.`);
+    }
+
+    if (engineOilLevel === "LOW") warnings.push("Engine oil level low — top up before commencing operations.");
+    if (coolantLevel === "LOW") warnings.push("Coolant level low — top up and investigate for leaks.");
+    if (hydraulicFluidLevel === "LOW") warnings.push("Hydraulic fluid low — check for leaks before operation.");
+
+    if (defectsFound === true || defectsFound === "true") {
+      if (defects.length > 0) {
+        warnings.push(`Defects recorded: ${defects.map(d => sanitiseInput(String(d))).join("; ")}`);
+      } else {
+        warnings.push("Defects flagged but no details recorded — document all defects.");
+      }
+    }
+
+    const fitForUse = criticalIssues.length > 0 ? false : plantFitForUse !== false && plantFitForUse !== "false";
+    const checkStatus = criticalIssues.length > 0 ? "TAKE_OUT_OF_SERVICE" : warnings.length > 0 ? "USE_WITH_CAUTION" : "CLEARED_FOR_OPERATION";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("plant_pre_start_checks")
+        .insert({
+          project_id: safeProject,
+          plant_id: safePlant,
+          plant_type: safePlantType,
+          registration_number: registrationNumber ? sanitiseInput(String(registrationNumber)) : null,
+          inspection_date: inspectionDate,
+          operator_name: safeOperator,
+          operator_licence_number: operatorLicenceNumber ? sanitiseInput(String(operatorLicenceNumber)) : null,
+          brakes_ok: brakeTestPassed !== false && brakeTestPassed !== "false",
+          steering_ok: steeringOk !== false && steeringOk !== "false",
+          rops_ok: ropsOk !== false && ropsOk !== "false",
+          fops_ok: fopsOk !== false && fopsOk !== "false",
+          seatbelt_ok: seatbeltPresent && seatbeltOk !== false && seatbeltOk !== "false",
+          safety_devices_ok: safetyDevicesOk !== false && safetyDevicesOk !== "false",
+          fire_extinguisher_ok: fireExtinguisherPresent && fireExtinguisherCharged !== false,
+          reverse_camera_ok: reverseCameraOk !== false && reverseCameraOk !== "false",
+          leaks_detected: leaksDetected || false,
+          defects_found: defectsFound || false,
+          defect_details: defects,
+          fit_for_use: fitForUse,
+          check_status: checkStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          operator_signature: operatorSignature || false,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        checkStatus,
+        fitForUse,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Plant must be taken out of service — critical pre-start failures identified.",
+        standards: ["OHS Regulations 2017 (Vic) Part 5.1", "AS 2550", "AS ISO 3449"],
+      });
+    }
+
+    res.json({
+      checkStatus,
+      fitForUse,
+      criticalIssues,
+      warnings,
+      savedId,
+      plantType: safePlantType,
+      standards: ["OHS Regulations 2017 (Vic) Part 5.1", "AS 2550"],
+    });
+  } catch (err) {
+    console.error("POST /plant-pre-start-check error:", err.message);
+    res.status(500).json({ error: "Failed to record plant pre-start check." });
+  }
+});
+
+// POST /concrete-pour-record — Record concrete pour details for traceability and compliance
+app.post("/concrete-pour-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, structureElement, pourDate, supervisorName,
+      concreteSupplier, deliveryDocketNumbers, specifiedGrade,
+      actualGrade, slumpSpecifiedMm, slumpMeasuredMm,
+      waterAddedOnsite, waterAddedLitres, temperatureDegC,
+      cylinderSamplesTaken, cylinderCount, cylinderLabReference,
+      placementMethod, vibratedOk, constructionJointsFormed,
+      curingMethodApplied, formworkCheckBeforePour,
+      reinforcementCheckBeforePour, coverMeasuredMm, specifiedCoverMm, notes
+    } = req.body;
+
+    if (!projectId || !structureElement || !pourDate || !supervisorName) {
+      return res.status(400).json({ error: "projectId, structureElement, pourDate, supervisorName are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeElement = sanitiseInput(String(structureElement));
+    const safeSupervisor = sanitiseInput(String(supervisorName));
+
+    const dockets = Array.isArray(deliveryDocketNumbers) ? deliveryDocketNumbers : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const slumpSpec = parseFloat(slumpSpecifiedMm) || null;
+    const slumpMeas = parseFloat(slumpMeasuredMm) || null;
+    const tempC = parseFloat(temperatureDegC) || null;
+    const coverMeasured = parseFloat(coverMeasuredMm) || null;
+    const coverSpec = parseFloat(specifiedCoverMm) || null;
+
+    // AS 3600 — Concrete structures, AS 1379 — Specification and supply of concrete
+    if (specifiedGrade && actualGrade && specifiedGrade !== actualGrade) {
+      criticalIssues.push(`Concrete grade mismatch: specified ${specifiedGrade} but delivered ${actualGrade}. Do not place until resolved.`);
+    }
+
+    if (slumpSpec !== null && slumpMeas !== null) {
+      const slumpDiff = slumpMeas - slumpSpec;
+      if (slumpDiff > 30) {
+        criticalIssues.push(`Slump ${slumpMeas}mm exceeds specified ${slumpSpec}mm by ${slumpDiff}mm — reject load or seek structural engineer approval.`);
+      } else if (slumpDiff > 15) {
+        warnings.push(`Slump ${slumpMeas}mm — ${slumpDiff}mm above specification. Monitor w/c ratio.`);
+      }
+    }
+
+    if (waterAddedOnsite === true || waterAddedOnsite === "true") {
+      const litres = parseFloat(waterAddedLitres) || 0;
+      if (litres > 0) {
+        criticalIssues.push(`${litres}L water added on-site — increases w/c ratio and reduces strength. Record on docket and notify structural engineer.`);
+      } else {
+        warnings.push("Water addition on-site noted but volume not recorded — document immediately.");
+      }
+    }
+
+    // Temperature limits per AS 1379 and hot/cold weather concreting
+    if (tempC !== null) {
+      if (tempC > 35) {
+        criticalIssues.push(`Concrete temperature ${tempC}°C exceeds 35°C maximum — hot weather concreting procedures required (AS 3600).`);
+      } else if (tempC < 5) {
+        criticalIssues.push(`Concrete temperature ${tempC}°C below 5°C minimum — cold weather concreting procedures required.`);
+      } else if (tempC > 30) {
+        warnings.push(`Concrete temperature ${tempC}°C — elevated. Apply additional curing measures.`);
+      }
+    }
+
+    // Cover check
+    if (coverSpec !== null && coverMeasured !== null && coverMeasured < coverSpec - 5) {
+      criticalIssues.push(`Measured cover ${coverMeasured}mm below specified ${coverSpec}mm — reinforcement durability risk. Notify structural engineer.`);
+    } else if (coverSpec !== null && coverMeasured !== null && coverMeasured < coverSpec) {
+      warnings.push(`Measured cover ${coverMeasured}mm — slightly below specified ${coverSpec}mm (within 5mm tolerance).`);
+    }
+
+    if (!cylinderSamplesTaken || (cylinderCount != null && parseInt(cylinderCount) === 0)) {
+      warnings.push("No cylinder samples taken — compressive strength testing cannot be verified. AS 1012.9 requires samples per batch.");
+    }
+
+    if (!formworkCheckBeforePour) {
+      warnings.push("Formwork pre-pour check not confirmed — record prior to pour.");
+    }
+    if (!reinforcementCheckBeforePour) {
+      warnings.push("Reinforcement pre-pour check not confirmed — record prior to pour.");
+    }
+    if (!vibratedOk) {
+      warnings.push("Concrete vibration not confirmed — risk of voids reducing structural integrity.");
+    }
+    if (!curingMethodApplied) {
+      warnings.push("Curing method not recorded — curing is critical for strength and durability (AS 3600 cl.19.1.3).");
+    }
+
+    const pourceStatus = criticalIssues.length > 0 ? "HOLD" : warnings.length > 0 ? "ACCEPT_WITH_CONDITIONS" : "ACCEPTED";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("concrete_pour_records")
+        .insert({
+          project_id: safeProject,
+          structure_element: safeElement,
+          pour_date: pourDate,
+          supervisor_name: safeSupervisor,
+          concrete_supplier: concreteSupplier ? sanitiseInput(String(concreteSupplier)) : null,
+          delivery_docket_numbers: dockets,
+          specified_grade: specifiedGrade || null,
+          actual_grade: actualGrade || null,
+          slump_specified_mm: slumpSpec,
+          slump_measured_mm: slumpMeas,
+          water_added_onsite: waterAddedOnsite || false,
+          water_added_litres: waterAddedLitres || null,
+          temperature_deg_c: tempC,
+          cylinder_samples_taken: cylinderSamplesTaken || false,
+          cylinder_count: cylinderCount || null,
+          cylinder_lab_reference: cylinderLabReference ? sanitiseInput(String(cylinderLabReference)) : null,
+          placement_method: placementMethod ? sanitiseInput(String(placementMethod)) : null,
+          vibrated_ok: vibratedOk || false,
+          curing_method: curingMethodApplied ? sanitiseInput(String(curingMethodApplied)) : null,
+          formwork_check_before_pour: formworkCheckBeforePour || false,
+          reinforcement_check_before_pour: reinforcementCheckBeforePour || false,
+          cover_measured_mm: coverMeasured,
+          specified_cover_mm: coverSpec,
+          pour_status: pourceStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        pourStatus: pourceStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Concrete pour on hold — critical non-conformance. Notify structural engineer.",
+        standards: ["AS 3600", "AS 1379", "AS 1012.9"],
+      });
+    }
+
+    res.json({
+      pourStatus: pourceStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      specifiedGrade: specifiedGrade || null,
+      actualGrade: actualGrade || null,
+      slumpMeasuredMm: slumpMeas,
+      temperatureDegC: tempC,
+      standards: ["AS 3600", "AS 1379"],
+    });
+  } catch (err) {
+    console.error("POST /concrete-pour-record error:", err.message);
+    res.status(500).json({ error: "Failed to record concrete pour." });
+  }
+});
+
+// POST /ai-concrete-quality-assessment — AI assesses concrete quality and structural risk
+app.post("/ai-concrete-quality-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      structureElement, specifiedGrade, actualGrade, slumpMm, slumpSpecMm,
+      temperatureDegC, cylinderResults, coverMm, specifiedCoverMm,
+      waterCementRatio, ageMoistureCured, environmentalExposureClass,
+      constructionDefectsObserved, siteContext
+    } = req.body;
+
+    if (!structureElement) {
+      return res.status(400).json({ error: "structureElement is required." });
+    }
+
+    const safeElement = sanitiseInput(String(structureElement));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const cylResults = Array.isArray(cylinderResults) ? cylinderResults : [];
+    const defects = Array.isArray(constructionDefectsObserved) ? constructionDefectsObserved.map(d => sanitiseInput(String(d))) : [];
+
+    const prompt = `You are a structural engineer assessing concrete quality and structural adequacy for a Victorian construction project.
+
+Structure element: ${safeElement}
+Specified grade: ${specifiedGrade || "Unknown"}
+Delivered grade: ${actualGrade || "Unknown"}
+Measured slump: ${slumpMm ? slumpMm + " mm" : "Not measured"}
+Specified slump: ${slumpSpecMm ? slumpSpecMm + " mm" : "Not specified"}
+Pour temperature: ${temperatureDegC ? temperatureDegC + "°C" : "Not recorded"}
+Cylinder test results (MPa): ${cylResults.length > 0 ? cylResults.join(", ") : "Not available"}
+Cover measured: ${coverMm ? coverMm + " mm" : "Not measured"}
+Specified cover: ${specifiedCoverMm ? specifiedCoverMm + " mm" : "Not specified"}
+Water-cement ratio: ${waterCementRatio || "Not recorded"}
+Age/moisture cured: ${ageMoistureCured || "Not specified"}
+Exposure class: ${environmentalExposureClass || "Not stated"}
+Defects observed: ${defects.length > 0 ? defects.join("; ") : "None"}
+Location: ${safeSite}
+
+Assess under AS 3600 and AS 1379:
+1. Strength adequacy — will specified grade likely achieve design strength?
+2. Durability risk — cover, exposure class, w/c ratio
+3. Structural risk rating
+4. Remediation required (if any)
+5. Follow-up testing recommendations
+6. Hold points before proceeding with further structural work
+
+Respond ONLY in JSON:
+{
+  "strengthAdequate": true|false|null,
+  "durabilityRisk": "LOW|MODERATE|HIGH",
+  "structuralRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "holdPointsRequired": ["string"],
+  "remediationRequired": ["string"],
+  "furtherTestingRecommended": ["string"],
+  "coverAssessment": "string",
+  "curingRecommendations": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 750,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        strengthAdequate: null,
+        durabilityRisk: "MODERATE",
+        structuralRisk: "MODERATE",
+        holdPointsRequired: ["Structural engineer to review all non-conformances"],
+        remediationRequired: ["AI assessment unavailable — engage structural engineer"],
+        furtherTestingRecommended: ["28-day compressive strength testing", "Cover survey"],
+        coverAssessment: "Unable to assess — measure cover and compare to AS 3600 requirements.",
+        curingRecommendations: ["Continue moist curing for minimum 7 days", "Protect from temperature extremes"],
+        applicableStandards: ["AS 3600", "AS 1379", "AS 1012.9"],
+        summary: "AI concrete quality assessment unavailable. Structural engineer review required for all non-conformances.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      structureElement: safeElement,
+      specifiedGrade: specifiedGrade || null,
+      actualGrade: actualGrade || null,
+      standards: ["AS 3600", "AS 1379", "AS 1012.9"],
+    });
+  } catch (err) {
+    console.error("POST /ai-concrete-quality-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess concrete quality." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
