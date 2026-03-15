@@ -26743,6 +26743,159 @@ app.post("/waste-manifest", apiKeyAuth, async (req, res) => {
   return res.status(201).json({ ...record, saved: !!supabaseAdmin });
 });
 
+// POST /chemical-register  — Log chemicals/hazardous substances on site (SDS register)
+app.post("/chemical-register", apiKeyAuth, async (req, res) => {
+  const { siteId, chemicals = [] } = req.body || {};
+  if (!siteId) return res.status(400).json({ error: "siteId required." });
+  if (!Array.isArray(chemicals) || chemicals.length === 0) return res.status(400).json({ error: "chemicals array required." });
+
+  const VALID_HAZARD_CLASSES = ["flammable", "corrosive", "toxic", "oxidising", "explosive", "compressed-gas", "environmental-hazard", "irritant", "other"];
+  const safeSiteId = sanitiseInput(String(siteId)).slice(0, 80);
+
+  const stored = chemicals.slice(0, 100).map(c => ({
+    name:          sanitiseInput(String(c.name || "")).slice(0, 100),
+    productCode:   c.productCode ? sanitiseInput(String(c.productCode)).slice(0, 50) : null,
+    manufacturer:  c.manufacturer ? sanitiseInput(String(c.manufacturer)).slice(0, 100) : null,
+    hazardClass:   VALID_HAZARD_CLASSES.includes(String(c.hazardClass || "").toLowerCase().replace(/ /g, "-")) ? String(c.hazardClass).toLowerCase().replace(/ /g, "-") : "other",
+    quantity:      c.quantity ? sanitiseInput(String(c.quantity)).slice(0, 30) : null,
+    storageLocation: c.storageLocation ? sanitiseInput(String(c.storageLocation)).slice(0, 100) : null,
+    sdsAvailable:  c.sdsAvailable !== false,
+    emergencyContact: c.emergencyContact ? sanitiseInput(String(c.emergencyContact)).slice(0, 80) : "CHEMCALL 1800 127 406",
+    notes:         c.notes ? sanitiseInput(String(c.notes)).slice(0, 150) : null,
+  }));
+
+  const noSds    = stored.filter(c => !c.sdsAvailable).length;
+  const hazardous = stored.filter(c => ["flammable", "toxic", "corrosive", "explosive"].includes(c.hazardClass)).length;
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("chemical_register").upsert(
+        stored.map(c => ({ site_id: safeSiteId, ...c, updated_at: new Date().toISOString() })),
+        { onConflict: "site_id,name,product_code" }
+      );
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.json({
+    siteId: safeSiteId, chemicalCount: stored.length, hazardousCount: hazardous,
+    missingSds: noSds,
+    warnings: noSds > 0 ? [`${noSds} chemical(s) missing Safety Data Sheet — SDS must be available for all hazardous substances`] : [],
+    chemicals: stored, savedAt: new Date().toISOString(),
+  });
+});
+
+// GET /chemical-register/:siteId  — Get all chemicals registered for a site
+app.get("/chemical-register/:siteId", apiKeyAuth, async (req, res) => {
+  const siteId      = sanitiseInput(String(req.params.siteId || "")).slice(0, 80);
+  const hazardClass = req.query.hazard ? sanitiseInput(String(req.query.hazard)).toLowerCase() : null;
+  if (!siteId) return res.status(400).json({ error: "siteId required." });
+
+  let chemicals = [];
+  if (supabaseAdmin) {
+    try {
+      let q = supabaseAdmin.from("chemical_register").select("*").eq("site_id", siteId).order("name", { ascending: true }).limit(200);
+      if (hazardClass) q = q.eq("hazard_class", hazardClass);
+      const { data } = await q;
+      chemicals = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const classes = {};
+  chemicals.forEach(c => { classes[c.hazard_class] = (classes[c.hazard_class] || 0) + 1; });
+
+  return res.json({ siteId, count: chemicals.length, byHazardClass: classes, filter: hazardClass || "all", chemicals, generatedAt: new Date().toISOString() });
+});
+
+// POST /exposure-monitoring  — Log workplace health monitoring (dust/noise/fume)
+app.post("/exposure-monitoring", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, worker, monitoringDate, exposureType, measuredValue, unit, oel, twa, stel, result, controlMeasures, notes } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+  if (!exposureType) return res.status(400).json({ error: "exposureType required." });
+
+  const VALID_TYPES = ["silica-dust", "asbestos-fibre", "noise", "welding-fume", "isocyanate", "lead", "chemical-vapour", "other"];
+  const UNITS_MAP   = { "silica-dust": "mg/m³", "noise": "dB(A)", "asbestos-fibre": "fibres/mL", "lead": "mg/m³", "other": "units" };
+
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeWorker = worker ? sanitiseInput(String(worker)).slice(0, 100) : null;
+  const safeDate   = monitoringDate ? sanitiseInput(String(monitoringDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeType   = VALID_TYPES.includes(String(exposureType).toLowerCase().replace(/ /g, "-")) ? String(exposureType).toLowerCase().replace(/ /g, "-") : "other";
+  const safeValue  = measuredValue !== undefined ? parseFloat(measuredValue) : null;
+  const safeUnit   = unit ? sanitiseInput(String(unit)).slice(0, 20) : UNITS_MAP[safeType] || "units";
+  const safeOEL    = oel !== undefined ? parseFloat(oel) : null;
+  const safeTWA    = twa !== undefined ? parseFloat(twa) : null;
+  const safeSTEL   = stel !== undefined ? parseFloat(stel) : null;
+
+  const exceedsTWA   = safeTWA !== null && safeValue !== null && safeValue > safeTWA;
+  const exceedsSTEL  = safeSTEL !== null && safeValue !== null && safeValue > safeSTEL;
+  const safeResult   = result ? sanitiseInput(String(result)).toUpperCase() : (exceedsTWA || exceedsSTEL ? "EXCEEDED" : safeValue !== null ? "WITHIN_LIMITS" : "RECORDED");
+  const safeControls = controlMeasures ? sanitiseInput(String(controlMeasures)).slice(0, 300) : null;
+  const safeNotes    = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const record = {
+    monitoringId: `EXP-${(safeSiteId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId, jobId: safeJobId, worker: safeWorker, monitoringDate: safeDate,
+    exposureType: safeType, measuredValue: safeValue, unit: safeUnit,
+    oel: safeOEL, twa: safeTWA, stel: safeSTEL,
+    result: safeResult, exceedsTWA, exceedsSTEL, controlMeasures: safeControls, notes: safeNotes,
+    requiresAction: exceedsTWA || exceedsSTEL,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("exposure_monitoring").insert({
+        monitoring_id: record.monitoringId, site_id: safeSiteId, job_id: safeJobId, worker: safeWorker,
+        monitoring_date: safeDate, exposure_type: safeType, measured_value: safeValue, unit: safeUnit,
+        oel: safeOEL, twa: safeTWA, stel: safeSTEL, result: safeResult, exceeds_twa: exceedsTWA,
+        exceeds_stel: exceedsSTEL, control_measures: safeControls, notes: safeNotes,
+        requires_action: record.requiresAction, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// POST /return-to-work  — Log a return-to-work plan for an injured worker
+app.post("/return-to-work", apiKeyAuth, async (req, res) => {
+  const { contractorId, workerName, injuryDate, injuryType, treatingDoctor, returnDate, restrictions = [], dutiesModified, reviewDate, notes } = req.body || {};
+  if (!contractorId || !workerName) return res.status(400).json({ error: "contractorId and workerName required." });
+
+  const safeCId    = sanitiseInput(String(contractorId)).slice(0, 80);
+  const safeName   = sanitiseInput(String(workerName)).slice(0, 100);
+  const safeInjDate = injuryDate ? sanitiseInput(String(injuryDate)).slice(0, 20) : null;
+  const safeInjType = injuryType ? sanitiseInput(String(injuryType)).slice(0, 100) : null;
+  const safeDoctor = treatingDoctor ? sanitiseInput(String(treatingDoctor)).slice(0, 100) : null;
+  const safeReturn = returnDate ? sanitiseInput(String(returnDate)).slice(0, 20) : null;
+  const safeReview = reviewDate ? sanitiseInput(String(reviewDate)).slice(0, 20) : null;
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 500) : null;
+  const safeRestrictions = Array.isArray(restrictions) ? restrictions.slice(0, 20).map(r => sanitiseInput(String(r)).slice(0, 150)) : [];
+
+  const record = {
+    rtwId: `RTW-${safeCId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    contractorId: safeCId, workerName: safeName, injuryDate: safeInjDate, injuryType: safeInjType,
+    treatingDoctor: safeDoctor, returnDate: safeReturn, restrictions: safeRestrictions,
+    dutiesModified: dutiesModified !== false, reviewDate: safeReview, notes: safeNotes,
+    status: "ACTIVE",
+    reminder: "WorkSafe must be notified of all serious injuries. An RTW plan is legally required if worker is off >5 days.",
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("return_to_work").insert({
+        rtw_id: record.rtwId, contractor_id: safeCId, worker_name: safeName,
+        injury_date: safeInjDate, injury_type: safeInjType, treating_doctor: safeDoctor,
+        return_date: safeReturn, restrictions: safeRestrictions, duties_modified: record.dutiesModified,
+        review_date: safeReview, status: "ACTIVE", notes: safeNotes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
