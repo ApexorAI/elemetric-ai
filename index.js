@@ -51506,6 +51506,342 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /lift-inspection — Log an ESV Victoria lift/elevator safety inspection
+app.post("/lift-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      liftId,
+      liftType,
+      location,
+      inspector,
+      inspectorLicenceNumber,
+      inspectionDate,
+      inspectionType,
+      registrationNumber,
+      lastMajorInspectionDate,
+      loadRating,
+      speedRating,
+      doorsOperational,
+      safetyGearTested,
+      bufferCondition,
+      hoistingRopeCondition,
+      oilLubricationOk,
+      emergencyLightingOk,
+      intercomOperational,
+      overloadDeviceOk,
+      finalLimitSwitchOk,
+      doorInterlockOk,
+      machineRoomCondition,
+      pitCondition,
+      faults,
+      overallResult,
+      nextInspectionDue,
+      notes,
+    } = req.body;
+
+    if (!liftId || !liftType || !inspector || !inspectionDate || !overallResult) {
+      return res.status(400).json({ error: "liftId, liftType, inspector, inspectionDate, and overallResult are required" });
+    }
+
+    const criticalFailures = [];
+    if (!safetyGearTested) criticalFailures.push("Safety gear (governor/buffer) not tested — mandatory per ESV");
+    if (!doorInterlockOk) criticalFailures.push("Door interlock failure — lift must not operate until rectified");
+    if (!finalLimitSwitchOk) criticalFailures.push("Final limit switch non-functional — overshoot risk");
+    if (overallResult === "FAIL" && criticalFailures.length === 0) criticalFailures.push("Lift failed inspection — out-of-service order required");
+
+    if (criticalFailures.length > 0) {
+      console.warn(`[LIFT SAFETY] Lift ${liftId} at project ${projectId} — critical failures: ${criticalFailures.join("; ")}`);
+    }
+
+    const record = {
+      project_id: sanitiseInput(projectId || ""),
+      lift_id: sanitiseInput(liftId),
+      lift_type: sanitiseInput(liftType),
+      location: sanitiseInput(location || ""),
+      inspector: sanitiseInput(inspector),
+      inspector_licence_number: sanitiseInput(inspectorLicenceNumber || ""),
+      inspection_date: inspectionDate,
+      inspection_type: sanitiseInput(inspectionType || "periodic"),
+      registration_number: sanitiseInput(registrationNumber || ""),
+      last_major_inspection_date: lastMajorInspectionDate || null,
+      load_rating: loadRating || null,
+      speed_rating: speedRating || null,
+      doors_operational: !!doorsOperational,
+      safety_gear_tested: !!safetyGearTested,
+      buffer_condition: sanitiseInput(bufferCondition || ""),
+      hoisting_rope_condition: sanitiseInput(hoistingRopeCondition || ""),
+      oil_lubrication_ok: !!oilLubricationOk,
+      emergency_lighting_ok: !!emergencyLightingOk,
+      intercom_operational: !!intercomOperational,
+      overload_device_ok: !!overloadDeviceOk,
+      final_limit_switch_ok: !!finalLimitSwitchOk,
+      door_interlock_ok: !!doorInterlockOk,
+      machine_room_condition: sanitiseInput(machineRoomCondition || ""),
+      pit_condition: sanitiseInput(pitCondition || ""),
+      faults: Array.isArray(faults) ? faults.map(f => sanitiseInput(f)) : [],
+      critical_failures: criticalFailures,
+      overall_result: sanitiseInput(overallResult),
+      next_inspection_due: nextInspectionDue || null,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("lift_inspections").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (criticalFailures.length > 0) {
+      return res.status(422).json({
+        outOfService: true,
+        criticalFailures,
+        message: "Lift must be taken out of service immediately. Notify ESV Victoria and building owner.",
+        record,
+        saved,
+      });
+    }
+
+    res.json({
+      outOfService: false,
+      criticalFailures: [],
+      overallResult,
+      nextInspectionDue: nextInspectionDue || null,
+      esvRegistrationRequired: true,
+      applicableStandards: ["AS 1735.1 (Lifts and escalators)", "OHS Equipment (Plant) Regulations 2007 (Vic)", "ESV Registration and periodic inspection requirements"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/lift-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record lift inspection" });
+  }
+});
+
+// GET /lift-inspection/:projectId — Retrieve lift inspections for a project
+app.get("/lift-inspection/:projectId", apiKeyAuth, async (req, res) => {
+  try {
+    const projectId = sanitiseInput(req.params.projectId);
+    if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured" });
+    const { data, error } = await supabaseAdmin
+      .from("lift_inspections")
+      .select("*")
+      .eq("project_id", projectId)
+      .order("inspection_date", { ascending: false });
+    if (error) return res.status(500).json({ error: "Failed to retrieve lift inspections" });
+    res.json({ projectId, inspections: data || [] });
+  } catch (err) {
+    console.error("/lift-inspection GET error:", err.message);
+    res.status(500).json({ error: "Failed to retrieve lift inspections" });
+  }
+});
+
+// POST /welding-procedure-qualification — Record a WPS/PQR per AS/NZS 2980
+app.post("/welding-procedure-qualification", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      wpsRef,
+      pqrRef,
+      welder,
+      welderCertificationNumber,
+      weldingProcess,
+      baseMaterial,
+      baseMaterialThickness,
+      fillerMaterial,
+      fillerClassification,
+      jointType,
+      weldPosition,
+      preheatTemperature,
+      interpassTemperature,
+      postWeldHeatTreatment,
+      shieldingGas,
+      currentType,
+      voltage,
+      amperage,
+      travelSpeed,
+      heatInput,
+      visualInspectionResult,
+      ndeMethod,
+      ndeResult,
+      tensileTestResult,
+      bendTestResult,
+      impactTestResult,
+      hardnessTestResult,
+      overallResult,
+      qualifiedBy,
+      qualificationDate,
+      expiryDate,
+      notes,
+    } = req.body;
+
+    if (!wpsRef || !welder || !weldingProcess || !baseMaterial || !overallResult) {
+      return res.status(400).json({ error: "wpsRef, welder, weldingProcess, baseMaterial, and overallResult are required" });
+    }
+
+    const failures = [];
+    if (visualInspectionResult && visualInspectionResult.toUpperCase() === "FAIL") failures.push("Visual inspection failed — weld does not meet AS/NZS 2980 acceptance criteria");
+    if (ndeResult && ndeResult.toUpperCase() === "FAIL") failures.push(`NDE (${ndeMethod || "NDT"}) failed — reject weld per AS/NZS 2980`);
+    if (tensileTestResult && tensileTestResult.toUpperCase() === "FAIL") failures.push("Tensile test failed — WPS not qualified");
+    if (bendTestResult && bendTestResult.toUpperCase() === "FAIL") failures.push("Bend test failed — WPS not qualified");
+    if (overallResult === "FAIL") failures.push("Welding procedure qualification FAILED — WPS is not approved for production use");
+
+    const record = {
+      project_id: sanitiseInput(projectId || ""),
+      wps_ref: sanitiseInput(wpsRef),
+      pqr_ref: sanitiseInput(pqrRef || ""),
+      welder: sanitiseInput(welder),
+      welder_certification_number: sanitiseInput(welderCertificationNumber || ""),
+      welding_process: sanitiseInput(weldingProcess),
+      base_material: sanitiseInput(baseMaterial),
+      base_material_thickness: baseMaterialThickness || null,
+      filler_material: sanitiseInput(fillerMaterial || ""),
+      filler_classification: sanitiseInput(fillerClassification || ""),
+      joint_type: sanitiseInput(jointType || ""),
+      weld_position: sanitiseInput(weldPosition || ""),
+      preheat_temperature: preheatTemperature || null,
+      interpass_temperature: interpassTemperature || null,
+      post_weld_heat_treatment: sanitiseInput(postWeldHeatTreatment || ""),
+      shielding_gas: sanitiseInput(shieldingGas || ""),
+      current_type: sanitiseInput(currentType || ""),
+      voltage: voltage || null,
+      amperage: amperage || null,
+      travel_speed: travelSpeed || null,
+      heat_input: heatInput || null,
+      visual_inspection_result: sanitiseInput(visualInspectionResult || ""),
+      nde_method: sanitiseInput(ndeMethod || ""),
+      nde_result: sanitiseInput(ndeResult || ""),
+      tensile_test_result: sanitiseInput(tensileTestResult || ""),
+      bend_test_result: sanitiseInput(bendTestResult || ""),
+      impact_test_result: sanitiseInput(impactTestResult || ""),
+      hardness_test_result: sanitiseInput(hardnessTestResult || ""),
+      overall_result: sanitiseInput(overallResult),
+      qualified_by: sanitiseInput(qualifiedBy || ""),
+      qualification_date: qualificationDate || null,
+      expiry_date: expiryDate || null,
+      failures,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("welding_procedure_qualifications").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (failures.length > 0) {
+      return res.status(422).json({
+        qualified: false,
+        failures,
+        message: "WPS qualification failed. Production welding must not proceed until procedure is re-qualified.",
+        record,
+        saved,
+      });
+    }
+
+    res.json({
+      qualified: true,
+      wpsRef,
+      pqrRef: pqrRef || null,
+      expiryDate: expiryDate || null,
+      applicableStandard: "AS/NZS 2980 Quality of welding of steel structures",
+      note: "Retain WPS and PQR records for the life of the structure plus 7 years.",
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/welding-procedure-qualification error:", err.message);
+    res.status(500).json({ error: "Failed to record welding procedure qualification" });
+  }
+});
+
+// POST /ai-welding-risk-assessment — AI assesses welding risk and compliance
+app.post("/ai-welding-risk-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      weldingProcess,
+      baseMaterial,
+      jointType,
+      applicationCategory,
+      workEnvironment,
+      hazards,
+      existingControls,
+    } = req.body;
+
+    if (!weldingProcess || !baseMaterial) {
+      return res.status(400).json({ error: "weldingProcess and baseMaterial are required" });
+    }
+
+    const prompt = `You are a welding safety and quality compliance expert familiar with AS/NZS 2980, AS/NZS 1554, Victorian OHS Regulations, and Safe Work Australia welding guidance.
+
+Assess the welding risk and compliance requirements for the following:
+- Welding process: ${sanitiseInput(weldingProcess)}
+- Base material: ${sanitiseInput(baseMaterial)}
+- Joint type: ${sanitiseInput(jointType || "not specified")}
+- Application category: ${sanitiseInput(applicationCategory || "general structural")}
+- Work environment: ${sanitiseInput(workEnvironment || "workshop")}
+- Identified hazards: ${sanitiseInput(hazards || "not specified")}
+- Existing controls: ${sanitiseInput(existingControls || "not specified")}
+
+Return a JSON object with:
+{
+  "riskLevel": "LOW|MEDIUM|HIGH|CRITICAL",
+  "wpsRequired": boolean,
+  "ndeRequired": boolean,
+  "ndeRecommended": string,
+  "preheatRequired": boolean,
+  "preheatTemperature": string,
+  "phwtRequired": boolean,
+  "keyHazards": [string],
+  "mandatoryPPE": [string],
+  "ventilationRequired": string,
+  "fumeExposureRisk": string,
+  "workPermitRequired": boolean,
+  "applicableStandards": [string],
+  "qualityLevel": string,
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ weldingProcess, baseMaterial, assessment });
+  } catch (err) {
+    console.error("/ai-welding-risk-assessment error:", err.message);
+    res.json({
+      weldingProcess: req.body.weldingProcess || "",
+      baseMaterial: req.body.baseMaterial || "",
+      assessment: {
+        riskLevel: "MEDIUM",
+        wpsRequired: true,
+        ndeRequired: false,
+        ndeRecommended: "Visual inspection + magnetic particle testing (MPI) for structural welds",
+        preheatRequired: false,
+        preheatTemperature: "Refer to AS/NZS 1554.1 Table 5.1 based on carbon equivalent",
+        phwtRequired: false,
+        keyHazards: ["UV radiation arc flash", "Welding fumes (manganese, chromium, nickel)", "Hot work fire risk", "Electric shock"],
+        mandatoryPPE: ["Welding helmet shade 10–13", "Leather gloves", "Flame-resistant clothing", "Steel-capped boots"],
+        ventilationRequired: "Local exhaust ventilation (LEV) required for enclosed spaces",
+        fumeExposureRisk: "Monitor for manganese fumes — WES-TWA 0.2 mg/m³",
+        workPermitRequired: true,
+        applicableStandards: ["AS/NZS 2980 — Welding procedure qualification", "AS/NZS 1554.1 — Structural steel welding", "Safe Work Australia Welding Processes Code of Practice 2020"],
+        qualityLevel: "Weld quality class SP (structural purpose) per AS/NZS 1554.1",
+        recommendation: "Prepare and qualify a WPS before production welding. Conduct visual inspection of all welds. Consider MPI for Category SP welds on primary structural elements.",
+        summary: "Welding compliance requires a qualified WPS, appropriate fume controls, and inspection per AS/NZS 1554. Engage a certified welding supervisor for structural applications.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
