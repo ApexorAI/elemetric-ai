@@ -20560,6 +20560,196 @@ app.post("/compliance-snapshot", apiKeyAuth, async (req, res) => {
   return res.status(201).json({ ...snapshot, saved });
 });
 
+// ── Round 54 ──────────────────────────────────────────────────────────────────
+
+// POST /ai-material-recommendation  — AI recommends materials for a job scope
+app.post("/ai-material-recommendation", apiKeyAuth, async (req, res) => {
+  const { jobType, scope, propertyAge, location, budget } = req.body;
+
+  if (!jobType || !scope) return res.status(400).json({ error: "jobType and scope are required." });
+
+  const safeJobType  = sanitiseInput(String(jobType)).toLowerCase();
+  const safeScope    = sanitiseInput(String(scope)).slice(0, 500);
+  const ageYears     = parseInt(propertyAge) || 0;
+  const safeLocation = sanitiseInput(String(location || "Victoria, Australia"));
+  const safeBudget   = sanitiseInput(String(budget || "standard")).toLowerCase();
+
+  const contextNotes = [
+    ageYears > 50 ? "Pre-1970s property — check for asbestos before specifying any board products. Avoid cutting or drilling without testing." : null,
+    ageYears > 30 && ageYears <= 50 ? "1970s-1990s property — check for early asbestos products in wet areas and roof spaces." : null,
+    safeBudget === "budget" ? "Budget conscious — recommend cost-effective compliant alternatives." : safeBudget === "premium" ? "Premium budget — recommend top-tier materials for longevity." : null,
+  ].filter(Boolean).join(" ");
+
+  const systemPrompt = `You are a Victorian trade materials specialist. Recommend specific, currently available Australian materials for the described job. All recommendations must comply with relevant AS/NZS standards and NCC requirements. Return JSON with: "recommendations" (array of objects each with "item", "specification", "brand" (optional), "alternativeBrand", "standardReference", "estimatedCost", "notes").`;
+
+  let recommendations;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: `Trade: ${safeJobType}\nScope: ${safeScope}\nLocation: ${safeLocation}\nBudget: ${safeBudget}\n${contextNotes}` },
+      ],
+      max_tokens: 600,
+      response_format: { type: "json_object" },
+    });
+    const parsed    = JSON.parse(aiRes.choices[0].message.content);
+    recommendations = Array.isArray(parsed.recommendations)
+      ? parsed.recommendations.slice(0, 12).map(r => ({
+          item:              sanitiseInput(String(r.item              || "")),
+          specification:     sanitiseInput(String(r.specification     || "")),
+          brand:             r.brand             ? sanitiseInput(String(r.brand))             : null,
+          alternativeBrand:  r.alternativeBrand  ? sanitiseInput(String(r.alternativeBrand))  : null,
+          standardReference: r.standardReference ? sanitiseInput(String(r.standardReference)).slice(0, 50) : null,
+          estimatedCost:     r.estimatedCost      ? sanitiseInput(String(r.estimatedCost))     : null,
+          notes:             r.notes             ? sanitiseInput(String(r.notes)).slice(0, 200) : null,
+        }))
+      : [];
+  } catch {
+    recommendations = [{ item: "AI unavailable — manual selection required", specification: safeScope, brand: null, alternativeBrand: null, standardReference: null, estimatedCost: null, notes: null }];
+  }
+
+  return res.json({
+    jobType:         safeJobType,
+    propertyAge:     ageYears || null,
+    budget:          safeBudget,
+    recommendationCount: recommendations.length,
+    recommendations,
+    disclaimer:      "Material recommendations are indicative only. Always verify availability and current pricing with your supplier. Ensure all selected materials comply with the current NCC and relevant Australian Standards.",
+    generatedAt:     new Date().toISOString(),
+  });
+});
+
+// POST /regulatory-impact  — Assess how a recent regulatory change affects a specific job type
+app.post("/regulatory-impact", apiKeyAuth, (req, res) => {
+  const { jobType, regulatoryUpdate, existingJobData } = req.body;
+
+  if (!jobType || !regulatoryUpdate) {
+    return res.status(400).json({ error: "jobType and regulatoryUpdate are required." });
+  }
+
+  const safeJobType  = sanitiseInput(String(jobType)).toLowerCase();
+  const safeUpdate   = sanitiseInput(String(regulatoryUpdate)).slice(0, 500);
+
+  const IMPACT_KEYWORDS = {
+    plumbing:   { high: ["water supply", "hot water", "backflow", "tempering", "tpr", "3500"], low: ["stormwater", "roof", "gutters"] },
+    gas:        { high: ["appliance", "type a", "combustion", "pressure", "5601"], low: ["network", "meter"] },
+    electrical: { high: ["rcd", "circuit", "wiring rules", "3000", "switchboard", "earthing"], low: ["street light", "transmission"] },
+    drainage:   { high: ["sanitary", "sewer", "inspection", "3500.2"], low: ["stormwater", "rainwater"] },
+    carpentry:  { high: ["framing", "1684", "structural", "bracing", "termite", "3660"], low: ["heritage", "interior"] },
+    hvac:       { high: ["refrigerant", "arctick", "r32", "r410", "1677", "condensate"], low: ["ventilation", "natural ventilation"] },
+  };
+
+  const keywords    = IMPACT_KEYWORDS[safeJobType] || { high: [], low: [] };
+  const updateLower = safeUpdate.toLowerCase();
+
+  const highImpactHits = keywords.high.filter(kw => updateLower.includes(kw)).length;
+  const lowImpactHits  = keywords.low.filter(kw => updateLower.includes(kw)).length;
+
+  const impactLevel  = highImpactHits >= 2 ? "HIGH" : highImpactHits === 1 ? "MEDIUM" : lowImpactHits > 0 ? "LOW" : "MINIMAL";
+
+  const recommendations = {
+    HIGH:    ["Review all current job documentation against the new requirement", "Update your site checklist immediately", "Consult the relevant authority for clarification if needed"],
+    MEDIUM:  ["Review whether your current practice meets the new requirement", "Update relevant checklist items"],
+    LOW:     ["Monitor for further updates — low impact on current work type"],
+    MINIMAL: ["No action required for this trade type"],
+  };
+
+  const existingScore = existingJobData ? parseFloat(existingJobData.complianceScore) || null : null;
+
+  return res.json({
+    jobType:      safeJobType,
+    regulatoryUpdate: safeUpdate,
+    impactLevel,
+    impactSummary: `This regulatory update has a ${impactLevel.toLowerCase()} impact on ${safeJobType} work.`,
+    recommendations: recommendations[impactLevel] || [],
+    existingJobImpact: existingScore !== null
+      ? existingScore < 70 ? "Existing job at risk — low compliance score may compound new requirements"
+        : "Existing job compliance should be reviewed against the new requirement"
+      : null,
+    assessedAt: new Date().toISOString(),
+  });
+});
+
+// POST /photo-set-export  — Prepare a photo set export manifest for a job
+app.post("/photo-set-export", apiKeyAuth, (req, res) => {
+  const { jobId, jobType, photos, exportFormat, contractorName, address, includeMetadata } = req.body;
+
+  if (!photos || !Array.isArray(photos) || photos.length === 0) {
+    return res.status(400).json({ error: "photos array is required." });
+  }
+
+  const safeJobType    = sanitiseInput(String(jobType || "general")).toLowerCase();
+  const safeContractor = sanitiseInput(String(contractorName || "Contractor"));
+  const safeAddress    = sanitiseInput(String(address || "Unknown"));
+  const safeFormat     = sanitiseInput(String(exportFormat || "zip")).toLowerCase();
+  const exportId       = `EXP-${Date.now().toString(36).toUpperCase()}`;
+
+  const manifest = photos.slice(0, 50).map((p, i) => {
+    const filename = p.filename
+      ? sanitiseInput(String(p.filename))
+      : `${safeJobType}-photo-${String(i + 1).padStart(3, "0")}.jpg`;
+
+    const entry = {
+      index:    i + 1,
+      filename,
+      stage:    ["Before", "During", "After"].includes(p.stage) ? p.stage : "Other",
+      caption:  p.caption     ? sanitiseInput(String(p.caption)).slice(0, 100)  : null,
+      timestamp: p.timestamp  || p.takenAt || null,
+      hasGps:   !!(p.gpsLat && p.gpsLng) || !!p.gpsCoords,
+    };
+
+    if (includeMetadata) {
+      Object.assign(entry, {
+        gpsLat:   p.gpsLat  || null,
+        gpsLng:   p.gpsLng  || null,
+        fileSize: p.fileSize ? `${Math.round(p.fileSize / 1024)} KB` : null,
+      });
+    }
+
+    return entry;
+  });
+
+  const byStage = { Before: 0, During: 0, After: 0, Other: 0 };
+  for (const p of manifest) byStage[p.stage]++;
+
+  return res.json({
+    exportId,
+    jobId:         jobId ? sanitiseInput(String(jobId)) : null,
+    jobType:       safeJobType,
+    contractorName: safeContractor,
+    address:       safeAddress,
+    exportFormat:  safeFormat,
+    photoCount:    manifest.length,
+    byStage,
+    withGps:       manifest.filter(p => p.hasGps).length,
+    withTimestamp: manifest.filter(p => p.timestamp).length,
+    manifest,
+    exportNote:    `${manifest.length} photos ready for export in ${safeFormat.toUpperCase()} format. Retain this manifest as part of your compliance record.`,
+    generatedAt:   new Date().toISOString(),
+  });
+});
+
+// GET /compliance-grades  — Explanation of compliance grade thresholds
+app.get("/compliance-grades", apiKeyAuth, (req, res) => {
+  return res.json({
+    grades: [
+      { grade: "A", range: "90–100", label: "Excellent", description: "All compliance items detected, full documentation, GPS and signature present. Job meets or exceeds all requirements.", colour: "#2e7d32" },
+      { grade: "B", range: "80–89",  label: "Good",        description: "Most items compliant. Minor gaps in documentation or evidence. Suitable for archiving with follow-up.", colour: "#388e3c" },
+      { grade: "C", range: "70–79",  label: "Satisfactory", description: "Core compliance items present but notable gaps. Action required to bring to full compliance.", colour: "#f57f17" },
+      { grade: "D", range: "60–69",  label: "Below Standard", description: "Significant missing items or documentation failures. Re-inspection or remediation recommended.", colour: "#e65100" },
+      { grade: "F", range: "0–59",   label: "Fail",         description: "Critical compliance failures. Do not archive — immediate rectification required.", colour: "#b71c1c" },
+    ],
+    scoringComponents: [
+      { component: "Item coverage",      weight: "40%", description: "Proportion of required items detected vs missing" },
+      { component: "Photo evidence",     weight: "25%", description: "Number of photos vs minimum required" },
+      { component: "Regulatory markings", weight: "20%", description: "Presence of AS/NZS standard markings and regulatory items" },
+      { component: "Documentation",      weight: "15%", description: "GPS recorded, client signature, certificate filed, complexity" },
+    ],
+    note: "Scores are calculated automatically from the AI analysis. Grades are indicative — always consult the full report.",
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
