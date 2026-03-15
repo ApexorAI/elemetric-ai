@@ -22620,6 +22620,166 @@ app.post("/cost-centre", apiKeyAuth, async (req, res) => {
   return res.json(record);
 });
 
+// POST /photo-tag  — Tag individual photos with categories and metadata
+app.post("/photo-tag", apiKeyAuth, async (req, res) => {
+  const { jobId, photos = [] } = req.body || {};
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+  if (!Array.isArray(photos) || photos.length === 0) return res.status(400).json({ error: "photos array required." });
+
+  const VALID_CATEGORIES = ["before", "during", "after", "defect", "certificate", "label", "meter", "test", "material", "aerial", "other"];
+  const safeJobId = sanitiseInput(String(jobId)).slice(0, 80);
+
+  const tagged = photos.slice(0, 100).map((p, idx) => ({
+    photoId:   p.photoId ? sanitiseInput(String(p.photoId)).slice(0, 80) : `photo-${idx + 1}`,
+    url:       p.url && isSafeUrl(p.url) ? p.url : null,
+    category:  VALID_CATEGORIES.includes(String(p.category || "").toLowerCase()) ? String(p.category).toLowerCase() : "other",
+    label:     p.label ? sanitiseInput(String(p.label)).slice(0, 100) : null,
+    takenAt:   p.takenAt ? sanitiseInput(String(p.takenAt)).slice(0, 30) : null,
+    gps:       p.gps && typeof p.gps === "object" ? { lat: parseFloat(p.gps.lat) || null, lng: parseFloat(p.gps.lng) || null } : null,
+    notes:     p.notes ? sanitiseInput(String(p.notes)).slice(0, 200) : null,
+  }));
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("job_photos").upsert(
+        tagged.map(p => ({ job_id: safeJobId, photo_id: p.photoId, url: p.url, category: p.category, label: p.label, taken_at: p.takenAt, gps: p.gps, notes: p.notes, updated_at: new Date().toISOString() })),
+        { onConflict: "job_id,photo_id" }
+      );
+    } catch (_) { /* non-critical */ }
+  }
+
+  const counts = {};
+  VALID_CATEGORIES.forEach(c => { counts[c] = tagged.filter(p => p.category === c).length; });
+
+  return res.json({ jobId: safeJobId, photosTagged: tagged.length, categoryCounts: counts, photos: tagged, savedAt: new Date().toISOString() });
+});
+
+// GET /photos/:jobId  — Get all tagged photos for a job
+app.get("/photos/:jobId", apiKeyAuth, async (req, res) => {
+  const jobId    = sanitiseInput(String(req.params.jobId || "")).slice(0, 80);
+  const category = req.query.category ? sanitiseInput(String(req.query.category)).toLowerCase() : null;
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  let photos = [];
+  if (supabaseAdmin) {
+    try {
+      let q = supabaseAdmin.from("job_photos").select("*").eq("job_id", jobId).order("taken_at", { ascending: true });
+      if (category) q = q.eq("category", category);
+      const { data } = await q.limit(200);
+      photos = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  return res.json({ jobId, count: photos.length, filter: category || "all", photos, generatedAt: new Date().toISOString() });
+});
+
+// POST /work-stoppage  — Log a work stoppage or stop-work order event
+app.post("/work-stoppage", apiKeyAuth, async (req, res) => {
+  const { jobId, contractorId, issuedBy, reason, authority, stoppageDate, reinstateDate, notes } = req.body || {};
+  if (!jobId || !reason) return res.status(400).json({ error: "jobId and reason required." });
+
+  const VALID_AUTHORITIES = ["vba", "worksafe", "council", "client", "contractor", "esv", "epa", "other"];
+  const safeJobId   = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeCId     = contractorId ? sanitiseInput(String(contractorId)).slice(0, 80) : null;
+  const safeIssuedBy = issuedBy ? sanitiseInput(String(issuedBy)).slice(0, 100) : null;
+  const safeReason  = sanitiseInput(String(reason)).slice(0, 500);
+  const safeAuth    = VALID_AUTHORITIES.includes(String(authority || "").toLowerCase()) ? String(authority).toLowerCase() : "other";
+  const safeStop    = stoppageDate ? sanitiseInput(String(stoppageDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeReinstate = reinstateDate ? sanitiseInput(String(reinstateDate)).slice(0, 20) : null;
+  const safeNotes   = notes ? sanitiseInput(String(notes)).slice(0, 500) : null;
+
+  const record = {
+    jobId: safeJobId, contractorId: safeCId, issuedBy: safeIssuedBy,
+    reason: safeReason, authority: safeAuth,
+    stoppageDate: safeStop, reinstateDate: safeReinstate,
+    status: "ACTIVE",
+    notes: safeNotes,
+    stoppageRef: `SWO-${safeJobId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("work_stoppages").insert({
+        job_id: safeJobId, contractor_id: safeCId, issued_by: safeIssuedBy,
+        reason: safeReason, authority: safeAuth, stoppage_date: safeStop,
+        reinstate_date: safeReinstate, status: "ACTIVE",
+        notes: safeNotes, stoppage_ref: record.stoppageRef, created_at: record.createdAt,
+      });
+      await supabaseAdmin.from("jobs").update({ status: "STOPPED", stop_work_ref: record.stoppageRef }).eq("id", safeJobId);
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// POST /quality-inspection  — Log a QC inspection result for a job stage
+app.post("/quality-inspection", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, stage, inspectedBy, result, findings = [], photoRefs = [], notes } = req.body || {};
+  if (!jobId || !stage) return res.status(400).json({ error: "jobId and stage required." });
+
+  const VALID_RESULTS  = ["PASS", "FAIL", "CONDITIONAL", "PENDING"];
+  const safeJobId   = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeType    = jobType ? sanitiseInput(String(jobType)).toLowerCase().slice(0, 40) : null;
+  const safeStage   = sanitiseInput(String(stage)).slice(0, 80);
+  const safeBy      = inspectedBy ? sanitiseInput(String(inspectedBy)).slice(0, 100) : null;
+  const safeResult  = VALID_RESULTS.includes(String(result || "").toUpperCase()) ? String(result).toUpperCase() : "PENDING";
+  const safeFindings = Array.isArray(findings) ? findings.slice(0, 30).map(f => sanitiseInput(String(f)).slice(0, 200)) : [];
+  const safePhotos   = Array.isArray(photoRefs) ? photoRefs.slice(0, 20).map(p => sanitiseInput(String(p)).slice(0, 80)) : [];
+  const safeNotes   = notes ? sanitiseInput(String(notes)).slice(0, 500) : null;
+
+  const inspection = {
+    jobId: safeJobId, jobType: safeType, stage: safeStage,
+    inspectedBy: safeBy, result: safeResult,
+    findingsCount: safeFindings.length, findings: safeFindings,
+    photoRefs: safePhotos, notes: safeNotes,
+    inspectionRef: `QCI-${safeJobId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    inspectedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("quality_inspections").insert({
+        job_id: safeJobId, job_type: safeType, stage: safeStage, inspected_by: safeBy,
+        result: safeResult, findings: safeFindings, photo_refs: safePhotos,
+        notes: safeNotes, inspection_ref: inspection.inspectionRef, inspected_at: inspection.inspectedAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...inspection, saved: !!supabaseAdmin });
+});
+
+// GET /quality-inspection/:jobId  — Get QC inspection results for a job
+app.get("/quality-inspection/:jobId", apiKeyAuth, async (req, res) => {
+  const jobId = sanitiseInput(String(req.params.jobId || "")).slice(0, 80);
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  let inspections = [];
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin
+        .from("quality_inspections")
+        .select("*")
+        .eq("job_id", jobId)
+        .order("inspected_at", { ascending: false })
+        .limit(50);
+      inspections = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const results = { PASS: 0, FAIL: 0, CONDITIONAL: 0, PENDING: 0 };
+  inspections.forEach(i => { if (results[i.result] !== undefined) results[i.result]++; });
+
+  return res.json({
+    jobId, totalInspections: inspections.length,
+    resultCounts: results,
+    overallStatus: results.FAIL > 0 ? "HAS_FAILURES" : results.CONDITIONAL > 0 ? "CONDITIONAL" : results.PENDING > 0 ? "IN_PROGRESS" : inspections.length > 0 ? "ALL_PASSED" : "NO_INSPECTIONS",
+    inspections,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
