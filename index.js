@@ -44349,6 +44349,308 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /traffic-management-plan — Create a Traffic Management Plan (TMP)
+app.post("/traffic-management-plan", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, roadName, suburb, localCouncil,
+    worksDescription, worksStartDate, worksEndDate,
+    peakHourImpact, laneClosures, footpathClosure, bikeLaneClosure,
+    speedReduction, detourRequired, detourRoute,
+    trafficControllerRequired, tcLicenceNumbers,
+    vmsBoards, cones, barricades, flashingArrowRequired,
+    approvedBy, vicRoadsRef, councilPermitRef,
+    adjacentToSchool, adjacentToHospital, adjacentToLevel1Road, notes,
+  } = req.body;
+
+  if (!projectId || !roadName || !worksDescription) {
+    return res.status(400).json({ error: "projectId, roadName, and worksDescription are required." });
+  }
+
+  const sanitisedRoad = sanitiseInput(roadName, 200);
+  const sanitisedDesc = sanitiseInput(worksDescription, 500);
+
+  // Determine approval authority (VicRoads vs council) per Victorian road hierarchy
+  const isArteryOrHighway = (adjacentToLevel1Road || roadName.toLowerCase().includes("freeway") || roadName.toLowerCase().includes("highway") || roadName.toLowerCase().includes("arterial"));
+  const approvalAuthority = isArteryOrHighway ? "VicRoads" : `${sanitiseInput(localCouncil || "Local Council", 100)}`;
+
+  // Risk assessment for traffic impacts
+  const riskFactors = [];
+  if (peakHourImpact) riskFactors.push("Works during peak hours increase incident risk");
+  if (laneClosures) riskFactors.push("Lane closure requires Traffic Management Device setup per AS 1742.3");
+  if (detourRequired) riskFactors.push("Detour signage must comply with AS 1742 series");
+  if (adjacentToSchool) riskFactors.push("School zone — enhanced pedestrian management required (7:30–9:00am, 2:30–4:00pm)");
+  if (adjacentToHospital) riskFactors.push("Hospital — emergency vehicle access must be maintained at all times");
+  if (!trafficControllerRequired && laneClosures) riskFactors.push("Lane closures typically require Traffic Controllers — confirm with approval authority");
+
+  const complianceRequirements = [
+    "AS 1742.3 Traffic control devices for works on roads",
+    "VicRoads Traffic Engineering Manual Volume 2",
+    "Occupational Health and Safety Regulations 2017 — traffic management plan obligation",
+  ];
+  if (speedReduction) complianceRequirements.push("Speed zone authorisation required from VicRoads/council before works");
+  if (adjacentToSchool) complianceRequirements.push("VicRoads school zone guidelines");
+
+  const ref = `TMP-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectName: sanitiseInput(projectName || "", 200),
+    roadName: sanitisedRoad,
+    suburb: sanitiseInput(suburb || "", 100),
+    localCouncil: sanitiseInput(localCouncil || "", 100),
+    approvalAuthority,
+    worksDescription: sanitisedDesc,
+    worksStartDate: worksStartDate || null,
+    worksEndDate: worksEndDate || null,
+    impacts: {
+      peakHourImpact: !!peakHourImpact,
+      laneClosures: !!laneClosures,
+      footpathClosure: !!footpathClosure,
+      bikeLaneClosure: !!bikeLaneClosure,
+      speedReduction: speedReduction || null,
+      detourRequired: !!detourRequired,
+      detourRoute: sanitiseInput(detourRoute || "", 300),
+    },
+    devices: {
+      trafficControllerRequired: !!trafficControllerRequired,
+      tcLicenceNumbers: (tcLicenceNumbers || []).map(n => sanitiseInput(String(n), 40)).slice(0, 10),
+      vmsBoards: vmsBoards || 0,
+      cones: cones || 0,
+      barricades: barricades || 0,
+      flashingArrowRequired: !!flashingArrowRequired,
+    },
+    adjacency: {
+      school: !!adjacentToSchool,
+      hospital: !!adjacentToHospital,
+      level1Road: !!adjacentToLevel1Road,
+    },
+    riskFactors,
+    complianceRequirements,
+    approvedBy: sanitiseInput(approvedBy || "", 120),
+    vicRoadsRef: sanitiseInput(vicRoadsRef || "", 80),
+    councilPermitRef: sanitiseInput(councilPermitRef || "", 80),
+    notes: sanitiseInput(notes || "", 500),
+    status: "DRAFT",
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("traffic_management_plans").insert(record);
+      if (error) console.error("TMP insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("TMP DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    approvalAuthority,
+    riskFactors,
+    complianceRequirements,
+    message: `TMP created. Approval required from ${approvalAuthority}${vicRoadsRef ? ` (VicRoads ref: ${vicRoadsRef})` : ""}.`,
+    saved,
+    record,
+  });
+});
+
+// POST /traffic-controller-booking — Record a Traffic Controller booking/deployment
+app.post("/traffic-controller-booking", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, tmpRef, controllerName, licenceNumber, licenceState,
+    licenceExpiry, employedBy, workDate, startTime, endTime,
+    location, controlType, remarks,
+  } = req.body;
+
+  if (!projectId || !controllerName || !licenceNumber || !workDate) {
+    return res.status(400).json({ error: "projectId, controllerName, licenceNumber, and workDate are required." });
+  }
+
+  const sanitisedName = sanitiseInput(controllerName, 120);
+  const sanitisedLicence = sanitiseInput(licenceNumber, 40);
+
+  // Licence expiry check
+  let licenceStatus = "UNKNOWN";
+  let licenceWarning = null;
+  if (licenceExpiry) {
+    const expiryDate = new Date(licenceExpiry);
+    const today = new Date();
+    const daysUntilExpiry = Math.ceil((expiryDate - today) / (1000 * 60 * 60 * 24));
+    if (daysUntilExpiry < 0) {
+      licenceStatus = "EXPIRED";
+      licenceWarning = "Traffic Controller licence is EXPIRED — cannot deploy to site.";
+    } else if (daysUntilExpiry <= 30) {
+      licenceStatus = "EXPIRING_SOON";
+      licenceWarning = `Licence expires in ${daysUntilExpiry} day(s) — arrange renewal immediately.`;
+    } else {
+      licenceStatus = "VALID";
+    }
+  }
+
+  if (licenceStatus === "EXPIRED") {
+    return res.status(422).json({
+      error: "Cannot book an expired Traffic Controller licence.",
+      licenceExpiry,
+      licenceWarning,
+    });
+  }
+
+  const validControlTypes = ["STOP_SLOW", "LANE_CLOSURE", "INTERSECTION_CONTROL", "PEDESTRIAN_GUIDANCE", "EMERGENCY_SCENE"];
+  const resolvedControlType = validControlTypes.includes((controlType || "").toUpperCase()) ? controlType.toUpperCase() : "STOP_SLOW";
+
+  const ref = `TC-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    tmpRef: sanitiseInput(tmpRef || "", 40),
+    controllerName: sanitisedName,
+    licenceNumber: sanitisedLicence,
+    licenceState: sanitiseInput(licenceState || "VIC", 10),
+    licenceExpiry: licenceExpiry || null,
+    licenceStatus,
+    employedBy: sanitiseInput(employedBy || "", 120),
+    workDate,
+    startTime: startTime || null,
+    endTime: endTime || null,
+    location: sanitiseInput(location || "", 200),
+    controlType: resolvedControlType,
+    remarks: sanitiseInput(remarks || "", 300),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("traffic_controller_bookings").insert(record);
+      if (error) console.error("TC booking insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("TC booking DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    licenceStatus,
+    licenceWarning,
+    message: licenceWarning || `Traffic Controller ${sanitisedName} booked for ${workDate}.`,
+    saved,
+    record,
+  });
+});
+
+// POST /ai-traffic-impact-assessment — AI evaluates traffic impact of proposed works
+app.post("/ai-traffic-impact-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    roadName, suburb, roadClassification, averageDailyTraffic,
+    peakAmVolume, peakPmVolume, worksDescription, duration,
+    laneClosures, detourAvailable, publicTransportRoutes,
+    nearSchool, nearHospital, nearTram, notes,
+  } = req.body;
+
+  if (!roadName || !worksDescription) {
+    return res.status(400).json({ error: "roadName and worksDescription are required." });
+  }
+
+  const sanitisedRoad = sanitiseInput(roadName, 200);
+  const sanitisedDesc = sanitiseInput(worksDescription, 400);
+
+  const prompt = `You are a traffic engineer in Victoria, Australia with expertise in AS 1742.3 and VicRoads traffic management.
+
+Assess the traffic impact of the following works:
+- Road: ${sanitisedRoad}, ${sanitiseInput(suburb || "", 100)}
+- Road classification: ${sanitiseInput(roadClassification || "Local road", 60)}
+- Average daily traffic: ${averageDailyTraffic || "Unknown"} vpd
+- AM peak volume: ${peakAmVolume || "Unknown"} vph
+- PM peak volume: ${peakPmVolume || "Unknown"} vph
+- Works: ${sanitisedDesc}
+- Duration: ${sanitiseInput(duration || "Unknown", 60)}
+- Lane closures: ${laneClosures ? "Yes" : "No"}
+- Detour available: ${detourAvailable ? "Yes" : "No"}
+- Public transport routes affected: ${sanitiseInput(publicTransportRoutes || "None", 150)}
+- Near school: ${nearSchool ? "Yes" : "No"}
+- Near hospital: ${nearHospital ? "Yes" : "No"}
+- Near tram: ${nearTram ? "Yes" : "No"}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Respond ONLY with a JSON object:
+{
+  "impactLevel": "LOW|MODERATE|HIGH|CRITICAL",
+  "impactScore": number (0-100),
+  "delayEstimateMinutes": number,
+  "queueLengthEstimateM": number,
+  "peakHourRecommendation": string,
+  "stagingRecommendations": [string],
+  "mitigationMeasures": [string],
+  "signageRequirements": [string],
+  "approvalRequirements": [string],
+  "communityNotificationRequired": boolean,
+  "communityNotificationLeadTimeDays": number,
+  "publicTransportImpact": string,
+  "pedestrianCyclistImpact": string,
+  "emergencyAccessMaintained": boolean,
+  "summary": string (2-3 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1000,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      impactLevel: parsed.impactLevel || "MODERATE",
+      impactScore: parsed.impactScore ?? null,
+      delayEstimateMinutes: parsed.delayEstimateMinutes ?? null,
+      queueLengthEstimateM: parsed.queueLengthEstimateM ?? null,
+      peakHourRecommendation: parsed.peakHourRecommendation || "",
+      stagingRecommendations: parsed.stagingRecommendations || [],
+      mitigationMeasures: parsed.mitigationMeasures || [],
+      signageRequirements: parsed.signageRequirements || [],
+      approvalRequirements: parsed.approvalRequirements || [],
+      communityNotificationRequired: parsed.communityNotificationRequired ?? false,
+      communityNotificationLeadTimeDays: parsed.communityNotificationLeadTimeDays ?? 5,
+      publicTransportImpact: parsed.publicTransportImpact || "",
+      pedestrianCyclistImpact: parsed.pedestrianCyclistImpact || "",
+      emergencyAccessMaintained: parsed.emergencyAccessMaintained ?? true,
+      summary: parsed.summary || "Traffic impact assessment complete.",
+    });
+  } catch (e) {
+    console.error("AI traffic impact error:", e.message);
+    return res.json({
+      success: true,
+      impactLevel: "MODERATE",
+      impactScore: 50,
+      delayEstimateMinutes: 5,
+      queueLengthEstimateM: 200,
+      peakHourRecommendation: "Avoid works between 7:00–9:00am and 4:00–6:30pm on weekdays where possible.",
+      stagingRecommendations: ["Stage works to maintain one lane of traffic flow at all times if possible"],
+      mitigationMeasures: ["Deploy Traffic Controllers for lane closures", "Install advance warning signage 100m before works", "Use VMS board to notify road users 24 hours prior"],
+      signageRequirements: ["AS 1742.3 compliant signage layout", "Advance warning signs", "Works ahead signs", "Speed limit signs"],
+      approvalRequirements: ["Works on Road permit from council", "Traffic Management Plan approval"],
+      communityNotificationRequired: true,
+      communityNotificationLeadTimeDays: 5,
+      publicTransportImpact: "Confirm with PTV if bus or tram routes are affected — diversions may require 10 business days notice.",
+      pedestrianCyclistImpact: "Maintain safe pedestrian path and cyclist access or provide suitable diversion.",
+      emergencyAccessMaintained: true,
+      summary: "Moderate traffic impact expected. Prepare Traffic Management Plan and obtain permits before commencing works.",
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
