@@ -52961,6 +52961,299 @@ Return a JSON object with:
   }
 });
 
+// POST /nathers-energy-assessment — Record a NatHERS thermal performance / energy rating assessment
+app.post("/nathers-energy-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      assessmentRef,
+      assessmentDate,
+      assessor,
+      assessorAccreditationNumber,
+      propertyAddress,
+      buildingClass,
+      climateZone,
+      totalFloorAreaM2,
+      heatingLoadMjM2,
+      coolingLoadMjM2,
+      totalLoadMjM2,
+      starRating,
+      minRequiredStars,
+      insulationWallR,
+      insulationCeilingR,
+      insulationFloorR,
+      glazingType,
+      glazingShgc,
+      hvacEfficiency,
+      naturalVentilationAdequate,
+      thermalMassRating,
+      buildingOrientationOptimal,
+      softwareUsed,
+      certificateIssued,
+      certificateNumber,
+      notes,
+    } = req.body;
+
+    if (!projectId || !assessmentDate || !assessor || !starRating) {
+      return res.status(400).json({ error: "projectId, assessmentDate, assessor, and starRating are required" });
+    }
+
+    // NCC 2022 requires minimum 7.0 stars for Class 1 residential buildings
+    const minStars = minRequiredStars || (buildingClass === "1" ? 7.0 : 6.0);
+    const compliant = Number(starRating) >= minStars;
+    const flags = [];
+    if (!compliant) flags.push(`Star rating ${starRating} is below the NCC 2022 minimum of ${minStars} stars — building consent cannot proceed`);
+    if (totalLoadMjM2 && Number(totalLoadMjM2) > 200) flags.push(`Total thermal load ${totalLoadMjM2} MJ/m² — high energy demand, consider additional insulation or glazing improvements`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      assessment_ref: sanitiseInput(assessmentRef || `NE-${Date.now()}`),
+      assessment_date: assessmentDate,
+      assessor: sanitiseInput(assessor),
+      assessor_accreditation_number: sanitiseInput(assessorAccreditationNumber || ""),
+      property_address: sanitiseInput(propertyAddress || ""),
+      building_class: sanitiseInput(buildingClass || "1"),
+      climate_zone: sanitiseInput(climateZone || ""),
+      total_floor_area_m2: totalFloorAreaM2 || null,
+      heating_load_mj_m2: heatingLoadMjM2 || null,
+      cooling_load_mj_m2: coolingLoadMjM2 || null,
+      total_load_mj_m2: totalLoadMjM2 || null,
+      star_rating: Number(starRating),
+      min_required_stars: minStars,
+      compliant,
+      insulation_wall_r: insulationWallR || null,
+      insulation_ceiling_r: insulationCeilingR || null,
+      insulation_floor_r: insulationFloorR || null,
+      glazing_type: sanitiseInput(glazingType || ""),
+      glazing_shgc: glazingShgc || null,
+      hvac_efficiency: sanitiseInput(hvacEfficiency || ""),
+      natural_ventilation_adequate: !!naturalVentilationAdequate,
+      thermal_mass_rating: sanitiseInput(thermalMassRating || ""),
+      building_orientation_optimal: !!buildingOrientationOptimal,
+      software_used: sanitiseInput(softwareUsed || "AccuRate/FirstRate5"),
+      certificate_issued: !!certificateIssued,
+      certificate_number: sanitiseInput(certificateNumber || ""),
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("nathers_energy_assessments").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      compliant,
+      starRating: Number(starRating),
+      minRequiredStars: minStars,
+      flags,
+      applicableStandards: ["NCC 2022 Section J (energy efficiency)", "NatHERS (Nationwide House Energy Rating Scheme)", "AS/NZS 4859.1 Thermal insulation materials"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/nathers-energy-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to record NatHERS energy assessment" });
+  }
+});
+
+// POST /radiation-safety-record — Record nuclear density gauge / radiation safety inspection (Vic ARPANSA/DHHS)
+app.post("/radiation-safety-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      recordRef,
+      date,
+      responsibleOfficer,
+      radiationLicenceNumber,
+      gaugeType,
+      gaugeSerialNumber,
+      gaugeRegistrationNumber,
+      sourceActivity,
+      sourceMaterial,
+      transportDocumentRef,
+      storageLocationSecure,
+      sealIntact,
+      warningLabelsPresent,
+      personnelDosimetryWorn,
+      usageLogUpdated,
+      leakTestDate,
+      leakTestResult,
+      contaminationCheckResult,
+      unusualEvents,
+      unusualEventDescription,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !responsibleOfficer || !gaugeType || !gaugeSerialNumber) {
+      return res.status(400).json({ error: "projectId, date, responsibleOfficer, gaugeType, and gaugeSerialNumber are required" });
+    }
+
+    const flags = [];
+    if (!storageLocationSecure) flags.push("Gauge storage location is not secure — ARPANSA licence requires locked, designated storage at all times");
+    if (!sealIntact) flags.push("Source seal may not be intact — cease use immediately, notify Radiation Safety Officer and DHHS Victorian Radiation Safety");
+    if (!warningLabelsPresent) flags.push("Warning labels missing or damaged — radiation hazard labels required by Australian Radiation Protection and Nuclear Safety Regulations 2018");
+    if (!personnelDosimetryWorn) flags.push("Personnel dosimetry not worn — mandatory for all workers operating or handling radiation sources");
+    if (leakTestResult && leakTestResult.toUpperCase() === "FAIL") flags.push("Leak test failed — source must be quarantined and ARPANSA notified immediately");
+    if (unusualEvents) flags.push(`Unusual radiation event: ${sanitiseInput(unusualEventDescription || "details not provided")} — report to ARPANSA and Victorian DHHS within 24 hours`);
+
+    if (flags.length > 0) console.warn(`[RADIATION] Gauge ${gaugeSerialNumber} at ${projectId} — ${flags.join("; ")}`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      record_ref: sanitiseInput(recordRef || `RAD-${Date.now()}`),
+      date,
+      responsible_officer: sanitiseInput(responsibleOfficer),
+      radiation_licence_number: sanitiseInput(radiationLicenceNumber || ""),
+      gauge_type: sanitiseInput(gaugeType),
+      gauge_serial_number: sanitiseInput(gaugeSerialNumber),
+      gauge_registration_number: sanitiseInput(gaugeRegistrationNumber || ""),
+      source_activity: sanitiseInput(sourceActivity || ""),
+      source_material: sanitiseInput(sourceMaterial || ""),
+      transport_document_ref: sanitiseInput(transportDocumentRef || ""),
+      storage_location_secure: !!storageLocationSecure,
+      seal_intact: !!sealIntact,
+      warning_labels_present: !!warningLabelsPresent,
+      personnel_dosimetry_worn: !!personnelDosimetryWorn,
+      usage_log_updated: !!usageLogUpdated,
+      leak_test_date: leakTestDate || null,
+      leak_test_result: sanitiseInput(leakTestResult || ""),
+      contamination_check_result: sanitiseInput(contaminationCheckResult || ""),
+      unusual_events: !!unusualEvents,
+      unusual_event_description: sanitiseInput(unusualEventDescription || ""),
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("radiation_safety_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (flags.some(f => f.includes("immediately"))) {
+      return res.status(422).json({
+        criticalFlag: true,
+        flags,
+        message: "Critical radiation safety issue detected. Cease gauge operations and contact your Radiation Safety Officer immediately.",
+        record,
+        saved,
+      });
+    }
+
+    res.json({
+      criticalFlag: false,
+      flags,
+      applicableRegulations: ["Australian Radiation Protection and Nuclear Safety Act 1998 (Cth)", "Radiation Act 2005 (Vic)", "Australian Radiation Protection and Nuclear Safety Regulations 2018", "ARPANSA RPS 14.1 — Safety of nuclear density gauges"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/radiation-safety-record error:", err.message);
+    res.status(500).json({ error: "Failed to record radiation safety inspection" });
+  }
+});
+
+// POST /ai-energy-efficiency-assessment — AI assesses building energy efficiency and improvement opportunities
+app.post("/ai-energy-efficiency-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      buildingType,
+      buildingAgeYears,
+      climateZone,
+      currentStarRating,
+      targetStarRating,
+      currentInsulation,
+      currentGlazing,
+      hvacSystem,
+      orientationDescription,
+      shading,
+      thermalMass,
+      ventilationStrategy,
+      budget,
+    } = req.body;
+
+    if (!buildingType || !climateZone) {
+      return res.status(400).json({ error: "buildingType and climateZone are required" });
+    }
+
+    const prompt = `You are an accredited NatHERS energy assessor and building performance expert for Victoria, Australia.
+
+Assess energy efficiency improvement opportunities for:
+- Building type: ${sanitiseInput(buildingType)}
+- Building age: ${sanitiseInput(String(buildingAgeYears || "unknown"))} years
+- Climate zone: ${sanitiseInput(climateZone)} (Victorian NatHERS zone)
+- Current star rating: ${sanitiseInput(String(currentStarRating || "not rated"))}
+- Target star rating: ${sanitiseInput(String(targetStarRating || "7.0 (NCC 2022 minimum)"))}
+- Current insulation: ${sanitiseInput(currentInsulation || "not specified")}
+- Current glazing: ${sanitiseInput(currentGlazing || "not specified")}
+- HVAC system: ${sanitiseInput(hvacSystem || "not specified")}
+- Orientation: ${sanitiseInput(orientationDescription || "not specified")}
+- Shading: ${sanitiseInput(shading || "not specified")}
+- Thermal mass: ${sanitiseInput(thermalMass || "not specified")}
+- Ventilation strategy: ${sanitiseInput(ventilationStrategy || "not specified")}
+- Budget: ${sanitiseInput(budget || "not specified")}
+
+Return a JSON object with:
+{
+  "currentPerformanceRating": string,
+  "targetAchievable": boolean,
+  "priorityImprovements": [{"measure": string, "estimatedStarImprovement": string, "costRange": string}],
+  "insulationRecommendations": string,
+  "glazingRecommendations": string,
+  "hvacRecommendations": string,
+  "passiveDesignOpportunities": [string],
+  "estimatedEnergyReduction": string,
+  "paybackPeriodYears": string,
+  "nccCompliancePath": string,
+  "applicableIncentives": [string],
+  "applicableStandards": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ buildingType, climateZone, assessment });
+  } catch (err) {
+    console.error("/ai-energy-efficiency-assessment error:", err.message);
+    res.json({
+      buildingType: req.body.buildingType || "",
+      climateZone: req.body.climateZone || "",
+      assessment: {
+        currentPerformanceRating: "Below NCC 2022 minimum — assessment required",
+        targetAchievable: true,
+        priorityImprovements: [
+          { measure: "Ceiling insulation upgrade to R5.0+", estimatedStarImprovement: "0.5–1.5 stars", costRange: "$1,500–$4,000" },
+          { measure: "Double-glazed low-e windows", estimatedStarImprovement: "0.5–1.0 stars", costRange: "$8,000–$20,000" },
+          { measure: "Draught sealing and vapour barrier", estimatedStarImprovement: "0.2–0.5 stars", costRange: "$500–$2,000" },
+        ],
+        insulationRecommendations: "Install R5.0 ceiling batts, R2.5 wall batts. Consider reflective foil under roof.",
+        glazingRecommendations: "Low-e double glazing with SHGC 0.4–0.6 for northern facades, SHGC < 0.3 for east/west.",
+        hvacRecommendations: "Select split-system with COP ≥ 4.5 (heating) and EER ≥ 3.5 (cooling). Consider zoning to reduce conditioned floor area.",
+        passiveDesignOpportunities: ["Optimise window-to-floor ratio on north facade", "Add external shading (eaves/louvres) to north and west", "Increase exposed concrete slab thermal mass"],
+        estimatedEnergyReduction: "30–50% heating/cooling energy reduction achievable with priority measures",
+        paybackPeriodYears: "5–12 years depending on measures selected",
+        nccCompliancePath: "NCC 2022 Section J — elemental DTS provisions or NatHERS whole-of-home pathway (minimum 7.0 stars)",
+        applicableIncentives: ["Victorian Energy Upgrades (VEU) program rebates", "Vic Homes for Victorians energy efficiency grants", "Federal SRES for solar and battery"],
+        applicableStandards: ["NCC 2022 Volume Two — Section 13 (Class 1)", "AS/NZS 4859.1 Thermal insulation", "NatHERS Technical Note 2022.1"],
+        recommendation: "Commission a full NatHERS assessment using AccuRate or FirstRate5 to establish baseline and model improvement pathways. Prioritise ceiling insulation and air-sealing as the highest value-to-cost measures.",
+        summary: "Significant energy efficiency gains are achievable through targeted insulation, glazing, and passive design improvements. A NatHERS assessment is required to confirm NCC 2022 compliance.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
