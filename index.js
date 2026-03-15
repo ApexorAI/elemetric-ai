@@ -516,7 +516,7 @@ function generateMaskPNG(width = 1024, height = 768) {
   const rectX1 = Math.floor(width * 0.20);
   const rectX2 = Math.floor(width * 0.80);
   const rectY1 = Math.floor(height * 0.10);
-  const rectY2 = Math.floor(height * 0.55);
+  const rectY2 = Math.floor(height * 0.40);
 
   // Build raw scanlines: 1 filter byte (0=None) + width grayscale pixels per row
   const rows = [];
@@ -618,8 +618,8 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
     // Step 3: Run Stable Diffusion inpainting via Replicate
     // Only the masked (white) region is edited; everything else is preserved exactly.
     const prompt =
-      `a ${modelNumber} mounted on the wall, photorealistic, natural lighting, seamlessly integrated, ` +
-      `${roomDescription}, high quality photograph`;
+      `A ${modelNumber} mounted high on the wall only, nothing else added, no furniture, no objects below, ` +
+      `clean installation, photorealistic, natural lighting, ${roomDescription}, high quality photograph`;
 
     console.log("[visualise] Step 3 - Calling Replicate with prompt:", prompt);
 
