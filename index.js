@@ -35704,6 +35704,204 @@ Return a JSON object with:
   }
 });
 
+// ── Round 136: Apprentice management, RPL assessment, trade test booking ──────
+
+// POST /apprentice-record — Register and track an apprentice
+app.post("/apprentice-record", apiKeyAuth, async (req, res) => {
+  const {
+    apprenticeId, firstName, lastName, trade, trainingContract,
+    rtoName, rtoCode, supervisorId, supervisorName,
+    startDate, expectedCompletionDate, currentYear,
+    aasn, // Australian Apprenticeships Support Network ref
+    hoursCompleted = 0, hoursRequired,
+    unitsCompleted = [], unitsRemaining = [],
+    state = "VIC", employerName, notes,
+  } = req.body;
+
+  if (!firstName || !lastName || !trade)
+    return res.status(400).json({ error: "firstName, lastName, trade required." });
+
+  const totalUnits = unitsCompleted.length + unitsRemaining.length;
+  const completionPercent = totalUnits > 0 ? Math.round((unitsCompleted.length / totalUnits) * 100) : 0;
+  const hoursPercent = hoursRequired ? Math.round((Number(hoursCompleted) / Number(hoursRequired)) * 100) : null;
+
+  const record = {
+    apprentice_id: sanitiseInput(apprenticeId || ""),
+    first_name: sanitiseInput(firstName),
+    last_name: sanitiseInput(lastName),
+    trade: sanitiseInput(trade),
+    training_contract: sanitiseInput(trainingContract || ""),
+    rto_name: sanitiseInput(rtoName || ""),
+    rto_code: sanitiseInput(rtoCode || ""),
+    supervisor_id: sanitiseInput(supervisorId || ""),
+    supervisor_name: sanitiseInput(supervisorName || ""),
+    start_date: startDate || null,
+    expected_completion_date: expectedCompletionDate || null,
+    current_year: Number(currentYear) || 1,
+    aasn: sanitiseInput(aasn || ""),
+    hours_completed: Number(hoursCompleted),
+    hours_required: Number(hoursRequired) || null,
+    hours_percent: hoursPercent,
+    units_completed: unitsCompleted.map(u => sanitiseInput(u)),
+    units_remaining: unitsRemaining.map(u => sanitiseInput(u)),
+    units_total: totalUnits,
+    completion_percent: completionPercent,
+    state: sanitiseInput(state),
+    employer_name: sanitiseInput(employerName || ""),
+    notes: sanitiseInput(notes || ""),
+    status: "CURRENT",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("apprentice_records")
+      .upsert({ ...record, apprentice_id: record.apprentice_id || `APP-${Date.now().toString(36)}` }, { onConflict: "apprentice_id" })
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, recordId: data.id, completionPercent, hoursPercent, ...record });
+  }
+
+  res.json({ success: true, recordId: null, completionPercent, hoursPercent, ...record, saved: false });
+});
+
+// GET /apprentice-record/:apprenticeId — Get apprentice progress record
+app.get("/apprentice-record/:apprenticeId", apiKeyAuth, async (req, res) => {
+  const { apprenticeId } = req.params;
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("apprentice_records")
+      .select("*")
+      .eq("apprentice_id", apprenticeId)
+      .single();
+
+    if (error) return res.status(404).json({ error: "Apprentice record not found." });
+    return res.json(data);
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /rpl-assessment — Record a Recognition of Prior Learning (RPL) assessment
+app.post("/rpl-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, assessorName, rtoName, qualificationCode, qualificationName,
+    trade, experienceYears, evidenceProvided = [],
+    unitsGranted = [], unitsDenied = [], unitsGap = [],
+    assessmentDate, outcomeDate, outcome,
+    notes,
+  } = req.body;
+
+  if (!contractorId || !qualificationCode) return res.status(400).json({ error: "contractorId and qualificationCode required." });
+
+  const validOutcomes = ["GRANTED", "PARTIAL_GRANT", "DENIED", "PENDING", "ADDITIONAL_EVIDENCE_REQUIRED"];
+  const out = (outcome || "PENDING").toUpperCase();
+
+  const totalUnits = unitsGranted.length + unitsDenied.length + unitsGap.length;
+  const grantPercent = totalUnits > 0 ? Math.round((unitsGranted.length / totalUnits) * 100) : null;
+
+  const record = {
+    contractor_id: sanitiseInput(contractorId),
+    assessor_name: sanitiseInput(assessorName || ""),
+    rto_name: sanitiseInput(rtoName || ""),
+    qualification_code: sanitiseInput(qualificationCode),
+    qualification_name: sanitiseInput(qualificationName || ""),
+    trade: sanitiseInput(trade || ""),
+    experience_years: Number(experienceYears) || null,
+    evidence_provided: evidenceProvided.map(e => sanitiseInput(e)),
+    units_granted: unitsGranted.map(u => sanitiseInput(u)),
+    units_denied: unitsDenied.map(u => sanitiseInput(u)),
+    units_gap: unitsGap.map(u => sanitiseInput(u)),
+    total_units: totalUnits,
+    grant_percent: grantPercent,
+    assessment_date: assessmentDate || null,
+    outcome_date: outcomeDate || null,
+    outcome: validOutcomes.includes(out) ? out : "PENDING",
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("rpl_assessments")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, assessmentId: data.id, outcome: out, grantPercent, ...record });
+  }
+
+  res.json({ success: true, assessmentId: null, outcome: out, grantPercent, ...record, saved: false });
+});
+
+// POST /ai-apprentice-progress-report — AI generates a progress report for an apprentice
+app.post("/ai-apprentice-progress-report", apiKeyAuth, async (req, res) => {
+  const {
+    apprenticeName, trade, currentYear, completionPercent,
+    hoursPercent, unitsCompleted = [], strengths = [],
+    areasForDevelopment = [], supervisorComments,
+    assessmentPeriod,
+  } = req.body;
+
+  if (!apprenticeName || !trade) return res.status(400).json({ error: "apprenticeName and trade required." });
+
+  const prompt = `You are an experienced trade trainer and assessor writing a formal apprentice progress report.
+
+Apprentice: ${sanitiseInput(apprenticeName)}
+Trade: ${sanitiseInput(trade)}
+Year of apprenticeship: ${currentYear || "Unknown"}
+Completion: ${completionPercent !== undefined ? `${completionPercent}%` : "Unknown"}
+Hours completed: ${hoursPercent !== undefined ? `${hoursPercent}%` : "Unknown"}
+Units completed: ${unitsCompleted.length}
+Assessment period: ${sanitiseInput(assessmentPeriod || "Current period")}
+Supervisor comments: ${sanitiseInput(supervisorComments || "Not provided")}
+Strengths noted: ${strengths.map(s => sanitiseInput(s)).join("; ") || "Not specified"}
+Areas for development: ${areasForDevelopment.map(a => sanitiseInput(a)).join("; ") || "Not specified"}
+
+Write a formal apprentice progress report. Return a JSON object with:
+- "reportTitle": formal title
+- "overallProgressRating": "EXCELLENT"|"SATISFACTORY"|"NEEDS_IMPROVEMENT"|"UNSATISFACTORY"
+- "progressSummary": 2-3 paragraph narrative
+- "strengthsNarrative": string highlighting positive performance
+- "developmentNarrative": string addressing areas needing improvement
+- "attitudeAndWorkEthic": string assessment
+- "safetyCompliance": string assessment
+- "technicalSkills": string assessment
+- "goalsForNextPeriod": array of specific, measurable goals
+- "supervisorRecommendation": "CONTINUE"|"ADDITIONAL_SUPPORT"|"REVIEW_REQUIRED"
+- "closingStatement": professional closing`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, apprenticeName, trade, currentYear, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    const rating = completionPercent >= 90 ? "EXCELLENT" : completionPercent >= 70 ? "SATISFACTORY" : "NEEDS_IMPROVEMENT";
+    return res.json({
+      reportTitle: `Apprentice Progress Report — ${sanitiseInput(apprenticeName)}`,
+      overallProgressRating: rating,
+      progressSummary: `${sanitiseInput(apprenticeName)} is progressing through their ${sanitiseInput(trade)} apprenticeship with ${completionPercent !== undefined ? completionPercent + "%" : "ongoing"} completion.`,
+      strengthsNarrative: strengths.length > 0 ? `Key strengths include: ${strengths.join(", ")}.` : "Ongoing assessment required.",
+      developmentNarrative: areasForDevelopment.length > 0 ? `Areas for continued development: ${areasForDevelopment.join(", ")}.` : "Continue to progress through program.",
+      attitudeAndWorkEthic: sanitiseInput(supervisorComments || "To be assessed by supervisor."),
+      safetyCompliance: "Safety compliance is monitored and reinforced continuously.",
+      technicalSkills: `Technical skills are developing in line with year ${currentYear || "progress"} expectations.`,
+      goalsForNextPeriod: ["Complete outstanding units", "Increase workplace hours", "Seek additional mentoring"],
+      supervisorRecommendation: rating === "UNSATISFACTORY" ? "REVIEW_REQUIRED" : "CONTINUE",
+      closingStatement: "We remain committed to supporting this apprentice's development and success in the trade.",
+      apprenticeName, trade, currentYear, generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
