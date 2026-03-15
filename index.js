@@ -44883,6 +44883,301 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /payment-claim — Submit a progress payment claim (Building and Construction Industry Security of Payment Act 2002 Vic)
+app.post("/payment-claim", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, contractorName, respondentName, contractRef,
+    claimNumber, claimDate, referenceDate,
+    claimedAmount, gst, descriptionOfWorks,
+    progressPercent, variationsIncluded, retentionClaimed,
+    supportingDocuments, contractType, notes,
+  } = req.body;
+
+  if (!projectId || !contractorName || !respondentName || !claimedAmount || !claimDate) {
+    return res.status(400).json({ error: "projectId, contractorName, respondentName, claimedAmount, and claimDate are required." });
+  }
+
+  const claimAmt = Number(claimedAmount);
+  if (isNaN(claimAmt) || claimAmt <= 0) {
+    return res.status(400).json({ error: "claimedAmount must be a positive number." });
+  }
+
+  const gstAmt = gst !== undefined ? Number(gst) : Math.round(claimAmt * 0.1 * 100) / 100;
+  const totalWithGst = Math.round((claimAmt + gstAmt) * 100) / 100;
+
+  // SOPA Victoria due dates
+  // Reference date triggers the claim window. Payment schedule due within 10 business days for non-residential, 15 for residential
+  const isResidential = (contractType || "").toLowerCase().includes("residential");
+  const paymentScheduleDueDays = isResidential ? 15 : 10;
+  const paymentDueDays = isResidential ? 15 : 15; // s16 — 15 business days after claim if no schedule
+
+  const claimDateObj = new Date(claimDate);
+  // Approximate business days (not accounting for public holidays — production would need a calendar)
+  const addBusinessDays = (date, days) => {
+    const result = new Date(date);
+    let added = 0;
+    while (added < days) {
+      result.setDate(result.getDate() + 1);
+      const day = result.getDay();
+      if (day !== 0 && day !== 6) added++;
+    }
+    return result.toISOString().split("T")[0];
+  };
+
+  const paymentScheduleDueDate = addBusinessDays(claimDateObj, paymentScheduleDueDays);
+  const paymentDueDate = addBusinessDays(claimDateObj, paymentDueDays);
+  const adjudicationWindowEndDate = addBusinessDays(claimDateObj, 10); // s18 — 10 business days to apply for adjudication if schedule served
+
+  const ref = `PC-${sanitiseInput(String(projectId), 20)}-${String(claimNumber || Date.now().toString(36)).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    contractorName: sanitiseInput(contractorName, 150),
+    respondentName: sanitiseInput(respondentName, 150),
+    contractRef: sanitiseInput(contractRef || "", 80),
+    claimNumber: claimNumber || ref,
+    claimDate,
+    referenceDate: referenceDate || claimDate,
+    claimedAmount: claimAmt,
+    gst: gstAmt,
+    totalWithGst,
+    descriptionOfWorks: sanitiseInput(descriptionOfWorks || "", 500),
+    progressPercent: progressPercent ?? null,
+    variationsIncluded: !!variationsIncluded,
+    retentionClaimed: retentionClaimed || null,
+    supportingDocuments: (supportingDocuments || []).map(d => sanitiseInput(String(d), 100)).slice(0, 20),
+    contractType: sanitiseInput(contractType || "Commercial", 60),
+    status: "SUBMITTED",
+    paymentScheduleDueDate,
+    paymentDueDate,
+    adjudicationWindowEndDate,
+    notes: sanitiseInput(notes || "", 500),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("payment_claims").insert(record);
+      if (error) console.error("Payment claim insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Payment claim DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    claimedAmount: claimAmt,
+    gst: gstAmt,
+    totalWithGst,
+    sopaKeyDates: {
+      claimDate,
+      paymentScheduleDueDate,
+      paymentDueDate,
+      adjudicationWindowEndDate,
+      note: `Respondent must serve payment schedule within ${paymentScheduleDueDays} business days or become liable for full claimed amount.`,
+    },
+    message: `Payment claim ${ref} submitted for $${totalWithGst.toFixed(2)} (inc. GST). Payment schedule due from respondent by ${paymentScheduleDueDate}.`,
+    saved,
+    record,
+  });
+});
+
+// POST /payment-schedule — Respond to a payment claim with a payment schedule (SOPA s14)
+app.post("/payment-schedule", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, paymentClaimRef, respondentName, claimantName,
+    scheduleDate, scheduledAmount, withheldAmount,
+    withheldReasons, defects, variations, liquidatedDamages,
+    set_offs, notes,
+  } = req.body;
+
+  if (!projectId || !paymentClaimRef || !respondentName || scheduleDate === undefined) {
+    return res.status(400).json({ error: "projectId, paymentClaimRef, respondentName, and scheduleDate are required." });
+  }
+
+  const scheduledAmt = Number(scheduledAmount || 0);
+  const withheldAmt = Number(withheldAmount || 0);
+
+  const withholdingItems = [];
+  if (defects) withholdingItems.push({ reason: "Defects", amount: sanitiseInput(String(defects), 200) });
+  if (variations) withholdingItems.push({ reason: "Variations in dispute", amount: sanitiseInput(String(variations), 200) });
+  if (liquidatedDamages) withholdingItems.push({ reason: "Liquidated damages", amount: sanitiseInput(String(liquidatedDamages), 200) });
+  if (Array.isArray(set_offs)) {
+    set_offs.slice(0, 10).forEach(s => withholdingItems.push({ reason: sanitiseInput(String(s.reason || "Set-off"), 150), amount: sanitiseInput(String(s.amount || ""), 100) }));
+  }
+  if (Array.isArray(withheldReasons)) {
+    withheldReasons.slice(0, 10).forEach(r => withholdingItems.push({ reason: sanitiseInput(String(r), 200), amount: null }));
+  }
+
+  // SOPA compliance warning — schedule must state reasons for each withholding
+  const complianceWarnings = [];
+  if (withheldAmt > 0 && withholdingItems.length === 0) {
+    complianceWarnings.push("WARNING: SOPA s14(3) requires reasons for each amount withheld — add withheldReasons or specific withholding items.");
+  }
+
+  const ref = `PS-${sanitiseInput(String(paymentClaimRef), 30)}-${Date.now().toString(36).toUpperCase()}`;
+
+  // Adjudication window for claimant: 10 business days after receiving schedule
+  const schedDateObj = new Date(scheduleDate);
+  const addBDays = (d, n) => { const r = new Date(d); let a = 0; while (a < n) { r.setDate(r.getDate() + 1); if (r.getDay() !== 0 && r.getDay() !== 6) a++; } return r.toISOString().split("T")[0]; };
+  const claimantAdjudicationDeadline = addBDays(schedDateObj, 10);
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    paymentClaimRef: sanitiseInput(paymentClaimRef, 60),
+    respondentName: sanitiseInput(respondentName, 150),
+    claimantName: sanitiseInput(claimantName || "", 150),
+    scheduleDate,
+    scheduledAmount: scheduledAmt,
+    withheldAmount: withheldAmt,
+    withholdingItems,
+    complianceWarnings,
+    claimantAdjudicationDeadline,
+    notes: sanitiseInput(notes || "", 500),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("payment_schedules").insert(record);
+      if (error) console.error("Payment schedule insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Payment schedule DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    scheduledAmount: scheduledAmt,
+    withheldAmount: withheldAmt,
+    withholdingItems,
+    complianceWarnings,
+    sopaKeyDates: {
+      scheduleDate,
+      claimantAdjudicationDeadline,
+      note: `Claimant has until ${claimantAdjudicationDeadline} to apply for adjudication (10 business days from schedule date).`,
+    },
+    message: complianceWarnings.length > 0
+      ? complianceWarnings[0]
+      : `Payment schedule issued. Scheduled amount: $${scheduledAmt.toFixed(2)}.`,
+    saved,
+    record,
+  });
+});
+
+// POST /ai-sopa-advice — AI advises on SOPA rights and obligations for a given payment dispute
+app.post("/ai-sopa-advice", apiKeyAuth, async (req, res) => {
+  const {
+    role, situationDescription, claimedAmount, scheduledAmount,
+    paymentScheduleServed, claimDate, scheduleDate,
+    hasWrittenContract, contractType, disputeType, notes,
+  } = req.body;
+
+  if (!role || !situationDescription) {
+    return res.status(400).json({ error: "role (claimant/respondent) and situationDescription are required." });
+  }
+
+  const sanitisedRole = sanitiseInput(role, 40);
+  const sanitisedDesc = sanitiseInput(situationDescription, 600);
+
+  const prompt = `You are a construction law specialist with expertise in the Building and Construction Industry Security of Payment Act 2002 (Victoria) (SOPA).
+
+A ${sanitisedRole} is seeking advice on a payment dispute:
+
+SITUATION: ${sanitisedDesc}
+
+DETAILS:
+- Role: ${sanitisedRole}
+- Claimed amount: ${claimedAmount ? `$${claimedAmount}` : "Not specified"}
+- Scheduled amount: ${scheduledAmount !== undefined ? `$${scheduledAmount}` : "Not specified"}
+- Payment schedule served: ${paymentScheduleServed ? "Yes" : "No"}
+- Claim date: ${claimDate || "Not specified"}
+- Schedule date: ${scheduleDate || "Not specified"}
+- Written contract: ${hasWrittenContract ? "Yes" : "No"}
+- Contract type: ${sanitiseInput(contractType || "Not specified", 60)}
+- Dispute type: ${sanitiseInput(disputeType || "Non-payment", 60)}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Provide practical SOPA advice. Reference specific sections of the Act (e.g., s9, s14, s17, s18, s22).
+
+Respond ONLY with a JSON object:
+{
+  "sopaApplies": boolean,
+  "keyRights": [string],
+  "keyObligations": [string],
+  "immediateActions": [{"action": string, "deadline": string, "sopaSection": string}],
+  "adjudicationAvailable": boolean,
+  "adjudicationDeadline": string,
+  "recommendedNextStep": string,
+  "riskAssessment": "LOW|MEDIUM|HIGH",
+  "caveats": [string],
+  "summary": string (2-3 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1000,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      disclaimer: "This is general information only and does not constitute legal advice. Consult a construction lawyer for advice specific to your situation.",
+      sopaApplies: parsed.sopaApplies ?? true,
+      keyRights: parsed.keyRights || [],
+      keyObligations: parsed.keyObligations || [],
+      immediateActions: parsed.immediateActions || [],
+      adjudicationAvailable: parsed.adjudicationAvailable ?? false,
+      adjudicationDeadline: parsed.adjudicationDeadline || "",
+      recommendedNextStep: parsed.recommendedNextStep || "",
+      riskAssessment: parsed.riskAssessment || "MEDIUM",
+      caveats: parsed.caveats || [],
+      summary: parsed.summary || "Review your SOPA rights and obligations with a construction lawyer.",
+    });
+  } catch (e) {
+    console.error("AI SOPA advice error:", e.message);
+    return res.json({
+      success: true,
+      disclaimer: "This is general information only and does not constitute legal advice. Consult a construction lawyer for advice specific to your situation.",
+      sopaApplies: true,
+      keyRights: [
+        "Right to serve a payment claim (s9) on each reference date",
+        "Right to apply for adjudication if payment schedule withholds amounts without valid reasons (s18)",
+        "Right to suspend works after 2 business days notice if payment not received (s24)",
+      ],
+      keyObligations: [
+        "Payment claim must be in writing and identify the relevant construction work (s13)",
+        "Respondent must serve payment schedule within 10–15 business days (s14)",
+        "Adjudication application must be made within strict time limits",
+      ],
+      immediateActions: [
+        { action: "Document all payment claim details and service method", deadline: "Immediately", sopaSection: "s13" },
+        { action: "If no payment schedule received, send formal written demand", deadline: "After payment schedule due date", sopaSection: "s14" },
+      ],
+      adjudicationAvailable: true,
+      adjudicationDeadline: "Typically 10 business days after receiving payment schedule or payment due date expiry",
+      recommendedNextStep: "Seek advice from a construction lawyer or the Master Builders Association of Victoria.",
+      riskAssessment: "MEDIUM",
+      caveats: ["Time limits under SOPA are strict — missing a deadline can extinguish your rights", "Seek legal advice before suspending works"],
+      summary: "SOPA provides significant payment rights for contractors. Act quickly within the prescribed time limits and consider engaging a specialist construction lawyer.",
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
