@@ -45985,6 +45985,231 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /dilapidation-survey — Record pre or post-construction condition of a neighboring property
+app.post("/dilapidation-survey", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectAddress,
+    surveyType, surveyDate,
+    subjectPropertyAddress, subjectOwnerName, subjectOwnerContact,
+    surveyorName, surveyorCompany,
+    distanceFromWorksM, structureType, constructionYear,
+    conditionItems, photoReferences,
+    vibrationSensitive, heritageProtected,
+    ownerPresent, ownerSignature, notes,
+  } = req.body;
+
+  if (!projectId || !subjectPropertyAddress || !surveyType || !surveyDate) {
+    return res.status(400).json({ error: "projectId, subjectPropertyAddress, surveyType, and surveyDate are required." });
+  }
+
+  const validTypes = ["PRE_CONSTRUCTION", "POST_CONSTRUCTION", "INTERIM"];
+  const resolvedType = validTypes.includes((surveyType || "").toUpperCase()) ? surveyType.toUpperCase() : "PRE_CONSTRUCTION";
+
+  const sanitisedSubjectAddress = sanitiseInput(subjectPropertyAddress, 300);
+  const sanitisedSurveyor = sanitiseInput(surveyorName || "", 120);
+
+  // Default condition items if not provided
+  const processedItems = Array.isArray(conditionItems)
+    ? conditionItems.slice(0, 50).map(item => ({
+        element: sanitiseInput(String(item.element || ""), 100),
+        location: sanitiseInput(String(item.location || ""), 100),
+        condition: sanitiseInput(String(item.condition || ""), 60),
+        description: sanitiseInput(String(item.description || ""), 300),
+        photoRefs: (item.photoRefs || []).map(p => sanitiseInput(String(p), 60)).slice(0, 5),
+        crackWidthMm: item.crackWidthMm || null,
+        crackLength: item.crackLength || null,
+      }))
+    : [];
+
+  // Identify pre-existing damage items
+  const damageItems = processedItems.filter(i =>
+    ["POOR", "DAMAGED", "CRACKED", "DEFECTIVE"].some(kw => i.condition.toUpperCase().includes(kw))
+  );
+
+  const ref = `DIL-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectAddress: sanitiseInput(projectAddress || "", 300),
+    surveyType: resolvedType,
+    surveyDate,
+    subject: {
+      address: sanitisedSubjectAddress,
+      ownerName: sanitiseInput(subjectOwnerName || "", 150),
+      ownerContact: sanitiseInput(subjectOwnerContact || "", 100),
+      distanceFromWorksM: distanceFromWorksM || null,
+      structureType: sanitiseInput(structureType || "", 80),
+      constructionYear: constructionYear || null,
+      vibrationSensitive: !!vibrationSensitive,
+      heritageProtected: !!heritageProtected,
+    },
+    surveyor: {
+      name: sanitisedSurveyor,
+      company: sanitiseInput(surveyorCompany || "", 150),
+    },
+    conditionItems: processedItems,
+    damageItemCount: damageItems.length,
+    photoReferences: (photoReferences || []).map(p => sanitiseInput(String(p), 100)).slice(0, 30),
+    ownerPresent: !!ownerPresent,
+    ownerSignature: !!ownerSignature,
+    notes: sanitiseInput(notes || "", 500),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("dilapidation_surveys").insert(record);
+      if (error) console.error("Dilapidation survey insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Dilapidation survey DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    surveyType: resolvedType,
+    conditionItemCount: processedItems.length,
+    damageItemCount: damageItems.length,
+    message: resolvedType === "PRE_CONSTRUCTION"
+      ? `Pre-construction dilapidation survey recorded for ${sanitisedSubjectAddress}. ${damageItems.length} pre-existing damage items noted.`
+      : `Post-construction dilapidation survey recorded for ${sanitisedSubjectAddress}.`,
+    saved,
+    record,
+  });
+});
+
+// GET /dilapidation-survey/:projectId — List dilapidation surveys for a project
+app.get("/dilapidation-survey/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { type } = req.query;
+
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  try {
+    let query = supabaseAdmin
+      .from("dilapidation_surveys")
+      .select("*")
+      .eq("projectId", sanitiseInput(String(projectId), 80))
+      .order("surveyDate", { ascending: false });
+
+    if (type) query = query.eq("surveyType", sanitiseInput(String(type), 30).toUpperCase());
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const records = data || [];
+    const preCount = records.filter(r => r.surveyType === "PRE_CONSTRUCTION").length;
+    const postCount = records.filter(r => r.surveyType === "POST_CONSTRUCTION").length;
+    const heritageCount = records.filter(r => r.subject?.heritageProtected).length;
+
+    return res.json({
+      projectId,
+      total: records.length,
+      preConstructionCount: preCount,
+      postConstructionCount: postCount,
+      heritagePropertiesCount: heritageCount,
+      surveys: records,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to retrieve dilapidation surveys.", detail: e.message });
+  }
+});
+
+// POST /ai-dilapidation-comparison — AI compares pre and post-construction dilapidation surveys
+app.post("/ai-dilapidation-comparison", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, projectDescription,
+    preConstructionCondition, postConstructionCondition,
+    worksCompleted, vibrationRecorded, settlementObserved, notes,
+  } = req.body;
+
+  if (!propertyAddress || !preConstructionCondition || !postConstructionCondition) {
+    return res.status(400).json({ error: "propertyAddress, preConstructionCondition, and postConstructionCondition are required." });
+  }
+
+  const sanitisedAddress = sanitiseInput(propertyAddress, 300);
+  const sanitisedPre = sanitiseInput(String(preConstructionCondition), 800);
+  const sanitisedPost = sanitiseInput(String(postConstructionCondition), 800);
+
+  const prompt = `You are a forensic building inspector assessing potential construction damage claims in Victoria, Australia.
+
+Compare the following pre and post-construction condition reports for a neighboring property:
+
+PROPERTY: ${sanitisedAddress}
+PROJECT: ${sanitiseInput(projectDescription || "Adjacent construction works", 200)}
+WORKS COMPLETED: ${sanitiseInput(worksCompleted || "Not specified", 200)}
+VIBRATION RECORDED: ${vibrationRecorded ? "Yes" : "No"}
+SETTLEMENT OBSERVED: ${settlementObserved ? "Yes" : "No"}
+
+PRE-CONSTRUCTION CONDITION:
+${sanitisedPre}
+
+POST-CONSTRUCTION CONDITION:
+${sanitisedPost}
+${notes ? `\nINSPECTOR NOTES: ${sanitiseInput(notes, 200)}` : ""}
+
+Assess whether any changes represent construction-induced damage per Australian building standards (AS 3798, AS 2870, DIN 4150-3 vibration limits).
+
+Respond ONLY with a JSON object:
+{
+  "newDamageFound": boolean,
+  "damageItems": [{"element": string, "preCondition": string, "postCondition": string, "likelyCause": string, "constructionRelated": boolean, "severity": "MINOR|MODERATE|MAJOR", "repairEstimate": string}],
+  "overallAssessment": "NO_CHANGE|MINOR_CHANGE|SIGNIFICANT_CHANGE|MAJOR_DAMAGE",
+  "constructionRelatedDamage": boolean,
+  "contributingFactors": [string],
+  "recommendedRemediation": [string],
+  "insuranceNotificationRecommended": boolean,
+  "engineeringAssessmentRequired": boolean,
+  "summary": string (3-4 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1000,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      propertyAddress: sanitisedAddress,
+      newDamageFound: parsed.newDamageFound ?? false,
+      damageItems: parsed.damageItems || [],
+      overallAssessment: parsed.overallAssessment || "NO_CHANGE",
+      constructionRelatedDamage: parsed.constructionRelatedDamage ?? false,
+      contributingFactors: parsed.contributingFactors || [],
+      recommendedRemediation: parsed.recommendedRemediation || [],
+      insuranceNotificationRecommended: parsed.insuranceNotificationRecommended ?? false,
+      engineeringAssessmentRequired: parsed.engineeringAssessmentRequired ?? false,
+      summary: parsed.summary || "Dilapidation comparison complete.",
+    });
+  } catch (e) {
+    console.error("AI dilapidation comparison error:", e.message);
+    return res.json({
+      success: true,
+      propertyAddress: sanitisedAddress,
+      newDamageFound: false,
+      damageItems: [],
+      overallAssessment: "NO_CHANGE",
+      constructionRelatedDamage: false,
+      contributingFactors: [],
+      recommendedRemediation: ["Engage a structural or building engineer for independent assessment if damage is claimed"],
+      insuranceNotificationRecommended: false,
+      engineeringAssessmentRequired: false,
+      summary: "Automated comparison unavailable. Manual comparison of pre and post-construction reports recommended. Engage a building engineer if damage claims are made.",
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
