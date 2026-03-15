@@ -69738,6 +69738,405 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /drug-alcohol-test-record — Drug and alcohol testing record per industry standards and OHS Act 2004 (Vic)
+app.post("/drug-alcohol-test-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    testDate,
+    testTime,
+    testerName,
+    testerAccreditation,
+    workerName,
+    workerEmployer,
+    workerRole,
+    testType,             // pre-access | random | post-incident | for-cause | return-to-work
+    testMethod,           // breath-alcohol | oral-fluid | urine | blood
+    alcoholResult_BAC,    // Blood Alcohol Concentration e.g. "0.00"
+    alcoholResult_Pass,   // true | false
+    alcoholLimit_BAC,     // site policy limit e.g. "0.00" or "0.02"
+    drugScreenResult,     // negative | non-negative | positive | inconclusive
+    substancesScreened,   // array of { substance, result }
+    // e.g. Cannabis, Opiates, Cocaine, Amphetamines, Benzodiazepines, MDMA
+    confirmationTestRequired, // if initial non-negative
+    confirmationTestDate,
+    confirmationTestResult,
+    fitnessForDutyDecision,   // fit | unfit | restricted-duties
+    supervisorNotified,
+    workerSentHome,
+    incidentRelated,
+    incidentId,
+    policyVersion,
+    chainOfCustodyMaintained,  // critical for legal defensibility
+    photos,                    // optional — test device photo
+    notes,
+  } = req.body;
+
+  const bac = parseFloat(alcoholResult_BAC) || 0;
+  const limit = parseFloat(alcoholLimit_BAC) || 0;
+
+  const violations = [];
+
+  // Alcohol above limit
+  if (limit > 0 && bac > limit) {
+    violations.push(
+      `BAC ${bac} is above site limit ${limit} — worker must not perform safety-critical duties`
+    );
+  } else if (bac > 0 && !limit) {
+    violations.push(`Positive BAC reading ${bac} — verify against site drug and alcohol policy`);
+  }
+
+  // Non-negative drug result
+  if (drugScreenResult === "non-negative" || drugScreenResult === "positive") {
+    violations.push(
+      `Drug screen ${drugScreenResult} — confirmation test required. Worker must stand down from safety-critical duties`
+    );
+  }
+
+  // Chain of custody
+  if (!chainOfCustodyMaintained) {
+    violations.push("Chain of custody not maintained — result may not be legally defensible for employment action");
+  }
+
+  const fitnessDecision = violations.length > 0 ? "unfit" : (fitnessForDutyDecision || "fit");
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    test_date: testDate,
+    test_time: testTime,
+    tester_name: sanitiseInput(testerName),
+    tester_accreditation: sanitiseInput(testerAccreditation),
+    worker_name: sanitiseInput(workerName),
+    worker_employer: sanitiseInput(workerEmployer),
+    worker_role: sanitiseInput(workerRole),
+    test_type: sanitiseInput(testType),
+    test_method: sanitiseInput(testMethod),
+    alcohol_result_bac: alcoholResult_BAC,
+    alcohol_result_pass: alcoholResult_Pass,
+    alcohol_limit_bac: alcoholLimit_BAC,
+    drug_screen_result: sanitiseInput(drugScreenResult),
+    substances_screened: substancesScreened || [],
+    confirmation_test_required: confirmationTestRequired,
+    confirmation_test_date: confirmationTestDate,
+    confirmation_test_result: sanitiseInput(confirmationTestResult),
+    fitness_for_duty_decision: fitnessDecision,
+    supervisor_notified: supervisorNotified,
+    worker_sent_home: workerSentHome,
+    incident_related: incidentRelated,
+    incident_id: sanitiseInput(incidentId),
+    policy_version: sanitiseInput(policyVersion),
+    chain_of_custody_maintained: chainOfCustodyMaintained,
+    violations,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("drug_alcohol_test_records")
+      .insert(record);
+    if (dbErr) console.error("DB error /drug-alcohol-test-record:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Drug and alcohol test record saved",
+    testType: sanitiseInput(testType),
+    fitnessForDutyDecision: fitnessDecision,
+    alcoholBAC: bac,
+    drugScreenResult: sanitiseInput(drugScreenResult),
+    violationsCount: violations.length,
+    violations,
+    confirmationRequired: drugScreenResult === "non-negative",
+    applicableLegislation: [
+      "OHS Act 2004 (Vic) s.21 (employer duty)",
+      "Australian Standard AS/NZS 4760 (oral fluid testing)",
+      "AS/NZS 3547 (breath alcohol testing)",
+      "National Transport Commission HVNL Chain of Responsibility",
+    ],
+    saved,
+  });
+});
+
+// POST /air-compressor-inspection — Air compressor and pressure vessel inspection per AS 3788 / AS 1210
+app.post("/air-compressor-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    facilityName,
+    equipmentId,
+    manufacturer,
+    model,
+    serialNumber,
+    inspectionDate,
+    inspector,
+    inspectorLicence,
+    equipmentType,        // reciprocating | rotary-screw | centrifugal | compressor | air-receiver
+    designPressure_kPa,
+    testPressure_kPa,
+    workingPressure_kPa,
+    receiverVolume_L,
+    registrationNumber,   // AS 3788 requires registration for certain vessels
+    lastInspectionDate,
+    nextInspectionDue,
+    inspectionType,       // external | internal | hydraulic-test | ultrasonic | annual
+    pressureReliefValvePresent,
+    prvSetPressure_kPa,
+    prvTestedDate,
+    prvBlownDown,         // quarterly blow-down test
+    pressureGaugePrecise,
+    pressureGaugeCalibrated,
+    safetyValveWorking,
+    drainValveWorking,
+    automaticDrainWorking,
+    oilLevelAdequate,
+    beltDriveGuardsIn_place,
+    pipeworkCondition,    // good | corroded | damaged | leaking
+    shellCondition,       // good | corroded | pitting | crack | distortion
+    weldCondition,
+    minimumWallThickness_mm,
+    measuredWallThickness_mm,
+    corrosionAllowance_mm,
+    criticalDefects,      // array of strings
+    overallResult,        // FIT-FOR-SERVICE | TAKE-OUT-OF-SERVICE | REPAIR-REQUIRED
+    photos,
+    notes,
+  } = req.body;
+
+  const failures = [];
+
+  // Pressure relief valve checks
+  if (!pressureReliefValvePresent) {
+    failures.push("Pressure relief valve absent — mandatory safety device per AS 1210");
+  }
+  if (!prvTestedDate) {
+    failures.push("PRV test date not recorded — annual testing required per AS 3788");
+  }
+
+  // Working pressure vs design
+  const working = parseFloat(workingPressure_kPa) || 0;
+  const design = parseFloat(designPressure_kPa) || 0;
+  if (design > 0 && working > design) {
+    failures.push(`Working pressure ${working} kPa exceeds design pressure ${design} kPa`);
+  }
+
+  // Wall thickness
+  const measured = parseFloat(measuredWallThickness_mm) || 0;
+  const minimum = parseFloat(minimumWallThickness_mm) || 0;
+  const corAllowance = parseFloat(corrosionAllowance_mm) || 0;
+  if (minimum > 0 && measured < (minimum - corAllowance)) {
+    failures.push(
+      `Measured wall thickness ${measured} mm is below minimum ${minimum - corAllowance} mm (including corrosion allowance)`
+    );
+  }
+
+  // Shell defects
+  if (shellCondition === "crack") {
+    failures.push("Shell crack detected — immediate decommission required — catastrophic failure risk");
+  }
+  if (shellCondition === "distortion") {
+    failures.push("Shell distortion detected — do not pressurise until engineer assessment");
+  }
+
+  // Pipework leaking
+  if (pipeworkCondition === "leaking") {
+    failures.push("Pipework leak detected — de-pressurise and repair before use");
+  }
+
+  // Guards
+  if (!beltDriveGuardsIn_place) {
+    failures.push("Belt drive guards not in place — entanglement risk");
+  }
+
+  // Custom critical defects
+  if (Array.isArray(criticalDefects)) criticalDefects.forEach((d) => failures.push(d));
+
+  const result = failures.length > 0 ? "TAKE-OUT-OF-SERVICE" : (overallResult || "FIT-FOR-SERVICE");
+
+  if (result === "TAKE-OUT-OF-SERVICE") {
+    return res.status(422).json({
+      error: "Air compressor/pressure vessel — critical defects — take out of service",
+      failures,
+      immediateActions: [
+        "De-pressurise vessel immediately",
+        "Isolate and lock out energy supply",
+        "Engage AS 3788 competent person for engineering assessment",
+        "Do not return to service until all defects rectified",
+        "Notifiable plant — notify WorkSafe Victoria if incident occurred",
+      ],
+      applicableStandards: [
+        "AS 1210",
+        "AS 3788",
+        "AS 1271",
+        "OHS Regulations 2017 (Vic) Part 5.1",
+      ],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    facility_name: sanitiseInput(facilityName),
+    equipment_id: sanitiseInput(equipmentId),
+    manufacturer: sanitiseInput(manufacturer),
+    model: sanitiseInput(model),
+    serial_number: sanitiseInput(serialNumber),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    equipment_type: sanitiseInput(equipmentType),
+    design_pressure_kpa: designPressure_kPa,
+    test_pressure_kpa: testPressure_kPa,
+    working_pressure_kpa: workingPressure_kPa,
+    receiver_volume_l: receiverVolume_L,
+    registration_number: sanitiseInput(registrationNumber),
+    next_inspection_due: nextInspectionDue,
+    pressure_relief_valve_present: pressureReliefValvePresent,
+    prv_set_pressure_kpa: prvSetPressure_kPa,
+    prv_tested_date: prvTestedDate,
+    shell_condition: sanitiseInput(shellCondition),
+    minimum_wall_thickness_mm: minimumWallThickness_mm,
+    measured_wall_thickness_mm: measuredWallThickness_mm,
+    overall_result: result,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("air_compressor_inspections")
+      .insert(record);
+    if (dbErr) console.error("DB error /air-compressor-inspection:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Air compressor/pressure vessel inspection recorded — fit for service",
+    overallResult: result,
+    workingPressure_kPa: working,
+    designPressure_kPa: design,
+    nextInspectionDue: nextInspectionDue || null,
+    applicableStandards: ["AS 1210", "AS 3788", "AS 1271", "OHS Regulations 2017 (Vic)"],
+    saved,
+  });
+});
+
+// POST /ai-drug-alcohol-policy-assessment — AI assesses D&A testing compliance, risk, and policy adequacy
+app.post("/ai-drug-alcohol-policy-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    industryType,         // construction | mining | transport | manufacturing | healthcare
+    projectType,
+    existingPolicy,       // true | false
+    testingScope,         // all-workers | safety-critical | post-incident | random
+    testingMethod,
+    alcoholLimit_BAC,
+    consequenceFramework, // zero-tolerance | stepped-response | rehabilitation-focus
+    positiveTestsLastYear,
+    incidentHistory,
+    contractorCoverage,
+    chainOfCustody,
+    notes,
+  } = req.body;
+
+  const systemPrompt = `You are an occupational health specialist and workplace drug and alcohol policy expert with 20 years experience in Australian construction and mining sectors. Assess drug and alcohol management policy adequacy per OHS Act 2004 (Vic), industry standards, and Safe Work Australia guidance.
+
+Assess:
+1. Policy scope adequacy — covers all safety-critical roles, contractors, visitors
+2. Testing method compliance — AS/NZS 4760 (oral fluid), AS/NZS 3547 (breath), chain of custody
+3. Consequence framework — legal defensibility, natural justice, rehabilitation
+4. Post-incident testing program — mandatory trigger criteria
+5. Contractor management — ensuring subcontractor compliance
+6. Industry benchmarks — construction: typically zero-tolerance BAC; mining: often 0.00
+7. Confidentiality and worker rights obligations
+8. Return-to-work program for positive tests
+
+Respond with JSON: { "policyAdequacy": "inadequate|basic|adequate|comprehensive", "gapAreas": [], "testingScopeRisk": "low|medium|high", "legalRisk": "low|medium|high", "chainOfCustodyRequirements": [], "recommendedImprovements": [], "industryBenchmark": "string", "consequenceFrameworkRecommendation": "string", "contractorManagementGap": boolean, "rehabilitationProgramRecommended": boolean, "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Industry type: ${industryType || "construction"}
+Project type: ${projectType || "not specified"}
+Existing policy: ${existingPolicy || "unknown"}
+Testing scope: ${testingScope || "not specified"}
+Testing method: ${testingMethod || "not specified"}
+Alcohol limit (BAC): ${alcoholLimit_BAC || "not specified"}
+Consequence framework: ${consequenceFramework || "not specified"}
+Positive tests last year: ${positiveTestsLastYear || "unknown"}
+Incident history: ${incidentHistory || "none"}
+Contractor coverage: ${contractorCoverage || "unknown"}
+Chain of custody: ${chainOfCustody || "unknown"}
+Notes: ${notes || "none"}`,
+    },
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-drug-alcohol-policy-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        policyAdequacy: "basic",
+        gapAreas: [
+          "Contractor and subcontractor compliance monitoring",
+          "Chain of custody documentation for legal defensibility",
+          "Post-incident mandatory testing trigger criteria",
+          "Rehabilitation and return-to-work pathway",
+        ],
+        testingScopeRisk: "medium",
+        legalRisk: "medium",
+        chainOfCustodyRequirements: [
+          "Collect and seal sample in worker's presence",
+          "Unique identifier on sample and request form",
+          "Continuous possession documentation from collection to lab",
+          "NATA-accredited laboratory for confirmation tests",
+        ],
+        recommendedImprovements: [
+          "Extend policy to cover all contractors and visitors",
+          "Implement random testing programme with documented selection process",
+          "Add mandatory post-incident testing trigger for all notifiable incidents",
+          "Provide Employee Assistance Program (EAP) referral for positive results",
+        ],
+        industryBenchmark:
+          "Construction industry standard is typically zero-tolerance (0.00% BAC). Mining: 0.00%. Some civil works: 0.02% BAC.",
+        consequenceFrameworkRecommendation:
+          "Stepped-response is legally defensible and supports rehabilitation: 1st positive = immediate stand-down + EAP referral; 2nd positive = formal warning; 3rd positive = termination.",
+        contractorManagementGap: true,
+        rehabilitationProgramRecommended: true,
+        applicableStandards: [
+          "OHS Act 2004 (Vic)",
+          "AS/NZS 4760",
+          "AS/NZS 3547",
+          "Safe Work Australia Drug and Alcohol Guidance",
+          "National Transport Commission HVNL",
+        ],
+        recommendation:
+          "Develop comprehensive D&A policy covering all site personnel. Implement random testing with documented selection. Establish EAP for positive results. Ensure chain of custody for all samples.",
+        summary:
+          "D&A policy requires improvement to cover contractors, ensure chain of custody, and provide rehabilitation pathway. Random testing with proper chain of custody is the most effective deterrent.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
