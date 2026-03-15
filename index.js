@@ -11010,6 +11010,284 @@ app.post("/subcontractor-brief", (req, res) => {
   return res.json(brief);
 });
 
+// ── GET /public-holidays ──────────────────────────────────────────────────────
+// Returns Victorian public holidays for the current and next year.
+// Used to calculate certificate lodgement deadlines accurately (business days).
+app.get("/public-holidays", (req, res) => {
+  const year = parseInt(req.query.year) || new Date().getFullYear();
+
+  if (year < 2024 || year > 2030) {
+    return res.status(400).json({ error: "Year must be between 2024 and 2030." });
+  }
+
+  // Static Victorian public holiday dates (approximate — verify at business.vic.gov.au)
+  const VIC_HOLIDAYS = {
+    2024: [
+      { name: "New Year's Day",                 date: "2024-01-01" },
+      { name: "Australia Day",                  date: "2024-01-26" },
+      { name: "Labour Day",                     date: "2024-03-11" },
+      { name: "Good Friday",                    date: "2024-03-29" },
+      { name: "Easter Saturday",                date: "2024-03-30" },
+      { name: "Easter Sunday",                  date: "2024-03-31" },
+      { name: "Easter Monday",                  date: "2024-04-01" },
+      { name: "Anzac Day",                      date: "2024-04-25" },
+      { name: "King's Birthday",                date: "2024-06-10" },
+      { name: "AFL Grand Final Friday",         date: "2024-09-27" },
+      { name: "Melbourne Cup Day",              date: "2024-11-05" },
+      { name: "Christmas Day",                  date: "2024-12-25" },
+      { name: "Boxing Day",                     date: "2024-12-26" },
+    ],
+    2025: [
+      { name: "New Year's Day",                 date: "2025-01-01" },
+      { name: "Australia Day",                  date: "2025-01-27" },
+      { name: "Labour Day",                     date: "2025-03-10" },
+      { name: "Good Friday",                    date: "2025-04-18" },
+      { name: "Easter Saturday",                date: "2025-04-19" },
+      { name: "Easter Sunday",                  date: "2025-04-20" },
+      { name: "Easter Monday",                  date: "2025-04-21" },
+      { name: "Anzac Day",                      date: "2025-04-25" },
+      { name: "King's Birthday",                date: "2025-06-09" },
+      { name: "AFL Grand Final Friday",         date: "2025-09-26" },
+      { name: "Melbourne Cup Day",              date: "2025-11-04" },
+      { name: "Christmas Day",                  date: "2025-12-25" },
+      { name: "Boxing Day",                     date: "2025-12-26" },
+    ],
+    2026: [
+      { name: "New Year's Day",                 date: "2026-01-01" },
+      { name: "Australia Day",                  date: "2026-01-26" },
+      { name: "Labour Day",                     date: "2026-03-09" },
+      { name: "Good Friday",                    date: "2026-04-03" },
+      { name: "Easter Saturday",                date: "2026-04-04" },
+      { name: "Easter Sunday",                  date: "2026-04-05" },
+      { name: "Easter Monday",                  date: "2026-04-06" },
+      { name: "Anzac Day",                      date: "2026-04-25" },
+      { name: "King's Birthday",                date: "2026-06-08" },
+      { name: "AFL Grand Final Friday",         date: "2026-09-25" },
+      { name: "Melbourne Cup Day",              date: "2026-11-03" },
+      { name: "Christmas Day",                  date: "2026-12-25" },
+      { name: "Boxing Day",                     date: "2026-12-26" },
+    ],
+  };
+
+  const holidays = VIC_HOLIDAYS[year] || [];
+
+  // Calculate business days until next lodgement deadline from today
+  const today = new Date();
+  const holidayDates = new Set(holidays.map(h => h.date));
+  const isBusinessDay = (d) => {
+    const day = d.getDay(); // 0=Sun, 6=Sat
+    return day !== 0 && day !== 6 && !holidayDates.has(d.toISOString().split("T")[0]);
+  };
+
+  // Find next 2 business days (for plumbing/drainage CoC deadline)
+  let businessDaysCount = 0;
+  let checkDate = new Date(today);
+  while (businessDaysCount < 2) {
+    checkDate.setDate(checkDate.getDate() + 1);
+    if (isBusinessDay(checkDate)) businessDaysCount++;
+  }
+  const cocDeadline = checkDate.toISOString().split("T")[0];
+
+  return res.json({
+    year,
+    jurisdiction:  "Victoria, Australia",
+    holidayCount:  holidays.length,
+    holidays,
+    lodgementGuidance: {
+      plumbingCoC:     { deadline: "2 business days", nextDeadlineFrom: `today (${today.toISOString().split("T")[0]})`, deadlineDate: cocDeadline },
+      gasCompliance:   { deadline: "48 hours" },
+      electricalCoES:  { deadline: "5 business days (residential), 2 business days (commercial)" },
+    },
+    note: "Verify current holiday dates at business.vic.gov.au before making critical deadline decisions.",
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /council-requirements ────────────────────────────────────────────────
+// Returns planning-related requirements for major Melbourne councils.
+// Useful when determining if a planning permit is needed before starting work.
+app.post("/council-requirements", (req, res) => {
+  const { council, jobType, existingDwelling = true } = req.body || {};
+
+  if (!council) {
+    return res.status(400).json({ error: "council is required (e.g., 'yarra', 'melbourne', 'whitehorse')." });
+  }
+
+  const COUNCIL_DATA = {
+    melbourne:     { name: "City of Melbourne",     heritage_overlays: "Extensive — much of CBD and Carlton", typical_setback: "0 m in CBD zones", specialNote: "Extensive heritage overlays. Most work in HO areas requires planning permit." },
+    yarra:         { name: "Yarra City Council",    heritage_overlays: "Very extensive — Fitzroy, Richmond, Collingwood", typical_setback: "Varies by zone", specialNote: "One of VIC's highest heritage overlay densities. Check VCAT decisions before applying." },
+    boroondara:    { name: "Boroondara City Council", heritage_overlays: "Significant — Hawthorn, Kew, Camberwell", typical_setback: "4–9 m front setback typical", specialNote: "Restrictive overlays in many residential streets. Pre-application meetings recommended." },
+    stonnington:   { name: "Stonnington City Council", heritage_overlays: "Moderate to significant — Prahran, South Yarra", typical_setback: "Varies", specialNote: "Significant heritage areas. Basement and rear extension permits complex." },
+    portphillip:   { name: "Port Phillip City Council", heritage_overlays: "Significant — St Kilda, South Melbourne", typical_setback: "Variable by zone", specialNote: "Coastal development and heritage overlays require early planning advice." },
+    whitehorse:    { name: "Whitehorse City Council", heritage_overlays: "Low to moderate",  typical_setback: "6 m front, 2 m side/rear", specialNote: "Predominantly residential — standard requirements apply. Some heritage precincts in Nunawading." },
+    knox:          { name: "Knox City Council",     heritage_overlays: "Low",               typical_setback: "6 m front, 3 m side/rear (typical)", specialNote: "Bushfire risk areas in eastern Knox — BAL assessment may be required." },
+    monash:        { name: "Monash City Council",   heritage_overlays: "Low to moderate",   typical_setback: "7.6 m front (standard residential)", specialNote: "Restrictive vegetation protections in some areas. Check significant tree overlays." },
+    glen_eira:     { name: "Glen Eira City Council", heritage_overlays: "Moderate — Elsternwick, Carnegie", typical_setback: "Varies by zone", specialNote: "Minimal change zones restrict significant residential development." },
+    casey:         { name: "Casey City Council",    heritage_overlays: "Low",               typical_setback: "4–5 m front typical", specialNote: "Growing growth corridor area — Precinct Structure Plans apply to new estates." },
+    geelong:       { name: "City of Greater Geelong", heritage_overlays: "Moderate — central Geelong", typical_setback: "Varies by zone", specialNote: "Waterfront development tightly controlled. Heritage overlays throughout CBD." },
+    ballarat:      { name: "City of Ballarat",      heritage_overlays: "Significant — Ballarat Central", typical_setback: "Varies", specialNote: "Ballarat is a significant heritage city. Pre-application meetings are free and highly recommended." },
+    bendigo:       { name: "Greater Bendigo City",  heritage_overlays: "Significant — central Bendigo", typical_setback: "Varies", specialNote: "Heritage overlays throughout inner suburbs. Check Bendigo DCPOs." },
+  };
+
+  const councilKey = council.toLowerCase().replace(/\s+/g, "_").replace(/[^a-z_]/g, "");
+  const data = COUNCIL_DATA[councilKey];
+
+  if (!data) {
+    return res.json({
+      council,
+      message:        "Council not in reference database — consult council directly or via planning.vic.gov.au",
+      generalGuidance: [
+        "All Victorian councils: Check the planning scheme at planning.vic.gov.au/planning-schemes",
+        "Heritage overlays (HO): Planning permit required for most external works",
+        "Vegetation Protection Overlay (VPO): Permit required for tree removal or pruning",
+        "Bushfire Management Overlay (BMO): BAL assessment required for new buildings",
+        "Use a licensed town planner for complex overlay situations",
+      ],
+      retrievedAt: new Date().toISOString(),
+    });
+  }
+
+  const PLANNING_TRIGGERS = {
+    carpentry:  ["Extension > 40% of existing dwelling area", "Second storey additions in residential zones", "Work in heritage overlay areas", "Removal of significant vegetation"],
+    plumbing:   ["New tank > 10,000 litres visible from street in some councils", "Swimming pool construction (building permit via council)", "Commercial plumbing serving multi-dwelling"],
+    gas:        ["Generally no planning permit required for standard residential gas work"],
+    electrical: ["Generally no planning permit required for standard residential electrical work", "Solar panels on heritage-listed properties may require planning permit"],
+    drainage:   ["Stormwater connection to council drain — council approval required", "Works in drainage easement require council consent"],
+    hvac:       ["Rooftop equipment on heritage properties may require planning permit", "Noise-generating outdoor units in sensitive overlays may require permit"],
+  };
+
+  const triggers = PLANNING_TRIGGERS[jobType?.toLowerCase()] || ["Contact council for trade-specific planning requirements"];
+
+  return res.json({
+    council:         data.name,
+    heritageOverlays: data.heritage_overlays,
+    typicalSetback:  data.typical_setback,
+    specialNote:     data.specialNote,
+    planningTriggers: triggers,
+    priorToWork: [
+      "Check all overlays at planning.vic.gov.au/planning-schemes",
+      "Contact council planning department for pre-application advice (usually free)",
+      "Confirm whether your Registered Building Surveyor needs council input",
+    ],
+    councilContact:  "planning.vic.gov.au or contact council directly",
+    retrievedAt:     new Date().toISOString(),
+  });
+});
+
+// ── POST /validate-request ────────────────────────────────────────────────────
+// Pre-validates a /review request body. Returns a detailed list of errors and
+// warnings so the client can fix issues before spending API credits.
+app.post("/validate-request", (req, res) => {
+  const { type, photos = [], label1, label2, label3, label4, label5, label6, label7, label8, gps, complexity } = req.body || {};
+
+  const errors   = [];
+  const warnings = [];
+
+  const VALID_TYPES = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+
+  if (!type) {
+    errors.push({ field: "type", message: "Job type is required." });
+  } else if (!VALID_TYPES.includes(String(type).toLowerCase())) {
+    errors.push({ field: "type", message: `Invalid job type "${type}". Use one of: ${VALID_TYPES.join(", ")}` });
+  }
+
+  // Check photos array
+  if (!Array.isArray(photos) || photos.length === 0) {
+    errors.push({ field: "photos", message: "At least one photo is required in the photos array." });
+  } else {
+    const REQUIRED_COUNTS = { plumbing: 8, gas: 8, electrical: 8, drainage: 6, carpentry: 6, hvac: 6 };
+    const required = REQUIRED_COUNTS[String(type).toLowerCase()] || 6;
+
+    if (photos.length < required) {
+      warnings.push({ field: "photos", message: `Only ${photos.length} photos provided. ${required} are required for ${type} jobs — AI confidence may be lower.` });
+    }
+
+    photos.forEach((photo, idx) => {
+      if (!photo.data && !photo.url) {
+        errors.push({ field: `photos[${idx}]`, message: "Each photo must have either a 'data' (base64) or 'url' field." });
+      }
+      if (!photo.label) {
+        warnings.push({ field: `photos[${idx}]`, message: `Photo ${idx + 1} has no label — labels improve AI accuracy.` });
+      }
+      if (photo.data && typeof photo.data === "string" && photo.data.length < 100) {
+        errors.push({ field: `photos[${idx}].data`, message: `Photo ${idx + 1} base64 data appears too short to be a valid image.` });
+      }
+    });
+  }
+
+  // Legacy label fields
+  const legacyLabels = [label1, label2, label3, label4, label5, label6, label7, label8].filter(Boolean);
+  if (legacyLabels.length > 0 && (!Array.isArray(photos) || photos.length === 0)) {
+    warnings.push({ field: "label1–label8", message: "Legacy label fields detected. Consider migrating to the photos array format for better results." });
+  }
+
+  if (complexity !== undefined && !["simple", "medium", "complex"].includes(complexity)) {
+    warnings.push({ field: "complexity", message: `Unexpected complexity value "${complexity}". Expected: simple, medium, complex.` });
+  }
+
+  const valid = errors.length === 0;
+
+  return res.json({
+    valid,
+    errorCount:   errors.length,
+    warningCount: warnings.length,
+    errors,
+    warnings,
+    summary: valid
+      ? warnings.length > 0 ? `Request is valid but has ${warnings.length} warning(s). Review warnings to improve AI accuracy.` : "Request is valid and ready to submit to /review."
+      : `Request has ${errors.length} error(s) that must be fixed before submitting to /review.`,
+    validatedAt: new Date().toISOString(),
+  });
+});
+
+// ── GET /model-info ───────────────────────────────────────────────────────────
+// Returns information about the AI models used by the Elemetric platform.
+app.get("/model-info", (_req, res) => {
+  return res.json({
+    platform: "Elemetric AI Compliance Platform",
+    models: [
+      {
+        name:        "GPT-4.1-mini Vision",
+        provider:    "OpenAI",
+        modelId:     "gpt-4.1-mini",
+        usedFor:     ["Primary compliance photo analysis (/review)", "Photo quality pre-screening", "Auto-classification (/auto-classify)", "Apprentice guide (/apprentice-guide)", "Note interpretation (/interpret-notes)", "Photo captioning (/photo-ai-caption)"],
+        contextWindow: "1M tokens",
+        vision:      true,
+        description: "Fast, cost-efficient vision model used for the majority of compliance analysis tasks. Balances speed and accuracy for Victorian trade photo analysis.",
+      },
+      {
+        name:        "GPT-4o",
+        provider:    "OpenAI",
+        modelId:     "gpt-4o",
+        usedFor:     ["Job description generation (/generate-description)", "Summarise report (/summarise-report)", "Training mode (/training-mode)"],
+        contextWindow: "128K tokens",
+        vision:      true,
+        description: "Higher-capability model used for long-form text generation tasks requiring richer language output.",
+      },
+      {
+        name:        "Stable Diffusion (Inpainting)",
+        provider:    "Replicate",
+        modelId:     "stability-ai/stable-diffusion-inpainting",
+        usedFor:     ["AC unit visualisation (/visualise)"],
+        description: "Image-to-image inpainting model used to visualise split system air conditioner installations on property photos.",
+      },
+    ],
+    promptVersions: PROMPT_REGISTRY,
+    abTesting: {
+      enabled:     true,
+      v2TrafficPct: "20%",
+      description: "20% of /review requests receive the chain-of-thought v2 prompt for A/B performance comparison.",
+    },
+    caching: {
+      type:       "LRU Cache (lru-cache npm package)",
+      maxEntries: 500,
+      ttl:        "1 hour",
+      keyStrategy: "SHA-256 hash of job type + image data lengths",
+    },
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
