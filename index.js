@@ -81629,6 +81629,455 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 286 ─────────────────────────────────────────────────────────────────
+
+// POST /traffic-management-plan-record — Record TMP review and implementation status per AS 1742.3
+app.post("/traffic-management-plan-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, tmpId, siteAddress, recordDate, preparedBy,
+      roadAuthority, roadCategory, speedZoneKmh,
+      tmpApproved, approvalReference, approvalDate, approvalExpiry,
+      trafficControllerRequired, trafficControllerLicence,
+      signageInstalled, signageCompliantWith1742,
+      delineationInstalled, delineationCompliant,
+      pedestrianManagementProvided, pedestrianPathMaintained,
+      cycleFacilitiesProvided, emergencyAccessMaintained,
+      workAreaProtected, conesBollards, crashAttenuatorRequired, crashAttenuatorInstalled,
+      nightWorkPermit, lightingAdequate,
+      tmpInspectedOnSite, inspectionOutcome,
+      publicComplaintsReceived, complaintDetails,
+      incidentsOccurred, incidentDetails,
+      nextInspectionDue, notes
+    } = req.body;
+
+    if (!tmpId || !siteAddress || !recordDate || !preparedBy) {
+      return res.status(400).json({ error: "tmpId, siteAddress, recordDate, preparedBy are required." });
+    }
+
+    const safeTmpId = sanitiseInput(String(tmpId));
+    const safeAddress = sanitiseInput(String(siteAddress));
+    const safePreparer = sanitiseInput(String(preparedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const criticalIssues = [];
+    const warnings = [];
+
+    const speedZone = parseInt(speedZoneKmh) || null;
+
+    // AS 1742.3 — Manual of uniform traffic control devices — Part 3: Works on roads
+    // Road Management Act 2004 (Vic) / AUSTROADS Guide to Traffic Management
+    if (!tmpApproved) {
+      criticalIssues.push("Traffic management plan not approved by road authority — works on public roads require approved TMP before commencement (Road Management Act 2004 (Vic) s.59).");
+    }
+
+    if (approvalExpiry) {
+      const expiry = new Date(approvalExpiry);
+      if (expiry < new Date()) {
+        criticalIssues.push(`TMP approval expired ${approvalExpiry} — works must cease until TMP is renewed with road authority.`);
+      }
+    }
+
+    if (!signageCompliantWith1742) {
+      criticalIssues.push("Traffic control signage not compliant with AS 1742.3 — non-compliant signage creates public safety risk and road authority liability.");
+    }
+
+    if (!delineationCompliant) {
+      criticalIssues.push("Delineation devices not compliant — lane/path delineation must meet AS 1742.3 standards for the applicable speed zone.");
+    }
+
+    if (!workAreaProtected) {
+      criticalIssues.push("Work area not adequately protected — workers in the roadway must be protected from traffic intrusion by approved safety barriers/devices (AS 1742.3).");
+    }
+
+    if (crashAttenuatorRequired === true || crashAttenuatorRequired === "true") {
+      if (!crashAttenuatorInstalled) {
+        criticalIssues.push("Crash attenuator required for this speed zone but not installed — AS 1742.3 and AUSTROADS require attenuator for works in speeds >70 km/h without positive protection.");
+      }
+    }
+
+    if (speedZone !== null && speedZone > 60 && !crashAttenuatorInstalled) {
+      warnings.push(`Speed zone ${speedZone} km/h — consider whether crash attenuator / truck-mounted attenuator is required for worker protection (AS 1742.3 / AUSTROADS).`);
+    }
+
+    if (trafficControllerRequired === true || trafficControllerRequired === "true") {
+      if (!trafficControllerLicence) {
+        criticalIssues.push("Traffic controller required but no licence number recorded — all traffic controllers must hold current Road Management Act 2004 (Vic) accreditation.");
+      }
+    }
+
+    if (!pedestrianManagementProvided) {
+      warnings.push("Pedestrian management not confirmed — pedestrian path must be maintained or redirected safely (AS 1742.3 cl.5.5).");
+    }
+
+    if (!emergencyAccessMaintained) {
+      warnings.push("Emergency vehicle access not confirmed maintained — emergency access through work zone must be ensured at all times.");
+    }
+
+    if (nightWorkPermit === true || nightWorkPermit === "true") {
+      if (!lightingAdequate) {
+        warnings.push("Night work without confirmed adequate lighting — temporary lighting must meet AS/NZS 1680 requirements for night roadwork sites.");
+      }
+    }
+
+    if (tmpInspectedOnSite) {
+      const outcome = String(inspectionOutcome || "").toUpperCase();
+      if (outcome === "FAIL" || outcome === "FAILED") {
+        criticalIssues.push("On-site TMP inspection failed — address all deficiencies before continuing works.");
+      }
+    }
+
+    const tmpStatus = criticalIssues.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "REVIEW_REQUIRED" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("traffic_management_records")
+        .insert({
+          project_id: safeProject,
+          tmp_id: safeTmpId,
+          site_address: safeAddress,
+          record_date: recordDate,
+          prepared_by: safePreparer,
+          road_authority: roadAuthority ? sanitiseInput(String(roadAuthority)) : null,
+          road_category: roadCategory ? sanitiseInput(String(roadCategory)) : null,
+          speed_zone_kmh: speedZone,
+          tmp_approved: tmpApproved !== false && tmpApproved !== "false",
+          approval_reference: approvalReference ? sanitiseInput(String(approvalReference)) : null,
+          approval_date: approvalDate || null,
+          approval_expiry: approvalExpiry || null,
+          traffic_controller_required: trafficControllerRequired || false,
+          traffic_controller_licence: trafficControllerLicence ? sanitiseInput(String(trafficControllerLicence)) : null,
+          signage_compliant: signageCompliantWith1742 !== false && signageCompliantWith1742 !== "false",
+          delineation_compliant: delineationCompliant !== false && delineationCompliant !== "false",
+          pedestrian_management: pedestrianManagementProvided !== false && pedestrianManagementProvided !== "false",
+          pedestrian_path_maintained: pedestrianPathMaintained !== false && pedestrianPathMaintained !== "false",
+          emergency_access_maintained: emergencyAccessMaintained !== false && emergencyAccessMaintained !== "false",
+          work_area_protected: workAreaProtected !== false && workAreaProtected !== "false",
+          crash_attenuator_required: crashAttenuatorRequired || false,
+          crash_attenuator_installed: crashAttenuatorInstalled || false,
+          night_work_permit: nightWorkPermit || false,
+          lighting_adequate: lightingAdequate !== false && lightingAdequate !== "false",
+          incidents_occurred: incidentsOccurred || false,
+          incident_details: incidentDetails ? sanitiseInput(String(incidentDetails)) : null,
+          next_inspection_due: nextInspectionDue || null,
+          tmp_status: tmpStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        tmpStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Traffic management non-compliance — works must cease until TMP issues are resolved.",
+        standards: ["AS 1742.3", "Road Management Act 2004 (Vic)", "AUSTROADS Guide to Traffic Management"],
+      });
+    }
+
+    res.json({
+      tmpStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      tmpId: safeTmpId,
+      nextInspectionDue: nextInspectionDue || null,
+      standards: ["AS 1742.3", "Road Management Act 2004 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /traffic-management-plan-record error:", err.message);
+    res.status(500).json({ error: "Failed to record traffic management plan." });
+  }
+});
+
+// POST /environmental-monitoring-record — Record environmental monitoring results per EPA Victoria
+app.post("/environmental-monitoring-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, monitoringId, siteAddress, monitoringDate, monitoredBy,
+      monitoringType, mediaMonitored,
+      airDustMgm3, airDustLimit,
+      noiseDBA, noiseLimit, noiseTimeOfDay,
+      waterTurbidityNtu, waterTurbidityLimit,
+      waterPhValue, waterPhMin, waterPhMax,
+      soilContaminationFound, contaminantTypes, contaminantLevels,
+      sedimentBarrierIntact, siltFenceInstalled,
+      stormwaterDischargeOccurred, stormwaterTreatment,
+      complianceStatus, exceedanceDetails,
+      epaNotificationRequired, epaNotified, epaReferenceNumber,
+      correctiveActionsRequired, correctiveActionDetails,
+      nextMonitoringDate, certRef, notes
+    } = req.body;
+
+    if (!monitoringId || !siteAddress || !monitoringDate || !monitoredBy) {
+      return res.status(400).json({ error: "monitoringId, siteAddress, monitoringDate, monitoredBy are required." });
+    }
+
+    const safeMonitoringId = sanitiseInput(String(monitoringId));
+    const safeAddress = sanitiseInput(String(siteAddress));
+    const safeMonitor = sanitiseInput(String(monitoredBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const criticalIssues = [];
+    const warnings = [];
+
+    const dustLevel = parseFloat(airDustMgm3) || null;
+    const dustLimit = parseFloat(airDustLimit) || null;
+    const noiseLevel = parseFloat(noiseDBA) || null;
+    const noiseLimitVal = parseFloat(noiseLimit) || null;
+    const turbidity = parseFloat(waterTurbidityNtu) || null;
+    const turbidityLimit = parseFloat(waterTurbidityLimit) || null;
+    const phValue = parseFloat(waterPhValue) || null;
+    const phMin = parseFloat(waterPhMin) || 6.5;
+    const phMax = parseFloat(waterPhMax) || 8.5;
+
+    // Environment Protection Act 2017 (Vic)
+    // SEPP Waters 2018 (Vic) / SEPP Ambient Air 1999 (Vic)
+    if (dustLevel !== null && dustLimit !== null && dustLevel > dustLimit) {
+      criticalIssues.push(`Dust level ${dustLevel} mg/m³ exceeds limit ${dustLimit} mg/m³ — EPA exceedance. Implement immediate dust suppression measures and notify EPA if required (Environment Protection Act 2017 (Vic) s.27).`);
+    }
+
+    if (noiseLevel !== null && noiseLimitVal !== null && noiseLevel > noiseLimitVal) {
+      const period = String(noiseTimeOfDay || "").toUpperCase();
+      criticalIssues.push(`Noise level ${noiseLevel} dBA exceeds${period ? " " + period.toLowerCase() + " limit" : " limit"} ${noiseLimitVal} dBA — non-compliant with EPA noise regulations. Review hours of work and noise control measures.`);
+    }
+
+    if (turbidity !== null && turbidityLimit !== null && turbidity > turbidityLimit) {
+      criticalIssues.push(`Water turbidity ${turbidity} NTU exceeds limit ${turbidityLimit} NTU — SEPP Waters 2018 (Vic) compliance breach. Inspect and repair sediment controls immediately.`);
+    }
+
+    if (phValue !== null && (phValue < phMin || phValue > phMax)) {
+      criticalIssues.push(`Water pH ${phValue} outside acceptable range ${phMin}–${phMax} — potential chemical contamination of waterway. Investigate source and notify EPA.`);
+    }
+
+    if (stormwaterDischargeOccurred === true || stormwaterDischargeOccurred === "true") {
+      if (!stormwaterTreatment) {
+        criticalIssues.push("Untreated stormwater discharge occurred — Environment Protection Act 2017 (Vic) s.27 general environmental duty breach. Install or repair treatment controls immediately.");
+      }
+    }
+
+    if (soilContaminationFound === true || soilContaminationFound === "true") {
+      criticalIssues.push(`Soil contamination detected (${contaminantTypes || "types not specified"}) — notify EPA Victoria and engage environmental consultant for contamination assessment per Environment Protection Act 2017 (Vic).`);
+    }
+
+    if (epaNotificationRequired === true || epaNotificationRequired === "true") {
+      if (!epaNotified) {
+        criticalIssues.push("EPA notification required but not yet made — Environment Protection Act 2017 (Vic) requires notification of certain incidents within specified timeframes.");
+      }
+    }
+
+    if (!sedimentBarrierIntact) {
+      warnings.push("Sediment barrier/silt fence not intact — repair immediately to prevent sediment runoff to stormwater (SEPP Waters 2018 (Vic)).");
+    }
+
+    const monitoringStatusResult = criticalIssues.length > 0 ? "EXCEEDANCE" : warnings.length > 0 ? "REVIEW_REQUIRED" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("environmental_monitoring_records")
+        .insert({
+          project_id: safeProject,
+          monitoring_id: safeMonitoringId,
+          site_address: safeAddress,
+          monitoring_date: monitoringDate,
+          monitored_by: safeMonitor,
+          monitoring_type: monitoringType ? sanitiseInput(String(monitoringType)) : null,
+          media_monitored: mediaMonitored ? sanitiseInput(String(mediaMonitored)) : null,
+          air_dust_mg_m3: dustLevel,
+          air_dust_limit: dustLimit,
+          noise_dba: noiseLevel,
+          noise_limit_dba: noiseLimitVal,
+          noise_time_of_day: noiseTimeOfDay ? sanitiseInput(String(noiseTimeOfDay)) : null,
+          water_turbidity_ntu: turbidity,
+          water_turbidity_limit: turbidityLimit,
+          water_ph: phValue,
+          soil_contamination_found: soilContaminationFound || false,
+          contaminant_types: contaminantTypes ? sanitiseInput(String(contaminantTypes)) : null,
+          sediment_barrier_intact: sedimentBarrierIntact !== false && sedimentBarrierIntact !== "false",
+          stormwater_discharge: stormwaterDischargeOccurred || false,
+          stormwater_treatment: stormwaterTreatment ? sanitiseInput(String(stormwaterTreatment)) : null,
+          epa_notification_required: epaNotificationRequired || false,
+          epa_notified: epaNotified || false,
+          epa_reference: epaReferenceNumber ? sanitiseInput(String(epaReferenceNumber)) : null,
+          corrective_actions_required: correctiveActionsRequired || false,
+          corrective_action_details: correctiveActionDetails ? sanitiseInput(String(correctiveActionDetails)) : null,
+          next_monitoring_date: nextMonitoringDate || null,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          monitoring_status: monitoringStatusResult,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        monitoringStatus: monitoringStatusResult,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Environmental exceedance detected — immediate corrective action and potential EPA notification required.",
+        standards: ["Environment Protection Act 2017 (Vic)", "SEPP Waters 2018 (Vic)", "SEPP Ambient Air Quality 1999"],
+      });
+    }
+
+    res.json({
+      monitoringStatus: monitoringStatusResult,
+      criticalIssues,
+      warnings,
+      savedId,
+      monitoringId: safeMonitoringId,
+      nextMonitoringDate: nextMonitoringDate || null,
+      standards: ["Environment Protection Act 2017 (Vic)", "SEPP Waters 2018 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /environmental-monitoring-record error:", err.message);
+    res.status(500).json({ error: "Failed to record environmental monitoring." });
+  }
+});
+
+// POST /ai-site-environmental-compliance — AI assesses site environmental management compliance
+app.post("/ai-site-environmental-compliance", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      siteId, projectType, siteAreaHa, isNearWaterway, distanceToWaterwayM,
+      epaPermitRequired, epaPermitNumber, epaPermitConditions,
+      cepaaApprovalRequired, planningPermitConditions,
+      sedimentControlsInstalled, sedimentControlsCondition,
+      dustControlsInstalled, dustControlsCondition,
+      noiseManagementPlanInPlace, worksHoursCompliant,
+      wasteManagementPlanInPlace, recyclingRatePercent,
+      chemicalStorageCompliant, spillKitOnSite,
+      vegetationClearanceApproved, floraFaunaAssessmentConducted,
+      heritageAssessmentConducted, archaeologicalMonitoringRequired,
+      environmentalIncidents12Months, epaInspectionsReceived,
+      deficienciesNoted, notes
+    } = req.body;
+
+    if (!siteId) {
+      return res.status(400).json({ error: "siteId is required." });
+    }
+
+    const safeSite = sanitiseInput(String(siteId));
+    const deficiencies = Array.isArray(deficienciesNoted) ? deficienciesNoted : [];
+    const permitConditions = Array.isArray(planningPermitConditions) ? planningPermitConditions : [];
+
+    const prompt = `You are an environmental compliance expert. Assess the site environmental management compliance and risk under Victorian and Australian regulations.
+
+Site ID: ${safeSite}
+Project type: ${projectType || "Unknown"}
+Site area: ${siteAreaHa ? siteAreaHa + " ha" : "Unknown"}
+Near waterway: ${isNearWaterway ? "Yes (" + (distanceToWaterwayM || "distance unknown") + " m)" : "No"}
+
+REGULATORY APPROVALS:
+- EPA permit required: ${epaPermitRequired ? "Yes — permit: " + (epaPermitNumber || "not recorded") : "No"}
+- CEPA approval required: ${cepaaApprovalRequired ? "Yes" : "No"}
+- Planning permit conditions: ${permitConditions.join("; ") || "None identified"}
+
+ENVIRONMENTAL CONTROLS:
+- Sediment controls installed: ${sedimentControlsInstalled ? "Yes — condition: " + (sedimentControlsCondition || "not specified") : "No"}
+- Dust controls installed: ${dustControlsInstalled ? "Yes — condition: " + (dustControlsCondition || "not specified") : "No"}
+- Noise management plan: ${noiseManagementPlanInPlace ? "Yes" : "No"}
+- Works hours compliant: ${worksHoursCompliant ? "Yes" : "No/Unknown"}
+- Waste management plan: ${wasteManagementPlanInPlace ? "Yes" : "No"}
+- Recycling rate: ${recyclingRatePercent ? recyclingRatePercent + "%" : "Unknown"}
+- Chemical storage compliant: ${chemicalStorageCompliant ? "Yes" : "No"}
+- Spill kit on site: ${spillKitOnSite ? "Yes" : "No"}
+
+BIODIVERSITY AND HERITAGE:
+- Vegetation clearance approved: ${vegetationClearanceApproved ? "Yes" : "No/Unknown"}
+- Flora/fauna assessment: ${floraFaunaAssessmentConducted ? "Conducted" : "Not conducted"}
+- Heritage assessment: ${heritageAssessmentConducted ? "Conducted" : "Not conducted"}
+- Archaeological monitoring required: ${archaeologicalMonitoringRequired ? "Yes" : "No"}
+
+COMPLIANCE HISTORY:
+- Environmental incidents (12 months): ${environmentalIncidents12Months || 0}
+- EPA inspections received: ${epaInspectionsReceived || 0}
+
+Deficiencies: ${deficiencies.join("; ") || "None"}
+
+Assess under:
+- Environment Protection Act 2017 (Vic)
+- SEPP Waters 2018 (Vic)
+- Planning and Environment Act 1987 (Vic)
+- Flora and Fauna Guarantee Act 1988 (Vic)
+- Heritage Act 2017 (Vic)
+- Environment Protection and Biodiversity Conservation Act 1999 (Cth)
+- Dangerous Goods Act 1985 (Vic) — chemical storage
+
+Provide:
+1. Overall environmental compliance risk
+2. Key compliance gaps by category
+3. Waterway/stormwater risk
+4. Heritage and biodiversity risk
+5. Immediate corrective actions
+6. Permit condition compliance summary
+
+Respond ONLY in JSON:
+{
+  "overallRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "waterRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "airRisk": "LOW|MODERATE|HIGH",
+  "biodiversityRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "heritageRisk": "LOW|MODERATE|HIGH",
+  "wasteRisk": "LOW|MODERATE|HIGH",
+  "complianceGaps": ["string"],
+  "immediateActions": ["string"],
+  "permitConditionFindings": ["string"],
+  "recommendedMonitoring": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 900,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallRisk: "MODERATE",
+        waterRisk: "MODERATE",
+        airRisk: "LOW",
+        biodiversityRisk: "LOW",
+        heritageRisk: "LOW",
+        wasteRisk: "MODERATE",
+        complianceGaps: ["AI assessment unavailable — engage environmental consultant for formal review"],
+        immediateActions: ["Inspect all sediment controls", "Verify EPA permit conditions are being met", "Ensure spill kit is available and accessible"],
+        permitConditionFindings: ["Review all planning permit environmental conditions"],
+        recommendedMonitoring: ["Monthly environmental monitoring during construction", "Post-rainfall inspection of all sediment controls"],
+        applicableStandards: ["Environment Protection Act 2017 (Vic)", "SEPP Waters 2018 (Vic)", "Planning and Environment Act 1987 (Vic)"],
+        summary: "AI environmental compliance assessment unavailable. Engage environmental consultant for formal compliance audit.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      siteId: safeSite,
+      standards: ["Environment Protection Act 2017 (Vic)", "SEPP Waters 2018 (Vic)", "Planning and Environment Act 1987 (Vic)", "Flora and Fauna Guarantee Act 1988 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /ai-site-environmental-compliance error:", err.message);
+    res.status(500).json({ error: "Failed to assess site environmental compliance." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
