@@ -27561,6 +27561,211 @@ app.get("/contractor-summary/:contractorId", apiKeyAuth, async (req, res) => {
   return res.json(summary);
 });
 
+// POST /ai-claim-narrative  — AI writes a claim narrative for an insurance/damage claim
+app.post("/ai-claim-narrative", apiKeyAuth, async (req, res) => {
+  const { claimType, incidentDate, incidentDescription, damagesDescription, witnesses, contractorId, jobId, estimatedLoss } = req.body || {};
+  if (!claimType || !incidentDescription) return res.status(400).json({ error: "claimType and incidentDescription required." });
+
+  const CLAIM_TYPES = ["property-damage", "public-liability", "professional-indemnity", "workers-compensation", "contract-works", "other"];
+  const safeType    = CLAIM_TYPES.includes(String(claimType).toLowerCase().replace(/ /g, "-")) ? String(claimType).toLowerCase().replace(/ /g, "-") : "other";
+  const safeDesc    = sanitiseInput(String(incidentDescription)).slice(0, 2000);
+  const safeDamages = damagesDescription ? sanitiseInput(String(damagesDescription)).slice(0, 1000) : null;
+  const safeDate    = incidentDate ? sanitiseInput(String(incidentDate)).slice(0, 20) : null;
+  const safeWit     = witnesses ? sanitiseInput(String(witnesses)).slice(0, 300) : null;
+  const safeCId     = contractorId ? sanitiseInput(String(contractorId)).slice(0, 80) : null;
+  const safeJobId   = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeLoss    = estimatedLoss ? Math.max(0, parseFloat(estimatedLoss) || 0) : null;
+
+  const prompt = `You are an insurance claims specialist helping write a formal claim narrative in Australia.
+
+Claim type: ${safeType}
+${safeDate ? `Incident date: ${safeDate}` : ""}
+Incident description: ${safeDesc}
+${safeDamages ? `Damages: ${safeDamages}` : ""}
+${safeWit ? `Witnesses: ${safeWit}` : ""}
+${safeLoss ? `Estimated loss: $${safeLoss.toLocaleString()}` : ""}
+
+Write a professional claim narrative in JSON:
+{
+  "narrative": "formal 3-5 paragraph claim narrative",
+  "keyFacts": ["fact 1"],
+  "supportingEvidence": ["evidence type to collect"],
+  "immediateActions": ["action to take now"],
+  "claimStrength": "STRONG|MODERATE|WEAK"
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 700 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      claimType: safeType, contractorId: safeCId, jobId: safeJobId,
+      incidentDate: safeDate, estimatedLoss: safeLoss,
+      narrative:          parsed.narrative || "",
+      keyFacts:           Array.isArray(parsed.keyFacts) ? parsed.keyFacts : [],
+      supportingEvidence: Array.isArray(parsed.supportingEvidence) ? parsed.supportingEvidence : [],
+      immediateActions:   Array.isArray(parsed.immediateActions) ? parsed.immediateActions : [],
+      claimStrength:      ["STRONG", "MODERATE", "WEAK"].includes(parsed.claimStrength) ? parsed.claimStrength : "MODERATE",
+      disclaimer: "AI-assisted narrative only. Engage a licensed public loss adjuster or insurance broker for formal claims.",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      claimType: safeType, contractorId: safeCId, jobId: safeJobId,
+      incidentDate: safeDate, estimatedLoss: safeLoss,
+      narrative: "Claim narrative generation temporarily unavailable.",
+      keyFacts: [], supportingEvidence: [], immediateActions: [], claimStrength: "MODERATE",
+      disclaimer: "Engage a licensed public loss adjuster or insurance broker for formal claims.",
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /contract-milestone-sign  — Sign off on a contract milestone
+app.post("/contract-milestone-sign", apiKeyAuth, async (req, res) => {
+  const { contractId, milestoneId, milestoneDescription, signedBy, signedByRole, amount, allWorkCompleted, defectsIdentified, defectsList, signOffDate, notes } = req.body || {};
+  if (!contractId || !milestoneId) return res.status(400).json({ error: "contractId and milestoneId required." });
+
+  const safeContractId  = sanitiseInput(String(contractId)).slice(0, 80);
+  const safeMilestoneId = sanitiseInput(String(milestoneId)).slice(0, 40);
+  const safeDesc        = milestoneDescription ? sanitiseInput(String(milestoneDescription)).slice(0, 200) : null;
+  const safeSignedBy    = signedBy ? sanitiseInput(String(signedBy)).slice(0, 100) : null;
+  const safeRole        = signedByRole ? sanitiseInput(String(signedByRole)).slice(0, 80) : null;
+  const safeAmount      = amount ? Math.max(0, parseFloat(amount) || 0) : null;
+  const safeDefects     = Array.isArray(defectsList) ? defectsList.slice(0, 20).map(d => sanitiseInput(String(d)).slice(0, 150)) : [];
+  const safeDate        = signOffDate ? sanitiseInput(String(signOffDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeNotes       = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+  const hasDefects      = defectsIdentified === true || safeDefects.length > 0;
+
+  const record = {
+    signOffId:       `MSO-${safeContractId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    contractId:      safeContractId, milestoneId: safeMilestoneId, milestoneDescription: safeDesc,
+    signedBy:        safeSignedBy, signedByRole: safeRole,
+    milestoneAmount: safeAmount, allWorkCompleted: allWorkCompleted !== false,
+    defectsIdentified: hasDefects, defectsList: safeDefects,
+    signOffDate: safeDate, status: hasDefects ? "CONDITIONAL" : "APPROVED",
+    notes: safeNotes, createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("contract_milestone_signoffs").insert({
+        sign_off_id: record.signOffId, contract_id: safeContractId, milestone_id: safeMilestoneId,
+        description: safeDesc, signed_by: safeSignedBy, signed_by_role: safeRole,
+        milestone_amount: safeAmount, all_work_completed: record.allWorkCompleted,
+        defects_identified: hasDefects, defects_list: safeDefects,
+        sign_off_date: safeDate, status: record.status, notes: safeNotes, created_at: record.createdAt,
+      });
+      // Update payment schedule milestone status
+      await supabaseAdmin.from("payment_schedules").update({}).eq("project_id", safeContractId).catch(() => {});
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// POST /dispute-record  — Log a formal construction dispute
+app.post("/dispute-record", apiKeyAuth, async (req, res) => {
+  const { contractId, jobId, disputeType, claimantId, respondentId, disputeAmount, description, status, tribunalRef, notes } = req.body || {};
+  if (!contractId && !jobId) return res.status(400).json({ error: "contractId or jobId required." });
+  if (!description) return res.status(400).json({ error: "description required." });
+
+  const DISPUTE_TYPES = ["payment", "variation", "defect", "delay", "termination", "design", "scope", "other"];
+  const safeContractId = contractId ? sanitiseInput(String(contractId)).slice(0, 80) : null;
+  const safeJobId      = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeType       = DISPUTE_TYPES.includes(String(disputeType || "").toLowerCase()) ? String(disputeType).toLowerCase() : "other";
+  const safeClaimant   = claimantId ? sanitiseInput(String(claimantId)).slice(0, 80) : null;
+  const safeRespondent = respondentId ? sanitiseInput(String(respondentId)).slice(0, 80) : null;
+  const safeAmount     = disputeAmount ? Math.max(0, parseFloat(disputeAmount) || 0) : null;
+  const safeDesc       = sanitiseInput(String(description)).slice(0, 2000);
+  const safeTribunalRef = tribunalRef ? sanitiseInput(String(tribunalRef)).slice(0, 80) : null;
+  const safeNotes      = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+  const VALID_STATUSES = ["LODGED", "MEDIATION", "ADJUDICATION", "TRIBUNAL", "RESOLVED", "WITHDRAWN"];
+  const safeStatus     = VALID_STATUSES.includes(String(status || "").toUpperCase()) ? String(status).toUpperCase() : "LODGED";
+
+  const record = {
+    disputeId:    `DIS-${(safeContractId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    contractId:   safeContractId, jobId: safeJobId, disputeType: safeType,
+    claimantId:   safeClaimant, respondentId: safeRespondent,
+    disputeAmount: safeAmount, description: safeDesc, status: safeStatus,
+    tribunalRef:  safeTribunalRef, notes: safeNotes,
+    lodgedAt:     new Date().toISOString(),
+    legalNote: "Consider engaging a construction solicitor or the Victorian Building Authority for dispute resolution guidance.",
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("dispute_records").insert({
+        dispute_id: record.disputeId, contract_id: safeContractId, job_id: safeJobId,
+        dispute_type: safeType, claimant_id: safeClaimant, respondent_id: safeRespondent,
+        dispute_amount: safeAmount, description: safeDesc, status: safeStatus,
+        tribunal_ref: safeTribunalRef, notes: safeNotes, lodged_at: record.lodgedAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// POST /ai-dispute-analysis  — AI analyses a construction dispute and suggests resolution
+app.post("/ai-dispute-analysis", apiKeyAuth, async (req, res) => {
+  const { disputeType, contractValue, claimedAmount, description, hasWrittenContract, state = "VIC" } = req.body || {};
+  if (!disputeType || !description) return res.status(400).json({ error: "disputeType and description required." });
+
+  const safeType   = sanitiseInput(String(disputeType)).slice(0, 60);
+  const safeDesc   = sanitiseInput(String(description)).slice(0, 2000);
+  const safeState  = sanitiseInput(String(state)).toUpperCase().slice(0, 5);
+  const contractV  = contractValue ? Math.max(0, parseFloat(contractValue) || 0) : null;
+  const claimedAmt = claimedAmount ? Math.max(0, parseFloat(claimedAmount) || 0) : null;
+
+  const prompt = `You are a construction dispute resolution advisor for ${safeState}, Australia.
+
+Dispute type: ${safeType}
+${contractV ? `Contract value: $${contractV.toLocaleString()}` : ""}
+${claimedAmt ? `Amount claimed: $${claimedAmt.toLocaleString()}` : ""}
+Written contract: ${hasWrittenContract === true ? "Yes" : hasWrittenContract === false ? "No" : "Unknown"}
+Description: ${safeDesc}
+
+Analyse in JSON:
+{
+  "likelyOutcome": "brief assessment",
+  "strengthOfClaim": "STRONG|MODERATE|WEAK",
+  "recommendedPath": "recommended dispute resolution path",
+  "options": [{"option": "...", "pros": ["..."], "cons": ["..."], "cost": "..."}],
+  "keyEvidence": ["evidence to gather"],
+  "timeframes": "typical timeframe",
+  "relevantLegislation": ["relevant Act or regulation"],
+  "disclaimer": "disclaimer"
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 700 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      disputeType: safeType, state: safeState, contractValue: contractV, claimedAmount: claimedAmt,
+      likelyOutcome:      parsed.likelyOutcome || "",
+      strengthOfClaim:    ["STRONG", "MODERATE", "WEAK"].includes(parsed.strengthOfClaim) ? parsed.strengthOfClaim : "MODERATE",
+      recommendedPath:    parsed.recommendedPath || "",
+      options:            Array.isArray(parsed.options) ? parsed.options : [],
+      keyEvidence:        Array.isArray(parsed.keyEvidence) ? parsed.keyEvidence : [],
+      timeframes:         parsed.timeframes || null,
+      relevantLegislation: Array.isArray(parsed.relevantLegislation) ? parsed.relevantLegislation : [],
+      disclaimer: parsed.disclaimer || "AI analysis only. Seek legal advice from a construction solicitor.",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      disputeType: safeType, state: safeState, contractValue: contractV, claimedAmount: claimedAmt,
+      likelyOutcome: "Analysis temporarily unavailable.", strengthOfClaim: "MODERATE",
+      recommendedPath: "Consider mediation before proceeding to adjudication or tribunal.",
+      options: [], keyEvidence: [], timeframes: null, relevantLegislation: [],
+      disclaimer: "Seek legal advice from a construction solicitor.",
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
