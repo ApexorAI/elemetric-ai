@@ -19001,6 +19001,284 @@ app.get("/server-stats", apiKeyAuth, (req, res) => {
   });
 });
 
+// ── Round 47 ──────────────────────────────────────────────────────────────────
+
+// POST /ai-checklist-generator  — AI-generated custom checklist for a specific scope
+app.post("/ai-checklist-generator", apiKeyAuth, async (req, res) => {
+  const { jobType, scope, propertyAge, propertyType, complexity, maxItems } = req.body;
+
+  if (!jobType || !scope) return res.status(400).json({ error: "jobType and scope are required." });
+
+  const safeJobType    = sanitiseInput(String(jobType)).toLowerCase();
+  const safeScope      = sanitiseInput(String(scope)).slice(0, 500);
+  const safePropType   = sanitiseInput(String(propertyType || "residential"));
+  const safeComplexity = sanitiseInput(String(complexity   || "medium")).toLowerCase();
+  const maxCount       = Math.min(parseInt(maxItems) || 20, 40);
+  const ageYears       = parseInt(propertyAge) || 0;
+
+  const systemPrompt = `You are a Victorian trade compliance specialist. Generate a specific compliance checklist for the described job scope. Each item must be a concrete, verifiable compliance requirement — not general advice. Return JSON with: "title" (string), "items" (array of objects each having "item" (string), "required" (boolean), "regulatoryRef" (string or null), "tip" (string or null)).`;
+
+  const contextNotes = [
+    ageYears > 30 ? `Property is ${ageYears} years old — check for asbestos (pre-1990), lead paint (pre-1970), and outdated systems.` : null,
+    safePropType === "commercial" ? "Commercial property — commercial-grade requirements apply." : null,
+    safeComplexity === "complex" || safeComplexity === "very complex" ? "High-complexity job — additional documentation and engineering signoff may be required." : null,
+  ].filter(Boolean).join(" ");
+
+  let title, items;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: `Trade: ${safeJobType}\nScope: ${safeScope}\nMax items: ${maxCount}\n${contextNotes}` },
+      ],
+      max_tokens: 800,
+      response_format: { type: "json_object" },
+    });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    title  = sanitiseInput(String(parsed.title || `${safeJobType} Compliance Checklist`));
+    items  = Array.isArray(parsed.items)
+      ? parsed.items.slice(0, maxCount).map(i => ({
+          item:          sanitiseInput(String(i.item || "")),
+          required:      i.required !== false,
+          regulatoryRef: i.regulatoryRef ? sanitiseInput(String(i.regulatoryRef)).slice(0, 60) : null,
+          tip:           i.tip           ? sanitiseInput(String(i.tip)).slice(0, 200)            : null,
+        }))
+      : [];
+  } catch {
+    title = `${safeJobType.charAt(0).toUpperCase() + safeJobType.slice(1)} Compliance Checklist`;
+    items = [{ item: "Manual checklist generation required — AI unavailable", required: true, regulatoryRef: null, tip: null }];
+  }
+
+  return res.json({
+    jobType:      safeJobType,
+    propertyType: safePropType,
+    complexity:   safeComplexity,
+    propertyAge:  ageYears || null,
+    title,
+    itemCount:    items.length,
+    requiredItems: items.filter(i => i.required).length,
+    items,
+    generatedAt:  new Date().toISOString(),
+  });
+});
+
+// POST /near-miss-analysis  — Analyse near-miss patterns across a set of logged incidents
+app.post("/near-miss-analysis", apiKeyAuth, (req, res) => {
+  const { incidents, jobType } = req.body;
+
+  if (!incidents || !Array.isArray(incidents) || incidents.length === 0) {
+    return res.status(400).json({ error: "incidents array is required." });
+  }
+
+  const safeJobType = jobType ? sanitiseInput(String(jobType)).toLowerCase() : null;
+  const now         = new Date();
+
+  const processedIncidents = incidents.slice(0, 200).map(inc => ({
+    type:       sanitiseInput(String(inc.type         || "unknown")).toLowerCase(),
+    severity:   sanitiseInput(String(inc.severity     || "low")).toLowerCase(),
+    trade:      sanitiseInput(String(inc.tradeType    || inc.jobType || "unknown")).toLowerCase(),
+    date:       inc.date ? new Date(inc.date) : null,
+    resolved:   !!inc.resolved,
+    location:   inc.location ? sanitiseInput(String(inc.location)) : null,
+  }));
+
+  const typeFreq     = {};
+  const severityFreq = {};
+  const tradeFreq    = {};
+  const monthlyTrend = {};
+
+  for (const inc of processedIncidents) {
+    typeFreq[inc.type]         = (typeFreq[inc.type] || 0) + 1;
+    severityFreq[inc.severity] = (severityFreq[inc.severity] || 0) + 1;
+    tradeFreq[inc.trade]       = (tradeFreq[inc.trade] || 0) + 1;
+    if (inc.date && !isNaN(inc.date.getTime())) {
+      const key = `${inc.date.getFullYear()}-${String(inc.date.getMonth() + 1).padStart(2, "0")}`;
+      monthlyTrend[key] = (monthlyTrend[key] || 0) + 1;
+    }
+  }
+
+  const total     = processedIncidents.length;
+  const resolved  = processedIncidents.filter(i => i.resolved).length;
+  const critical  = processedIncidents.filter(i => i.severity === "critical" || i.severity === "high").length;
+  const topType   = Object.entries(typeFreq).sort((a, b) => b[1] - a[1])[0];
+  const topTrade  = Object.entries(tradeFreq).sort((a, b) => b[1] - a[1])[0];
+
+  const recommendations = [
+    topType   ? `Most frequent incident type: "${topType[0]}" (${topType[1]} occurrences) — targeted training recommended` : null,
+    topTrade  ? `Trade with most incidents: "${topTrade[0]}" — review ${topTrade[0]} safety procedures` : null,
+    critical > total * 0.3 ? "Over 30% of incidents are high/critical severity — immediate safety review required" : null,
+    resolved  < total * 0.8 ? `${total - resolved} incidents remain unresolved — escalate outstanding items` : null,
+  ].filter(Boolean);
+
+  return res.json({
+    totalIncidents: total,
+    resolvedCount:  resolved,
+    unresolved:     total - resolved,
+    resolutionRate: `${Math.round((resolved / total) * 100)}%`,
+    criticalHighCount: critical,
+    typeFrequency:   typeFreq,
+    severityBreakdown: severityFreq,
+    tradeBreakdown:  tradeFreq,
+    monthlyTrend:    Object.fromEntries(Object.entries(monthlyTrend).sort()),
+    recommendations,
+    analysedAt: new Date().toISOString(),
+  });
+});
+
+// POST /permit-document  — Generate a permit application summary document
+app.post("/permit-document", apiKeyAuth, (req, res) => {
+  const { jobType, address, ownerName, contractorName, contractorLicence,
+          workDescription, estimatedCost, startDate, endDate, propertyClass, notes } = req.body;
+
+  if (!jobType || !address || !workDescription) {
+    return res.status(400).json({ error: "jobType, address, and workDescription are required." });
+  }
+
+  const safeJobType    = sanitiseInput(String(jobType)).toLowerCase();
+  const safeAddress    = sanitiseInput(String(address));
+  const safeOwner      = sanitiseInput(String(ownerName       || "Property Owner"));
+  const safeContractor = sanitiseInput(String(contractorName  || "Contractor"));
+  const safeLicence    = sanitiseInput(String(contractorLicence || "Not provided"));
+  const safeWork       = sanitiseInput(String(workDescription)).slice(0, 500);
+  const safePropClass  = sanitiseInput(String(propertyClass   || "Class 1"));
+  const safeNotes      = sanitiseInput(String(notes || ""));
+
+  const PERMIT_TYPES = {
+    plumbing:   "Plumbing Permit",
+    gas:        "Gas Work Permit",
+    electrical: "Electrical Work Permit",
+    drainage:   "Drainage Permit",
+    carpentry:  "Building Permit",
+    hvac:       "Mechanical Services Permit (if applicable)",
+  };
+
+  const PERMIT_AUTHORITIES = {
+    plumbing:   "Victorian Building Authority (VBA) — my.vba.vic.gov.au",
+    gas:        "Energy Safe Victoria (ESV) — esv.vic.gov.au",
+    electrical: "Energy Safe Victoria (ESV) — esv.vic.gov.au",
+    drainage:   "Victorian Building Authority (VBA) — my.vba.vic.gov.au",
+    carpentry:  "Relevant Municipal Council and/or VBA",
+    hvac:       "N/A for most RAC work — check VBA for mechanical services",
+  };
+
+  const permitType  = PERMIT_TYPES[safeJobType]     || "Work Permit";
+  const authority   = PERMIT_AUTHORITIES[safeJobType]|| "VBA";
+  const permitId    = `PERMIT-APP-${Date.now().toString(36).toUpperCase()}`;
+  const docDate     = new Date().toISOString().slice(0, 10);
+
+  const REQUIRED_ATTACHMENTS = {
+    plumbing:   ["Plumbing plan (if new installation)", "Site plan"],
+    gas:        ["Site plan", "Appliance specifications"],
+    electrical: ["Electrical site plan or diagrams", "Load schedule"],
+    drainage:   ["Drainage plan", "Site plan"],
+    carpentry:  ["Architectural plans", "Structural engineer's certificate (if required)", "Site plan"],
+    hvac:       ["Mechanical services plan", "Equipment specifications"],
+  };
+
+  return res.json({
+    documentId:          permitId,
+    documentDate:        docDate,
+    permitType,
+    issuingAuthority:    authority,
+    propertyAddress:     safeAddress,
+    propertyClass:       safePropClass,
+    propertyOwner:       safeOwner,
+    contractor: {
+      name:              safeContractor,
+      licenceNumber:     safeLicence,
+    },
+    workDescription:     safeWork,
+    estimatedCost:       estimatedCost ? parseFloat(estimatedCost) : null,
+    proposedStartDate:   startDate ? sanitiseInput(String(startDate)) : null,
+    proposedEndDate:     endDate   ? sanitiseInput(String(endDate))   : null,
+    requiredAttachments: REQUIRED_ATTACHMENTS[safeJobType] || [],
+    permitFeeNote:       "Permit fees vary by council and work type. Check with the issuing authority before submitting.",
+    notes:               safeNotes || null,
+    generatedAt:         new Date().toISOString(),
+  });
+});
+
+// GET /job-types-full  — Extended job type listing with descriptions and requirements
+app.get("/job-types-full", apiKeyAuth, (req, res) => {
+  const JOB_TYPES_FULL = [
+    {
+      jobType:       "plumbing",
+      label:         "Plumbing",
+      description:   "Water supply, hot water, gas, drainage, and stormwater systems for domestic and commercial buildings.",
+      licencingBody: "VBA",
+      certRequired:  true,
+      permitRequired: "Often — depends on scope",
+      commonWork:    ["Hot water unit replacement", "Tap and mixer replacement", "Bathroom renovation", "New water supply", "Roof plumbing"],
+      keyStandards:  ["AS/NZS 3500", "NCC Plumbing Code"],
+    },
+    {
+      jobType:       "gas",
+      label:         "Gas Fitting",
+      description:   "Installation, maintenance, and servicing of Type A and Type B gas appliances and gas piping.",
+      licencingBody: "VBA / ESV",
+      certRequired:  true,
+      permitRequired: "Yes for new gas installations",
+      commonWork:    ["Gas heater installation", "Cooktop installation", "New gas piping", "Appliance service"],
+      keyStandards:  ["AS/NZS 5601.1", "AG 601"],
+    },
+    {
+      jobType:       "electrical",
+      label:         "Electrical",
+      description:   "Electrical installation, maintenance, and testing for domestic, commercial, and industrial premises.",
+      licencingBody: "Energy Safe Victoria",
+      certRequired:  true,
+      permitRequired: "Yes for prescribed work",
+      commonWork:    ["Switchboard upgrade", "New power circuits", "Lighting installation", "RCD installation"],
+      keyStandards:  ["AS/NZS 3000 (Wiring Rules)", "AS/NZS 61008"],
+    },
+    {
+      jobType:       "drainage",
+      label:         "Drainage",
+      description:   "Sanitary and stormwater drainage installation and maintenance.",
+      licencingBody: "VBA",
+      certRequired:  true,
+      permitRequired: "Often — check with VBA",
+      commonWork:    ["New sewer connection", "Stormwater installation", "Drain relining", "CCTV inspection"],
+      keyStandards:  ["AS/NZS 3500.2", "AS/NZS 3500.3"],
+    },
+    {
+      jobType:       "carpentry",
+      label:         "Carpentry / Building",
+      description:   "Structural and non-structural timber framing, residential and commercial building construction.",
+      licencingBody: "VBA",
+      certRequired:  false,
+      permitRequired: "Yes for domestic building work > $10,000",
+      commonWork:    ["New room addition", "Deck construction", "Structural framing", "Pergola"],
+      keyStandards:  ["AS 1684", "NCC Volume 2"],
+    },
+    {
+      jobType:       "hvac",
+      label:         "HVAC / Refrigeration",
+      description:   "Heating, ventilation, air conditioning, and refrigeration system installation and servicing.",
+      licencingBody: "ARC (ARCtick) + ESV",
+      certRequired:  false,
+      permitRequired: "Rarely — check with VBA for mechanical services",
+      commonWork:    ["Split system installation", "Ducted system", "Refrigerant service", "Commercial HVAC"],
+      keyStandards:  ["AS/NZS 1677", "AS/NZS 3000", "ARCtick Code"],
+    },
+  ];
+
+  const { trade } = req.query;
+  if (trade) {
+    const key  = sanitiseInput(String(trade)).toLowerCase();
+    const found = JOB_TYPES_FULL.find(j => j.jobType === key);
+    if (!found) return res.status(404).json({ error: `Trade not found: ${key}`, availableTrades: JOB_TYPES_FULL.map(j => j.jobType) });
+    return res.json(found);
+  }
+
+  return res.json({
+    trades:    JOB_TYPES_FULL,
+    count:     JOB_TYPES_FULL.length,
+    note:      "Requirements apply in Victoria. Always verify with the relevant authority.",
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
