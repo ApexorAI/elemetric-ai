@@ -34584,6 +34584,218 @@ app.get("/service-due", apiKeyAuth, async (req, res) => {
   res.status(503).json({ error: "Database not configured." });
 });
 
+// ── Round 130: Reporting suite — weekly/monthly/annual report endpoints ────────
+
+// POST /weekly-report — Generate a weekly site activity report
+app.post("/weekly-report", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, weekEnding, preparedBy,
+    weatherDays = 0, workingDays = 5,
+    manpowerPeak = 0, manpowerAvg = 0,
+    activitiesCompleted = [], activitiesInProgress = [], plannedNextWeek = [],
+    safetyObservations = 0, nearMisses = 0, incidents = 0,
+    openNcrs = 0, closedNcrs = 0,
+    labourCost = 0, materialCost = 0, plantCost = 0,
+    programmeVarianceDays = 0, percentComplete = 0,
+    issuesRisks = [], keyDecisions = [], notes,
+  } = req.body;
+
+  if (!projectId || !weekEnding) return res.status(400).json({ error: "projectId and weekEnding required." });
+
+  const totalCost = Number(labourCost) + Number(materialCost) + Number(plantCost);
+  const reportNumber = `WR-${sanitiseInput(projectId).slice(-4).toUpperCase()}-${weekEnding.replace(/-/g, "")}`;
+
+  const record = {
+    report_number: reportNumber,
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName || ""),
+    week_ending: weekEnding,
+    prepared_by: sanitiseInput(preparedBy || ""),
+    weather_days_lost: Number(weatherDays),
+    working_days: Number(workingDays),
+    productive_days: Number(workingDays) - Number(weatherDays),
+    manpower_peak: Number(manpowerPeak),
+    manpower_avg: Number(manpowerAvg),
+    activities_completed: activitiesCompleted.map(a => sanitiseInput(a)),
+    activities_in_progress: activitiesInProgress.map(a => sanitiseInput(a)),
+    planned_next_week: plannedNextWeek.map(a => sanitiseInput(a)),
+    safety_observations: Number(safetyObservations),
+    near_misses: Number(nearMisses),
+    incidents: Number(incidents),
+    open_ncrs: Number(openNcrs),
+    closed_ncrs: Number(closedNcrs),
+    labour_cost: Number(labourCost),
+    material_cost: Number(materialCost),
+    plant_cost: Number(plantCost),
+    total_weekly_cost: totalCost,
+    programme_variance_days: Number(programmeVarianceDays),
+    percent_complete: Number(percentComplete),
+    issues_risks: issuesRisks.map(i => sanitiseInput(i)),
+    key_decisions: keyDecisions.map(d => sanitiseInput(d)),
+    notes: sanitiseInput(notes || ""),
+    status: "ISSUED",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("weekly_reports")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, reportId: data.id, reportNumber, totalWeeklyCost: totalCost, ...record });
+  }
+
+  res.json({ success: true, reportId: null, reportNumber, totalWeeklyCost: totalCost, ...record, saved: false });
+});
+
+// POST /monthly-report — Generate a monthly project summary report
+app.post("/monthly-report", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, month, year, preparedBy,
+    workingDays, weatherDaysLost = 0,
+    percentCompleteStart, percentCompleteEnd,
+    programmeVarianceDays = 0,
+    monthlySpend, cumulativeSpend, forecastAtCompletion, budget,
+    safetyStats = {}, qualityStats = {}, keyActivities = [],
+    issuesRisks = [], keyDecisions = [], nextMonthPlan = [],
+    notes,
+  } = req.body;
+
+  if (!projectId || !month || !year) return res.status(400).json({ error: "projectId, month, year required." });
+
+  const monthStr = String(month).padStart(2, "0");
+  const reportPeriod = `${year}-${monthStr}`;
+  const reportNumber = `MR-${sanitiseInput(projectId).slice(-4).toUpperCase()}-${year}${monthStr}`;
+
+  const progressThisMonth = (Number(percentCompleteEnd) || 0) - (Number(percentCompleteStart) || 0);
+  const costVariance = budget && forecastAtCompletion ? Number(budget) - Number(forecastAtCompletion) : null;
+
+  const record = {
+    report_number: reportNumber,
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName || ""),
+    report_period: reportPeriod,
+    month: Number(month), year: Number(year),
+    prepared_by: sanitiseInput(preparedBy || ""),
+    working_days: Number(workingDays) || null,
+    weather_days_lost: Number(weatherDaysLost),
+    percent_complete_start: Number(percentCompleteStart) || 0,
+    percent_complete_end: Number(percentCompleteEnd) || 0,
+    progress_this_month: progressThisMonth,
+    programme_variance_days: Number(programmeVarianceDays),
+    monthly_spend: Number(monthlySpend) || null,
+    cumulative_spend: Number(cumulativeSpend) || null,
+    forecast_at_completion: Number(forecastAtCompletion) || null,
+    budget: Number(budget) || null,
+    cost_variance: costVariance,
+    safety_stats: safetyStats,
+    quality_stats: qualityStats,
+    key_activities: keyActivities.map(a => sanitiseInput(a)),
+    issues_risks: issuesRisks.map(i => sanitiseInput(i)),
+    key_decisions: keyDecisions.map(d => sanitiseInput(d)),
+    next_month_plan: nextMonthPlan.map(p => sanitiseInput(p)),
+    notes: sanitiseInput(notes || ""),
+    overall_status: programmeVarianceDays > 5 ? "BEHIND" : programmeVarianceDays < -5 ? "AHEAD" : "ON_TRACK",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("monthly_reports")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, reportId: data.id, reportNumber, progressThisMonth, overallStatus: record.overall_status, ...record });
+  }
+
+  res.json({ success: true, reportId: null, reportNumber, progressThisMonth, overallStatus: record.overall_status, ...record, saved: false });
+});
+
+// GET /reports/:projectId — List all reports for a project
+app.get("/reports/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { reportType } = req.query;
+
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  const tables = reportType === "WEEKLY" ? ["weekly_reports"] : reportType === "MONTHLY" ? ["monthly_reports"] : ["weekly_reports", "monthly_reports"];
+
+  const results = await Promise.all(tables.map(table =>
+    supabaseAdmin.from(table).select("report_number, report_period, week_ending, month, year, percent_complete, overall_status, created_at").eq("project_id", projectId).order("created_at", { ascending: false }).limit(20)
+  ));
+
+  const allReports = results.flatMap((r, i) =>
+    (r.data || []).map(rep => ({ ...rep, reportType: tables[i] === "weekly_reports" ? "WEEKLY" : "MONTHLY" }))
+  ).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+  res.json({ projectId, reports: allReports, count: allReports.length });
+});
+
+// POST /ai-executive-summary — AI generates an executive summary from a set of project data points
+app.post("/ai-executive-summary", apiKeyAuth, async (req, res) => {
+  const {
+    projectName, projectType, percentComplete, programmeStatus,
+    budgetStatus, safetyStatus, qualityStatus, keyRisks = [],
+    keyAchievements = [], clientSatisfaction, forecastDate,
+    reportingPeriod, audienceType = "client",
+  } = req.body;
+
+  if (!projectName || percentComplete === undefined)
+    return res.status(400).json({ error: "projectName and percentComplete required." });
+
+  const prompt = `You are a senior project director writing an executive summary for a construction project. This summary will be read by ${sanitiseInput(audienceType)}.
+
+Project: ${sanitiseInput(projectName)}
+Type: ${sanitiseInput(projectType || "Construction")}
+Reporting period: ${sanitiseInput(reportingPeriod || "Current")}
+Progress: ${percentComplete}% complete
+Programme status: ${sanitiseInput(programmeStatus || "On track")}
+Budget status: ${sanitiseInput(budgetStatus || "Within budget")}
+Safety status: ${sanitiseInput(safetyStatus || "No LTIs")}
+Quality status: ${sanitiseInput(qualityStatus || "Satisfactory")}
+Forecast completion: ${sanitiseInput(forecastDate || "Per programme")}
+Client satisfaction: ${sanitiseInput(clientSatisfaction || "Not assessed")}
+Key achievements: ${keyAchievements.map(a => sanitiseInput(a)).join("; ") || "On target"}
+Key risks: ${keyRisks.map(r => sanitiseInput(r)).join("; ") || "None critical"}
+
+Return a JSON object with:
+- "executiveSummary": 3-4 paragraph formal summary
+- "overallProjectStatus": "GREEN"|"AMBER"|"RED"
+- "statusRationale": one sentence explaining status
+- "keyHighlights": array of 3-5 bullet point highlights
+- "keyRisksAndIssues": array of critical risks summary
+- "lookAhead": 2-3 sentence look-ahead
+- "recommendedActions": array of action items for executive attention
+- "confidenceLevel": "LOW"|"MEDIUM"|"HIGH" (project delivery confidence)`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, projectName, percentComplete, reportingPeriod, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      executiveSummary: `${projectName} is currently ${percentComplete}% complete. Programme: ${programmeStatus || "On track"}. Budget: ${budgetStatus || "Within budget"}. Safety: ${safetyStatus || "No incidents"}.`,
+      overallProjectStatus: "AMBER",
+      statusRationale: "Automated executive summary unavailable — manual review required.",
+      keyHighlights: [`Progress: ${percentComplete}%`, `Programme: ${programmeStatus || "On track"}`, `Budget: ${budgetStatus || "Within budget"}`],
+      keyRisksAndIssues: keyRisks,
+      lookAhead: "Ongoing works in progress. Monitor closely.",
+      recommendedActions: ["Review project status manually with project manager"],
+      confidenceLevel: "MEDIUM",
+      projectName, percentComplete, reportingPeriod, generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
