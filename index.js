@@ -16980,6 +16980,234 @@ app.post("/photo-gps-check", apiKeyAuth, (req, res) => {
   });
 });
 
+// ── Round 38 ──────────────────────────────────────────────────────────────────
+
+// POST /tag-photo-set  — Auto-tag a set of photos with compliance-relevant labels
+app.post("/tag-photo-set", apiKeyAuth, async (req, res) => {
+  const { jobType, photos } = req.body;
+  if (!photos || !Array.isArray(photos) || photos.length === 0) {
+    return res.status(400).json({ error: "photos array is required." });
+  }
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+
+  const safeJobType = sanitiseInput(String(jobType)).toLowerCase();
+
+  const TAG_BANK = {
+    plumbing:   ["pipe-run", "isolation-valve", "hot-water-unit", "tempering-valve", "tpr-valve", "backflow-device", "flexible-hose", "inspection-point", "penetration-seal", "water-meter"],
+    gas:        ["gas-meter", "regulator", "isolation-valve", "flexible-connector", "appliance", "flue", "ventilation", "pressure-test", "combustion-analyser"],
+    electrical: ["switchboard", "rcd", "mcb", "cable-run", "earthing", "gpo", "smoke-alarm", "sub-board", "conduit", "escc"],
+    drainage:   ["pipe-in-trench", "inspection-opening", "gradient-check", "junction", "drain-pit", "storm-drain", "grease-trap", "water-test"],
+    carpentry:  ["framing", "bearer-joist", "connection-detail", "bracing", "timber-grade-stamp", "hold-down", "subfloor", "roof-structure"],
+    hvac:       ["indoor-unit", "outdoor-unit", "refrigerant-lineset", "condensate-drain", "electrical-isolator", "nameplate", "ductwork", "commissioning"],
+  };
+
+  const tradeTags = TAG_BANK[safeJobType] || [];
+
+  const systemPrompt = `You are an AI that tags trade compliance photos with relevant labels. For each photo described, assign 2–4 tags from the provided list. Return JSON array: [{ "photoIndex": number, "tags": string[], "stage": "Before|During|After", "quality": "good|acceptable|poor" }]`;
+
+  const imageMessages = photos.slice(0, 8).map(p => ({
+    type: "image_url",
+    image_url: { url: p.dataUrl || p.url || "", detail: "low" },
+  })).filter(m => m.image_url.url);
+
+  let taggedPhotos;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: [
+          { type: "text", text: `Tag these ${photos.length} ${safeJobType} photos. Available tags: ${tradeTags.join(", ")}` },
+          ...imageMessages,
+        ]},
+      ],
+      max_tokens: 600,
+      response_format: { type: "json_object" },
+    });
+    const raw     = JSON.parse(aiRes.choices[0].message.content);
+    taggedPhotos  = Array.isArray(raw) ? raw : (raw.photos || raw.results || []);
+  } catch {
+    taggedPhotos = photos.slice(0, 8).map((_, i) => ({
+      photoIndex: i + 1,
+      tags:       tradeTags.slice(0, 2),
+      stage:      "During",
+      quality:    "acceptable",
+    }));
+  }
+
+  const allTags = taggedPhotos.flatMap(p => p.tags || []);
+  const tagFrequency = allTags.reduce((acc, t) => { acc[t] = (acc[t] || 0) + 1; return acc; }, {});
+
+  return res.json({
+    jobType:      safeJobType,
+    photoCount:   photos.length,
+    taggedPhotos,
+    tagFrequency,
+    availableTags: tradeTags,
+    generatedAt:  new Date().toISOString(),
+  });
+});
+
+// POST /ai-document-extract  — Extract structured data from a compliance document description
+app.post("/ai-document-extract", apiKeyAuth, async (req, res) => {
+  const { documentType, rawText, jobType } = req.body;
+
+  if (!rawText || !documentType) {
+    return res.status(400).json({ error: "documentType and rawText are required." });
+  }
+
+  const safeText     = sanitiseInput(String(rawText)).slice(0, 2000);
+  const safeDocType  = sanitiseInput(String(documentType));
+  const safeJobType  = sanitiseInput(String(jobType || "general")).toLowerCase();
+
+  const systemPrompt = `You are a trade compliance document parser for Victoria, Australia. Extract structured data from the document text. Return a JSON object with relevant fields — always include: "documentType", "issueDate", "expiryDate" (or null), "licenceOrCertNumber", "tradesperson", "address", "tradeType", "status", "keyValues" (an object of any other important extracted fields).`;
+
+  let extracted;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: `Document type: ${safeDocType}\nTrade type: ${safeJobType}\n\nDocument text:\n${safeText}` },
+      ],
+      max_tokens: 500,
+      response_format: { type: "json_object" },
+    });
+    extracted = JSON.parse(aiRes.choices[0].message.content);
+  } catch {
+    extracted = {
+      documentType:       safeDocType,
+      issueDate:          null,
+      expiryDate:         null,
+      licenceOrCertNumber: null,
+      tradesperson:       null,
+      address:            null,
+      tradeType:          safeJobType,
+      status:             "UNKNOWN",
+      keyValues:          {},
+    };
+  }
+
+  return res.json({
+    input: { documentType: safeDocType, jobType: safeJobType, textLength: safeText.length },
+    extracted,
+    extractedAt: new Date().toISOString(),
+  });
+});
+
+// POST /job-notes-summary  — AI-summarise a set of raw job notes into structured output
+app.post("/job-notes-summary", apiKeyAuth, async (req, res) => {
+  const { notes, jobType, maxWords } = req.body;
+
+  if (!notes) return res.status(400).json({ error: "notes is required." });
+
+  const safeNotes   = sanitiseInput(String(notes)).slice(0, 3000);
+  const safeJobType = sanitiseInput(String(jobType || "general")).toLowerCase();
+  const wordLimit   = Math.min(parseInt(maxWords) || 100, 300);
+
+  const systemPrompt = `You are a trade compliance assistant. Summarise raw job notes into a professional structured output. Return JSON with: "summary" (plain text, under ${wordLimit} words), "workPerformed" (array of strings), "issuesFound" (array of strings), "actionRequired" (array of strings), "complianceNotes" (string or null).`;
+
+  let summary, workPerformed, issuesFound, actionRequired, complianceNotes;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: `Trade: ${safeJobType}\nNotes:\n${safeNotes}` },
+      ],
+      max_tokens: 400,
+      response_format: { type: "json_object" },
+    });
+    const parsed    = JSON.parse(aiRes.choices[0].message.content);
+    summary         = sanitiseInput(String(parsed.summary      || "")).slice(0, 1000);
+    workPerformed   = Array.isArray(parsed.workPerformed)  ? parsed.workPerformed.slice(0, 10).map(i => sanitiseInput(String(i)))  : [];
+    issuesFound     = Array.isArray(parsed.issuesFound)    ? parsed.issuesFound.slice(0, 10).map(i => sanitiseInput(String(i)))    : [];
+    actionRequired  = Array.isArray(parsed.actionRequired) ? parsed.actionRequired.slice(0, 10).map(i => sanitiseInput(String(i))) : [];
+    complianceNotes = parsed.complianceNotes ? sanitiseInput(String(parsed.complianceNotes)).slice(0, 500) : null;
+  } catch {
+    summary         = safeNotes.slice(0, 300);
+    workPerformed   = [];
+    issuesFound     = [];
+    actionRequired  = [];
+    complianceNotes = null;
+  }
+
+  return res.json({
+    jobType:        safeJobType,
+    originalLength: safeNotes.length,
+    summary,
+    workPerformed,
+    issuesFound,
+    actionRequired,
+    complianceNotes,
+    generatedAt:    new Date().toISOString(),
+  });
+});
+
+// POST /client-notification  — Send a client a job update notification via Resend email
+app.post("/client-notification", apiKeyAuth, async (req, res) => {
+  const { clientEmail, clientName, subject, message, jobId, jobType, notificationType } = req.body;
+
+  if (!clientEmail || !message) {
+    return res.status(400).json({ error: "clientEmail and message are required." });
+  }
+
+  if (!isValidEmail(clientEmail)) {
+    return res.status(400).json({ error: "clientEmail is not a valid email address." });
+  }
+
+  const safeClient   = sanitiseInput(String(clientName || "Client"));
+  const safeSubject  = sanitiseInput(String(subject    || "Job Update from Elemetric")).slice(0, 200);
+  const safeMessage  = sanitiseInput(String(message)).slice(0, 2000);
+  const safeJobType  = sanitiseInput(String(jobType    || "trade")).toLowerCase();
+  const safeNotifType= sanitiseInput(String(notificationType || "update"));
+
+  const NOTIFICATION_TYPES = { update: "Job Update", completion: "Job Completion", reminder: "Service Reminder", alert: "Compliance Alert" };
+  const notifLabel = NOTIFICATION_TYPES[safeNotifType] || "Notification";
+
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+      <div style="background: #1a1a2e; color: white; padding: 20px; border-radius: 8px 8px 0 0;">
+        <h1 style="margin: 0; font-size: 20px;">Elemetric — ${notifLabel}</h1>
+      </div>
+      <div style="padding: 24px; background: #f9f9f9; border: 1px solid #e0e0e0;">
+        <p>Dear ${escHtml(safeClient)},</p>
+        <p>${escHtml(safeMessage).replace(/\n/g, "<br>")}</p>
+        ${jobId ? `<p style="color: #666; font-size: 13px;">Job reference: ${escHtml(sanitiseInput(String(jobId)))}</p>` : ""}
+      </div>
+      <div style="padding: 16px; background: #f0f0f0; border-radius: 0 0 8px 8px; font-size: 12px; color: #888;">
+        <p>Elemetric — Trade Compliance Platform | www.elemetric.com.au</p>
+      </div>
+    </div>`;
+
+  let sent = false;
+  let messageId = null;
+  try {
+    if (resend) {
+      const emailRes = await resend.emails.send({
+        from:    process.env.EMAIL_FROM || "Elemetric <noreply@elemetric.app>",
+        to:      [clientEmail],
+        subject: safeSubject,
+        html,
+      });
+      sent      = true;
+      messageId = emailRes.id || null;
+      usageStats.emailCalls++;
+    }
+  } catch { /* email failure is non-fatal */ }
+
+  return res.json({
+    sent,
+    messageId,
+    clientEmail,
+    subject: safeSubject,
+    notificationType: safeNotifType,
+    jobId:   jobId ? sanitiseInput(String(jobId)) : null,
+    jobType: safeJobType,
+    sentAt:  new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
