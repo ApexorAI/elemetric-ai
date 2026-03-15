@@ -56684,6 +56684,277 @@ Return a JSON object with:
   }
 });
 
+// POST /site-induction-record — Record a worker site induction
+app.post("/site-induction-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      inductionDate,
+      inductionType,
+      conductedBy,
+      workerName,
+      workerCompany,
+      workerRole,
+      workerPhone,
+      workerEmail,
+      workerTickets,
+      whiteCardNumber,
+      whiteCardVerified,
+      licencesVerified,
+      topicsCovers,
+      siteSafetyRules,
+      emergencyProcedures,
+      firstAidLocationShown,
+      welfareArrangementsExplained,
+      hazardsDiscussed,
+      ppeIssued,
+      ppeList,
+      workerSignedOff,
+      supervisorSignedOff,
+      inductionValidUntil,
+      notes,
+    } = req.body;
+
+    if (!projectId || !inductionDate || !workerName || !conductedBy) {
+      return res.status(400).json({ error: "projectId, inductionDate, workerName, and conductedBy are required" });
+    }
+
+    const flags = [];
+    if (!whiteCardVerified && workerRole !== "visitor") flags.push("White Card not verified — construction workers must hold a valid White Card (general construction induction) per OHS Regulations 2017 (Vic)");
+    if (!workerSignedOff) flags.push("Worker has not signed induction acknowledgement — written sign-off required");
+    if (!emergencyProcedures) flags.push("Emergency procedures not covered — mandatory topic in all site inductions");
+    if (!ppeIssued && workerRole !== "visitor") flags.push("PPE not issued or confirmed — workers must have appropriate PPE before commencing work");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      induction_date: inductionDate,
+      induction_type: sanitiseInput(inductionType || "general"),
+      conducted_by: sanitiseInput(conductedBy),
+      worker_name: sanitiseInput(workerName),
+      worker_company: sanitiseInput(workerCompany || ""),
+      worker_role: sanitiseInput(workerRole || ""),
+      worker_phone: sanitiseInput(workerPhone || ""),
+      worker_email: isValidEmail(workerEmail || "") ? workerEmail : "",
+      worker_tickets: Array.isArray(workerTickets) ? workerTickets.map(t => sanitiseInput(t)) : [],
+      white_card_number: sanitiseInput(whiteCardNumber || ""),
+      white_card_verified: !!whiteCardVerified,
+      licences_verified: !!licencesVerified,
+      topics_covered: Array.isArray(topicsCovers) ? topicsCovers.map(t => sanitiseInput(t)) : [],
+      site_safety_rules: !!siteSafetyRules,
+      emergency_procedures: !!emergencyProcedures,
+      first_aid_location_shown: !!firstAidLocationShown,
+      welfare_arrangements_explained: !!welfareArrangementsExplained,
+      hazards_discussed: sanitiseInput(hazardsDiscussed || ""),
+      ppe_issued: !!ppeIssued,
+      ppe_list: Array.isArray(ppeList) ? ppeList.map(p => sanitiseInput(p)) : [],
+      worker_signed_off: !!workerSignedOff,
+      supervisor_signed_off: !!supervisorSignedOff,
+      induction_valid_until: inductionValidUntil || null,
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("site_induction_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({ workerName, inductionType: record.induction_type, flags, record, saved });
+  } catch (err) {
+    console.error("/site-induction-record error:", err.message);
+    res.status(500).json({ error: "Failed to record site induction" });
+  }
+});
+
+// GET /site-induction-record/:projectId — Retrieve site induction records for a project
+app.get("/site-induction-record/:projectId", apiKeyAuth, async (req, res) => {
+  try {
+    const projectId = sanitiseInput(req.params.projectId);
+    if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured" });
+    const { data, error } = await supabaseAdmin
+      .from("site_induction_records")
+      .select("worker_name, worker_company, worker_role, induction_date, induction_type, white_card_verified, induction_valid_until")
+      .eq("project_id", projectId)
+      .order("induction_date", { ascending: false });
+    if (error) return res.status(500).json({ error: "Failed to retrieve induction records" });
+    res.json({ projectId, inductedWorkers: data || [], count: (data || []).length });
+  } catch (err) {
+    console.error("/site-induction-record GET error:", err.message);
+    res.status(500).json({ error: "Failed to retrieve induction records" });
+  }
+});
+
+// POST /toolbox-talk-record — Record a toolbox talk / pre-start safety meeting
+app.post("/toolbox-talk-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      talkRef,
+      date,
+      time,
+      conductedBy,
+      location,
+      topic,
+      topicCategory,
+      keyMessages,
+      hazardsDiscussed,
+      controlsDiscussed,
+      incidentsReviewed,
+      workerQuestions,
+      actionItems,
+      attendees,
+      attendeeCount,
+      allAttendeeSigned,
+      duration,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !conductedBy || !topic) {
+      return res.status(400).json({ error: "projectId, date, conductedBy, and topic are required" });
+    }
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      talk_ref: sanitiseInput(talkRef || `TBT-${Date.now()}`),
+      date,
+      time: sanitiseInput(time || ""),
+      conducted_by: sanitiseInput(conductedBy),
+      location: sanitiseInput(location || ""),
+      topic: sanitiseInput(topic),
+      topic_category: sanitiseInput(topicCategory || "general safety"),
+      key_messages: Array.isArray(keyMessages) ? keyMessages.map(m => sanitiseInput(m)) : [],
+      hazards_discussed: sanitiseInput(hazardsDiscussed || ""),
+      controls_discussed: sanitiseInput(controlsDiscussed || ""),
+      incidents_reviewed: sanitiseInput(incidentsReviewed || ""),
+      worker_questions: sanitiseInput(workerQuestions || ""),
+      action_items: Array.isArray(actionItems) ? actionItems.map(a => sanitiseInput(a)) : [],
+      attendees: Array.isArray(attendees) ? attendees.map(a => sanitiseInput(a)) : [],
+      attendee_count: attendeeCount || (Array.isArray(attendees) ? attendees.length : 0),
+      all_attendee_signed: !!allAttendeeSigned,
+      duration: sanitiseInput(duration || ""),
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("toolbox_talk_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({ talkRef: record.talk_ref, topic, attendeeCount: record.attendee_count, record, saved });
+  } catch (err) {
+    console.error("/toolbox-talk-record error:", err.message);
+    res.status(500).json({ error: "Failed to record toolbox talk" });
+  }
+});
+
+// POST /hydraulic-pressure-test — Record a hydraulic pressure test for piping or vessels per AS 4041
+app.post("/hydraulic-pressure-test", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      testRef,
+      date,
+      testedBy,
+      system,
+      pipeSize,
+      pipeGrade,
+      testMedium,
+      testPressureKpa,
+      designPressureKpa,
+      mawpKpa,
+      holdPeriodMin,
+      testStartTime,
+      testEndTime,
+      pressureAtStart,
+      pressureAtEnd,
+      pressureDropKpa,
+      leaksObserved,
+      leakLocations,
+      fittingsInspected,
+      jointsInspected,
+      testPassed,
+      gaugeRef,
+      gaugeCalibrationDate,
+      certificateIssued,
+      certificateNumber,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !testedBy || !system || !testPressureKpa || testPassed === undefined) {
+      return res.status(400).json({ error: "projectId, date, testedBy, system, testPressureKpa, and testPassed are required" });
+    }
+
+    const failures = [];
+    // AS 4041: hydraulic test pressure typically 1.5× MAWP; gas test typically 1.1× MAWP
+    if (mawpKpa && Number(testPressureKpa) < Number(mawpKpa) * 1.5 && testMedium !== "gas") {
+      failures.push(`Test pressure ${testPressureKpa} kPa is below AS 4041 minimum 1.5× MAWP (${Number(mawpKpa) * 1.5} kPa) for hydraulic test`);
+    }
+    if (pressureDropKpa && Number(pressureDropKpa) > 0) failures.push(`Pressure drop of ${pressureDropKpa} kPa observed during hold period — indicates leak, test failed`);
+    if (leaksObserved) failures.push(`Leak(s) observed at: ${sanitiseInput(leakLocations || "locations not specified")} — repair and re-test`);
+    if (!testPassed) failures.push("Pressure test FAILED — system must not be placed into service until rectified and re-tested");
+
+    if (failures.length > 0) console.warn(`[PRESSURE TEST] ${system} at ${projectId} — ${failures.join("; ")}`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      test_ref: sanitiseInput(testRef || `HPT-${Date.now()}`),
+      date,
+      tested_by: sanitiseInput(testedBy),
+      system: sanitiseInput(system),
+      pipe_size: sanitiseInput(pipeSize || ""),
+      pipe_grade: sanitiseInput(pipeGrade || ""),
+      test_medium: sanitiseInput(testMedium || "water"),
+      test_pressure_kpa: Number(testPressureKpa),
+      design_pressure_kpa: designPressureKpa || null,
+      mawp_kpa: mawpKpa || null,
+      hold_period_min: holdPeriodMin || null,
+      test_start_time: sanitiseInput(testStartTime || ""),
+      test_end_time: sanitiseInput(testEndTime || ""),
+      pressure_at_start: pressureAtStart || null,
+      pressure_at_end: pressureAtEnd || null,
+      pressure_drop_kpa: pressureDropKpa || null,
+      leaks_observed: !!leaksObserved,
+      leak_locations: sanitiseInput(leakLocations || ""),
+      fittings_inspected: !!fittingsInspected,
+      joints_inspected: !!jointsInspected,
+      test_passed: !!testPassed,
+      failures,
+      gauge_ref: sanitiseInput(gaugeRef || ""),
+      gauge_calibration_date: gaugeCalibrationDate || null,
+      certificate_issued: !!certificateIssued,
+      certificate_number: sanitiseInput(certificateNumber || ""),
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("hydraulic_pressure_tests").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (failures.length > 0) {
+      return res.status(422).json({ testPassed: false, failures, message: "Pressure test failed. System must not be placed into service. Repair all leaks and re-test.", record, saved });
+    }
+
+    res.json({
+      testPassed: true,
+      testRef: record.test_ref,
+      failures: [],
+      applicableStandards: ["AS 4041 Pressure piping", "AS 1210 Pressure vessels", "AS 3788 Pressure equipment in-service inspection"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/hydraulic-pressure-test error:", err.message);
+    res.status(500).json({ error: "Failed to record hydraulic pressure test" });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
