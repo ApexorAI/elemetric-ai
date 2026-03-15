@@ -41609,6 +41609,227 @@ Return JSON with:
   }
 });
 
+// POST /defect-liability-tracker — Track defects during the defect liability period
+app.post("/defect-liability-tracker", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, practicalCompletionDate, defectLiabilityPeriodDays = 365,
+    defect, defectLocation, tradeResponsible, reportedBy,
+    reportedDate, severity = "MINOR", urgency = "ROUTINE",
+    rectificationDeadlineDays, status = "OPEN", notes,
+  } = req.body;
+  if (!projectId || !defect || !practicalCompletionDate) {
+    return res.status(400).json({ error: "projectId, defect, and practicalCompletionDate are required." });
+  }
+  const validSeverities = ["CRITICAL", "MAJOR", "MODERATE", "MINOR", "COSMETIC"];
+  const validUrgencies = ["EMERGENCY", "URGENT", "ROUTINE", "SCHEDULED"];
+  const validStatuses = ["OPEN", "NOTIFIED", "IN_RECTIFICATION", "COMPLETED", "DISPUTED", "WITHHELD"];
+  if (!validSeverities.includes(severity)) return res.status(400).json({ error: `severity must be one of: ${validSeverities.join(", ")}` });
+  if (!validUrgencies.includes(urgency)) return res.status(400).json({ error: `urgency must be one of: ${validUrgencies.join(", ")}` });
+  if (!validStatuses.includes(status)) return res.status(400).json({ error: `status must be one of: ${validStatuses.join(", ")}` });
+  const dlpExpiryDate = new Date(new Date(practicalCompletionDate).getTime() + Number(defectLiabilityPeriodDays) * 86400000).toISOString().split("T")[0];
+  const daysUntilDlpExpiry = Math.ceil((new Date(dlpExpiryDate) - new Date()) / (1000 * 60 * 60 * 24));
+  const deadlineDays = rectificationDeadlineDays || (urgency === "EMERGENCY" ? 1 : urgency === "URGENT" ? 5 : urgency === "ROUTINE" ? 14 : 30);
+  const rectificationDeadline = new Date(Date.now() + deadlineDays * 86400000).toISOString().split("T")[0];
+  const defectRef = `DLP-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    defect_ref: defectRef,
+    project_id: projectId,
+    practical_completion_date: practicalCompletionDate,
+    dlp_expiry_date: dlpExpiryDate,
+    days_until_dlp_expiry: daysUntilDlpExpiry,
+    defect: sanitiseInput(defect),
+    defect_location: sanitiseInput(defectLocation || ""),
+    trade_responsible: sanitiseInput(tradeResponsible || ""),
+    reported_by: sanitiseInput(reportedBy || ""),
+    reported_date: reportedDate || new Date().toISOString().split("T")[0],
+    severity, urgency,
+    rectification_deadline: rectificationDeadline,
+    status,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("dlp_defects").insert(record);
+    if (error) console.error("defect-liability-tracker DB error:", error.message);
+  }
+  res.json({
+    defectRef, severity, urgency, status, dlpExpiryDate, daysUntilDlpExpiry,
+    rectificationDeadline, saved: !!supabaseAdmin,
+  });
+});
+
+// GET /defect-liability-tracker/:projectId — List DLP defects for a project
+app.get("/defect-liability-tracker/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { status, severity } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("dlp_defects").select("*").eq("project_id", projectId).order("reported_date", { ascending: false });
+  if (status) query = query.eq("status", status);
+  if (severity) query = query.eq("severity", severity);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  const now = new Date();
+  res.json({
+    projectId, total: data.length,
+    open: data.filter(d => d.status === "OPEN" || d.status === "NOTIFIED").length,
+    overdue: data.filter(d => d.rectification_deadline && new Date(d.rectification_deadline) < now && d.status !== "COMPLETED").length,
+    critical: data.filter(d => d.severity === "CRITICAL").length,
+    defects: data,
+  });
+});
+
+// POST /as-built-register — Register an as-built drawing revision
+app.post("/as-built-register", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, drawingNumber, title, revision, discipline, format,
+    scale, preparedBy, checkedBy, approvedBy,
+    revisionDate, changes = [], status = "FOR_CONSTRUCTION",
+    fileUrl, notes,
+  } = req.body;
+  if (!projectId || !drawingNumber || !title) {
+    return res.status(400).json({ error: "projectId, drawingNumber, and title are required." });
+  }
+  const validStatuses = ["DRAFT", "ISSUED_FOR_REVIEW", "FOR_CONSTRUCTION", "AS_BUILT", "SUPERSEDED", "CANCELLED"];
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${validStatuses.join(", ")}` });
+  }
+  if (fileUrl && !isSafeUrl(fileUrl)) return res.status(400).json({ error: "Invalid fileUrl." });
+  const drawingRef = `DRG-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    drawing_ref: drawingRef,
+    project_id: projectId,
+    drawing_number: sanitiseInput(drawingNumber),
+    title: sanitiseInput(title),
+    revision: sanitiseInput(String(revision || "A")),
+    discipline: sanitiseInput(discipline || ""),
+    format: sanitiseInput(format || ""),
+    scale: sanitiseInput(scale || ""),
+    prepared_by: sanitiseInput(preparedBy || ""),
+    checked_by: sanitiseInput(checkedBy || ""),
+    approved_by: sanitiseInput(approvedBy || ""),
+    revision_date: revisionDate || new Date().toISOString().split("T")[0],
+    changes: Array.isArray(changes) ? changes.map(c => sanitiseInput(c)) : [],
+    status,
+    file_url: fileUrl || null,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("as_built_register").insert(record);
+    if (error) console.error("as-built-register DB error:", error.message);
+  }
+  res.json({ drawingRef, drawingNumber, title, revision, status, saved: !!supabaseAdmin });
+});
+
+// GET /as-built-register/:projectId — List drawings for a project
+app.get("/as-built-register/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { status, discipline } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("as_built_register").select("*").eq("project_id", projectId).order("drawing_number", { ascending: true });
+  if (status) query = query.eq("status", status);
+  if (discipline) query = query.eq("discipline", discipline);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ projectId, drawingCount: data.length, drawings: data });
+});
+
+// POST /ai-handover-checklist — AI generates a practical completion handover checklist
+app.post("/ai-handover-checklist", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, projectType = "residential", trade = "general",
+    buildingClass, state = "VIC", handoverDate,
+    specialSystems = [], tenantOccupied = false, stageHandover = false,
+  } = req.body;
+  if (!projectName) {
+    return res.status(400).json({ error: "projectName is required." });
+  }
+  const sanitisedProject = sanitiseInput(projectName);
+  const sanitisedType = sanitiseInput(projectType);
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian construction project manager specialising in practical completion and project handover.`;
+  const userPrompt = `Generate a comprehensive practical completion handover checklist for:
+Project: ${sanitisedProject}
+Type: ${sanitisedType}
+Trade scope: ${sanitisedTrade}
+Building class: ${sanitiseInput(buildingClass || "Unknown")}
+State: ${sanitisedState}
+Handover date: ${sanitiseInput(handoverDate || "TBD")}
+Special systems: ${specialSystems.map(s => sanitiseInput(s)).join(", ") || "Standard"}
+Tenant occupied: ${tenantOccupied}
+Stage handover: ${stageHandover}
+
+Return JSON with:
+{
+  "checklistTitle": "...",
+  "sections": [
+    {
+      "section": "DOCUMENTATION",
+      "items": [{"item": "...", "responsible": "...", "critical": true, "notes": "..."}]
+    }
+  ],
+  "documentationRequired": ["...", "..."],
+  "keyHandoverItems": ["...", "..."],
+  "clientTrainingRequired": ["...", "..."],
+  "defectLiabilityNotes": "...",
+  "outstandingWorksProcess": "...",
+  "retentionReleaseConditions": ["...", "..."],
+  "summary": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 3000,
+    });
+    usageStats.openaiCalls++;
+    const checklist = JSON.parse(aiRes.choices[0].message.content);
+    const checklistRef = `HOC-${Date.now().toString(36).toUpperCase()}`;
+    res.json({ checklistRef, projectId, projectName: sanitisedProject, projectType: sanitisedType, state: sanitisedState, checklist });
+  } catch (err) {
+    console.error("ai-handover-checklist error:", err.message);
+    const checklistRef = `HOC-FALLBACK`;
+    res.json({
+      checklistRef, projectId, projectName: sanitisedProject, projectType: sanitisedType, state: sanitisedState,
+      checklist: {
+        checklistTitle: `Practical Completion Checklist — ${sanitisedProject}`,
+        sections: [
+          { section: "DOCUMENTATION", items: [
+            { item: "Certificate of Occupancy / Building Approval", responsible: "Builder", critical: true, notes: "" },
+            { item: "Compliance certificates (plumbing, electrical, gas)", responsible: "Builder", critical: true, notes: "" },
+            { item: "Warranty documentation for all fixtures and fittings", responsible: "Builder", critical: false, notes: "" },
+            { item: "As-built drawings", responsible: "Builder", critical: true, notes: "" },
+            { item: "O&M manuals for all plant and equipment", responsible: "Builder", critical: true, notes: "" },
+          ]},
+          { section: "DEFECTS", items: [
+            { item: "Defect inspection walkthrough with client", responsible: "Builder + Client", critical: true, notes: "" },
+            { item: "Defect schedule issued and signed", responsible: "Builder", critical: true, notes: "" },
+          ]},
+          { section: "KEYS AND ACCESS", items: [
+            { item: "All keys and access cards handed over", responsible: "Builder", critical: true, notes: "" },
+            { item: "Security codes and alarm information provided", responsible: "Builder", critical: true, notes: "" },
+          ]},
+          { section: "TRAINING", items: [
+            { item: "Client briefed on all installed systems", responsible: "Builder", critical: false, notes: "" },
+          ]},
+        ],
+        documentationRequired: ["Certificate of Occupancy", "Compliance certificates", "Warranty documents", "As-built drawings", "O&M manuals"],
+        keyHandoverItems: ["All keys and access devices", "Utility account handover", "Warranty registration"],
+        clientTrainingRequired: specialSystems.length > 0 ? specialSystems : ["General building systems"],
+        defectLiabilityNotes: "A 12-month defect liability period commences on the date of practical completion.",
+        outstandingWorksProcess: "Outstanding works to be completed within agreed timeframes per the practical completion notice.",
+        retentionReleaseConditions: ["Practical completion certificate issued", "Defect schedule signed", "Outstanding retention monies release at DLP expiry"],
+        summary: `Handover checklist for ${sanitisedProject} — practical completion.`,
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
