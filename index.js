@@ -51842,6 +51842,319 @@ Return a JSON object with:
   }
 });
 
+// POST /noise-monitoring-record — Record occupational noise monitoring per AS/NZS 1269 and Vic OHS Regs
+app.post("/noise-monitoring-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      monitoringRef,
+      dateMonitored,
+      monitoredBy,
+      instrumentType,
+      instrumentCalibrationDate,
+      workArea,
+      noiseSource,
+      taskDescription,
+      measurementType,
+      lavg8hr,
+      lc_peak,
+      dosePercent,
+      exposureDuration,
+      workerName,
+      hearingProtectionWorn,
+      hearingProtectionType,
+      engineeringControlsInPlace,
+      administrativeControlsInPlace,
+      result,
+      followUpRequired,
+      notes,
+    } = req.body;
+
+    if (!projectId || !dateMonitored || !workArea || !result) {
+      return res.status(400).json({ error: "projectId, dateMonitored, workArea, and result are required" });
+    }
+
+    const exceedances = [];
+    // Vic OHS Regs 2017 reg. 3.3.1: LAeq,8h > 85 dB(A) — action level; > 85 dB(A) averaged over 8hr
+    if (lavg8hr && Number(lavg8hr) > 85) exceedances.push(`LAeq,8h ${lavg8hr} dB(A) exceeds 85 dB(A) action level — hearing protection mandatory`);
+    if (lavg8hr && Number(lavg8hr) >= 100) exceedances.push(`LAeq,8h ${lavg8hr} dB(A) — extremely high exposure, engineering controls required as primary measure`);
+    // LC,peak > 140 dB(C) — peak noise limit
+    if (lc_peak && Number(lc_peak) > 140) exceedances.push(`LC,peak ${lc_peak} dB(C) exceeds 140 dB(C) limit — immediate engineering controls required`);
+    if (dosePercent && Number(dosePercent) > 100) exceedances.push(`Noise dose ${dosePercent}% exceeds 100% — TWA limit breached`);
+
+    if (exceedances.length > 0) console.warn(`[NOISE] ${workArea} — ${exceedances.join("; ")}`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      monitoring_ref: sanitiseInput(monitoringRef || `NM-${Date.now()}`),
+      date_monitored: dateMonitored,
+      monitored_by: sanitiseInput(monitoredBy || ""),
+      instrument_type: sanitiseInput(instrumentType || ""),
+      instrument_calibration_date: instrumentCalibrationDate || null,
+      work_area: sanitiseInput(workArea),
+      noise_source: sanitiseInput(noiseSource || ""),
+      task_description: sanitiseInput(taskDescription || ""),
+      measurement_type: sanitiseInput(measurementType || "personal dosimetry"),
+      lavg_8hr: lavg8hr || null,
+      lc_peak: lc_peak || null,
+      dose_percent: dosePercent || null,
+      exposure_duration: sanitiseInput(exposureDuration || ""),
+      worker_name: sanitiseInput(workerName || ""),
+      hearing_protection_worn: !!hearingProtectionWorn,
+      hearing_protection_type: sanitiseInput(hearingProtectionType || ""),
+      engineering_controls_in_place: !!engineeringControlsInPlace,
+      administrative_controls_in_place: !!administrativeControlsInPlace,
+      exceedances,
+      result: sanitiseInput(result),
+      follow_up_required: !!followUpRequired,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("noise_monitoring_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      exceedances,
+      actionLevelBreached: exceedances.length > 0,
+      applicableLimits: { laeq8hr_action: "85 dB(A)", lc_peak_limit: "140 dB(C)" },
+      applicableStandards: ["AS/NZS 1269.1 Occupational noise management", "OHS Regulations 2017 (Vic) r.3.3", "Safe Work Australia Managing Noise and Preventing Hearing Loss at Work Code of Practice"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/noise-monitoring-record error:", err.message);
+    res.status(500).json({ error: "Failed to record noise monitoring" });
+  }
+});
+
+// GET /noise-monitoring-record/:projectId — Retrieve noise monitoring records for a project
+app.get("/noise-monitoring-record/:projectId", apiKeyAuth, async (req, res) => {
+  try {
+    const projectId = sanitiseInput(req.params.projectId);
+    if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured" });
+    const { data, error } = await supabaseAdmin
+      .from("noise_monitoring_records")
+      .select("*")
+      .eq("project_id", projectId)
+      .order("date_monitored", { ascending: false });
+    if (error) return res.status(500).json({ error: "Failed to retrieve noise monitoring records" });
+    res.json({ projectId, records: data || [] });
+  } catch (err) {
+    console.error("/noise-monitoring-record GET error:", err.message);
+    res.status(500).json({ error: "Failed to retrieve noise monitoring records" });
+  }
+});
+
+// POST /confined-space-atmospheric-test — Record atmospheric testing before confined space entry
+app.post("/confined-space-atmospheric-test", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      permitRef,
+      spaceDescription,
+      testDate,
+      testTime,
+      testedBy,
+      instrumentRef,
+      instrumentCalibrated,
+      oxygenPercent,
+      lelPercent,
+      h2sPpm,
+      coPpm,
+      no2Ppm,
+      otherGas,
+      otherGasLevel,
+      otherGasWes,
+      ventilationApplied,
+      ventilationMethod,
+      reTestAfterVentilation,
+      o2AfterVentilation,
+      lelAfterVentilation,
+      safeToEnter,
+      authorisedEntrant,
+      standbyPersonAssigned,
+      rescuePlanInPlace,
+      entryApproved,
+      notes,
+    } = req.body;
+
+    if (!projectId || !spaceDescription || !testDate || !safeToEnter === undefined) {
+      return res.status(400).json({ error: "projectId, spaceDescription, testDate, and safeToEnter are required" });
+    }
+
+    const atmosphericFailures = [];
+    // Vic OHS Regs 2017 & AS 2865: O2 must be 19.5%–23.5%
+    if (oxygenPercent !== undefined) {
+      if (Number(oxygenPercent) < 19.5) atmosphericFailures.push(`Oxygen ${oxygenPercent}% — oxygen-deficient atmosphere (< 19.5%): DO NOT ENTER`);
+      if (Number(oxygenPercent) > 23.5) atmosphericFailures.push(`Oxygen ${oxygenPercent}% — oxygen-enriched atmosphere (> 23.5%): fire/explosion risk, DO NOT ENTER`);
+    }
+    // LEL threshold: > 5% LEL = do not enter (AS 2865)
+    if (lelPercent && Number(lelPercent) > 5) atmosphericFailures.push(`LEL ${lelPercent}% — exceeds 5% LEL threshold: flammable atmosphere, DO NOT ENTER`);
+    // H2S WES-STEL 10 ppm (Safe Work Australia)
+    if (h2sPpm && Number(h2sPpm) > 10) atmosphericFailures.push(`H2S ${h2sPpm} ppm — exceeds WES-STEL 10 ppm`);
+    // CO WES-TWA 20 ppm (Safe Work Australia)
+    if (coPpm && Number(coPpm) > 20) atmosphericFailures.push(`CO ${coPpm} ppm — exceeds WES-TWA 20 ppm`);
+    // NO2 WES-STEL 3 ppm
+    if (no2Ppm && Number(no2Ppm) > 3) atmosphericFailures.push(`NO2 ${no2Ppm} ppm — exceeds WES-STEL 3 ppm`);
+    if (!standbyPersonAssigned) atmosphericFailures.push("No standby person assigned — mandatory requirement per AS 2865");
+    if (!rescuePlanInPlace) atmosphericFailures.push("No rescue plan in place — required before confined space entry");
+
+    if (atmosphericFailures.length > 0) {
+      console.warn(`[CONFINED SPACE] ${spaceDescription} at ${projectId} — ${atmosphericFailures.join("; ")}`);
+    }
+
+    const entryAllowed = !safeToEnter ? false : (atmosphericFailures.filter(f => f.includes("DO NOT ENTER")).length === 0);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      permit_ref: sanitiseInput(permitRef || ""),
+      space_description: sanitiseInput(spaceDescription),
+      test_date: testDate,
+      test_time: sanitiseInput(testTime || ""),
+      tested_by: sanitiseInput(testedBy || ""),
+      instrument_ref: sanitiseInput(instrumentRef || ""),
+      instrument_calibrated: !!instrumentCalibrated,
+      oxygen_percent: oxygenPercent !== undefined ? Number(oxygenPercent) : null,
+      lel_percent: lelPercent !== undefined ? Number(lelPercent) : null,
+      h2s_ppm: h2sPpm || null,
+      co_ppm: coPpm || null,
+      no2_ppm: no2Ppm || null,
+      other_gas: sanitiseInput(otherGas || ""),
+      other_gas_level: otherGasLevel || null,
+      other_gas_wes: sanitiseInput(otherGasWes || ""),
+      ventilation_applied: !!ventilationApplied,
+      ventilation_method: sanitiseInput(ventilationMethod || ""),
+      re_test_after_ventilation: !!reTestAfterVentilation,
+      o2_after_ventilation: o2AfterVentilation || null,
+      lel_after_ventilation: lelAfterVentilation || null,
+      atmospheric_failures: atmosphericFailures,
+      safe_to_enter: !!safeToEnter,
+      entry_allowed: entryAllowed,
+      authorised_entrant: sanitiseInput(authorisedEntrant || ""),
+      standby_person_assigned: !!standbyPersonAssigned,
+      rescue_plan_in_place: !!rescuePlanInPlace,
+      entry_approved: !!entryApproved,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("confined_space_atmospheric_tests").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (!entryAllowed || atmosphericFailures.some(f => f.includes("DO NOT ENTER"))) {
+      return res.status(422).json({
+        entryAllowed: false,
+        atmosphericFailures,
+        message: "Entry must not proceed. Atmospheric conditions are unsafe. Apply ventilation and re-test before authorising entry.",
+        record,
+        saved,
+      });
+    }
+
+    res.json({
+      entryAllowed: true,
+      atmosphericFailures,
+      acceptableRanges: { o2: "19.5–23.5%", lel: "< 5%", h2s: "< 10 ppm (STEL)", co: "< 20 ppm (TWA)", no2: "< 3 ppm (STEL)" },
+      applicableStandards: ["AS 2865 Safe Working in a Confined Space", "OHS Regulations 2017 (Vic) Part 3.3", "Safe Work Australia Code of Practice: Confined Spaces 2021"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/confined-space-atmospheric-test error:", err.message);
+    res.status(500).json({ error: "Failed to record atmospheric test" });
+  }
+});
+
+// POST /ai-noise-exposure-assessment — AI assesses occupational noise exposure and controls
+app.post("/ai-noise-exposure-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      workArea,
+      noiseSources,
+      typicalLavg8hr,
+      typicalLcPeak,
+      taskDuration,
+      currentControls,
+      workerCount,
+    } = req.body;
+
+    if (!workArea || !noiseSources) {
+      return res.status(400).json({ error: "workArea and noiseSources are required" });
+    }
+
+    const prompt = `You are an occupational hygienist specialising in noise management under AS/NZS 1269 and the Victorian OHS Regulations 2017.
+
+Assess occupational noise exposure for:
+- Work area: ${sanitiseInput(workArea)}
+- Noise sources: ${sanitiseInput(noiseSources)}
+- Typical LAeq,8h: ${sanitiseInput(String(typicalLavg8hr || "not measured"))} dB(A)
+- Typical LC,peak: ${sanitiseInput(String(typicalLcPeak || "not measured"))} dB(C)
+- Task duration per shift: ${sanitiseInput(taskDuration || "not specified")}
+- Current controls: ${sanitiseInput(currentControls || "hearing protection only")}
+- Workers exposed: ${sanitiseInput(String(workerCount || "unknown"))}
+
+Return a JSON object with:
+{
+  "riskRating": "NEGLIGIBLE|LOW|MEDIUM|HIGH|EXTREME",
+  "actionLevelExceeded": boolean,
+  "limitExceeded": boolean,
+  "estimatedDose": string,
+  "engineeringControls": [string],
+  "administrativeControls": [string],
+  "hearingProtectionRequired": boolean,
+  "hearingProtectionRecommended": string,
+  "audiometricSurveillanceRequired": boolean,
+  "audiometricSurveillanceFrequency": string,
+  "monitoringRecommended": string,
+  "noiseMgmtProgramRequired": boolean,
+  "applicableStandards": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ workArea, noiseSources, assessment });
+  } catch (err) {
+    console.error("/ai-noise-exposure-assessment error:", err.message);
+    res.json({
+      workArea: req.body.workArea || "",
+      noiseSources: req.body.noiseSources || "",
+      assessment: {
+        riskRating: "HIGH",
+        actionLevelExceeded: true,
+        limitExceeded: false,
+        estimatedDose: "Likely 85–100% daily noise dose",
+        engineeringControls: ["Acoustic enclosures for stationary plant", "Isolation mounts to reduce vibration transmission", "Substitution with quieter equipment where practicable"],
+        administrativeControls: ["Job rotation to limit individual exposure time", "Noise hazard signage in high-noise zones", "Exclusion of non-essential workers from high-noise areas"],
+        hearingProtectionRequired: true,
+        hearingProtectionRecommended: "Class 4 earmuffs (SLC80 ≥ 27 dB) or combined earplug/earmuff for > 100 dB(A)",
+        audiometricSurveillanceRequired: true,
+        audiometricSurveillanceFrequency: "Baseline within 3 months of engagement, then annually",
+        monitoringRecommended: "Personal dosimetry survey using calibrated SLM/dosimeter per AS/NZS 1269.1",
+        noiseMgmtProgramRequired: true,
+        applicableStandards: ["AS/NZS 1269.1–4 Occupational noise management", "OHS Regulations 2017 (Vic) r.3.3", "Safe Work Australia Managing Noise Code of Practice 2022"],
+        recommendation: "Implement a formal noise management program. Conduct personal dosimetry. Enrol exposed workers in audiometric surveillance. Prioritise engineering controls over PPE.",
+        summary: "Noise levels indicate a high-risk exposure environment. A formal noise management program with monitoring, engineering controls, and audiometric surveillance is required under the OHS Regulations.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
