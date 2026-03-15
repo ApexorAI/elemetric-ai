@@ -52430,6 +52430,280 @@ Return a JSON object with:
   }
 });
 
+// POST /heat-stress-monitoring — Record heat stress monitoring per Safe Work Australia guidance
+app.post("/heat-stress-monitoring", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      monitoringRef,
+      date,
+      time,
+      location,
+      monitoredBy,
+      airTemperatureC,
+      relativeHumidityPercent,
+      wbgtC,
+      radiantHeatSource,
+      workIntensity,
+      acclimatised,
+      shadeAvailable,
+      coolWaterAvailable,
+      restBreaksProvided,
+      restBreakFrequencyMin,
+      workerSymptoms,
+      incidentOccurred,
+      incidentDescription,
+      controlsInPlace,
+      result,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !location || !result) {
+      return res.status(400).json({ error: "projectId, date, location, and result are required" });
+    }
+
+    const alerts = [];
+    // Safe Work Australia WBGT thresholds (acclimatised, moderate work)
+    // WBGT > 28°C light work, > 25°C moderate work, > 22°C heavy work → significant risk
+    if (wbgtC !== undefined) {
+      if (workIntensity === "heavy" && Number(wbgtC) >= 22) alerts.push(`WBGT ${wbgtC}°C during heavy work — high heat stress risk, mandatory rest breaks`);
+      else if (workIntensity === "moderate" && Number(wbgtC) >= 25) alerts.push(`WBGT ${wbgtC}°C during moderate work — high heat stress risk`);
+      else if (Number(wbgtC) >= 28) alerts.push(`WBGT ${wbgtC}°C — extreme heat stress conditions`);
+    }
+    if (airTemperatureC && Number(airTemperatureC) >= 38) alerts.push(`Air temperature ${airTemperatureC}°C — extreme heat, consider suspending outdoor work`);
+    if (!coolWaterAvailable) alerts.push("No cool water available — mandatory provision of cool drinking water (250 mL/hr minimum) per Safe Work Australia");
+    if (!shadeAvailable && airTemperatureC && Number(airTemperatureC) >= 30) alerts.push("No shade available during hot conditions — shade or cool rest area required");
+    if (incidentOccurred) alerts.push(`Heat-related incident reported: ${sanitiseInput(incidentDescription || "details not provided")}`);
+
+    if (alerts.length > 0) console.warn(`[HEAT STRESS] ${location} at ${projectId} — ${alerts.join("; ")}`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      monitoring_ref: sanitiseInput(monitoringRef || `HS-${Date.now()}`),
+      date,
+      time: sanitiseInput(time || ""),
+      location: sanitiseInput(location),
+      monitored_by: sanitiseInput(monitoredBy || ""),
+      air_temperature_c: airTemperatureC || null,
+      relative_humidity_percent: relativeHumidityPercent || null,
+      wbgt_c: wbgtC || null,
+      radiant_heat_source: sanitiseInput(radiantHeatSource || ""),
+      work_intensity: sanitiseInput(workIntensity || "moderate"),
+      acclimatised: !!acclimatised,
+      shade_available: !!shadeAvailable,
+      cool_water_available: !!coolWaterAvailable,
+      rest_breaks_provided: !!restBreaksProvided,
+      rest_break_frequency_min: restBreakFrequencyMin || null,
+      worker_symptoms: sanitiseInput(workerSymptoms || ""),
+      incident_occurred: !!incidentOccurred,
+      incident_description: sanitiseInput(incidentDescription || ""),
+      alerts,
+      controls_in_place: sanitiseInput(controlsInPlace || ""),
+      result: sanitiseInput(result),
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("heat_stress_monitoring").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      alerts,
+      highRisk: alerts.length > 0,
+      wbgtThresholds: { light: "28°C", moderate: "25°C", heavy: "22°C" },
+      applicableGuidance: ["Safe Work Australia Heat Stress Code of Practice 2021", "AS 1338 Personal protective equipment — eye protectors", "Vic OHS Regulations 2017 general duty of care"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/heat-stress-monitoring error:", err.message);
+    res.status(500).json({ error: "Failed to record heat stress monitoring" });
+  }
+});
+
+// POST /subcontractor-performance-evaluation — Record subcontractor performance evaluation
+app.post("/subcontractor-performance-evaluation", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      evaluationRef,
+      subcontractorName,
+      subcontractorAbn,
+      tradeType,
+      contractValue,
+      evaluationDate,
+      evaluatedBy,
+      evaluationPeriodFrom,
+      evaluationPeriodTo,
+      safetyScore,
+      qualityScore,
+      programmeScore,
+      communicationScore,
+      documentationScore,
+      environmentScore,
+      overallScore,
+      safetyComments,
+      qualityComments,
+      programmeComments,
+      communicationComments,
+      notifiableIncidents,
+      ncrsRaised,
+      ncrsResolved,
+      approved,
+      recommendedForFuture,
+      conditions,
+      notes,
+    } = req.body;
+
+    if (!projectId || !subcontractorName || !evaluationDate || !evaluatedBy || !overallScore) {
+      return res.status(400).json({ error: "projectId, subcontractorName, evaluationDate, evaluatedBy, and overallScore are required" });
+    }
+
+    const flags = [];
+    if (safetyScore !== undefined && Number(safetyScore) < 60) flags.push(`Safety score ${safetyScore}/100 — below acceptable threshold (60). Subcontractor must not be re-engaged without safety improvement plan.`);
+    if (overallScore !== undefined && Number(overallScore) < 50) flags.push(`Overall score ${overallScore}/100 — poor performer. Re-engagement requires management approval.`);
+    if (notifiableIncidents && Number(notifiableIncidents) > 0) flags.push(`${notifiableIncidents} notifiable incident(s) recorded during engagement`);
+    if (ncrsRaised && ncrsResolved !== undefined && Number(ncrsRaised) > Number(ncrsResolved)) flags.push(`${Number(ncrsRaised) - Number(ncrsResolved)} unresolved NCR(s) at time of evaluation`);
+
+    const grade = overallScore >= 90 ? "A" : overallScore >= 75 ? "B" : overallScore >= 60 ? "C" : overallScore >= 50 ? "D" : "F";
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      evaluation_ref: sanitiseInput(evaluationRef || `SPE-${Date.now()}`),
+      subcontractor_name: sanitiseInput(subcontractorName),
+      subcontractor_abn: sanitiseInput(subcontractorAbn || ""),
+      trade_type: sanitiseInput(tradeType || ""),
+      contract_value: contractValue || null,
+      evaluation_date: evaluationDate,
+      evaluated_by: sanitiseInput(evaluatedBy),
+      evaluation_period_from: evaluationPeriodFrom || null,
+      evaluation_period_to: evaluationPeriodTo || null,
+      safety_score: safetyScore !== undefined ? Number(safetyScore) : null,
+      quality_score: qualityScore !== undefined ? Number(qualityScore) : null,
+      programme_score: programmeScore !== undefined ? Number(programmeScore) : null,
+      communication_score: communicationScore !== undefined ? Number(communicationScore) : null,
+      documentation_score: documentationScore !== undefined ? Number(documentationScore) : null,
+      environment_score: environmentScore !== undefined ? Number(environmentScore) : null,
+      overall_score: Number(overallScore),
+      grade,
+      safety_comments: sanitiseInput(safetyComments || ""),
+      quality_comments: sanitiseInput(qualityComments || ""),
+      programme_comments: sanitiseInput(programmeComments || ""),
+      communication_comments: sanitiseInput(communicationComments || ""),
+      notifiable_incidents: notifiableIncidents || 0,
+      ncrs_raised: ncrsRaised || 0,
+      ncrs_resolved: ncrsResolved || 0,
+      flags,
+      approved: !!approved,
+      recommended_for_future: !!recommendedForFuture,
+      conditions: sanitiseInput(conditions || ""),
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("subcontractor_performance_evaluations").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({ evaluationRef: record.evaluation_ref, grade, overallScore: Number(overallScore), flags, approved, recommendedForFuture, record, saved });
+  } catch (err) {
+    console.error("/subcontractor-performance-evaluation error:", err.message);
+    res.status(500).json({ error: "Failed to record subcontractor performance evaluation" });
+  }
+});
+
+// POST /ai-heat-stress-assessment — AI assesses heat stress risk and recommends controls
+app.post("/ai-heat-stress-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      location,
+      season,
+      forecastTemperatureC,
+      forecastHumidityPercent,
+      workType,
+      workIntensity,
+      shiftDuration,
+      acclimatisationLevel,
+      vulnerableWorkers,
+      existingControls,
+    } = req.body;
+
+    if (!location || !workType) {
+      return res.status(400).json({ error: "location and workType are required" });
+    }
+
+    const prompt = `You are an occupational health expert specialising in heat stress risk management for construction sites in Victoria, Australia.
+
+Assess heat stress risk for:
+- Location: ${sanitiseInput(location)}
+- Season: ${sanitiseInput(season || "summer")}
+- Forecast temperature: ${sanitiseInput(String(forecastTemperatureC || "not provided"))}°C
+- Forecast humidity: ${sanitiseInput(String(forecastHumidityPercent || "not provided"))}%
+- Work type: ${sanitiseInput(workType)}
+- Work intensity: ${sanitiseInput(workIntensity || "moderate")}
+- Shift duration: ${sanitiseInput(shiftDuration || "8 hours")}
+- Acclimatisation level: ${sanitiseInput(acclimatisationLevel || "not specified")}
+- Vulnerable workers present: ${sanitiseInput(vulnerableWorkers || "unknown")}
+- Existing controls: ${sanitiseInput(existingControls || "none")}
+
+Return a JSON object with:
+{
+  "riskLevel": "LOW|MEDIUM|HIGH|EXTREME",
+  "workSuspensionRecommended": boolean,
+  "workSuspensionThreshold": string,
+  "mandatoryControls": [string],
+  "recommendedControls": [string],
+  "restBreakSchedule": string,
+  "hydrationRequirements": string,
+  "acclimatisationPlan": string,
+  "earlyWarningSymptoms": [string],
+  "emergencyProcedure": string,
+  "vulnerableWorkerConsiderations": string,
+  "applicableGuidance": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ location, workType, assessment });
+  } catch (err) {
+    console.error("/ai-heat-stress-assessment error:", err.message);
+    res.json({
+      location: req.body.location || "",
+      workType: req.body.workType || "",
+      assessment: {
+        riskLevel: "HIGH",
+        workSuspensionRecommended: false,
+        workSuspensionThreshold: "Suspend outdoor work when air temperature exceeds 38°C or WBGT exceeds 28°C for light work",
+        mandatoryControls: ["Provide cool drinking water (1 L/hr minimum in hot conditions)", "Provide shaded rest areas", "Mandatory rest breaks (10 min per hour in extreme heat)", "Heat stress emergency response plan posted on site"],
+        recommendedControls: ["Schedule heavy tasks for cooler morning hours", "Buddy system — workers monitor each other for symptoms", "Cooling towels and misting fans at rest areas", "Weather monitoring and daily heat alert briefings"],
+        restBreakSchedule: "5–10 min break per 45–55 min of moderate outdoor work; increase frequency as temperature rises",
+        hydrationRequirements: "250 mL cool water every 20 minutes during heat stress conditions; avoid alcohol, caffeine, and carbonated drinks",
+        acclimatisationPlan: "New and returning workers: 50% exposure day 1, increase by 10% per day over 10–14 days",
+        earlyWarningSymptoms: ["Excessive sweating", "Headache or dizziness", "Nausea", "Confusion or disorientation", "Pale/clammy skin"],
+        emergencyProcedure: "Move worker to shade immediately. Cool with water/wet towels. Call 000. Do not leave unattended. Record incident and notify WorkSafe if worker requires hospitalisation.",
+        vulnerableWorkerConsiderations: "Workers with cardiovascular conditions, diabetes, obesity, or on certain medications are at elevated risk. Conduct pre-season health screening.",
+        applicableGuidance: ["Safe Work Australia Managing the Work Environment and Facilities Code of Practice 2022", "Vic OHS Regulations 2017 — general duty to provide safe work environment", "BOM weather alerts and fire weather warnings"],
+        recommendation: "Implement a heat management plan including pre-work briefings, mandatory hydration, shade provision, and a clear trigger plan for work suspension based on daily forecast.",
+        summary: "Hot weather working presents a serious risk of heat-related illness on Victorian construction sites. A formal heat management plan with monitoring, acclimatisation, and emergency procedures is essential.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
