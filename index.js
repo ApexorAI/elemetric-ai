@@ -19279,6 +19279,227 @@ app.get("/job-types-full", apiKeyAuth, (req, res) => {
   });
 });
 
+// ── Round 48 ──────────────────────────────────────────────────────────────────
+
+// POST /work-order-track  — Update the status of a work order and log the change
+app.post("/work-order-track", apiKeyAuth, async (req, res) => {
+  const { workOrderId, newStatus, updatedBy, completionPercentage, notes } = req.body;
+
+  if (!workOrderId || !newStatus) {
+    return res.status(400).json({ error: "workOrderId and newStatus are required." });
+  }
+
+  const VALID_STATUSES = ["DRAFT", "ISSUED", "ACCEPTED", "IN_PROGRESS", "ON_HOLD", "COMPLETED", "CANCELLED", "INVOICED"];
+  const safeStatus  = sanitiseInput(String(newStatus)).toUpperCase();
+
+  if (!VALID_STATUSES.includes(safeStatus)) {
+    return res.status(400).json({ error: `newStatus must be one of: ${VALID_STATUSES.join(", ")}` });
+  }
+
+  const safeWorkOrderId = sanitiseInput(String(workOrderId));
+  const safeUpdatedBy   = sanitiseInput(String(updatedBy || "System"));
+  const safeNotes       = sanitiseInput(String(notes || ""));
+  const pct             = Math.min(100, Math.max(0, parseInt(completionPercentage) || 0));
+
+  const update = {
+    workOrderId:          safeWorkOrderId,
+    previousStatus:       null,
+    newStatus:            safeStatus,
+    completionPercentage: safeStatus === "COMPLETED" ? 100 : pct,
+    updatedBy:            safeUpdatedBy,
+    notes:                safeNotes || null,
+    updatedAt:            new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    // Fetch current status
+    const { data: current } = await supabaseAdmin
+      .from("work_orders")
+      .select("status")
+      .eq("work_order_id", safeWorkOrderId)
+      .single();
+
+    if (current) update.previousStatus = current.status;
+
+    const { error } = await supabaseAdmin
+      .from("work_orders")
+      .update({ status: safeStatus, completion_percentage: update.completionPercentage, updated_at: update.updatedAt })
+      .eq("work_order_id", safeWorkOrderId);
+    saved = !error;
+
+    if (!error) {
+      await supabaseAdmin.from("work_order_history").insert({
+        work_order_id:  safeWorkOrderId,
+        previous_status: update.previousStatus,
+        new_status:     safeStatus,
+        updated_by:     safeUpdatedBy,
+        notes:          safeNotes || null,
+        created_at:     update.updatedAt,
+      }).then(() => {}).catch(() => {});
+    }
+  }
+
+  return res.json({ ...update, saved });
+});
+
+// POST /compliance-notification  — Send a compliance alert email to a contractor
+app.post("/compliance-notification", apiKeyAuth, async (req, res) => {
+  const { contractorEmail, contractorName, alertType, jobId, jobType,
+          complianceScore, missingItems, dueDate, notes } = req.body;
+
+  if (!contractorEmail || !alertType) {
+    return res.status(400).json({ error: "contractorEmail and alertType are required." });
+  }
+  if (!isValidEmail(contractorEmail)) {
+    return res.status(400).json({ error: "contractorEmail is not valid." });
+  }
+
+  const ALERT_TYPES = {
+    low_score:      { subject: "Compliance Score Alert", urgency: "WARNING" },
+    missing_items:  { subject: "Outstanding Compliance Items", urgency: "ACTION_REQUIRED" },
+    cert_overdue:   { subject: "Certificate Filing Overdue", urgency: "URGENT" },
+    licence_expiry: { subject: "Licence Renewal Reminder", urgency: "WARNING" },
+    reinspection:   { subject: "Re-Inspection Required", urgency: "ACTION_REQUIRED" },
+  };
+
+  const safeName   = sanitiseInput(String(contractorName || "Contractor"));
+  const safeType   = sanitiseInput(String(alertType)).toLowerCase().replace(/\s/g, "_");
+  const alertInfo  = ALERT_TYPES[safeType] || { subject: "Compliance Notification", urgency: "INFO" };
+  const safeJobId  = jobId   ? sanitiseInput(String(jobId)) : null;
+  const safeNotes  = notes   ? sanitiseInput(String(notes)).slice(0, 500) : null;
+  const safeMissing= Array.isArray(missingItems) ? missingItems.slice(0, 10).map(i => sanitiseInput(String(i))) : [];
+
+  const URGENCY_COLORS = { URGENT: "#d32f2f", ACTION_REQUIRED: "#e65100", WARNING: "#f57f17", INFO: "#1565c0" };
+  const urgencyColor = URGENCY_COLORS[alertInfo.urgency] || "#1565c0";
+
+  const missingList = safeMissing.length > 0 ? `<ul>${safeMissing.map(i => `<li>${escHtml(i)}</li>`).join("")}</ul>` : "";
+
+  const html = `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
+    <div style="background:${urgencyColor};color:white;padding:20px;border-radius:8px 8px 0 0;">
+      <h2 style="margin:0">[${alertInfo.urgency}] ${escHtml(alertInfo.subject)}</h2>
+    </div>
+    <div style="padding:24px;background:#f9f9f9;border:1px solid #e0e0e0;">
+      <p>Dear ${escHtml(safeName)},</p>
+      ${complianceScore !== undefined ? `<p>Compliance score: <strong>${complianceScore}/100</strong></p>` : ""}
+      ${safeMissing.length > 0 ? `<p>Outstanding items requiring attention:</p>${missingList}` : ""}
+      ${dueDate ? `<p>Action required by: <strong>${escHtml(sanitiseInput(String(dueDate)))}</strong></p>` : ""}
+      ${safeNotes ? `<p>${escHtml(safeNotes)}</p>` : ""}
+      ${safeJobId ? `<p style="color:#666;font-size:13px">Job reference: ${escHtml(safeJobId)}</p>` : ""}
+    </div>
+    <div style="padding:16px;background:#f0f0f0;border-radius:0 0 8px 8px;font-size:12px;color:#888;">
+      Elemetric — Trade Compliance Platform | www.elemetric.com.au
+    </div>
+  </div>`;
+
+  let sent = false;
+  let messageId = null;
+  try {
+    if (resend) {
+      const result = await resend.emails.send({
+        from:    process.env.EMAIL_FROM || "Elemetric <noreply@elemetric.app>",
+        to:      [contractorEmail],
+        subject: alertInfo.subject,
+        html,
+      });
+      sent      = true;
+      messageId = result.id || null;
+      usageStats.emailCalls++;
+    }
+  } catch { /* non-fatal */ }
+
+  return res.json({
+    sent,
+    messageId,
+    alertType:    safeType,
+    urgency:      alertInfo.urgency,
+    subject:      alertInfo.subject,
+    contractorEmail,
+    jobId:        safeJobId,
+    sentAt:       new Date().toISOString(),
+  });
+});
+
+// POST /property-history  — Retrieve or log compliance history for a specific property
+app.post("/property-history", apiKeyAuth, async (req, res) => {
+  const { address, propertyId, jobType, complianceScore, contractorName,
+          completionDate, certificateFiled, notes } = req.body;
+
+  if (!address) return res.status(400).json({ error: "address is required." });
+
+  const safeAddress    = sanitiseInput(String(address));
+  const safeJobType    = sanitiseInput(String(jobType || "general")).toLowerCase();
+  const safeContractor = sanitiseInput(String(contractorName || "Unknown"));
+  const safeNotes      = sanitiseInput(String(notes || ""));
+
+  // Log the job to property history
+  const entryId = `PH-${Date.now().toString(36).toUpperCase()}`;
+  let saved     = false;
+
+  if (supabaseAdmin && complianceScore !== undefined) {
+    const { error } = await supabaseAdmin.from("property_history").insert({
+      entry_id:         entryId,
+      address:          safeAddress,
+      property_id:      propertyId ? sanitiseInput(String(propertyId)) : null,
+      job_type:         safeJobType,
+      compliance_score: parseFloat(complianceScore) || null,
+      contractor_name:  safeContractor,
+      completion_date:  completionDate || null,
+      certificate_filed: !!certificateFiled,
+      notes:            safeNotes || null,
+      created_at:       new Date().toISOString(),
+    });
+    saved = !error;
+  }
+
+  // Retrieve history for this address
+  let history = [];
+  if (supabaseAdmin) {
+    const { data } = await supabaseAdmin
+      .from("property_history")
+      .select("*")
+      .or(`address.ilike.${safeAddress}${propertyId ? `,property_id.eq.${sanitiseInput(String(propertyId))}` : ""}`)
+      .order("created_at", { ascending: false })
+      .limit(50);
+    history = data || [];
+  }
+
+  const scores = history.map(h => parseFloat(h.compliance_score)).filter(s => !isNaN(s) && s > 0);
+  const avgScore = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+
+  return res.json({
+    address:       safeAddress,
+    propertyId:    propertyId || null,
+    historyCount:  history.length,
+    averageScore:  avgScore,
+    tradeHistory:  history.reduce((acc, h) => { acc[h.job_type] = (acc[h.job_type] || 0) + 1; return acc; }, {}),
+    history,
+    lastEntryId:   history.length > 0 ? history[0].entry_id || entryId : entryId,
+    saved,
+    retrievedAt:   new Date().toISOString(),
+  });
+});
+
+// GET /api-changelog  — Return a changelog of API features and rounds
+app.get("/api-changelog", apiKeyAuth, (req, res) => {
+  const CHANGELOG = [
+    { version: "1.0", date: "2026-03-01", rounds: "1-10",  summary: "Core: AI compliance analysis, email, caching, deduplication, Stripe webhooks, security" },
+    { version: "1.1", date: "2026-03-05", rounds: "11-20", summary: "Victorian checklists, compliance scoring, risk assessment, regulatory monitoring, few-shot training" },
+    { version: "1.2", date: "2026-03-10", rounds: "21-30", summary: "Analytics, batch endpoints, job notes, handover, compliance calendar, licence lookup" },
+    { version: "1.3", date: "2026-03-12", rounds: "31-40", summary: "Trade conversion, permit tracking, site conditions, photo annotation, invoice tools, sign-off" },
+    { version: "1.4", date: "2026-03-13", rounds: "41-50", summary: "Contractor profiles, feedback, milestones, GPS checks, tools register, bulk operations" },
+    { version: "1.5", date: "2026-03-14", rounds: "51+",   summary: "AI checklists, workflows, near-miss analysis, property history, compliance certificates" },
+  ];
+
+  return res.json({
+    apiName:    "Elemetric Trade Compliance API",
+    currentVersion: "1.5",
+    changelog:  CHANGELOG,
+    totalRounds: 48,
+    buildDate:  "2026-03-15",
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
