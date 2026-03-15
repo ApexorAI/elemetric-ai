@@ -62420,6 +62420,351 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /mould-assessment — Mould/fungal contamination survey per AIOH guidelines / AS/NZS 4386
+app.post("/mould-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    propertyAddress,
+    assessmentDate,
+    assessor,
+    buildingType,          // residential | commercial | school | healthcare | industrial
+    affectedRooms,         // array of { room, area_m2, coverage_pct, mouldTypes, substrate }
+    totalAffectedArea_m2,
+    mouldSpecies,          // array of species identified (e.g. Stachybotrys, Aspergillus, Cladosporium)
+    moistureSource,        // roof-leak | plumbing-leak | condensation | rising-damp | flood | hvac | unknown
+    relativeHumidity_pct,
+    moistureContent_pct,   // timber/material moisture content
+    visibleMouldPresent,
+    mustyOdour,
+    airSampling,           // true | false
+    airSampleResults,      // array of { location, species, count_spores_m3, outdoor_baseline }
+    surfaceSampling,
+    surfaceSampleResults,  // array of { location, species, count }
+    occupantHealthComplaints, // array of symptoms reported
+    vulnerableOccupants,   // children | elderly | respiratory | immunocompromised | none
+    riskRating,            // low | medium | high | critical
+    remediationScope,      // minor (<1m2) | moderate (1-10m2) | major (>10m2) | structural
+    containmentRequired,
+    airScrubberRequired,
+    clearanceTestRequired,
+    photos,
+    notes,
+  } = req.body;
+
+  // Stachybotrys (black mould) is high health risk
+  const toxicMouldSpecies = ["stachybotrys", "aspergillus fumigatus", "chaetomium"];
+  const hasToxicMould = Array.isArray(mouldSpecies) && mouldSpecies.some(
+    (s) => toxicMouldSpecies.some((t) => s.toLowerCase().includes(t))
+  );
+
+  const totalArea = parseFloat(totalAffectedArea_m2) || 0;
+  const isMajorRemediation = totalArea > 10 || remediationScope === "major" || remediationScope === "structural";
+
+  const healthRisk = hasToxicMould || vulnerableOccupants !== "none" || riskRating === "critical";
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    property_address: sanitiseInput(propertyAddress),
+    assessment_date: assessmentDate,
+    assessor: sanitiseInput(assessor),
+    building_type: sanitiseInput(buildingType),
+    affected_rooms: affectedRooms || [],
+    total_affected_area_m2: totalAffectedArea_m2,
+    mould_species: mouldSpecies || [],
+    moisture_source: sanitiseInput(moistureSource),
+    relative_humidity_pct: relativeHumidity_pct,
+    moisture_content_pct: moistureContent_pct,
+    visible_mould_present: visibleMouldPresent,
+    musty_odour: mustyOdour,
+    air_sampling: airSampling,
+    air_sample_results: airSampleResults || [],
+    surface_sampling: surfaceSampling,
+    surface_sample_results: surfaceSampleResults || [],
+    occupant_health_complaints: occupantHealthComplaints || [],
+    vulnerable_occupants: sanitiseInput(vulnerableOccupants),
+    risk_rating: sanitiseInput(riskRating) || "medium",
+    remediation_scope: sanitiseInput(remediationScope),
+    containment_required: containmentRequired,
+    air_scrubber_required: airScrubberRequired,
+    clearance_test_required: clearanceTestRequired,
+    toxic_mould_present: hasToxicMould,
+    major_remediation_required: isMajorRemediation,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("mould_assessments")
+      .insert(record);
+    if (dbErr) console.error("DB error /mould-assessment:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Mould assessment recorded",
+    riskRating: sanitiseInput(riskRating) || "medium",
+    totalAffectedArea_m2: totalArea,
+    toxicMouldPresent: hasToxicMould,
+    majorRemediationRequired: isMajorRemediation,
+    healthRiskFlag: healthRisk,
+    healthRiskGuidance: healthRisk
+      ? "Health risk identified — relocate vulnerable occupants. Engage licensed mould remediator. Conduct clearance testing post-remediation."
+      : "Standard remediation protocols apply.",
+    remediationGuidance: {
+      minor: "Homeowner can remediate areas <1 m² using PPE, detergent, and HEPA vacuum",
+      moderate: "Engage professional remediator. Contain area. Air scrubber recommended.",
+      major: "Specialist remediation required. Full containment, negative pressure, clearance air test mandatory.",
+    }[remediationScope || "moderate"],
+    applicableStandards: [
+      "AIOH Mould in the Workplace Guidelines",
+      "AS/NZS 4386",
+      "NHMRC Indoor Air Quality Guidelines",
+      "WorkSafe Victoria Mould Guidance",
+    ],
+    saved,
+  });
+});
+
+// POST /pile-integrity-test — Record pile integrity testing results per AS 2159
+app.post("/pile-integrity-test", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    pileId,
+    pileType,             // bored | driven | CFA | screw | micropile | rock-socket
+    diameter_mm,
+    designLength_m,
+    asBuiltLength_m,
+    installDate,
+    testDate,
+    testMethod,           // PDA | CAPWAP | sonic-echo | gamma-gamma | crosshole-sonic | static-load
+    testingEngineer,
+    testingFirm,
+    concreteStrength_MPa,
+    designCapacity_kN,
+    measuredCapacity_kN,  // from load test
+    soilProfile,
+    drivingRecord,        // array of { depth, blowCount, set }
+    integrityResult,      // pass | fail | marginal | inconclusive
+    defectsIdentified,    // array of { depth, description, severity }
+    reductionFactor,      // capacity reduction if defect found
+    acceptanceCriteria,
+    overallResult,        // ACCEPTED | REJECTED | FURTHER-TESTING-REQUIRED
+    photos,
+    notes,
+  } = req.body;
+
+  // Capacity check
+  const design = parseFloat(designCapacity_kN) || 0;
+  const measured = parseFloat(measuredCapacity_kN) || 0;
+  const capacityShortfall = design > 0 && measured > 0 && measured < design * 0.9;
+
+  const criticalDefects = Array.isArray(defectsIdentified)
+    ? defectsIdentified.filter((d) => d.severity === "critical" || d.severity === "major")
+    : [];
+
+  const rejected =
+    overallResult === "REJECTED" ||
+    (integrityResult === "fail") ||
+    (capacityShortfall && measured < design * 0.7);
+
+  if (rejected) {
+    return res.status(422).json({
+      error: "Pile integrity test — pile REJECTED",
+      pileId: sanitiseInput(pileId),
+      reasons: [
+        capacityShortfall && measured > 0
+          ? `Measured capacity ${measured} kN is less than 70% of design ${design} kN`
+          : null,
+        integrityResult === "fail" ? "Integrity test FAILED" : null,
+        criticalDefects.length > 0 ? `${criticalDefects.length} critical defect(s) identified` : null,
+      ].filter(Boolean),
+      immediateActions: [
+        "Notify geotechnical engineer and structural engineer",
+        "Do not load this pile until remediation or replacement plan approved",
+        "Consider supplementary piling or pile redesign",
+      ],
+      applicableStandards: ["AS 2159", "AS 4678"],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    pile_id: sanitiseInput(pileId),
+    pile_type: sanitiseInput(pileType),
+    diameter_mm,
+    design_length_m: designLength_m,
+    as_built_length_m: asBuiltLength_m,
+    install_date: installDate,
+    test_date: testDate,
+    test_method: sanitiseInput(testMethod),
+    testing_engineer: sanitiseInput(testingEngineer),
+    testing_firm: sanitiseInput(testingFirm),
+    concrete_strength_mpa: concreteStrength_MPa,
+    design_capacity_kn: designCapacity_kN,
+    measured_capacity_kn: measuredCapacity_kN,
+    soil_profile: sanitiseInput(soilProfile),
+    driving_record: drivingRecord || [],
+    integrity_result: sanitiseInput(integrityResult),
+    defects_identified: defectsIdentified || [],
+    reduction_factor: reductionFactor,
+    acceptance_criteria: sanitiseInput(acceptanceCriteria),
+    overall_result: overallResult || "ACCEPTED",
+    critical_defects_count: criticalDefects.length,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("pile_integrity_tests")
+      .insert(record);
+    if (dbErr) console.error("DB error /pile-integrity-test:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Pile integrity test record saved",
+    pileId: sanitiseInput(pileId),
+    overallResult: overallResult || "ACCEPTED",
+    integrityResult: sanitiseInput(integrityResult),
+    capacityUtilisation: design > 0 && measured > 0 ? `${Math.round((measured / design) * 100)}%` : "N/A",
+    criticalDefectsCount: criticalDefects.length,
+    applicableStandards: ["AS 2159", "AS 1726", "AASHTO LRFD", "CAPWAP"],
+    saved,
+  });
+});
+
+// POST /ai-mould-risk-assessment — AI assesses mould health risks, root causes, and remediation strategy
+app.post("/ai-mould-risk-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    mouldSpecies,
+    affectedArea_m2,
+    moistureSource,
+    relativeHumidity_pct,
+    buildingType,
+    vulnerableOccupants,
+    healthComplaints,
+    existingControls,
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are an occupational hygienist and indoor air quality specialist with 20 years experience in Australian building assessments. Assess mould contamination health risks and remediation requirements per AIOH Mould in the Workplace guidelines, NHMRC indoor air quality guidelines, and AS/NZS 4386.
+
+Assess:
+1. Health risk severity based on species, area, occupant vulnerability
+2. Toxigenic mould identification and specific risks (mycotoxin production)
+3. Root cause — moisture source identification and fix priority
+4. Remediation scope and containment requirements
+5. Personal protective equipment for remediators
+6. Clearance testing requirements post-remediation
+7. Building envelope improvements to prevent recurrence
+8. Occupant communication and relocation guidance
+
+Respond with JSON: { "healthRiskLevel": "low|medium|high|critical", "toxigenicMouldPresent": boolean, "primaryHealthRisks": [], "rootCauseAssessment": "string", "moistureFixPriority": "string", "remediationLevel": "minor|moderate|major|specialist", "containmentRequired": boolean, "containmentType": "string", "airScrubberRequired": boolean, "ppeForRemediators": [], "clearanceTestRequired": boolean, "clearanceTestMethod": "string", "occupantRelocateRequired": boolean, "buildingImprovements": [], "preventionStrategies": [], "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Mould species: ${Array.isArray(mouldSpecies) ? mouldSpecies.join(", ") : (mouldSpecies || "unknown")}
+Affected area: ${affectedArea_m2 || "not specified"} m²
+Moisture source: ${moistureSource || "unknown"}
+Relative humidity: ${relativeHumidity_pct || "not specified"}%
+Building type: ${buildingType || "not specified"}
+Vulnerable occupants: ${vulnerableOccupants || "none"}
+Health complaints reported: ${Array.isArray(healthComplaints) ? healthComplaints.join(", ") : (healthComplaints || "none")}
+Existing controls: ${existingControls || "none"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-mould-risk-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        healthRiskLevel: "medium",
+        toxigenicMouldPresent: false,
+        primaryHealthRisks: [
+          "Respiratory irritation and allergic reactions",
+          "Exacerbation of asthma in susceptible occupants",
+          "Fungal sensitisation with prolonged exposure",
+        ],
+        rootCauseAssessment:
+          "High humidity and inadequate ventilation are the most common root causes in Australian buildings. Identify and fix moisture source before remediating mould.",
+        moistureFixPriority:
+          "High — fix moisture source first. Mould will return within weeks if moisture is not eliminated.",
+        remediationLevel: "moderate",
+        containmentRequired: true,
+        containmentType: "Polyethylene sheet enclosure with negative pressure and HEPA air filtration",
+        airScrubberRequired: true,
+        ppeForRemediators: [
+          "P2 half-face respirator minimum",
+          "Safety glasses",
+          "Nitrile gloves",
+          "Disposable coverall",
+        ],
+        clearanceTestRequired: true,
+        clearanceTestMethod: "Post-remediation air sampling compared to outdoor baseline",
+        occupantRelocateRequired: false,
+        buildingImprovements: [
+          "Increase mechanical ventilation to maintain RH <60%",
+          "Repair any roof or plumbing leaks",
+          "Improve vapour barriers in subfloor or slab",
+          "Install bathroom and kitchen exhaust fans if absent",
+        ],
+        preventionStrategies: [
+          "Maintain relative humidity <60% year-round",
+          "Repair water ingress sources promptly",
+          "Annual building envelope inspection",
+        ],
+        applicableStandards: [
+          "AIOH Mould in the Workplace Guidelines",
+          "NHMRC Indoor Air Quality Guidelines",
+          "AS/NZS 4386",
+          "WorkSafe Victoria Mould Guidance",
+        ],
+        recommendation:
+          "Fix the moisture source, then remediate mould with containment and HEPA air scrubbing. Post-remediation clearance air test recommended. Improve building ventilation to prevent recurrence.",
+        summary:
+          "Mould contamination presents medium health risk. Fix the underlying moisture issue first, then engage a professional remediator with appropriate containment. Conduct clearance testing before re-occupying the affected space.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
