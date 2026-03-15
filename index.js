@@ -19921,6 +19921,210 @@ app.post("/photo-evidence-summary", apiKeyAuth, (req, res) => {
   });
 });
 
+// ── Round 51 ──────────────────────────────────────────────────────────────────
+
+// POST /risk-register  — Maintain a risk register for a project
+app.post("/risk-register", apiKeyAuth, async (req, res) => {
+  const { projectId, risks } = req.body;
+
+  if (!projectId || !risks || !Array.isArray(risks) || risks.length === 0) {
+    return res.status(400).json({ error: "projectId and risks array are required." });
+  }
+
+  const safeProjectId = sanitiseInput(String(projectId));
+  const LIKELIHOOD    = { rare: 1, unlikely: 2, possible: 3, likely: 4, "almost certain": 5 };
+  const CONSEQUENCE   = { negligible: 1, minor: 2, moderate: 3, major: 4, catastrophic: 5 };
+
+  const processedRisks = risks.slice(0, 30).map((r, i) => {
+    const desc        = sanitiseInput(String(r.description || `Risk ${i + 1}`)).slice(0, 300);
+    const category    = sanitiseInput(String(r.category || "general")).toLowerCase();
+    const likelihood  = LIKELIHOOD[sanitiseInput(String(r.likelihood || "possible")).toLowerCase()] || 3;
+    const consequence = CONSEQUENCE[sanitiseInput(String(r.consequence || "moderate")).toLowerCase()] || 3;
+    const riskScore   = likelihood * consequence;
+    const riskLevel   = riskScore >= 15 ? "EXTREME" : riskScore >= 10 ? "HIGH" : riskScore >= 5 ? "MEDIUM" : "LOW";
+    const control     = r.control ? sanitiseInput(String(r.control)).slice(0, 300) : null;
+    const owner       = r.owner   ? sanitiseInput(String(r.owner)).slice(0, 100)   : null;
+
+    return {
+      riskId:        `R${String(i + 1).padStart(3, "0")}`,
+      description:   desc,
+      category,
+      likelihood,
+      consequence,
+      riskScore,
+      riskLevel,
+      control,
+      owner,
+      status:        sanitiseInput(String(r.status || "OPEN")).toUpperCase(),
+    };
+  });
+
+  const extreme = processedRisks.filter(r => r.riskLevel === "EXTREME").length;
+  const high    = processedRisks.filter(r => r.riskLevel === "HIGH").length;
+  const avgScore= Math.round(processedRisks.reduce((s, r) => s + r.riskScore, 0) / processedRisks.length * 10) / 10;
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("risk_registers").upsert({
+      project_id:   safeProjectId,
+      risk_count:   processedRisks.length,
+      extreme_count: extreme,
+      risk_data:    processedRisks,
+      updated_at:   new Date().toISOString(),
+    }, { onConflict: "project_id" });
+    saved = !error;
+  }
+
+  return res.json({
+    projectId:      safeProjectId,
+    totalRisks:     processedRisks.length,
+    extremeRisks:   extreme,
+    highRisks:      high,
+    averageRiskScore: avgScore,
+    overallRating:  extreme > 0 ? "EXTREME" : high > 0 ? "HIGH" : avgScore >= 5 ? "MEDIUM" : "LOW",
+    risks:          processedRisks,
+    saved,
+    updatedAt:      new Date().toISOString(),
+  });
+});
+
+// POST /ai-specification  — AI-generated technical specification for a scope of works
+app.post("/ai-specification", apiKeyAuth, async (req, res) => {
+  const { jobType, scope, standardsApplicable, propertyType, complexity } = req.body;
+
+  if (!jobType || !scope) return res.status(400).json({ error: "jobType and scope are required." });
+
+  const safeJobType  = sanitiseInput(String(jobType)).toLowerCase();
+  const safeScope    = sanitiseInput(String(scope)).slice(0, 600);
+  const safePropType = sanitiseInput(String(propertyType || "residential"));
+  const safeComplexity = sanitiseInput(String(complexity || "medium")).toLowerCase();
+  const safeStandards = Array.isArray(standardsApplicable) ? standardsApplicable.slice(0, 6).map(s => sanitiseInput(String(s))) : [];
+
+  const systemPrompt = `You are a Victorian trade technical specification writer. Write a formal technical specification for the described scope. Use precise, measurable language. Include material specifications, installation requirements, testing requirements, and quality standards. Return JSON with: "title" (string), "sections" (array of objects with "heading" and "content"), "qualityTests" (array of strings), "applicableStandards" (array of strings).`;
+
+  let title, sections, qualityTests, applicableStandards;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: `Trade: ${safeJobType}\nProperty: ${safePropType}\nComplexity: ${safeComplexity}\nScope: ${safeScope}\nKnown standards: ${safeStandards.join(", ") || "None specified"}` },
+      ],
+      max_tokens: 700,
+      response_format: { type: "json_object" },
+    });
+    const parsed       = JSON.parse(aiRes.choices[0].message.content);
+    title              = sanitiseInput(String(parsed.title || `${safeJobType} Technical Specification`));
+    sections           = Array.isArray(parsed.sections) ? parsed.sections.slice(0, 8).map(s => ({ heading: sanitiseInput(String(s.heading || "")), content: sanitiseInput(String(s.content || "")).slice(0, 500) })) : [];
+    qualityTests       = Array.isArray(parsed.qualityTests)       ? parsed.qualityTests.slice(0, 8).map(t => sanitiseInput(String(t)))       : [];
+    applicableStandards= Array.isArray(parsed.applicableStandards)? parsed.applicableStandards.slice(0, 8).map(s => sanitiseInput(String(s))) : safeStandards;
+  } catch {
+    title    = `${safeJobType.charAt(0).toUpperCase() + safeJobType.slice(1)} Technical Specification`;
+    sections = [{ heading: "Scope of Works", content: safeScope }];
+    qualityTests = ["Visual inspection", "Pressure/continuity test as applicable"];
+    applicableStandards = safeStandards;
+  }
+
+  return res.json({
+    jobType:             safeJobType,
+    propertyType:        safePropType,
+    complexity:          safeComplexity,
+    title,
+    sections,
+    qualityTests,
+    applicableStandards,
+    generatedAt:         new Date().toISOString(),
+  });
+});
+
+// POST /maintenance-log  — Record a maintenance activity for an asset
+app.post("/maintenance-log", apiKeyAuth, async (req, res) => {
+  const { assetId, assetDescription, jobType, activityType, performedBy,
+          performedDate, findings, nextServiceDate, cost, notes } = req.body;
+
+  if (!assetDescription || !activityType) {
+    return res.status(400).json({ error: "assetDescription and activityType are required." });
+  }
+
+  const ACTIVITY_TYPES = ["inspection", "service", "repair", "replacement", "test", "calibration", "cleaning"];
+  const safeActivity   = sanitiseInput(String(activityType)).toLowerCase().replace(/\s/g, "_");
+  const resolvedActivity = ACTIVITY_TYPES.find(a => a === safeActivity) || "inspection";
+
+  const safeAsset      = sanitiseInput(String(assetDescription));
+  const safeAssetId    = assetId ? sanitiseInput(String(assetId)) : `ASSET-${Date.now().toString(36).toUpperCase()}`;
+  const safePerformedBy= sanitiseInput(String(performedBy || "Technician"));
+  const safeJobType    = sanitiseInput(String(jobType || "general")).toLowerCase();
+  const safeFindings   = sanitiseInput(String(findings || "No issues found")).slice(0, 500);
+  const safeNotes      = sanitiseInput(String(notes || ""));
+  const logDate        = performedDate || new Date().toISOString().slice(0, 10);
+
+  const logId = `MLOG-${Date.now().toString(36).toUpperCase()}`;
+
+  const log = {
+    logId,
+    assetId:        safeAssetId,
+    assetDescription: safeAsset,
+    jobType:        safeJobType,
+    activityType:   resolvedActivity,
+    performedBy:    safePerformedBy,
+    performedDate:  logDate,
+    findings:       safeFindings,
+    nextServiceDate: nextServiceDate ? sanitiseInput(String(nextServiceDate)) : null,
+    cost:           cost ? parseFloat(cost) : null,
+    notes:          safeNotes || null,
+    loggedAt:       new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("maintenance_logs").insert({
+      log_id:          logId,
+      asset_id:        safeAssetId,
+      asset_description: safeAsset,
+      job_type:        safeJobType,
+      activity_type:   resolvedActivity,
+      performed_by:    safePerformedBy,
+      performed_date:  logDate,
+      findings:        safeFindings,
+      next_service_date: nextServiceDate || null,
+      cost:            log.cost,
+      created_at:      new Date().toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...log, saved });
+});
+
+// GET /maintenance-log/:assetId  — Retrieve maintenance history for an asset
+app.get("/maintenance-log/:assetId", apiKeyAuth, async (req, res) => {
+  const assetId = sanitiseInput(String(req.params.assetId || ""));
+  if (!assetId) return res.status(400).json({ error: "assetId is required." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  const { data, error } = await supabaseAdmin
+    .from("maintenance_logs")
+    .select("*")
+    .eq("asset_id", assetId)
+    .order("performed_date", { ascending: false })
+    .limit(100);
+
+  if (error) return res.status(500).json({ error: "Failed to retrieve maintenance log." });
+
+  const logs     = data || [];
+  const totalCost= Math.round(logs.reduce((s, l) => s + (parseFloat(l.cost) || 0), 0) * 100) / 100;
+
+  return res.json({
+    assetId,
+    totalEntries:   logs.length,
+    totalCost,
+    lastService:    logs.length > 0 ? logs[0].performed_date : null,
+    nextServiceDate: logs.length > 0 ? logs[0].next_service_date : null,
+    logs,
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
