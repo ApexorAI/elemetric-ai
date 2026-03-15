@@ -83457,6 +83457,470 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 290 ─────────────────────────────────────────────────────────────────
+
+// POST /food-business-inspection — Record food business premises inspection per Food Act 1984 (Vic) / AS 4674
+app.post("/food-business-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      businessId, businessName, address, inspectionDate, inspectedBy,
+      registrationNumber, registrationExpiry, foodBizClassification,
+      proprietorName, foodSafetyProgram, fspLastReview,
+      temperatureControlRecordsKept, coolingProcessDocumented,
+      coldStorageTempsOk, coldStorageReadingsC,
+      hotStorageTempsOk, hotStorageReadingsC,
+      crossContaminationControlsInPlace, rawCookedSeparated,
+      handwashingFacilitiesOk, soapPaperTowelAvailable,
+      foodHandlerHygiene, foodHandlerTrainingCurrent,
+      foodHandlerIllnessPolicy, sickWorkerExcluded,
+      pestControlProgramInPlace, lastPestInspectionDate, pestEvidenceFound,
+      cleaningScheduleInPlace, sanitisingUsed,
+      structuralConditionOk, wallsFloorsCeilingsOk,
+      waterSupplySafe, wasteManagementOk,
+      labelling, allergenManagementInPlace,
+      criticalControlPoints, ccp1Temp, ccp2Temp,
+      defectsFound, defectDetails, nextInspectionDue, certRef, notes
+    } = req.body;
+
+    if (!businessId || !address || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "businessId, address, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeBusinessId = sanitiseInput(String(businessId));
+    const safeAddress = sanitiseInput(String(address));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const criticalIssues = [];
+    const warnings = [];
+
+    const coldTemps = Array.isArray(coldStorageReadingsC) ? coldStorageReadingsC.map(parseFloat) : [];
+    const hotTemps = Array.isArray(hotStorageReadingsC) ? hotStorageReadingsC.map(parseFloat) : [];
+
+    // Food Act 1984 (Vic) / Food Standards Australia New Zealand (FSANZ) Food Standards Code
+    // AS 4674 — Design, construction and fit-out of food premises
+    if (!coldStorageTempsOk || coldTemps.some(t => t >= 5)) {
+      criticalIssues.push(`Cold storage temperature non-compliant — temperature-controlled foods must be stored at ≤5°C (Food Standards Code Standard 3.2.2). Current readings: ${coldTemps.join(", ")}°C`);
+    }
+
+    if (!hotStorageTempsOk || hotTemps.some(t => t < 60)) {
+      criticalIssues.push(`Hot storage temperature non-compliant — hot foods must be held at ≥60°C (Food Standards Code Standard 3.2.2). Current readings: ${hotTemps.join(", ")}°C`);
+    }
+
+    if (!handwashingFacilitiesOk) {
+      criticalIssues.push("Handwashing facilities not adequate or not accessible — a dedicated handwashing basin must be available at each food handling area (Food Standards Code Standard 3.2.3 cl.24).");
+    } else if (!soapPaperTowelAvailable) {
+      criticalIssues.push("Handwashing facilities missing soap or single-use paper towel — required at all handwashing basins (Food Standards Code Standard 3.2.3 cl.24).");
+    }
+
+    if (!crossContaminationControlsInPlace) {
+      criticalIssues.push("Cross-contamination controls not in place — raw and ready-to-eat foods must be physically separated to prevent cross-contamination (Food Standards Code Standard 3.2.2 cl.8).");
+    }
+
+    if (sickWorkerExcluded === false || sickWorkerExcluded === "false") {
+      criticalIssues.push("Ill food handler working with food — food handlers with gastroenteritis or other food-borne illness symptoms must be excluded from food handling (Food Standards Code Standard 3.2.2 cl.15).");
+    }
+
+    if (pestEvidenceFound === true || pestEvidenceFound === "true") {
+      criticalIssues.push("Pest evidence found in food premises — pest activity presents unacceptable food safety risk. Engage licensed pest controller immediately and remove all affected food (Food Standards Code Standard 3.2.3 cl.24).");
+    }
+
+    const fspReq = String(foodBizClassification || "").toUpperCase();
+    if ((fspReq === "CLASS_1" || fspReq === "CLASS1") && !foodSafetyProgram) {
+      criticalIssues.push("Class 1 food business without a Food Safety Program — Class 1 food businesses must have and comply with a documented FSP (Food Act 1984 (Vic) s.19C).");
+    }
+
+    if (!foodHandlerTrainingCurrent) {
+      warnings.push("Food handler training not confirmed current — all food handlers must have food safety skills and knowledge (Food Standards Code Standard 3.2.2 cl.16).");
+    }
+
+    if (!allergenManagementInPlace) {
+      warnings.push("Allergen management controls not confirmed — food businesses must manage allergen risks to prevent allergic reactions in susceptible customers (FSANZ Standard 1.2.3).");
+    }
+
+    if (!cleaningScheduleInPlace) {
+      warnings.push("Cleaning and sanitising schedule not confirmed in place — all food contact surfaces and equipment must be cleaned and sanitised regularly (Food Standards Code Standard 3.2.3 cl.18).");
+    }
+
+    if (registrationExpiry) {
+      const expiry = new Date(registrationExpiry);
+      if (expiry < new Date()) {
+        criticalIssues.push(`Food business registration expired ${registrationExpiry} — operating without current registration is an offence under Food Act 1984 (Vic) s.38.`);
+      }
+    }
+
+    if (!structuralConditionOk || !wallsFloorsCeilingsOk) {
+      warnings.push("Structural deficiencies noted — food premises must be constructed to prevent pest entry and allow effective cleaning (AS 4674 / Food Standards Code Standard 3.2.3).");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "FAIL" : warnings.length > 0 ? "CONDITIONAL" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("food_business_inspections")
+        .insert({
+          business_id: safeBusinessId,
+          business_name: businessName ? sanitiseInput(String(businessName)) : null,
+          address: safeAddress,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          registration_number: registrationNumber ? sanitiseInput(String(registrationNumber)) : null,
+          registration_expiry: registrationExpiry || null,
+          classification: foodBizClassification ? sanitiseInput(String(foodBizClassification)) : null,
+          food_safety_program: foodSafetyProgram !== false && foodSafetyProgram !== "false",
+          cold_storage_ok: coldStorageTempsOk !== false && coldStorageTempsOk !== "false",
+          cold_storage_temps: coldTemps,
+          hot_storage_ok: hotStorageTempsOk !== false && hotStorageTempsOk !== "false",
+          hot_storage_temps: hotTemps,
+          handwashing_ok: handwashingFacilitiesOk !== false && handwashingFacilitiesOk !== "false",
+          soap_towel_available: soapPaperTowelAvailable !== false && soapPaperTowelAvailable !== "false",
+          cross_contamination_controls: crossContaminationControlsInPlace !== false && crossContaminationControlsInPlace !== "false",
+          handler_hygiene: foodHandlerHygiene !== false && foodHandlerHygiene !== "false",
+          handler_training: foodHandlerTrainingCurrent !== false && foodHandlerTrainingCurrent !== "false",
+          sick_worker_excluded: sickWorkerExcluded !== false && sickWorkerExcluded !== "false",
+          pest_control_program: pestControlProgramInPlace !== false && pestControlProgramInPlace !== "false",
+          last_pest_inspection: lastPestInspectionDate || null,
+          pest_evidence: pestEvidenceFound || false,
+          cleaning_schedule: cleaningScheduleInPlace !== false && cleaningScheduleInPlace !== "false",
+          allergen_management: allergenManagementInPlace !== false && allergenManagementInPlace !== "false",
+          structural_ok: structuralConditionOk !== false && structuralConditionOk !== "false",
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          next_inspection_due: nextInspectionDue || null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Food business critical non-compliance — food safety risk to public. Immediate corrective action required.",
+        standards: ["Food Act 1984 (Vic)", "FSANZ Food Standards Code Standard 3.2.2", "FSANZ Food Standards Code Standard 3.2.3", "AS 4674"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      businessId: safeBusinessId,
+      nextInspectionDue: nextInspectionDue || null,
+      standards: ["Food Act 1984 (Vic)", "FSANZ Food Standards Code"],
+    });
+  } catch (err) {
+    console.error("POST /food-business-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record food business inspection." });
+  }
+});
+
+// POST /coolroom-inspection — Record cool room/refrigeration plant inspection
+app.post("/coolroom-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, unitId, location, inspectionDate, inspectedBy,
+      coolRoomType, refrigerant, installedYear,
+      setPointC, actualTempC, temperatureVarianceC,
+      defrostCycleWorking, doorSealsOk, doorCloserOk, curtainInstalled,
+      evaporatorFins, condenserCoilsOk, fanMotorsOk,
+      compressorOk, compressorNoisyOrVibrating,
+      refrigerantLeakDetected, leakTestConducted, leakTestPassed,
+      refrigerantChargeOk, refrigerantCertHeld,
+      electricalProtectionOk, earthingOk,
+      temperatureAlarmFunctional, alarmSetPointC,
+      condensateDrainageOk, insightTempLoggerInstalled,
+      lastServiceDate, nextServiceDate,
+      defectsFound, defectDetails, notes
+    } = req.body;
+
+    if (!unitId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "unitId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeUnitId = sanitiseInput(String(unitId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const defects = Array.isArray(defectDetails) ? defectDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const setPoint = parseFloat(setPointC) || null;
+    const actualTemp = parseFloat(actualTempC) || null;
+    const tempVariance = parseFloat(temperatureVarianceC) || null;
+    const alarmSetPoint = parseFloat(alarmSetPointC) || null;
+
+    // Food Standards Code Standard 3.2.2 — temperature requirements
+    // AS/NZS 1677 — Refrigerating systems
+    // AS/NZS 4760 — Refrigerant handling
+    if (actualTemp !== null && setPoint !== null && actualTemp > setPoint + 3) {
+      criticalIssues.push(`Cool room actual temperature ${actualTemp}°C is ${actualTemp - setPoint}°C above set point ${setPoint}°C — food safety risk. Food stored above 5°C may be unsafe (Food Standards Code Standard 3.2.2). Investigate immediately.`);
+    }
+
+    const coolType = String(coolRoomType || "").toLowerCase();
+    if ((coolType.includes("chilled") || coolType.includes("refrigerat")) && actualTemp !== null && actualTemp > 5) {
+      criticalIssues.push(`Chilled food storage temperature ${actualTemp}°C exceeds maximum 5°C — potential food safety breach. Remove all temperature-sensitive food and investigate refrigeration failure (FSANZ Standard 3.2.2).`);
+    }
+
+    if (refrigerantLeakDetected === true || refrigerantLeakDetected === "true") {
+      criticalIssues.push("Refrigerant leak detected — environmental and safety risk. Engage ARCtick licensed technician for repair and refrigerant recovery immediately (Ozone Protection and Synthetic Greenhouse Gas Management Act 1989 (Cth) / AS/NZS 4760).");
+    }
+
+    if (leakTestConducted === true || leakTestConducted === "true") {
+      if (!leakTestPassed) {
+        criticalIssues.push("Refrigerant leak test FAILED — unit must not operate until leak is located and repaired. Engage ARCtick licensed technician.");
+      }
+    }
+
+    if (!doorSealsOk) {
+      criticalIssues.push("Door seal(s) defective — warm air ingress will raise storage temperature and increase energy consumption. Replace seals immediately.");
+    }
+
+    if (!refrigerantCertHeld) {
+      warnings.push("Refrigerant handling certificate (ARCtick) not confirmed — all refrigerant handling must be performed by an ARCtick licensed technician (Ozone Protection and Synthetic Greenhouse Gas Management Act 1989 (Cth)).");
+    }
+
+    if (!temperatureAlarmFunctional) {
+      warnings.push("Temperature alarm not functional — temperature exceedances may go undetected. Repair alarm system to protect stored food/product.");
+    } else if (alarmSetPoint !== null && setPoint !== null && alarmSetPoint > setPoint + 2) {
+      warnings.push(`Temperature alarm set point ${alarmSetPoint}°C may be too high — alarm should trigger at no more than 2°C above storage set point ${setPoint}°C.`);
+    }
+
+    if (!doorCloserOk) {
+      warnings.push("Door closer not functioning — ensure door closes fully after each access to maintain set point temperature.");
+    }
+
+    if (compressorNoisyOrVibrating === true || compressorNoisyOrVibrating === "true") {
+      warnings.push("Compressor noise/vibration detected — early sign of compressor wear. Monitor and schedule service.");
+    }
+
+    if (!condenserCoilsOk) {
+      warnings.push("Condenser coils condition issue — dirty or damaged condenser coils reduce refrigeration efficiency. Clean or repair condenser coils.");
+    }
+
+    if (!insightTempLoggerInstalled) {
+      warnings.push("No temperature data logger installed — for food safety compliance, a continuous temperature logger is recommended to demonstrate temperature control records per Food Standards Code.");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "FAIL" : warnings.length > 0 ? "ATTENTION_REQUIRED" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("coolroom_inspections")
+        .insert({
+          project_id: safeProject,
+          unit_id: safeUnitId,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          cool_room_type: coolRoomType ? sanitiseInput(String(coolRoomType)) : null,
+          refrigerant: refrigerant ? sanitiseInput(String(refrigerant)) : null,
+          installed_year: parseInt(installedYear) || null,
+          set_point_c: setPoint,
+          actual_temp_c: actualTemp,
+          temp_variance_c: tempVariance,
+          defrost_ok: defrostCycleWorking !== false && defrostCycleWorking !== "false",
+          door_seals_ok: doorSealsOk !== false && doorSealsOk !== "false",
+          door_closer_ok: doorCloserOk !== false && doorCloserOk !== "false",
+          fan_motors_ok: fanMotorsOk !== false && fanMotorsOk !== "false",
+          compressor_ok: compressorOk !== false && compressorOk !== "false",
+          compressor_noisy: compressorNoisyOrVibrating || false,
+          refrigerant_leak: refrigerantLeakDetected || false,
+          leak_test_conducted: leakTestConducted || false,
+          leak_test_passed: leakTestPassed !== false && leakTestPassed !== "false",
+          arctick_cert: refrigerantCertHeld !== false && refrigerantCertHeld !== "false",
+          electrical_ok: electricalProtectionOk !== false && electricalProtectionOk !== "false",
+          earthing_ok: earthingOk !== false && earthingOk !== "false",
+          temp_alarm_functional: temperatureAlarmFunctional !== false && temperatureAlarmFunctional !== "false",
+          alarm_set_point_c: alarmSetPoint,
+          temp_logger_installed: insightTempLoggerInstalled !== false && insightTempLoggerInstalled !== "false",
+          last_service_date: lastServiceDate || null,
+          next_service_date: nextServiceDate || null,
+          defects_found: defectsFound || false,
+          defect_details: defects,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Cool room/refrigeration defects — food stored in non-compliant temperature may be unsafe for consumption.",
+        standards: ["FSANZ Food Standards Code Standard 3.2.2", "AS/NZS 1677", "AS/NZS 4760", "Food Act 1984 (Vic)"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      unitId: safeUnitId,
+      standards: ["FSANZ Food Standards Code Standard 3.2.2", "AS/NZS 1677"],
+    });
+  } catch (err) {
+    console.error("POST /coolroom-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record cool room inspection." });
+  }
+});
+
+// POST /ai-food-safety-assessment — AI assesses food business food safety program compliance
+app.post("/ai-food-safety-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      businessId, businessName, businessType, cuisineType,
+      classification, seatingCapacity, annualTurnover,
+      fspDocumented, fspLastAuditDate, fspAuditorName,
+      haccpPlanInPlace, haccpLastReview,
+      temperatureMonitoringFrequency, temperatureRecordsKept,
+      staffCount, foodSafetyTrainedStaff, supervisorCert,
+      allergenMenuLabelled, allergenProcedures,
+      supplierApprovalProcess, deliveryInspections,
+      cleaningSchedule, sanitisingProcedures,
+      pestControlFrequency, lastPestInspection,
+      councilInspectionResult, lastCouncilInspection,
+      incidentHistory, foodComplaintsReceived,
+      deficienciesNoted, notes
+    } = req.body;
+
+    if (!businessId) {
+      return res.status(400).json({ error: "businessId is required." });
+    }
+
+    const safeBizId = sanitiseInput(String(businessId));
+    const deficiencies = Array.isArray(deficienciesNoted) ? deficienciesNoted : [];
+
+    const prompt = `You are a food safety and food law expert. Assess this food business's food safety management system compliance under Victorian and Australian legislation.
+
+Business ID: ${safeBizId}
+Business name: ${businessName || "Unknown"}
+Type: ${businessType || "Unknown"} — cuisine: ${cuisineType || "Unknown"}
+Classification: ${classification || "Unknown"}
+Seating: ${seatingCapacity || "Unknown"}
+
+FOOD SAFETY PROGRAM:
+- FSP documented: ${fspDocumented ? "Yes (last audit: " + (fspLastAuditDate || "unknown") + ")" : "No"}
+- HACCP plan: ${haccpPlanInPlace ? "Yes (last review: " + (haccpLastReview || "unknown") + ")" : "No"}
+- Temperature monitoring: ${temperatureMonitoringFrequency || "Unknown"}
+- Temperature records kept: ${temperatureRecordsKept ? "Yes" : "No"}
+
+STAFF:
+- Total staff: ${staffCount || 0}
+- Food safety trained: ${foodSafetyTrainedStaff || 0}
+- Supervisor certificate: ${supervisorCert ? "Yes" : "No"}
+
+ALLERGEN MANAGEMENT:
+- Menu allergens labelled: ${allergenMenuLabelled ? "Yes" : "No"}
+- Allergen procedures in place: ${allergenProcedures ? "Yes" : "No"}
+
+SUPPLY CHAIN:
+- Supplier approval process: ${supplierApprovalProcess ? "Yes" : "No"}
+- Delivery inspections: ${deliveryInspections ? "Yes" : "No"}
+
+HYGIENE:
+- Cleaning schedule: ${cleaningSchedule ? "Yes" : "No"}
+- Sanitising procedures: ${sanitisingProcedures ? "Yes" : "No"}
+- Pest control frequency: ${pestControlFrequency || "Unknown"}
+- Last pest inspection: ${lastPestInspection || "Unknown"}
+
+COMPLIANCE HISTORY:
+- Last council inspection: ${lastCouncilInspection || "Unknown"} — result: ${councilInspectionResult || "Unknown"}
+- Food safety incidents: ${incidentHistory || "None recorded"}
+- Food complaints: ${foodComplaintsReceived || 0}
+
+Deficiencies: ${deficiencies.join("; ") || "None"}
+
+Assess under:
+- Food Act 1984 (Vic)
+- FSANZ Food Standards Code Standard 3.2.1 (Food Safety Programs)
+- FSANZ Food Standards Code Standard 3.2.2 (Food Safety Practices)
+- FSANZ Food Standards Code Standard 3.2.3 (Food Premises and Equipment)
+- FSANZ Food Standards Code Standard 1.2.3 (Information Requirements — Allergens)
+- Victorian Department of Health guidance
+
+Provide:
+1. Overall food safety compliance risk
+2. FSP/HACCP adequacy assessment
+3. Temperature control compliance
+4. Allergen management assessment
+5. Staff training adequacy
+6. Priority improvement actions
+
+Respond ONLY in JSON:
+{
+  "overallRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "fspComplianceRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "temperatureControlRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "allergenRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "staffTrainingRisk": "LOW|MODERATE|HIGH",
+  "supplyChainRisk": "LOW|MODERATE|HIGH",
+  "immediateActions": ["string"],
+  "fspFindings": ["string"],
+  "allergenFindings": ["string"],
+  "hygieneFindings": ["string"],
+  "recommendedActions": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 900,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallRisk: "MODERATE",
+        fspComplianceRisk: "MODERATE",
+        temperatureControlRisk: "MODERATE",
+        allergenRisk: "MODERATE",
+        staffTrainingRisk: "MODERATE",
+        supplyChainRisk: "LOW",
+        immediateActions: ["Ensure all staff complete food handler training", "Verify temperature monitoring records are maintained daily"],
+        fspFindings: ["AI assessment unavailable — engage registered food safety auditor for formal FSP review per Food Act 1984 (Vic)"],
+        allergenFindings: ["Review FSANZ Standard 1.2.3 allergen labelling and information requirements"],
+        hygieneFindings: ["Verify cleaning and sanitising schedules meet Food Standards Code Standard 3.2.3"],
+        recommendedActions: ["Develop or update Food Safety Program per FSANZ Standard 3.2.1", "Schedule HACCP plan review"],
+        applicableStandards: ["Food Act 1984 (Vic)", "FSANZ Standard 3.2.1", "FSANZ Standard 3.2.2", "FSANZ Standard 1.2.3"],
+        summary: "AI food safety assessment unavailable. Engage a registered food safety auditor for formal compliance assessment.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      businessId: safeBizId,
+      standards: ["Food Act 1984 (Vic)", "FSANZ Food Standards Code Standard 3.2.1", "FSANZ Food Standards Code Standard 3.2.2"],
+    });
+  } catch (err) {
+    console.error("POST /ai-food-safety-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess food safety." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
