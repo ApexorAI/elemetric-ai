@@ -20359,6 +20359,207 @@ app.get("/apprentice-logbook/:apprenticeId", apiKeyAuth, async (req, res) => {
   });
 });
 
+// ── Round 53 ──────────────────────────────────────────────────────────────────
+
+// POST /dispute-log  — Log a client dispute or complaint
+app.post("/dispute-log", apiKeyAuth, async (req, res) => {
+  const { jobId, contractorId, clientName, clientEmail, disputeType,
+          description, severity, responseRequired, notes } = req.body;
+
+  if (!description || !disputeType) {
+    return res.status(400).json({ error: "description and disputeType are required." });
+  }
+
+  const DISPUTE_TYPES = ["payment", "quality", "delay", "scope", "damage", "safety", "communication", "other"];
+  const safeDType     = sanitiseInput(String(disputeType)).toLowerCase().replace(/\s/g, "_");
+  const resolvedType  = DISPUTE_TYPES.find(t => t === safeDType) || "other";
+
+  const safeDesc      = sanitiseInput(String(description)).slice(0, 1000);
+  const safeClient    = sanitiseInput(String(clientName || "Anonymous"));
+  const safeEmail     = clientEmail && isValidEmail(clientEmail) ? clientEmail : null;
+  const safeSeverity  = sanitiseInput(String(severity || "medium")).toLowerCase();
+  const safeNotes     = sanitiseInput(String(notes || ""));
+
+  const SEVERITY_DEADLINES = { critical: 1, high: 3, medium: 7, low: 14 };
+  const daysToRespond = SEVERITY_DEADLINES[safeSeverity] || 7;
+  const dueDate = new Date();
+  dueDate.setDate(dueDate.getDate() + daysToRespond);
+
+  const disputeId = `DISP-${Date.now().toString(36).toUpperCase()}`;
+
+  const escalationPath = resolvedType === "safety"
+    ? ["Contact WorkSafe Victoria: 1800 136 089", "Document incident in safety observation log"]
+    : resolvedType === "quality"
+      ? ["Review compliance documentation", "Arrange site re-inspection", "Engage mediator if unresolved within 30 days"]
+      : resolvedType === "payment"
+        ? ["Review signed contract", "Issue formal payment demand letter", "Lodge with VCAT Building List if > $10,000"]
+        : ["Attempt direct resolution with client", "Engage VCAT or Consumer Affairs Victoria if unresolved"];
+
+  const record = {
+    disputeId,
+    status:          "OPEN",
+    jobId:           jobId   ? sanitiseInput(String(jobId))   : null,
+    contractorId:    contractorId ? sanitiseInput(String(contractorId)) : null,
+    clientName:      safeClient,
+    clientEmail:     safeEmail,
+    disputeType:     resolvedType,
+    severity:        safeSeverity.toUpperCase(),
+    description:     safeDesc,
+    responseDeadline: dueDate.toISOString().slice(0, 10),
+    escalationPath,
+    responseRequired: responseRequired !== false,
+    notes:           safeNotes || null,
+    loggedAt:        new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("dispute_logs").insert({
+      dispute_id:   disputeId,
+      job_id:       record.jobId,
+      contractor_id: record.contractorId,
+      dispute_type: resolvedType,
+      severity:     safeSeverity,
+      status:       "OPEN",
+      response_deadline: dueDate.toISOString(),
+      created_at:   new Date().toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...record, saved });
+});
+
+// POST /invoice-validate  — Validate an invoice for compliance completeness
+app.post("/invoice-validate", apiKeyAuth, (req, res) => {
+  const { invoiceNumber, contractorName, contractorLicence, contractorAbn,
+          clientName, address, invoiceDate, lineItems, subtotal, gst, total,
+          paymentTerms, jobType, certificateReference } = req.body;
+
+  if (!contractorName || !invoiceDate || !total) {
+    return res.status(400).json({ error: "contractorName, invoiceDate, and total are required." });
+  }
+
+  const safeContractor = sanitiseInput(String(contractorName));
+  const safeLicence    = contractorLicence ? sanitiseInput(String(contractorLicence)) : null;
+  const safeAbn        = contractorAbn ? sanitiseInput(String(contractorAbn)).replace(/\D/g, "") : null;
+  const safeJobType    = sanitiseInput(String(jobType || "general")).toLowerCase();
+
+  const checks = [
+    { item: "Contractor name included",            pass: !!contractorName,                                required: true },
+    { item: "Licence number on invoice",           pass: !!contractorLicence,                             required: true },
+    { item: "ABN included",                        pass: !!(safeAbn && safeAbn.length === 11),            required: true },
+    { item: "Invoice date present",                pass: !!invoiceDate,                                   required: true },
+    { item: "Invoice number present",              pass: !!invoiceNumber,                                 required: false },
+    { item: "Client name present",                 pass: !!clientName,                                    required: false },
+    { item: "Property address on invoice",         pass: !!address,                                       required: true },
+    { item: "Line items itemised",                 pass: Array.isArray(lineItems) && lineItems.length > 0, required: false },
+    { item: "GST amount shown",                    pass: gst !== undefined,                               required: true },
+    { item: "Total amount shown",                  pass: !!total,                                         required: true },
+    { item: "Payment terms stated",                pass: !!paymentTerms,                                  required: false },
+    { item: "Certificate reference included",      pass: !!certificateReference,                          required: false },
+  ];
+
+  const failures       = checks.filter(c => !c.pass);
+  const criticalFail   = failures.filter(c => c.required);
+  const valid          = criticalFail.length === 0;
+
+  // ABN validation (simplified mod 89 check)
+  let abnValid = false;
+  if (safeAbn && safeAbn.length === 11) {
+    const WEIGHTS = [10, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19];
+    const digits  = safeAbn.split("").map(Number);
+    digits[0] -= 1;
+    const sum     = WEIGHTS.reduce((s, w, i) => s + w * digits[i], 0);
+    abnValid      = sum % 89 === 0;
+  }
+
+  return res.json({
+    valid,
+    invoiceNumber:    invoiceNumber ? sanitiseInput(String(invoiceNumber)) : null,
+    contractorName:   safeContractor,
+    licenceNumber:    safeLicence,
+    abn:              safeAbn || null,
+    abnValid,
+    jobType:          safeJobType,
+    checks,
+    failedChecks:     failures.map(c => c.item),
+    criticalFailures: criticalFail.map(c => c.item),
+    score:            `${Math.round((checks.filter(c => c.pass).length / checks.length) * 100)}%`,
+    ataNote:          !abnValid && safeAbn ? "ABN appears invalid — verify at abr.business.gov.au" : null,
+    validatedAt:      new Date().toISOString(),
+  });
+});
+
+// POST /compliance-snapshot  — Take a point-in-time compliance snapshot of a contractor's portfolio
+app.post("/compliance-snapshot", apiKeyAuth, async (req, res) => {
+  const { contractorId, contractorName, snapshotDate, jobs } = req.body;
+
+  if (!jobs || !Array.isArray(jobs) || jobs.length === 0) {
+    return res.status(400).json({ error: "jobs array is required." });
+  }
+
+  const safeName   = sanitiseInput(String(contractorName || "Contractor"));
+  const snapDate   = snapshotDate || new Date().toISOString().slice(0, 10);
+  const snapshotId = `SNAP-${Date.now().toString(36).toUpperCase()}`;
+
+  const jobCount   = jobs.length;
+  const scores     = jobs.map(j => parseFloat(j.complianceScore) || 0).filter(s => s > 0);
+  const avgScore   = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+
+  const certRate   = Math.round((jobs.filter(j => j.certificateFiled).length / jobCount) * 100);
+  const sigRate    = Math.round((jobs.filter(j => j.signatureObtained).length / jobCount) * 100);
+  const gpsRate    = Math.round((jobs.filter(j => j.gpsRecorded).length  / jobCount) * 100);
+
+  const highRisk   = jobs.filter(j => (parseFloat(j.complianceScore) || 0) < 60).length;
+  const gradeA     = scores.filter(s => s >= 90).length;
+  const gradeF     = scores.filter(s => s < 60).length;
+
+  const tradeBreakdown = {};
+  for (const j of jobs) {
+    const t = sanitiseInput(String(j.jobType || "unknown")).toLowerCase();
+    if (!tradeBreakdown[t]) tradeBreakdown[t] = 0;
+    tradeBreakdown[t]++;
+  }
+
+  const snapshot = {
+    snapshotId,
+    contractorId:  contractorId ? sanitiseInput(String(contractorId)) : null,
+    contractorName: safeName,
+    snapshotDate:  snapDate,
+    summary: {
+      jobCount,
+      averageComplianceScore: avgScore,
+      certificateFilingRate:  `${certRate}%`,
+      signatureObtainedRate:  `${sigRate}%`,
+      gpsRecordedRate:        `${gpsRate}%`,
+      highRiskJobs:           highRisk,
+      gradeAJobs:             gradeA,
+      gradeFJobs:             gradeF,
+    },
+    tradeBreakdown,
+    overallHealth: highRisk > jobCount * 0.2 ? "POOR" : avgScore !== null && avgScore >= 80 ? "GOOD" : "FAIR",
+    takenAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin && contractorId) {
+    const { error } = await supabaseAdmin.from("compliance_snapshots").insert({
+      snapshot_id:   snapshotId,
+      contractor_id: sanitiseInput(String(contractorId)),
+      snapshot_date: snapDate,
+      job_count:     jobCount,
+      avg_score:     avgScore,
+      cert_rate:     certRate,
+      snapshot_data: snapshot.summary,
+      created_at:    new Date().toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...snapshot, saved });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
