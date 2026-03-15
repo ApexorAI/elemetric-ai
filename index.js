@@ -67754,6 +67754,416 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /overhead-powerline-clearance — Overhead power line clearance check per AS/NZS 4836 / Energy Safe Victoria
+app.post("/overhead-powerline-clearance", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    location,
+    inspectionDate,
+    inspector,
+    lineOwner,            // AusNet | Powercor | CitiPower | United Energy | Jemena | other
+    lineType,             // low-voltage | high-voltage | transmission | overhead-communications
+    voltageClass,         // LV (≤1kV) | HV (1–66kV) | EHV (>66kV)
+    measurementMethod,    // direct | laser-rangefinder | photogrammetry | estimated
+    clearanceToGround_m,
+    minimumGroundClearance_m,   // AS 4436 minimums: LV 5.5m road, HV 6.7m road
+    clearanceToBuilding_m,
+    minimumBuildingClearance_m,
+    clearanceToVegetation_m,
+    plantOrEquipmentWorkingNear, // true | false
+    equipmentType,        // crane | EWP | excavator | tipper-truck | scaffold | other
+    tallestEquipmentHeight_m,
+    requiredWorkingClearance_m,  // AS/NZS 4836: 3m for LV, 6.4m for HV approach limit
+    workingUnderLine,     // true | false
+    lineOwnerNotified,
+    safetyObserverAssigned,
+    exclusionZone_m,
+    additionalControls,   // array of strings
+    permitToApproachObtained,
+    criticalFindings,     // array of strings
+    photos,
+    notes,
+  } = req.body;
+
+  const violations = [];
+
+  // Ground clearance check
+  const groundClear = parseFloat(clearanceToGround_m) || 0;
+  const minGroundClear = parseFloat(minimumGroundClearance_m) || 5.5;
+  if (groundClear > 0 && groundClear < minGroundClear) {
+    violations.push(
+      `Ground clearance ${groundClear} m is below minimum ${minGroundClear} m — contact line owner immediately`
+    );
+  }
+
+  // Building clearance
+  const buildingClear = parseFloat(clearanceToBuilding_m) || 0;
+  const minBuildingClear = parseFloat(minimumBuildingClearance_m) || 0;
+  if (buildingClear > 0 && minBuildingClear > 0 && buildingClear < minBuildingClear) {
+    violations.push(`Building clearance ${buildingClear} m is below minimum ${minBuildingClear} m`);
+  }
+
+  // Working clearance check
+  const tallestEquip = parseFloat(tallestEquipmentHeight_m) || 0;
+  const reqClear = parseFloat(requiredWorkingClearance_m) || 3;
+  const groundClearToLineWithEquip = groundClear - tallestEquip;
+  if (tallestEquip > 0 && groundClear > 0 && groundClearToLineWithEquip < reqClear) {
+    violations.push(
+      `Equipment height ${tallestEquip} m + required clearance ${reqClear} m = ${(tallestEquip + reqClear).toFixed(1)} m exceeds available ground clearance ${groundClear} m`
+    );
+  }
+
+  // Working without permit near HV
+  if (
+    (voltageClass === "HV" || voltageClass === "EHV") &&
+    workingUnderLine &&
+    !permitToApproachObtained
+  ) {
+    violations.push("Working near high-voltage line without permit to approach — STOP WORK");
+  }
+
+  // No line owner notification
+  if (workingUnderLine && !lineOwnerNotified) {
+    violations.push("Line owner not notified before working near overhead lines — required per Energy Safe Victoria");
+  }
+
+  if (violations.length > 0) {
+    return res.status(422).json({
+      error: "Overhead power line clearance — unsafe conditions identified",
+      violations,
+      immediateActions: [
+        "STOP all plant and equipment near power lines immediately",
+        "Evacuate the area",
+        "Contact line owner (dial 13 17 02 for AusNet, 13 24 12 for Powercor emergencies)",
+        "Contact Emergency Services 000 if contact has been made",
+        "Do not resume work until line owner gives clearance",
+      ],
+      applicableStandards: [
+        "AS/NZS 4836",
+        "AS 4436",
+        "Energy Safe Victoria — Working Safely Near Power Lines",
+        "OHS Regulations 2017 (Vic)",
+      ],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    location: sanitiseInput(location),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    line_owner: sanitiseInput(lineOwner),
+    line_type: sanitiseInput(lineType),
+    voltage_class: sanitiseInput(voltageClass),
+    measurement_method: sanitiseInput(measurementMethod),
+    clearance_to_ground_m: clearanceToGround_m,
+    minimum_ground_clearance_m: minimumGroundClearance_m,
+    clearance_to_building_m: clearanceToBuilding_m,
+    clearance_to_vegetation_m: clearanceToVegetation_m,
+    plant_or_equipment_working_near: plantOrEquipmentWorkingNear,
+    equipment_type: sanitiseInput(equipmentType),
+    tallest_equipment_height_m: tallestEquipmentHeight_m,
+    required_working_clearance_m: requiredWorkingClearance_m,
+    working_under_line: workingUnderLine,
+    line_owner_notified: lineOwnerNotified,
+    safety_observer_assigned: safetyObserverAssigned,
+    exclusion_zone_m: exclusionZone_m,
+    additional_controls: additionalControls || [],
+    permit_to_approach_obtained: permitToApproachObtained,
+    violations,
+    result: "SAFE",
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("overhead_powerline_clearances")
+      .insert(record);
+    if (dbErr) console.error("DB error /overhead-powerline-clearance:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Overhead power line clearance check recorded — safe",
+    groundClearance_m: groundClear,
+    tallestEquipmentHeight_m: tallestEquip,
+    workingClearanceAdequate: groundClear - tallestEquip >= reqClear,
+    result: "SAFE",
+    applicableStandards: [
+      "AS/NZS 4836",
+      "AS 4436",
+      "Energy Safe Victoria Guidance",
+    ],
+    saved,
+  });
+});
+
+// POST /hazardous-manual-task-assessment — Hazardous manual task risk assessment per OHS Regs 2017 (Vic) Part 4.2
+app.post("/hazardous-manual-task-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    workplaceId,
+    assessmentDate,
+    assessor,
+    taskName,
+    taskDescription,
+    workerName,           // or "multiple workers"
+    taskFrequency,        // continuous | frequent | occasional | rare
+    taskDuration_min_per_day,
+    loadWeight_kg,
+    liftingHeight_from_m, // floor height of object start
+    liftingHeight_to_m,   // height where placed
+    liftDistance_m,       // horizontal carry
+    pushForce_N,          // force to push/pull
+    awkwardPostures,      // array of { posture: bent-back|twisted|overhead|squat|kneel, duration_pct }
+    repetitiveMovements,  // true | false
+    repetitionsPerHour,
+    staticPosture,        // true | false
+    staticDuration_minutes,
+    vibrationExposure,    // true | false
+    contactStress,        // sharp edges, handles
+    teamLift,
+    mechanicalAids,       // array of available aids
+    existingControls,     // array of strings
+    workerFeedback,       // array of reported discomfort locations
+    injuryHistory,        // previous MSD injuries related to task
+    riskRating,           // low | medium | high | critical
+    controlMeasures,      // array of recommended controls
+    implementationDate,
+    reviewDate,
+    photos,
+    notes,
+  } = req.body;
+
+  // Risk indicators per NIOSH lifting equation and REBA criteria
+  const load = parseFloat(loadWeight_kg) || 0;
+  const riskIndicators = [];
+
+  // Load thresholds per Safe Work Australia
+  if (load > 25 && !teamLift) {
+    riskIndicators.push(`Load ${load} kg exceeds 25 kg recommended single-person limit — use mechanical aid or team lift`);
+  }
+  if (load > 16 && liftingHeight_from_m === 0) {
+    riskIndicators.push(`Lifting ${load} kg from floor level — high lumbar spine loading`);
+  }
+
+  // Repetition
+  const reps = parseFloat(repetitionsPerHour) || 0;
+  if (reps > 200) {
+    riskIndicators.push(`${reps} repetitions/hour is a high-risk repetition rate for musculoskeletal disorders`);
+  }
+
+  // Awkward postures
+  const criticalPostures = Array.isArray(awkwardPostures)
+    ? awkwardPostures.filter((p) => p.duration_pct > 30)
+    : [];
+  if (criticalPostures.length > 0) {
+    riskIndicators.push(
+      `Awkward postures >30% of task time: ${criticalPostures.map((p) => p.posture).join(", ")}`
+    );
+  }
+
+  // Static posture
+  const staticDur = parseFloat(staticDuration_minutes) || 0;
+  if (staticPosture && staticDur > 20) {
+    riskIndicators.push(`Static posture maintained for ${staticDur} minutes — exceeds 20-minute limit`);
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    workplace_id: sanitiseInput(workplaceId),
+    assessment_date: assessmentDate,
+    assessor: sanitiseInput(assessor),
+    task_name: sanitiseInput(taskName),
+    task_description: sanitiseInput(taskDescription),
+    worker_name: sanitiseInput(workerName),
+    task_frequency: sanitiseInput(taskFrequency),
+    task_duration_min_per_day: taskDuration_min_per_day,
+    load_weight_kg: loadWeight_kg,
+    lifting_height_from_m: liftingHeight_from_m,
+    lifting_height_to_m: liftingHeight_to_m,
+    lift_distance_m: liftDistance_m,
+    push_force_n: pushForce_N,
+    awkward_postures: awkwardPostures || [],
+    repetitive_movements: repetitiveMovements,
+    repetitions_per_hour: repetitionsPerHour,
+    static_posture: staticPosture,
+    static_duration_minutes: staticDuration_minutes,
+    vibration_exposure: vibrationExposure,
+    contact_stress: contactStress,
+    team_lift: teamLift,
+    mechanical_aids: mechanicalAids || [],
+    existing_controls: existingControls || [],
+    worker_feedback: workerFeedback || [],
+    injury_history: injuryHistory,
+    risk_rating: sanitiseInput(riskRating) || (riskIndicators.length > 3 ? "high" : "medium"),
+    control_measures: controlMeasures || [],
+    risk_indicators: riskIndicators,
+    implementation_date: implementationDate,
+    review_date: reviewDate,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("hazardous_manual_task_assessments")
+      .insert(record);
+    if (dbErr) console.error("DB error /hazardous-manual-task-assessment:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Hazardous manual task assessment saved",
+    taskName: sanitiseInput(taskName),
+    riskRating: sanitiseInput(riskRating) || (riskIndicators.length > 3 ? "high" : "medium"),
+    riskIndicatorsCount: riskIndicators.length,
+    riskIndicators,
+    immediateAttentionRequired: riskIndicators.length >= 2,
+    applicableLegislation: [
+      "OHS Regulations 2017 (Vic) Part 4.2",
+      "Safe Work Australia Hazardous Manual Tasks Code of Practice",
+      "NIOSH Lifting Equation",
+      "Occupational Health and Safety Act 2004 (Vic)",
+    ],
+    saved,
+  });
+});
+
+// POST /ai-manual-task-risk-assessment — AI assesses biomechanical risks and ergonomic controls for manual tasks
+app.post("/ai-manual-task-risk-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    taskDescription,
+    loadWeight_kg,
+    liftingFromFloor,
+    awkwardPostures,
+    repetitionsPerHour,
+    vibration,
+    workerPopulation,     // age range, any known MSDs
+    existingControls,
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are an ergonomist and occupational health specialist with 20 years experience assessing manual tasks in Australian workplaces. Assess musculoskeletal disorder (MSD) risk and control options per OHS Regulations 2017 (Vic) Part 4.2, Safe Work Australia Hazardous Manual Tasks Code of Practice, and NIOSH Lifting Equation.
+
+Assess:
+1. Biomechanical loading — spine compression, shoulder moments, wrist loading
+2. NIOSH Recommended Weight Limit (RWL) and Lifting Index (LI) for the task
+3. Risk factors: force, repetition, awkward posture, duration, static load, vibration
+4. Hierarchy of controls — elimination > substitution > engineering > administrative > PPE
+5. Mechanical aid selection — trolley, hoist, conveyor, turntable, adjustable workbench
+6. Task redesign options — reduced batch size, two-person lift, job rotation
+7. Monitoring requirements — REBA/RULA scores, worker symptom surveys
+
+Respond with JSON: { "msdRisk": "low|medium|high|critical", "primaryBiomechanicalRisk": "string", "riskFactors": [], "noshLiftingIndex": number, "recommendedWeightLimit_kg": number, "controlHierarchy": [], "mechanicalAids": [], "taskRedesign": [], "adminControls": [], "ppeControls": [], "monitoringRequired": boolean, "ergonomicReviewFrequency": "string", "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const posturesSummary = Array.isArray(awkwardPostures)
+    ? awkwardPostures.map((p) => `${p.posture || p} (${p.duration_pct || "?"}%)`).join(", ")
+    : (awkwardPostures || "not specified");
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Task description: ${taskDescription || "not specified"}
+Load weight: ${loadWeight_kg || "not specified"} kg
+Lifting from floor: ${liftingFromFloor || "no"}
+Awkward postures: ${posturesSummary}
+Repetitions per hour: ${repetitionsPerHour || "not specified"}
+Vibration exposure: ${vibration || "no"}
+Worker population: ${workerPopulation || "not specified"}
+Existing controls: ${existingControls || "none"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-manual-task-risk-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        msdRisk: "medium",
+        primaryBiomechanicalRisk: "Lumbar spine overloading from heavy lifting in awkward posture",
+        riskFactors: [
+          "Load weight approaching or exceeding NIOSH recommended limit",
+          "Repeated bending and twisting during lift",
+          "Low lift origin (floor level) increasing spinal loading",
+        ],
+        noshLiftingIndex: 1.8,
+        recommendedWeightLimit_kg: 14,
+        controlHierarchy: [
+          "Eliminate: Can the task be automated or items reduced in weight?",
+          "Substitute: Smaller package sizes, lighter containers",
+          "Engineering: Height-adjustable work surface, pallet jack, vacuum lifter",
+          "Administrative: Job rotation every 2 hours, team lift, rest breaks",
+          "PPE: Back support belt (last resort, limited evidence)",
+        ],
+        mechanicalAids: [
+          "Hydraulic scissor-lift table to bring loads to knuckle height",
+          "Powered pallet jack for floor-to-height transfer",
+          "Vacuum lifter for flat items (panels, sheets)",
+          "Trolley for horizontal transport",
+        ],
+        taskRedesign: [
+          "Reduce maximum package weight to ≤16 kg",
+          "Specify lift zone as knuckle-to-shoulder height",
+          "Rotate task with light-duty work every 2 hours",
+        ],
+        adminControls: [
+          "Train workers in correct lifting technique",
+          "Post maximum weight limit at task location",
+          "Implement symptom reporting procedure",
+        ],
+        ppeControls: ["Anti-vibration gloves if tool vibration present"],
+        monitoringRequired: true,
+        ergonomicReviewFrequency: "Annual or after any MSD incident or task change",
+        applicableStandards: [
+          "OHS Regulations 2017 (Vic) Part 4.2",
+          "Safe Work Australia Hazardous Manual Tasks Code of Practice",
+          "NIOSH Revised Lifting Equation (1994)",
+          "AS 3590",
+        ],
+        recommendation:
+          "Install height-adjustable work surface to eliminate floor-level lifts. Implement job rotation at 2 hours. Reduce maximum package weight to 16 kg. Annual ergonomic review.",
+        summary:
+          "Task presents medium MSD risk from lumbar loading. Engineering controls (height-adjustable equipment) are the most effective intervention and should be prioritised over administrative or PPE controls.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
