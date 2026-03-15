@@ -48869,6 +48869,349 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /retaining-wall-inspection — Inspect a retaining wall (AS 4678, NCC 2022 Part B)
+app.post("/retaining-wall-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, propertyAddress, inspectionDate, inspectorName,
+    wallRef, wallType, wallMaterial, wallHeightM, wallLengthM,
+    // Structural condition
+    verticalAlignment, horizontalAlignment, cracking, crackWidthMm,
+    bulging, leaning, settlementEvident, footingExposure,
+    // Water management
+    drainsOperational, weeperHolesPresent, weeperHolesClear,
+    waterPondingBehindWall, waterStaining,
+    // Surcharge
+    surchargePresent, surchargeType, surchargeProximityM,
+    vehiclesOnSurcharge, structuresOnSurcharge,
+    // Geotechnical
+    soilErosion, undermining, retainedSoilCondition,
+    vegetationOnWall, rootDamage,
+    // Design
+    engineeringDesignAvailable, designHeightM, designSurchargekPa,
+    nonCompliances, rectificationRequired, urgency, notes,
+  } = req.body;
+
+  if (!projectId || !wallRef || !inspectionDate || !inspectorName) {
+    return res.status(400).json({ error: "projectId, wallRef, inspectionDate, and inspectorName are required." });
+  }
+
+  const sanitisedRef = sanitiseInput(wallRef, 60);
+  const sanitisedInspector = sanitiseInput(inspectorName, 120);
+  const wallH = Number(wallHeightM || 0);
+
+  // AS 4678 threshold — walls > 1.0m typically require engineering design in Vic (check council requirements)
+  // NCC 2022 Part B — retaining walls > 1.0m may need building permit
+  const engineeringRequired = wallH > 1.0;
+  const permitRequired = wallH > 1.0;
+
+  const failures = [];
+  const criticalFailures = [];
+
+  if (cracking === "MAJOR" || (crackWidthMm && Number(crackWidthMm) > 5)) {
+    criticalFailures.push(`Major cracking detected${crackWidthMm ? ` (width ${crackWidthMm}mm)` : ""} — immediate engineering assessment required.`);
+  } else if (cracking === "MINOR") {
+    failures.push("Minor cracking present — monitor and record.");
+  }
+
+  if (bulging) criticalFailures.push("Wall bulging detected — potential imminent failure. Restrict access and engage engineer immediately.");
+  if (leaning) criticalFailures.push("Wall leaning — structural integrity compromised. Engineering assessment urgent.");
+  if (undermining) criticalFailures.push("Undermining of footing observed — wall at risk of collapse.");
+
+  if (!weeperHolesClear) failures.push("Weeper holes blocked — clear to prevent hydrostatic pressure build-up.");
+  if (!weeperHolesPresent) failures.push("No weeper holes — hydrostatic pressure will increase over time.");
+  if (waterPondingBehindWall) failures.push("Water ponding behind wall — drainage investigation required.");
+  if (footingExposure) failures.push("Footing exposed — fill/protect to prevent undermining.");
+  if (soilErosion) failures.push("Soil erosion at base — address drainage and erosion controls.");
+  if (rootDamage) failures.push("Root damage to wall structure — remove vegetation and inspect structural impact.");
+
+  if (vehiclesOnSurcharge) failures.push("Vehicles within surcharge zone — may exceed design surcharge. Verify with engineer.");
+  if (structuresOnSurcharge) failures.push("Structures on surcharge — verify compliance with wall design.");
+
+  if (engineeringRequired && !engineeringDesignAvailable) {
+    failures.push(`Wall height ${wallH}m > 1.0m — engineering design required (AS 4678). Confirm design documentation is available.`);
+  }
+
+  const addlNC = (nonCompliances || []).map(n => sanitiseInput(String(n), 200)).slice(0, 10);
+  const allCritical = [...criticalFailures, ...addlNC.filter(n => n.toLowerCase().includes("critical"))];
+  const allFailures = [...failures, ...addlNC.filter(n => !n.toLowerCase().includes("critical"))];
+
+  const overallCondition = allCritical.length > 0 ? "CRITICAL" : allFailures.length > 3 ? "POOR" : allFailures.length > 0 ? "FAIR" : "GOOD";
+  const resolvedUrgency = allCritical.length > 0 ? "IMMEDIATE" : sanitiseInput(urgency || "ROUTINE", 20);
+
+  const ref = `RWI-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    propertyAddress: sanitiseInput(propertyAddress || "", 300),
+    inspectionDate,
+    inspectorName: sanitisedInspector,
+    wall: {
+      ref: sanitisedRef,
+      type: sanitiseInput(wallType || "", 60),
+      material: sanitiseInput(wallMaterial || "", 60),
+      heightM: wallH,
+      lengthM: wallLengthM || null,
+    },
+    structural: { verticalAlignment, horizontalAlignment, cracking, crackWidthMm, bulging, leaning, settlementEvident, footingExposure },
+    drainage: { drainsOperational, weeperHolesPresent, weeperHolesClear, waterPondingBehindWall, waterStaining },
+    surcharge: {
+      present: !!surchargePresent,
+      type: sanitiseInput(surchargeType || "", 60),
+      proximityM: surchargeProximityM || null,
+      vehiclesOnSurcharge: !!vehiclesOnSurcharge,
+    },
+    geotechnical: { soilErosion, undermining, retainedSoilCondition, vegetationOnWall, rootDamage },
+    design: {
+      engineeringDesignAvailable: !!engineeringDesignAvailable,
+      engineeringRequired,
+      permitRequired,
+      designHeightM: designHeightM || null,
+      designSurchargekPa: designSurchargekPa || null,
+    },
+    overallCondition,
+    criticalFailures: allCritical,
+    failures: allFailures,
+    urgency: resolvedUrgency,
+    rectificationRequired: (allCritical.length > 0 || allFailures.length > 0) && (rectificationRequired !== false),
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("retaining_wall_inspections").insert(record);
+      if (error) console.error("Retaining wall inspection insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Retaining wall inspection DB error:", e.message);
+    }
+  }
+
+  if (allCritical.length > 0) {
+    console.warn(`[SAFETY] Retaining wall ${sanitisedRef} at ${sanitiseInput(propertyAddress || "", 100)}: CRITICAL — ${allCritical[0]}`);
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    wallRef: sanitisedRef,
+    overallCondition,
+    urgency: resolvedUrgency,
+    criticalFailureCount: allCritical.length,
+    criticalFailures: allCritical,
+    failureCount: allFailures.length,
+    failures: allFailures,
+    engineeringRequired,
+    message: allCritical.length > 0
+      ? `CRITICAL: ${allCritical[0]} Restrict access immediately.`
+      : overallCondition === "GOOD"
+        ? `Retaining wall ${sanitisedRef} in GOOD condition — no immediate action required.`
+        : `Retaining wall ${sanitisedRef} requires attention — ${allFailures.length} issue(s) identified.`,
+    saved,
+    record,
+  });
+});
+
+// POST /ai-retaining-wall-assessment — AI assesses retaining wall stability and compliance
+app.post("/ai-retaining-wall-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    wallType, wallMaterial, wallHeightM, wallLengthM,
+    soilType, surchargekPa, groundwaterPresent,
+    slopeBehindWall, condition, drainageProvided,
+    constructionYear, engineeringDesignProvided, notes,
+  } = req.body;
+
+  if (!wallType || !wallHeightM) {
+    return res.status(400).json({ error: "wallType and wallHeightM are required." });
+  }
+
+  const sanitisedType = sanitiseInput(wallType, 80);
+  const h = Number(wallHeightM);
+
+  const prompt = `You are a structural and geotechnical engineer specialising in retaining walls in Victoria, Australia.
+
+Assess the stability and compliance of the following retaining wall:
+- Wall type: ${sanitisedType}
+- Material: ${sanitiseInput(wallMaterial || "Unknown", 60)}
+- Height: ${h}m
+- Length: ${wallLengthM ? `${wallLengthM}m` : "Unknown"}
+- Soil type behind wall: ${sanitiseInput(soilType || "Unknown", 60)}
+- Design surcharge: ${surchargekPa ? `${surchargekPa} kPa` : "Unknown"}
+- Groundwater present: ${groundwaterPresent ? "Yes" : "No"}
+- Slope behind wall: ${sanitiseInput(slopeBehindWall || "None (level)", 40)}
+- Current condition: ${sanitiseInput(condition || "Not assessed", 60)}
+- Drainage provided: ${drainageProvided ? "Yes" : "No"}
+- Construction year: ${constructionYear || "Unknown"}
+- Engineering design available: ${engineeringDesignProvided ? "Yes" : "No"}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Reference: AS 4678 (Earth retaining structures), AS 3600 (Concrete), AS 4100 (Steel), NCC 2022 Part B1.
+
+Respond ONLY with a JSON object:
+{
+  "stabilityAssessment": "STABLE|MONITOR|UNSTABLE|CRITICAL",
+  "engineeringDesignRequired": boolean,
+  "buildingPermitRequired": boolean,
+  "globalStabilityRisk": "LOW|MEDIUM|HIGH|CRITICAL",
+  "failureModes": [{"mode": string, "likelihood": "LOW|MEDIUM|HIGH", "consequence": string}],
+  "recommendedInvestigations": [string],
+  "remedialOptions": [{"option": string, "description": string, "priority": "IMMEDIATE|SHORT_TERM|LONG_TERM"}],
+  "drainageRecommendations": [string],
+  "maintenanceProgram": [string],
+  "regulatoryActions": [string],
+  "summary": string (2-3 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      wallType: sanitisedType,
+      heightM: h,
+      stabilityAssessment: parsed.stabilityAssessment || "MONITOR",
+      engineeringDesignRequired: parsed.engineeringDesignRequired ?? h > 1.0,
+      buildingPermitRequired: parsed.buildingPermitRequired ?? h > 1.0,
+      globalStabilityRisk: parsed.globalStabilityRisk || "MEDIUM",
+      failureModes: parsed.failureModes || [],
+      recommendedInvestigations: parsed.recommendedInvestigations || [],
+      remedialOptions: parsed.remedialOptions || [],
+      drainageRecommendations: parsed.drainageRecommendations || [],
+      maintenanceProgram: parsed.maintenanceProgram || [],
+      regulatoryActions: parsed.regulatoryActions || [],
+      summary: parsed.summary || "Retaining wall assessment complete.",
+      disclaimer: "AI assessment only — engage a structural/geotechnical engineer for all walls > 1.0m or showing signs of distress.",
+    });
+  } catch (e) {
+    console.error("AI retaining wall error:", e.message);
+    return res.json({
+      success: true,
+      wallType: sanitisedType,
+      heightM: h,
+      stabilityAssessment: "MONITOR",
+      engineeringDesignRequired: h > 1.0,
+      buildingPermitRequired: h > 1.0,
+      globalStabilityRisk: h > 2 ? "HIGH" : "MEDIUM",
+      failureModes: [
+        { mode: "Sliding failure", likelihood: "MEDIUM", consequence: "Wall slides on foundation — collapse risk" },
+        { mode: "Overturning", likelihood: "MEDIUM", consequence: "Wall tips forward — collapse risk, especially with high surcharge" },
+        { mode: "Hydrostatic failure", likelihood: !drainageProvided ? "HIGH" : "LOW", consequence: "Water pressure behind wall pushes wall outward" },
+      ],
+      recommendedInvestigations: ["Geotechnical investigation of retained soils", "Structural assessment by registered engineer"],
+      remedialOptions: [
+        { option: "Install weeper holes and subsoil drainage", description: "Reduce hydrostatic pressure", priority: "SHORT_TERM" },
+        { option: "Soil nail/anchor reinforcement", description: "Increase passive resistance", priority: "LONG_TERM" },
+      ],
+      drainageRecommendations: ["Install 100mm perforated pipe behind wall", "Ensure weeper holes at 1.5m centres"],
+      maintenanceProgram: ["Annual visual inspection", "Clear weeper holes and drains biannually"],
+      regulatoryActions: h > 1.0 ? ["Confirm building permit and engineering design on file"] : [],
+      summary: `Retaining wall requires monitoring. ${h > 1.0 ? "Engineering design and building permit are required for walls > 1.0m." : "Standard maintenance and monitoring recommended."}`,
+      disclaimer: "AI assessment only — engage a structural/geotechnical engineer for all walls > 1.0m or showing signs of distress.",
+    });
+  }
+});
+
+// POST /site-signage-audit — Audit construction site safety signage (WorkSafe Victoria)
+app.post("/site-signage-audit", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectAddress, auditDate, auditorName,
+    // Mandatory site signage checks
+    projectNameSignDisplayed, pcNameDisplayed, buildingPermitDisplayed,
+    workSafeNotificationDisplayed, emergencyContactsDisplayed,
+    firstAidLocationSignage, fireExtinguisherSignage, musterPointSignage,
+    noEntryUnauthorised, hardHatZoneSignage, highVisSignage,
+    noPedestrianEntry, hoardingSignage, speedSignage,
+    siteAddressSignage, siteHoursSignage,
+    // ESG / diversity
+    noBullyingSignage, womenWelcomeSignage,
+    nonCompliances, notes,
+  } = req.body;
+
+  if (!projectId || !auditDate || !auditorName) {
+    return res.status(400).json({ error: "projectId, auditDate, and auditorName are required." });
+  }
+
+  const sanitisedAuditor = sanitiseInput(auditorName, 120);
+
+  // WorkSafe Victoria construction signage requirements
+  const requiredSigns = [
+    { sign: "Project name board", present: !!projectNameSignDisplayed, required: true, regulation: "OHS Regulations 2017 reg.262" },
+    { sign: "Principal Contractor name and contact", present: !!pcNameDisplayed, required: true, regulation: "OHS Regulations 2017 reg.262" },
+    { sign: "Building permit displayed at site", present: !!buildingPermitDisplayed, required: true, regulation: "Building Act 1993 s.24" },
+    { sign: "WorkSafe notification (for notifiable work)", present: workSafeNotificationDisplayed ?? null, required: false, regulation: "OHS Act 2004 s.26" },
+    { sign: "Emergency contacts board", present: !!emergencyContactsDisplayed, required: true, regulation: "OHS Regulations 2017 reg.43" },
+    { sign: "First aid location signage", present: !!firstAidLocationSignage, required: true, regulation: "AS 4600 / First Aid Code of Practice" },
+    { sign: "Fire extinguisher location signage", present: !!fireExtinguisherSignage, required: true, regulation: "AS 2444" },
+    { sign: "Muster point signage", present: !!musterPointSignage, required: true, regulation: "Emergency Management Plan" },
+    { sign: "No unauthorised entry sign", present: !!noEntryUnauthorised, required: true, regulation: "OHS Regulations 2017 reg.262" },
+    { sign: "PPE mandatory signs (hard hat, hi-vis)", present: !!(hardHatZoneSignage && highVisSignage), required: true, regulation: "OHS Regulations 2017" },
+    { sign: "No pedestrian entry (plant zones)", present: noPedestrianEntry ?? null, required: false, regulation: "OHS Regulations 2017 reg.92" },
+    { sign: "Site address/street number", present: !!siteAddressSignage, required: false, regulation: "Local council requirements" },
+    { sign: "Site working hours", present: !!siteHoursSignage, required: false, regulation: "Local council / EPA EPA guidelines" },
+  ];
+
+  const missingMandatory = requiredSigns.filter(s => s.required && s.present === false);
+  const missingOptional = requiredSigns.filter(s => !s.required && s.present === false);
+  const addlNC = (nonCompliances || []).map(n => sanitiseInput(String(n), 200)).slice(0, 10);
+  const allFailures = [...missingMandatory.map(s => `Missing mandatory sign: ${s.sign} (${s.regulation})`), ...addlNC];
+
+  const overallResult = allFailures.length === 0 ? "PASS" : "FAIL";
+  const complianceScore = Math.round(((requiredSigns.filter(s => s.required).length - missingMandatory.length) / requiredSigns.filter(s => s.required).length) * 100);
+
+  const ref = `SSA-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectAddress: sanitiseInput(projectAddress || "", 300),
+    auditDate,
+    auditorName: sanitisedAuditor,
+    signs: requiredSigns,
+    overallResult,
+    complianceScore,
+    missingMandatoryCount: missingMandatory.length,
+    failures: allFailures,
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("site_signage_audits").insert(record);
+      if (error) console.error("Signage audit insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Signage audit DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    overallResult,
+    complianceScore,
+    missingMandatoryCount: missingMandatory.length,
+    failures: allFailures,
+    message: overallResult === "PASS"
+      ? `Site signage audit PASSED — all mandatory signs present.`
+      : `Site signage audit FAILED — ${missingMandatory.length} mandatory sign(s) missing. Rectify before next WorkSafe inspection.`,
+    saved,
+    record,
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
