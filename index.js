@@ -6007,6 +6007,137 @@ app.get("/near-miss-log", (req, res) => {
   return res.json({ total: nearMissLog.length, entries });
 });
 
+// ── Round 4: POST /bulk-review — Submit multiple jobs for analysis in batch ───
+// Allows submission of multiple job reviews in a single request.
+
+app.post("/bulk-review", async (req, res) => {
+  const { jobs } = req.body || {};
+
+  if (!Array.isArray(jobs) || jobs.length === 0) {
+    return res.status(400).json({ error: "jobs array is required." });
+  }
+  if (jobs.length > 5) {
+    return res.status(400).json({ error: "Maximum 5 jobs per bulk request." });
+  }
+
+  const results = [];
+
+  for (const job of jobs) {
+    const { id: jobId, jobType, images } = job;
+
+    if (!jobType || !Array.isArray(images) || images.length === 0) {
+      results.push({ jobId: jobId || null, error: "Missing jobType or images." });
+      continue;
+    }
+
+    // Check cache first
+    const cacheKey = getCacheKey(jobType, images);
+    const cached   = getCached(cacheKey);
+    if (cached) {
+      results.push({ jobId, result: cached, fromCache: true });
+      continue;
+    }
+
+    // Rate limit: use existing per-request AI cost tracking
+    // For bulk, we cap at 5 and charge per-job — same as individual reviews
+    try {
+      // Prescreening
+      const { passed: qualityPassedImages } = await prescreenPhotos(images);
+      if (qualityPassedImages.length === 0) {
+        results.push({ jobId, error: "All photos failed quality screening." });
+        continue;
+      }
+
+      // Minimal analysis (uses same prompt system as /review)
+      const promptText = `You are a trade compliance validator. Analyse these ${jobType} job photos.
+${buildRegulationsNote(jobType)}
+
+Return JSON: { "overall_confidence": number, "items_detected": [], "items_missing": [], "items_unclear": [], "risk_rating": "low|medium|high", "analysis": "string" }`;
+
+      usageStats.openaiCalls++;
+      const response = await callOpenAIWithRetry({
+        model:           "gpt-4.1-mini",
+        response_format: { type: "json_object" },
+        messages: [{
+          role:    "user",
+          content: [
+            { type: "text", text: PROMPT_OPTIMISATION_HEADER + promptText },
+            ...qualityPassedImages.flatMap(img => [
+              { type: "text",      text: `Photo: "${img.label}"` },
+              { type: "image_url", image_url: { url: `data:${img.mime};base64,${img.data}` } },
+            ]),
+          ],
+        }],
+        temperature: 0.1,
+        max_tokens:  800,
+      });
+
+      const parsed = JSON.parse(response.choices?.[0]?.message?.content || "{}");
+      validateAIResponse(parsed);
+      setCache(cacheKey, parsed);
+      results.push({ jobId, result: parsed });
+    } catch (err) {
+      console.error(`bulk-review job ${jobId} error:`, err.message);
+      results.push({ jobId, error: "Analysis failed for this job." });
+    }
+  }
+
+  return res.json({
+    processed:  results.length,
+    results,
+    processedAt: new Date().toISOString(),
+  });
+});
+
+// ── Round 4: POST /export-report — Export job data as structured JSON ─────────
+// Returns a structured exportable report suitable for PDF generation on the client.
+
+app.post("/export-report", async (req, res) => {
+  const { jobId, includePhotos = false } = req.body || {};
+
+  if (!jobId || typeof jobId !== "string") {
+    return res.status(400).json({ error: "jobId is required." });
+  }
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: "Database not configured." });
+  }
+
+  try {
+    const selectFields = includePhotos
+      ? "*"
+      : "id, user_id, employer_id, job_type, confidence, missing_items, items_detected, items_unclear, risk_rating, liability_summary, compliance_score, created_at, suburb, address, gps_lat, gps_lng, plumber_name, licence_number";
+
+    const { data, error } = await supabaseAdmin.from("analyses").select(selectFields).eq("id", jobId).single();
+
+    if (error || !data) {
+      return res.status(404).json({ error: "Job not found." });
+    }
+
+    const reportData = {
+      reportVersion:    "1.0",
+      exportedAt:       new Date().toISOString(),
+      jurisdiction:     "Victoria, Australia",
+      job:              data,
+      complianceStatus: (data.confidence || 0) >= 70 ? "COMPLIANT" : "REQUIRES ATTENTION",
+      liabilityPeriod: {
+        years:   LIABILITY_PERIODS[data.job_type]?.defects || 7,
+        statute: LIABILITY_PERIODS[data.job_type]?.statute || "Domestic Building Contracts Act 1995 (Vic)",
+      },
+      elemetric: {
+        platform:     "Elemetric AI Compliance Platform",
+        version:      "2.0.0",
+        aiModel:      "GPT-4.1-mini Vision",
+        jurisdiction: "Victorian Building Authority (VBA) Standards",
+      },
+    };
+
+    return res.json(reportData);
+  } catch (err) {
+    console.error("export-report error:", err);
+    return res.status(500).json({ error: "Report export failed." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
