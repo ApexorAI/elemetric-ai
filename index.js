@@ -32273,6 +32273,180 @@ app.post("/dilapidation-report", apiKeyAuth, async (req, res) => {
   res.json({ success: true, reportId: null, conditionRating, ...record, saved: false });
 });
 
+// ── Round 118: Plumbing certificate, gas certificate, electrical certificate ───
+
+// POST /plumbing-compliance-certificate — Issue a plumbing compliance certificate (Certificate of Compliance)
+app.post("/plumbing-compliance-certificate", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, jobAddress, licenceNumber, licenceExpiry,
+    workDescription, workType, permitNumber, inspectionDate,
+    testsPassed = [], testResults = {}, clientName,
+    certificateDate, state = "VIC",
+  } = req.body;
+
+  if (!contractorId || !jobAddress || !workDescription)
+    return res.status(400).json({ error: "contractorId, jobAddress, workDescription required." });
+
+  const validWorkTypes = ["SANITARY_PLUMBING", "DRAINAGE", "ROOFING", "MECHANICAL_SERVICES", "WATER_SUPPLY", "IRRIGATION", "BACKFLOW", "HOT_WATER"];
+  const certNumber = `PCC-${state}-${Date.now().toString(36).toUpperCase().slice(-8)}`;
+
+  const testsPassed_ = Array.isArray(testsPassed) ? testsPassed : [];
+  const allTestsPassed = testsPassed_.every(t => t === true || t === "PASS");
+
+  const record = {
+    certificate_number: certNumber,
+    contractor_id: sanitiseInput(contractorId),
+    job_address: sanitiseInput(jobAddress),
+    licence_number: sanitiseInput(licenceNumber || ""),
+    licence_expiry: licenceExpiry || null,
+    work_description: sanitiseInput(workDescription),
+    work_type: validWorkTypes.includes((workType || "").toUpperCase()) ? workType.toUpperCase() : "SANITARY_PLUMBING",
+    permit_number: sanitiseInput(permitNumber || ""),
+    inspection_date: inspectionDate || new Date().toISOString().split("T")[0],
+    tests_conducted: testsPassed_,
+    test_results: testResults,
+    all_tests_passed: allTestsPassed,
+    client_name: sanitiseInput(clientName || ""),
+    certificate_date: certificateDate || new Date().toISOString().split("T")[0],
+    state: sanitiseInput(state),
+    status: allTestsPassed ? "ISSUED" : "CONDITIONAL",
+    issued_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("plumbing_certificates")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, certId: data.id, certificateNumber: certNumber, status: record.status, ...record });
+  }
+
+  res.json({ success: true, certId: null, certificateNumber: certNumber, status: record.status, ...record, saved: false });
+});
+
+// POST /gas-compliance-certificate — Issue a gas work compliance certificate
+app.post("/gas-compliance-certificate", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, jobAddress, licenceNumber, licenceExpiry,
+    workDescription, gasType, pressureTestPassed = false,
+    pressureTestResult, appliances = [], permitNumber,
+    evacuationTestPassed = false, leakTestPassed = false,
+    clientName, certificateDate, state = "VIC",
+  } = req.body;
+
+  if (!contractorId || !jobAddress) return res.status(400).json({ error: "contractorId and jobAddress required." });
+
+  const validGasTypes = ["NATURAL_GAS", "LPG", "BOTH"];
+  const gas = (gasType || "NATURAL_GAS").toUpperCase();
+  const certNumber = `GCC-${state}-${Date.now().toString(36).toUpperCase().slice(-8)}`;
+
+  const allTestsPassed = Boolean(pressureTestPassed) && Boolean(leakTestPassed);
+
+  const record = {
+    certificate_number: certNumber,
+    contractor_id: sanitiseInput(contractorId),
+    job_address: sanitiseInput(jobAddress),
+    licence_number: sanitiseInput(licenceNumber || ""),
+    licence_expiry: licenceExpiry || null,
+    work_description: sanitiseInput(workDescription || ""),
+    gas_type: validGasTypes.includes(gas) ? gas : "NATURAL_GAS",
+    pressure_test_passed: Boolean(pressureTestPassed),
+    pressure_test_result: sanitiseInput(pressureTestResult || ""),
+    appliances: appliances.map(a => ({
+      type: sanitiseInput(a.type || ""),
+      make: sanitiseInput(a.make || ""),
+      model: sanitiseInput(a.model || ""),
+      serialNumber: sanitiseInput(a.serialNumber || ""),
+      gasStarRating: a.gasStarRating || null,
+    })),
+    permit_number: sanitiseInput(permitNumber || ""),
+    evacuation_test_passed: Boolean(evacuationTestPassed),
+    leak_test_passed: Boolean(leakTestPassed),
+    all_tests_passed: allTestsPassed,
+    client_name: sanitiseInput(clientName || ""),
+    certificate_date: certificateDate || new Date().toISOString().split("T")[0],
+    state: sanitiseInput(state),
+    status: allTestsPassed ? "ISSUED" : "CONDITIONAL",
+    issued_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("gas_certificates")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, certId: data.id, certificateNumber: certNumber, status: record.status, ...record });
+  }
+
+  res.json({ success: true, certId: null, certificateNumber: certNumber, status: record.status, ...record, saved: false });
+});
+
+// POST /electrical-safety-certificate — Issue an Electrical Safety Certificate (ESC)
+app.post("/electrical-safety-certificate", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, jobAddress, licenceNumber, licenceExpiry,
+    workDescription, workCategory, permitNumber,
+    circuitsInstalled = 0, circuitsTested = 0,
+    earthContinuityPassed = false, insulationResistancePassed = false,
+    rcdTested = false, rcdTestPassed = false, polarityChecked = false,
+    loopImpedanceMeasured = false, clientName,
+    certificateDate, supplyType = "240V_AC", state = "VIC",
+  } = req.body;
+
+  if (!contractorId || !jobAddress) return res.status(400).json({ error: "contractorId and jobAddress required." });
+
+  const validCategories = ["NEW_INSTALLATION", "ALTERATION", "ADDITION", "REPAIR", "INSPECTION_TEST", "SWITCHBOARD", "SOLAR_PV", "EV_CHARGER"];
+  const validSupply = ["240V_AC", "415V_AC", "DC_EV", "SOLAR"];
+  const cat = (workCategory || "NEW_INSTALLATION").toUpperCase();
+  const sup = (supplyType || "240V_AC").toUpperCase();
+  const certNumber = `ESC-${state}-${Date.now().toString(36).toUpperCase().slice(-8)}`;
+
+  const allTestsPassed = Boolean(earthContinuityPassed) && Boolean(insulationResistancePassed) && Boolean(polarityChecked);
+
+  const record = {
+    certificate_number: certNumber,
+    contractor_id: sanitiseInput(contractorId),
+    job_address: sanitiseInput(jobAddress),
+    licence_number: sanitiseInput(licenceNumber || ""),
+    licence_expiry: licenceExpiry || null,
+    work_description: sanitiseInput(workDescription || ""),
+    work_category: validCategories.includes(cat) ? cat : "NEW_INSTALLATION",
+    permit_number: sanitiseInput(permitNumber || ""),
+    circuits_installed: Number(circuitsInstalled),
+    circuits_tested: Number(circuitsTested),
+    earth_continuity_passed: Boolean(earthContinuityPassed),
+    insulation_resistance_passed: Boolean(insulationResistancePassed),
+    rcd_tested: Boolean(rcdTested),
+    rcd_test_passed: Boolean(rcdTestPassed),
+    polarity_checked: Boolean(polarityChecked),
+    loop_impedance_measured: Boolean(loopImpedanceMeasured),
+    all_tests_passed: allTestsPassed,
+    client_name: sanitiseInput(clientName || ""),
+    certificate_date: certificateDate || new Date().toISOString().split("T")[0],
+    supply_type: validSupply.includes(sup) ? sup : "240V_AC",
+    applicable_standard: "AS/NZS 3000",
+    state: sanitiseInput(state),
+    status: allTestsPassed ? "ISSUED" : "CONDITIONAL",
+    issued_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("electrical_certificates")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, certId: data.id, certificateNumber: certNumber, status: record.status, ...record });
+  }
+
+  res.json({ success: true, certId: null, certificateNumber: certNumber, status: record.status, ...record, saved: false });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
