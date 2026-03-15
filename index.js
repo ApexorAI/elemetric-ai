@@ -514,10 +514,10 @@ const replicate = new Replicate({
  * Image is assumed 1024px wide (mobile resizes before sending).
  */
 function generateMaskPNG(width = 1024, height = 768) {
-  const rectX1 = Math.floor(width * 0.20);
-  const rectX2 = Math.floor(width * 0.80);
-  const rectY1 = Math.floor(height * 0.10);
-  const rectY2 = Math.floor(height * 0.40);
+  const rectX1 = Math.floor(width * 0.25);
+  const rectX2 = Math.floor(width * 0.75);
+  const rectY1 = Math.floor(height * 0.25);
+  const rectY2 = Math.floor(height * 0.65);
 
   // Build raw scanlines: 1 filter byte (0=None) + width grayscale pixels per row
   const rows = [];
@@ -612,9 +612,24 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
       console.warn("[visualise] Step 1 - Vision step skipped:", visionErr.message);
     }
 
-    // Step 2: Generate mask PNG — white rectangle in upper-center wall area
+    // Step 2a: Auto-rotate image based on EXIF orientation so the mask aligns correctly
+    let correctedWallImage = wallImage;
+    let correctedMime = mime;
+    try {
+      const rotated = await sharp(Buffer.from(wallImage, "base64"))
+        .rotate() // reads EXIF orientation and rotates accordingly, strips EXIF
+        .jpeg({ quality: 92 })
+        .toBuffer();
+      correctedWallImage = rotated.toString("base64");
+      correctedMime = "image/jpeg";
+      console.log("[visualise] Step 2a - EXIF rotation applied, new size:", rotated.length);
+    } catch (rotateErr) {
+      console.warn("[visualise] Step 2a - EXIF rotation skipped:", rotateErr.message);
+    }
+
+    // Step 2b: Generate mask PNG — white rectangle in center-wall area
     const maskBase64 = generateMaskPNG(1024, 768);
-    console.log("[visualise] Step 2 - Mask generated, base64 length:", maskBase64.length);
+    console.log("[visualise] Step 2b - Mask generated, base64 length:", maskBase64.length);
 
     // Step 3: Run Stable Diffusion inpainting via Replicate
     // Only the masked (white) region is edited; everything else is preserved exactly.
@@ -622,7 +637,7 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
       `A ${modelNumber} mounted high on the wall only, nothing else added, no furniture, no objects below, ` +
       `clean installation, photorealistic, natural lighting, ${roomDescription}, high quality photograph`;
 
-    console.log("[visualise] Step 3 - Calling Replicate with prompt:", prompt);
+    console.log("[visualise] Step 3 - Calling Replicate with prompt:", prompt, "| image size:", correctedWallImage.length);
 
     let output;
     try {
@@ -630,7 +645,7 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
         "stability-ai/stable-diffusion-inpainting:95b7223104132402a9ae91cc677285bc5eb997834bd2349fa486f53910fd68b3",
         {
           input: {
-            image:            `data:${mime};base64,${wallImage}`,
+            image:            `data:${correctedMime};base64,${correctedWallImage}`,
             mask:             `data:image/png;base64,${maskBase64}`,
             prompt,
             negative_prompt:  "blurry, low quality, distorted, unrealistic, cartoon, sketch, watermark, text",
