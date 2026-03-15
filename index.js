@@ -26126,6 +26126,224 @@ Provide a clear, accurate answer in JSON:
   }
 });
 
+// GET /public-holidays/:year  — Get Victorian public holidays for a given year
+app.get("/public-holidays/:year", apiKeyAuth, (req, res) => {
+  const year = parseInt(req.params.year) || new Date().getFullYear();
+  if (year < 2020 || year > 2030) return res.status(400).json({ error: "Year must be between 2020 and 2030." });
+
+  const state  = (req.query.state || "VIC").toUpperCase();
+
+  // Victorian public holidays (fixed + calculated)
+  const holidays = [
+    { name: "New Year's Day",         date: `${year}-01-01`, type: "public" },
+    { name: "Australia Day",          date: `${year}-01-26`, type: "public" },
+    { name: "Labour Day (VIC)",       date: getSecondMondayMarch(year), type: "public" },
+    { name: "Good Friday",            date: getGoodFriday(year), type: "public" },
+    { name: "Easter Saturday",        date: addDays(getGoodFriday(year), 1), type: "public" },
+    { name: "Easter Sunday",          date: addDays(getGoodFriday(year), 2), type: "public" },
+    { name: "Easter Monday",          date: addDays(getGoodFriday(year), 3), type: "public" },
+    { name: "ANZAC Day",              date: `${year}-04-25`, type: "public" },
+    { name: "King's Birthday (VIC)",  date: getSecondMondayJune(year),  type: "public" },
+    { name: "AFL Grand Final Friday", date: getAFLGrandFinalFriday(year), type: "public" },
+    { name: "Melbourne Cup Day",      date: getFirstTuesdayNovember(year), type: "public" },
+    { name: "Christmas Day",          date: `${year}-12-25`, type: "public" },
+    { name: "Boxing Day",             date: `${year}-12-26`, type: "public" },
+  ].sort((a, b) => a.date.localeCompare(b.date));
+
+  function getGoodFriday(y) {
+    // Anonymous Gregorian algorithm
+    const a = y % 19, b = Math.floor(y / 100), c = y % 100;
+    const d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25);
+    const g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30;
+    const i = Math.floor(c / 4), k = c % 4;
+    const l = (32 + 2 * e + 2 * i - h - k) % 7;
+    const m = Math.floor((a + 11 * h + 22 * l) / 451);
+    const month = Math.floor((h + l - 7 * m + 114) / 31);
+    const day   = ((h + l - 7 * m + 114) % 31) + 1;
+    const easter = new Date(y, month - 1, day);
+    easter.setDate(easter.getDate() - 2);
+    return easter.toISOString().split("T")[0];
+  }
+  function addDays(dateStr, n) { const d = new Date(dateStr); d.setDate(d.getDate() + n); return d.toISOString().split("T")[0]; }
+  function getNthWeekdayOfMonth(y, month, weekday, n) {
+    const d = new Date(y, month - 1, 1); let count = 0;
+    while (count < n) { if (d.getDay() === weekday) count++; if (count < n) d.setDate(d.getDate() + 1); }
+    return d.toISOString().split("T")[0];
+  }
+  function getSecondMondayMarch(y) { return getNthWeekdayOfMonth(y, 3, 1, 2); }
+  function getSecondMondayJune(y)  { return getNthWeekdayOfMonth(y, 6, 1, 2); }
+  function getFirstTuesdayNovember(y) { return getNthWeekdayOfMonth(y, 11, 2, 1); }
+  function getAFLGrandFinalFriday(y) {
+    // Typically last Friday of September, but varies — return an estimate
+    const d = new Date(y, 8, 30); while (d.getDay() !== 5) d.setDate(d.getDate() - 1); return d.toISOString().split("T")[0];
+  }
+
+  return res.json({ year, state: state === "VIC" ? "VIC" : "VIC (only VIC supported)", count: holidays.length, holidays, note: "AFL Grand Final Friday and some dates may vary — always verify with the Victorian Government.", generatedAt: new Date().toISOString() });
+});
+
+// POST /hot-work-permit  — Log a hot work permit (welding, grinding, cutting, soldering)
+app.post("/hot-work-permit", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, location, workType, operator, supervisedBy, startTime, endTime, fireWatcherName, fireWatcherDurationMinutes, hotWorkChecks = [], notes } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+  if (!workType) return res.status(400).json({ error: "workType required." });
+
+  const VALID_TYPES = ["welding", "grinding", "cutting", "soldering", "brazing", "torch", "other"];
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeLoc    = location ? sanitiseInput(String(location)).slice(0, 150) : null;
+  const safeType   = VALID_TYPES.includes(String(workType).toLowerCase()) ? String(workType).toLowerCase() : "other";
+  const safeOp     = operator ? sanitiseInput(String(operator)).slice(0, 100) : null;
+  const safeSup    = supervisedBy ? sanitiseInput(String(supervisedBy)).slice(0, 100) : null;
+  const safeWatcher = fireWatcherName ? sanitiseInput(String(fireWatcherName)).slice(0, 100) : null;
+  const watchMins  = Math.max(0, parseInt(fireWatcherDurationMinutes) || 30);
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const DEFAULT_CHECKS = [
+    "Combustible materials removed or protected within 10m",
+    "Fire extinguisher within 10m",
+    "Fire watch person nominated",
+    "Sprinkler system checked (not isolated)",
+    "Smoke detectors near work area — covered/isolated as required",
+    "Proper PPE worn (welding mask, gloves, apron)",
+    "Hot work approved by site supervisor",
+  ];
+  const allChecks = (Array.isArray(hotWorkChecks) && hotWorkChecks.length > 0)
+    ? hotWorkChecks.slice(0, 20).map(c => ({ item: sanitiseInput(String(c.item || c)).slice(0, 150), done: c.done !== false }))
+    : DEFAULT_CHECKS.map(c => ({ item: c, done: true }));
+
+  const permit = {
+    permitId: `HWP-${(safeSiteId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId, jobId: safeJobId, location: safeLoc, workType: safeType,
+    operator: safeOp, supervisedBy: safeSup,
+    startTime: startTime ? sanitiseInput(String(startTime)).slice(0, 20) : new Date().toISOString(),
+    endTime:   endTime ? sanitiseInput(String(endTime)).slice(0, 20) : null,
+    fireWatcher: safeWatcher, fireWatchDurationMinutes: watchMins,
+    checks: allChecks, allChecksPassed: allChecks.every(c => c.done),
+    status: "ACTIVE", notes: safeNotes,
+    issuedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("hot_work_permits").insert({
+        permit_id: permit.permitId, site_id: safeSiteId, job_id: safeJobId, location: safeLoc,
+        work_type: safeType, operator: safeOp, supervised_by: safeSup,
+        start_time: permit.startTime, end_time: permit.endTime,
+        fire_watcher: safeWatcher, fire_watch_duration_minutes: watchMins,
+        checks: allChecks, status: "ACTIVE", notes: safeNotes, issued_at: permit.issuedAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...permit, saved: !!supabaseAdmin });
+});
+
+// POST /ai-quote-review  — AI reviews a supplier/subcontractor quote for reasonableness
+app.post("/ai-quote-review", apiKeyAuth, async (req, res) => {
+  const { jobType, quoteAmount, lineItems = [], scope, state = "VIC", urgency } = req.body || {};
+  if (!jobType || !quoteAmount) return res.status(400).json({ error: "jobType and quoteAmount required." });
+
+  const safeType   = sanitiseInput(String(jobType)).slice(0, 40);
+  const safeAmount = Math.max(0, parseFloat(quoteAmount) || 0);
+  const safeScope  = scope ? sanitiseInput(String(scope)).slice(0, 1000) : null;
+  const safeState  = sanitiseInput(String(state)).toUpperCase().slice(0, 5);
+  const safeUrgency = urgency ? sanitiseInput(String(urgency)).slice(0, 30) : null;
+  const safeItems  = Array.isArray(lineItems) ? lineItems.slice(0, 20).map(i => sanitiseInput(String(i)).slice(0, 150)) : [];
+
+  const prompt = `You are a ${safeType} trade estimator and procurement expert in ${safeState}, Australia.
+
+Review the following quote:
+Total amount: $${safeAmount.toLocaleString()}
+${safeScope ? `Scope: ${safeScope}` : ""}
+${safeItems.length > 0 ? `Line items: ${safeItems.join(", ")}` : ""}
+${safeUrgency ? `Urgency: ${safeUrgency}` : ""}
+
+Assess this quote in JSON:
+{
+  "verdict": "GOOD_VALUE|FAIR|OVERPRICED|POTENTIALLY_LOW",
+  "marketPosition": "LOW|AVERAGE|HIGH",
+  "concerns": ["concern1"],
+  "missingItems": ["item likely missing from quote"],
+  "negotiationPoints": ["area to negotiate"],
+  "recommendation": "brief recommendation",
+  "confidenceLevel": "LOW|MEDIUM|HIGH"
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 500 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      jobType: safeType, quoteAmount: safeAmount, state: safeState,
+      verdict:            parsed.verdict || "FAIR",
+      marketPosition:     parsed.marketPosition || "AVERAGE",
+      concerns:           Array.isArray(parsed.concerns) ? parsed.concerns : [],
+      missingItems:       Array.isArray(parsed.missingItems) ? parsed.missingItems : [],
+      negotiationPoints:  Array.isArray(parsed.negotiationPoints) ? parsed.negotiationPoints : [],
+      recommendation:     parsed.recommendation || "",
+      confidenceLevel:    ["LOW", "MEDIUM", "HIGH"].includes(parsed.confidenceLevel) ? parsed.confidenceLevel : "MEDIUM",
+      disclaimer: "AI analysis only. Obtain at least 3 quotes before accepting.",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      jobType: safeType, quoteAmount: safeAmount, verdict: "FAIR", marketPosition: "AVERAGE",
+      concerns: [], missingItems: [], negotiationPoints: [],
+      recommendation: "Quote review temporarily unavailable. Compare with at least 3 quotes.",
+      confidenceLevel: "LOW",
+      disclaimer: "AI analysis only. Obtain at least 3 quotes before accepting.",
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /dewatering-log  — Log a groundwater/dewatering management event during excavation
+app.post("/dewatering-log", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, logDate, groundwaterDepthM, dewateringMethod, pumpRateLpm, dischargeLocation, turbidity, waterQualityOk, councilNotified, notes } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+
+  const VALID_METHODS = ["sump-pump", "wellpoint", "deepwell", "sheet-piling", "cut-off-wall", "gravity", "other"];
+  const VALID_DISCHARGE = ["sewer", "stormwater", "sediment-basin", "tanker", "land", "other"];
+
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeDate   = logDate ? sanitiseInput(String(logDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeMethod = VALID_METHODS.includes(String(dewateringMethod || "").toLowerCase().replace(/ /g, "-")) ? String(dewateringMethod).toLowerCase().replace(/ /g, "-") : "sump-pump";
+  const safeDisch  = VALID_DISCHARGE.includes(String(dischargeLocation || "").toLowerCase()) ? String(dischargeLocation).toLowerCase() : "sediment-basin";
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+  const gwDepth    = groundwaterDepthM ? Math.max(0, parseFloat(groundwaterDepthM) || 0) : null;
+  const pumpRate   = pumpRateLpm ? Math.max(0, parseFloat(pumpRateLpm) || 0) : null;
+  const turbid     = turbidity ? sanitiseInput(String(turbidity)).slice(0, 30) : null;
+  const waterOk    = waterQualityOk !== false;
+
+  const warnings = [];
+  if (!waterOk) warnings.push("Poor water quality — do not discharge to stormwater without treatment");
+  if (safeDisch === "stormwater" && !waterOk) warnings.push("EPA notification may be required for contaminated groundwater discharge");
+  if (safeDisch === "sewer") warnings.push("Trade waste agreement may be required for sewer discharge");
+
+  const record = {
+    logId: `DWL-${(safeSiteId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId, jobId: safeJobId, logDate: safeDate,
+    groundwaterDepthM: gwDepth, dewateringMethod: safeMethod, pumpRateLpm: pumpRate,
+    dischargeLocation: safeDisch, turbidity: turbid, waterQualityOk: waterOk,
+    councilNotified: councilNotified === true, warnings, notes: safeNotes,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("dewatering_log").insert({
+        log_id: record.logId, site_id: safeSiteId, job_id: safeJobId, log_date: safeDate,
+        groundwater_depth_m: gwDepth, dewatering_method: safeMethod, pump_rate_lpm: pumpRate,
+        discharge_location: safeDisch, turbidity: turbid, water_quality_ok: waterOk,
+        council_notified: record.councilNotified, warnings, notes: safeNotes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
