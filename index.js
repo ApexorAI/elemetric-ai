@@ -595,6 +595,15 @@ const reviewLimiter = rateLimit({
   message: { error: "Too many requests. Please wait before analysing more photos." },
 });
 
+// Photo stamping: 30 per 15 minutes per IP (prevents bulk forging of timestamps)
+const stampLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many stamp requests. Please wait before stamping more photos." },
+});
+
 app.use(globalLimiter);
 
 // ── API key auth ───────────────────────────────────────────────────────────────
@@ -682,8 +691,55 @@ app.get("/", (_req, res) => {
   res.json({ ok: true, service: "Elemetric AI server" });
 });
 
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok", uptime: process.uptime() });
+app.get("/health", async (_req, res) => {
+  const checks = {};
+
+  // Supabase connectivity — lightweight count query
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("profiles").select("id", { count: "exact", head: true });
+      checks.supabase = error ? { status: "degraded", message: error.message } : { status: "ok" };
+    } catch (e) {
+      checks.supabase = { status: "error", message: e.message };
+    }
+  } else {
+    checks.supabase = { status: "unconfigured" };
+  }
+
+  // OpenAI connectivity — list models (fast, unauthenticated-safe ping)
+  if (openai) {
+    try {
+      await openai.models.list({ limit: 1 });
+      checks.openai = { status: "ok" };
+    } catch (e) {
+      // 401 = key misconfigured, but API is reachable
+      checks.openai = e.status === 401
+        ? { status: "auth_error", message: "API key invalid" }
+        : { status: "error", message: e.message };
+    }
+  } else {
+    checks.openai = { status: "unconfigured" };
+  }
+
+  // Replicate connectivity — check env var presence (no free ping endpoint)
+  checks.replicate = process.env.REPLICATE_API_TOKEN
+    ? { status: "configured" }
+    : { status: "unconfigured" };
+
+  // Resend connectivity — check env var presence
+  checks.resend = process.env.RESEND_API_KEY
+    ? { status: "configured" }
+    : { status: "unconfigured" };
+
+  const degraded = Object.values(checks).some(c => c.status === "error" || c.status === "degraded");
+  const httpStatus = degraded ? 503 : 200;
+
+  return res.status(httpStatus).json({
+    status:       degraded ? "degraded" : "ok",
+    uptime:       Math.round(process.uptime()),
+    checkedAt:    new Date().toISOString(),
+    services:     checks,
+  });
 });
 
 app.get("/timestamp", (_req, res) => {
@@ -1963,7 +2019,7 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
 // Burns GPS coordinates + server timestamp as a tamper-evident overlay onto the
 // image itself before the file is saved on-device.
 
-app.post("/stamp-photo", async (req, res) => {
+app.post("/stamp-photo", stampLimiter, async (req, res) => {
   try {
     const { image, mime, gps, capturedAt } = req.body || {};
 
@@ -3183,5 +3239,62 @@ app.use((err, req, res, _next) => {
 const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Elemetric AI server running on http://0.0.0.0:${PORT}`);
+  const env = process.env.NODE_ENV || "development";
+
+  // ── Startup security report ──────────────────────────────────────────────────
+  const configured   = (varName) => !!process.env[varName];
+  const present      = (val)     => val !== undefined && val !== null && val !== "";
+
+  const securityReport = [
+    "",
+    "╔══════════════════════════════════════════════════════════════╗",
+    "║              ELEMETRIC SERVER — STARTUP REPORT               ║",
+    "╚══════════════════════════════════════════════════════════════╝",
+    `  Environment  : ${env}`,
+    `  Port         : ${PORT}`,
+    `  Node.js      : ${process.version}`,
+    `  Started at   : ${new Date().toISOString()}`,
+    "",
+    "  ── Service Configuration ──────────────────────────────────────",
+    `  OpenAI        : ${configured("OPENAI_API_KEY")      ? "✓ configured" : "✗ MISSING — /review and /visualise will fail"}`,
+    `  Replicate     : ${configured("REPLICATE_API_TOKEN") ? "✓ configured" : "✗ MISSING — /visualise will fail"}`,
+    `  Supabase URL  : ${configured("SUPABASE_URL")        ? "✓ configured" : "✗ MISSING — DB features disabled"}`,
+    `  Supabase Key  : ${configured("SUPABASE_SERVICE_KEY")? "✓ configured" : "✗ MISSING — DB features disabled"}`,
+    `  Stripe Key    : ${configured("STRIPE_SECRET_KEY")   ? "✓ configured" : "✗ MISSING — billing disabled"}`,
+    `  Stripe Webook : ${configured("STRIPE_WEBHOOK_SECRET")?"✓ configured" : "⚠ MISSING — webhook signature not verified"}`,
+    `  Resend        : ${configured("RESEND_API_KEY")      ? "✓ configured" : "⚠ MISSING — transactional email disabled"}`,
+    `  Elemetric Key : ${configured("ELEMETRIC_API_KEY")   ? "✓ configured" : "⚠ MISSING — API auth not enforced"}`,
+    `  Allowed Origins: ${present(process.env.ALLOWED_ORIGINS) ? process.env.ALLOWED_ORIGINS : "⚠ not set — CORS open in dev, blocks in prod"}`,
+    "",
+    "  ── Security Controls ──────────────────────────────────────────",
+    `  Helmet        : ✓ active`,
+    `  Rate limiting : ✓ active (global 20/15min, review 5/min, stamp 30/15min, visualise 3/10min)`,
+    `  Input sanit.  : ✓ active (null-byte + control-char stripping)`,
+    `  API key auth  : ${configured("ELEMETRIC_API_KEY") ? "✓ enforced" : "⚠ not enforced (ELEMETRIC_API_KEY unset)"}`,
+    `  Reverse proxy : ✓ trust 1 hop (Railway)`,
+    "",
+    "  ── Registered Endpoints ───────────────────────────────────────",
+    "  POST  /review                 AI compliance photo analysis",
+    "  POST  /visualise              AC unit visualiser (Stable Diffusion)",
+    "  POST  /stamp-photo            GPS + timestamp watermark",
+    "  POST  /property-passport      Property compliance history",
+    "  POST  /send-invoice-email     Transactional email — invoice",
+    "  POST  /send-near-miss-alert   Transactional email — near-miss alert",
+    "  POST  /send-welcome-email     Transactional email — welcome",
+    "  POST  /before-after           Before/after photo comparison",
+    "  POST  /risk-assessment        Job risk profile engine",
+    "  POST  /compliance-check       Victorian regulation checker",
+    "  POST  /webhook                Stripe billing webhook",
+    "  POST  /webhook/user-created   Supabase auth signup webhook",
+    "  GET   /regulatory-updates     Regulatory change feed",
+    "  GET   /analytics              Business analytics dashboard",
+    "  GET   /stats                  Server usage + cost metrics",
+    "  GET   /health                 Service connectivity health check",
+    "  GET   /timestamp              Server UTC timestamp",
+    "  GET   /                       Heartbeat",
+    "═══════════════════════════════════════════════════════════════",
+    "",
+  ];
+
+  securityReport.forEach(line => console.log(line));
 });
