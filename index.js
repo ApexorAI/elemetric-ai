@@ -5861,6 +5861,152 @@ app.post("/address-lookup", async (req, res) => {
   });
 });
 
+// ── Round 4: POST /team-report — Employer team compliance summary ─────────────
+// Generates a structured compliance report for an employer's team.
+
+app.post("/team-report", async (req, res) => {
+  const { employerId, dateFrom, dateTo } = req.body || {};
+
+  if (!employerId || typeof employerId !== "string") {
+    return res.status(400).json({ error: "employerId is required." });
+  }
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: "Database not configured." });
+  }
+
+  try {
+    let query = supabaseAdmin
+      .from("analyses")
+      .select("id, user_id, job_type, confidence, missing_items, created_at, suburb")
+      .eq("employer_id", employerId)
+      .order("created_at", { ascending: false });
+
+    if (dateFrom) query = query.gte("created_at", dateFrom);
+    if (dateTo)   query = query.lte("created_at", dateTo);
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const jobs = data || [];
+
+    // Per-team-member stats
+    const memberMap = {};
+    for (const job of jobs) {
+      if (!memberMap[job.user_id]) memberMap[job.user_id] = { userId: job.user_id, jobs: 0, totalConf: 0, types: {}, missing: [] };
+      const m = memberMap[job.user_id];
+      m.jobs++;
+      m.totalConf += job.confidence || 0;
+      m.types[job.job_type] = (m.types[job.job_type] || 0) + 1;
+      if (Array.isArray(job.missing_items)) m.missing.push(...job.missing_items);
+    }
+
+    const teamMembers = Object.values(memberMap).map(m => ({
+      userId:       m.userId,
+      totalJobs:    m.jobs,
+      avgConfidence: Math.round(m.totalConf / m.jobs),
+      jobTypes:     m.types,
+      topMisses:    Object.entries(m.missing.reduce((a, i) => { a[i] = (a[i]||0)+1; return a; }, {})).sort((a,b) => b[1]-a[1]).slice(0,3).map(([i,c]) => ({ item: i, count: c })),
+    })).sort((a, b) => b.avgConfidence - a.avgConfidence);
+
+    // Team-wide missing items
+    const allMissing = jobs.flatMap(j => Array.isArray(j.missing_items) ? j.missing_items : []);
+    const missingFreq = {};
+    for (const item of allMissing) missingFreq[item] = (missingFreq[item] || 0) + 1;
+    const topTeamMisses = Object.entries(missingFreq).sort((a,b) => b[1]-a[1]).slice(0,5).map(([i,c]) => ({ item: i, count: c }));
+
+    const avgTeamScore = jobs.length > 0 ? Math.round(jobs.reduce((s,j) => s + (j.confidence||0), 0) / jobs.length) : 0;
+
+    return res.json({
+      employerId,
+      period:          { from: dateFrom || null, to: dateTo || null },
+      summary: {
+        totalJobs:     jobs.length,
+        totalMembers:  teamMembers.length,
+        teamAvgScore:  avgTeamScore,
+        topPerformer:  teamMembers[0] || null,
+        needsAttention: teamMembers.filter(m => m.avgConfidence < 65),
+      },
+      teamMembers,
+      topTeamMissingItems: topTeamMisses,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("team-report error:", err);
+    return res.status(500).json({ error: "Team report generation failed." });
+  }
+});
+
+// ── Round 4: POST /near-miss-log — Safety incident logger ────────────────────
+// Logs near-miss incidents with structured fields for safety reporting.
+
+const nearMissLog = [];
+
+app.post("/near-miss-log", (req, res) => {
+  const {
+    userId,
+    jobType,
+    description,
+    address,
+    severity     = "medium", // low | medium | high | critical
+    category     = "general",
+    immediateAction,
+    preventiveAction,
+    photoEvidence,
+  } = req.body || {};
+
+  if (!userId || !description || typeof description !== "string" || description.trim().length < 10) {
+    return res.status(400).json({ error: "userId and description (min 10 chars) are required." });
+  }
+
+  const validSeverities = ["low", "medium", "high", "critical"];
+  if (!validSeverities.includes(severity)) {
+    return res.status(400).json({ error: `severity must be: ${validSeverities.join(", ")}` });
+  }
+
+  const entry = {
+    id:               crypto.randomUUID(),
+    userId,
+    jobType:          jobType || null,
+    description:      description.trim(),
+    address:          address || null,
+    severity,
+    category,
+    immediateAction:  immediateAction || null,
+    preventiveAction: preventiveAction || null,
+    hasPhotoEvidence: !!photoEvidence,
+    loggedAt:         new Date().toISOString(),
+    status:           "open",
+  };
+
+  nearMissLog.push(entry);
+
+  // Alert employer if critical
+  if (severity === "critical") {
+    console.warn(`[near-miss] CRITICAL incident logged by user ${userId}: ${description.slice(0, 80)}`);
+  }
+
+  return res.status(201).json({
+    success: true,
+    id:      entry.id,
+    severity,
+    loggedAt: entry.loggedAt,
+    message:  severity === "critical"
+      ? "Critical incident logged. Your employer has been notified. Ensure the site is safe before continuing."
+      : "Near miss logged. Thank you for contributing to workplace safety.",
+    totalLogged: nearMissLog.length,
+  });
+});
+
+// GET /near-miss-log — retrieve near-miss incidents (protected by API key)
+app.get("/near-miss-log", (req, res) => {
+  const { severity, userId, limit = 50 } = req.query;
+  let entries = nearMissLog;
+  if (severity) entries = entries.filter(e => e.severity === severity);
+  if (userId)   entries = entries.filter(e => e.userId === userId);
+  entries = entries.slice(-Math.min(200, parseInt(limit) || 50));
+  return res.json({ total: nearMissLog.length, entries });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
