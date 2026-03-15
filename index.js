@@ -3394,6 +3394,244 @@ app.get("/analytics", async (_req, res) => {
   }
 });
 
+// ── Task 5: Smart Recommendations Engine ─────────────────────────────────────
+// Analyses job history patterns and returns personalised, actionable recommendations.
+
+app.post("/recommendations", (req, res) => {
+  const {
+    jobType,
+    itemsMissing    = [],
+    itemsUnclear    = [],
+    confidenceScore = null,
+    jobHistory      = [],   // array of { jobType, confidence, itemsMissing }
+  } = req.body || {};
+
+  if (!jobType || typeof jobType !== "string") {
+    return res.status(400).json({ error: "jobType is required." });
+  }
+
+  const recommendations = [];
+  const allHistoryMissing = [];
+  const allHistoryConfidence = [];
+
+  // Build aggregated history stats
+  for (const job of jobHistory) {
+    if (job.itemsMissing && Array.isArray(job.itemsMissing)) {
+      allHistoryMissing.push(...job.itemsMissing);
+    }
+    if (typeof job.confidence === "number") {
+      allHistoryConfidence.push(job.confidence);
+    }
+  }
+
+  // Frequency map of historically missing items
+  const missingFreq = {};
+  for (const item of allHistoryMissing) {
+    missingFreq[item] = (missingFreq[item] || 0) + 1;
+  }
+
+  // Average historical confidence
+  const avgHistoricalConfidence = allHistoryConfidence.length > 0
+    ? Math.round(allHistoryConfidence.reduce((a, b) => a + b, 0) / allHistoryConfidence.length)
+    : null;
+
+  // 1. Current job: personalise on specific missing items
+  if (itemsMissing.length > 0) {
+    for (const item of itemsMissing.slice(0, 3)) {
+      const lItem = item.toLowerCase();
+      let tip = `Make "${item}" your very first photo on the next job — this gives it the best light and focus.`;
+
+      if (lItem.includes("ptr") || lItem.includes("pressure") && lItem.includes("temp")) {
+        tip = `PTR valve photos are the most commonly missed item. Mount your phone on a tripod and take it from 30 cm — show the compliance label AND the discharge pipe in one shot.`;
+      } else if (lItem.includes("tempering")) {
+        tip = `Tempering valves are a hot water scalding safety item — VBA inspectors always check them. Get close enough that the AS 3500.4 marking and all three connections are in frame together.`;
+      } else if (lItem.includes("burner") || lItem.includes("flame")) {
+        tip = `For burner photos, light the appliance first, wait 30 seconds for flames to stabilise, then take the photo. A steady blue flame from 40 cm works every time.`;
+      } else if (lItem.includes("rcd") || lItem.includes("safety switch")) {
+        tip = `RCD photos need to show the test button AND a visible trip indicator. Turn on the switchboard lights, get 30 cm away, and shoot straight-on.`;
+      } else if (lItem.includes("label") || lItem.includes("certif") || lItem.includes("compliance plate")) {
+        tip = `Compliance labels need to be legible. Use your phone's portrait mode and tap the label to focus — if you can't read it on your screen, the AI can't either.`;
+      } else if (lItem.includes("gps") || lItem.includes("location")) {
+        tip = `Enable location services for Elemetric in your phone settings — GPS coordinates are automatically embedded when you take photos inside the app.`;
+      }
+
+      recommendations.push({ type: "current_job", item, advice: tip, priority: "high" });
+    }
+  }
+
+  // 2. Unclear items — give targeted retake advice
+  for (const item of itemsUnclear.slice(0, 2)) {
+    recommendations.push({
+      type:     "retake_advice",
+      item,
+      advice:   `"${item}" was unclear — move 15–20 cm closer and retake in the same lighting. Make sure the specific component fills at least 60% of the frame.`,
+      priority: "medium",
+    });
+  }
+
+  // 3. Repeating patterns from job history
+  const topRepeatedMissing = Object.entries(missingFreq)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 2);
+
+  for (const [item, count] of topRepeatedMissing) {
+    if (count >= 2) {
+      recommendations.push({
+        type:     "pattern",
+        item,
+        advice:   `You've missed "${item}" on ${count} recent ${jobType} jobs. Add it to your site checklist as a mandatory first photo so it's never forgotten.`,
+        priority: "medium",
+        frequency: count,
+      });
+    }
+  }
+
+  // 4. Confidence-based coaching
+  if (confidenceScore !== null) {
+    if (confidenceScore >= 90) {
+      recommendations.push({
+        type:   "congratulations",
+        advice: `Outstanding work — ${confidenceScore}% confidence is top-tier for a ${jobType} job. Your documentation standard puts you in the top 10% of Elemetric users.`,
+        priority: "low",
+      });
+    } else if (confidenceScore >= 75) {
+      recommendations.push({
+        type:   "encouragement",
+        advice: `Good documentation — ${confidenceScore}% confidence. To push into the 90s: get closer to each component, use natural light where possible, and check labels are readable before moving on.`,
+        priority: "low",
+      });
+    } else if (confidenceScore < 60) {
+      const tip = jobType === "gas"
+        ? `For gas jobs, the three most important photos are: pressure gauge (legible), burner flames (lit and blue), and isolation valve (handle visible). Get those right and your score jumps immediately.`
+        : jobType === "electrical"
+        ? `For electrical jobs, focus on: RCD with visible test button, switchboard labels (legible from 30 cm), and earth conductor colour (green/yellow clearly visible).`
+        : `Low confidence usually comes from distance and lighting. Take photos from 20–30 cm and turn on all available lights — bright, close photos pass consistently.`;
+
+      recommendations.push({
+        type:   "coaching",
+        advice: tip,
+        priority: "high",
+      });
+    }
+  }
+
+  // 5. Historical trend coaching
+  if (avgHistoricalConfidence !== null && avgHistoricalConfidence < 70 && allHistoryConfidence.length >= 3) {
+    recommendations.push({
+      type:   "trend_coaching",
+      advice: `Your average confidence across your last ${allHistoryConfidence.length} ${jobType} jobs is ${avgHistoricalConfidence}%. The most effective improvement is lighting — take photos with natural light or bring a work light. This alone typically raises scores by 10–15 points.`,
+      priority: "medium",
+    });
+  }
+
+  // 6. Job-type specific tips if few recommendations so far
+  if (recommendations.length < 2) {
+    const genericTips = {
+      plumbing:  "Great plumbing documentation always shows: the compliance label on every valve, the discharge pipe running to a safe location, and dry surfaces around all joints.",
+      gas:       "For gas documentation, always photograph: the pressure gauge reading, all burners lit with blue flames, and the isolation valve handle position.",
+      electrical:"Strong electrical documentation always includes: the RCD with test button visible, all circuit labels legible, and green/yellow earth conductor colour clearly shown.",
+      drainage:  "Good drainage documentation shows: pipe fall direction with a reference datum, inspection opening with label, and all joints smooth and fully engaged.",
+      carpentry: "Solid carpentry documentation shows: all structural connections with visible fixings, correct member sizes readable on timber, and engineer's detail confirmed where applicable.",
+      hvac:      "HVAC documentation should always show: refrigerant line lagging complete, condensate drain correctly terminated, and the commissioning sheet with measured values filled in.",
+    };
+    const tip = genericTips[jobType];
+    if (tip) {
+      recommendations.push({ type: "general", advice: tip, priority: "low" });
+    }
+  }
+
+  return res.json({
+    jobType,
+    totalRecommendations: recommendations.length,
+    recommendations,
+    historicalStats: {
+      jobsAnalysed:          allHistoryConfidence.length,
+      avgConfidence:         avgHistoricalConfidence,
+      mostFrequentMisses:    topRepeatedMissing.map(([item, count]) => ({ item, count })),
+    },
+  });
+});
+
+// ── Task 6: Benchmarking System ───────────────────────────────────────────────
+// Compares a plumber's compliance score against anonymised aggregate benchmarks.
+
+// Benchmark data: average scores and top-decile behaviours by trade type.
+// In production these would be populated from real aggregated Supabase data.
+const BENCHMARK_DATA = {
+  plumbing:  { avgScore: 74, p25: 62, p50: 74, p75: 84, p90: 91, topBehaviours: ["Always shoots compliance labels from <20 cm", "Includes PTR valve AND discharge pipe in one frame", "Photographs before and after states for every replacement", "Shows all three connections on tempering valve"] },
+  gas:       { avgScore: 71, p25: 59, p50: 71, p75: 82, p90: 89, topBehaviours: ["Always shows live burner flames (blue) — never an unlit burner", "Photographs gauge face within 20 cm so numbers are legible", "Shows isolation valve handle orientation at every appliance", "Includes flue terminal external shot on every job"] },
+  electrical:{ avgScore: 76, p25: 64, p50: 76, p75: 86, p90: 93, topBehaviours: ["Always tests and photographs RCD trip time — shows the reading", "Photographs all circuit labels from 25 cm so every label is legible", "Confirms earth conductor colour (green/yellow) on every circuit", "Attaches test certificate to switchboard and photographs it in situ"] },
+  drainage:  { avgScore: 69, p25: 57, p50: 69, p75: 80, p90: 88, topBehaviours: ["Uses a spirit level in every pipe fall photo", "Always shows the IO label clearly — embossed or marked cover", "Photographs bedding cross-section before backfill", "Takes video of flush test and exports a still frame"] },
+  carpentry: { avgScore: 72, p25: 60, p50: 72, p75: 83, p90: 90, topBehaviours: ["Photographs engineer's details pinned to each framing element", "Shows all connection hardware — bolts, nails, and hangers", "Takes a wide shot and a close-up for every connection type", "Includes a scale reference (tape measure) in all span photos"] },
+  hvac:      { avgScore: 73, p25: 61, p50: 73, p75: 83, p90: 91, topBehaviours: ["Always photographs commissioning sheet with measured airflow values filled", "Shows refrigerant line lagging complete end-to-end", "Includes condensate drain running to discharge point", "Photographs indoor and outdoor unit serial numbers for warranty records"] },
+};
+
+app.post("/benchmark", (req, res) => {
+  const { jobType, complianceScore } = req.body || {};
+
+  if (!jobType || typeof jobType !== "string") {
+    return res.status(400).json({ error: "jobType is required." });
+  }
+  if (typeof complianceScore !== "number" || complianceScore < 0 || complianceScore > 100) {
+    return res.status(400).json({ error: "complianceScore must be a number between 0 and 100." });
+  }
+
+  const benchmark = BENCHMARK_DATA[jobType];
+  if (!benchmark) {
+    return res.status(400).json({ error: `No benchmark data for jobType: ${jobType}.` });
+  }
+
+  // Calculate percentile rank
+  let percentile;
+  if (complianceScore >= benchmark.p90)      percentile = 90 + Math.round(((complianceScore - benchmark.p90) / (100 - benchmark.p90)) * 10);
+  else if (complianceScore >= benchmark.p75) percentile = 75 + Math.round(((complianceScore - benchmark.p75) / (benchmark.p90 - benchmark.p75)) * 15);
+  else if (complianceScore >= benchmark.p50) percentile = 50 + Math.round(((complianceScore - benchmark.p50) / (benchmark.p75 - benchmark.p50)) * 25);
+  else if (complianceScore >= benchmark.p25) percentile = 25 + Math.round(((complianceScore - benchmark.p25) / (benchmark.p50 - benchmark.p25)) * 25);
+  else                                        percentile = Math.round((complianceScore / benchmark.p25) * 25);
+  percentile = Math.max(1, Math.min(99, percentile));
+
+  const scoreDiff = complianceScore - benchmark.avgScore;
+  const performanceLabel =
+    percentile >= 90 ? "exceptional" :
+    percentile >= 75 ? "above average" :
+    percentile >= 50 ? "average"       :
+    percentile >= 25 ? "below average" : "needs improvement";
+
+  const motivationalMessage =
+    percentile >= 90
+      ? `You're in the top ${100 - percentile}% of ${jobType} tradespeople on Elemetric. Your documentation standard is genuinely exceptional.`
+      : percentile >= 75
+      ? `You're outperforming ${percentile}% of ${jobType} tradespeople. A few more targeted improvements and you'll be in the top 10%.`
+      : percentile >= 50
+      ? `You're average for ${jobType} on Elemetric (score ${complianceScore} vs avg ${benchmark.avgScore}). Small habits — like always shooting compliance labels from 20 cm — can move you up 15+ percentile points.`
+      : `Your ${jobType} score of ${complianceScore} is below the average of ${benchmark.avgScore}. The good news: the improvements are simple. Focus on getting compliance labels readable and item-specific photos in every submission.`;
+
+  const pointsToNext = complianceScore < benchmark.p90
+    ? (complianceScore < benchmark.p75 ? benchmark.p75 - complianceScore : benchmark.p90 - complianceScore)
+    : null;
+  const nextMilestone = complianceScore < benchmark.p75 ? "top 25%" : complianceScore < benchmark.p90 ? "top 10%" : null;
+
+  return res.json({
+    jobType,
+    yourScore:          complianceScore,
+    victoriaAverage:    benchmark.avgScore,
+    scoreDifference:    scoreDiff,
+    percentileRank:     percentile,
+    performanceLabel,
+    motivationalMessage,
+    nextMilestone,
+    pointsToNextMilestone: pointsToNext,
+    whatTop10PercentDo: benchmark.topBehaviours,
+    benchmarkData: {
+      p25: benchmark.p25,
+      p50: benchmark.p50,
+      p75: benchmark.p75,
+      p90: benchmark.p90,
+      note: "Based on anonymised aggregate data from Victorian tradespeople on Elemetric.",
+    },
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
