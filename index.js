@@ -43144,6 +43144,197 @@ Return JSON with:
   }
 });
 
+// POST /fire-protection-inspection — Record a fire protection system inspection
+app.post("/fire-protection-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, projectId, inspectionDate, technicianName,
+    technicianLicenceNumber, systemType,
+    inspectionType = "ANNUAL", itemsInspected = [],
+    defectsFound = [], isolationsActive = 0,
+    testsPassed = [], testsFailed = [],
+    overallResult = "SATISFACTORY", impairmentRequired = false,
+    notificationRequired = false, nextServiceDate, notes,
+  } = req.body;
+  if (!propertyAddress || !inspectionDate || !technicianName || !systemType) {
+    return res.status(400).json({ error: "propertyAddress, inspectionDate, technicianName, and systemType are required." });
+  }
+  const validSystemTypes = ["SPRINKLER", "FIRE_ALARM", "HYDRANT_HOSE_REEL", "PORTABLE_EXTINGUISHER", "EMERGENCY_LIGHTING", "EXIT_SIGNS", "FIRE_SUPPRESSION", "SMOKE_EXHAUST"];
+  const validResults = ["SATISFACTORY", "UNSATISFACTORY", "IMPAIRED", "CONDITIONAL"];
+  if (!validSystemTypes.includes(systemType)) return res.status(400).json({ error: `systemType must be one of: ${validSystemTypes.join(", ")}` });
+  if (!validResults.includes(overallResult)) return res.status(400).json({ error: `overallResult must be one of: ${validResults.join(", ")}` });
+  const inspectionRef = `FPI-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    inspection_ref: inspectionRef,
+    property_address: sanitiseInput(propertyAddress),
+    project_id: projectId || null,
+    inspection_date: inspectionDate,
+    technician_name: sanitiseInput(technicianName),
+    technician_licence: sanitiseInput(technicianLicenceNumber || ""),
+    system_type: systemType,
+    inspection_type: sanitiseInput(inspectionType),
+    items_inspected: Array.isArray(itemsInspected) ? itemsInspected.map(i => sanitiseInput(i)) : [],
+    defects_found: Array.isArray(defectsFound) ? defectsFound.map(d => sanitiseInput(d)) : [],
+    isolations_active: Number(isolationsActive),
+    tests_passed: Array.isArray(testsPassed) ? testsPassed.map(t => sanitiseInput(t)) : [],
+    tests_failed: Array.isArray(testsFailed) ? testsFailed.map(t => sanitiseInput(t)) : [],
+    overall_result: overallResult,
+    impairment_required: Boolean(impairmentRequired),
+    notification_required: overallResult === "IMPAIRED" || Boolean(notificationRequired),
+    next_service_date: nextServiceDate || null,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("fire_protection_inspections").insert(record);
+    if (error) console.error("fire-protection-inspection DB error:", error.message);
+  }
+  res.json({
+    inspectionRef, systemType, overallResult, defectCount: record.defects_found.length,
+    testsFailedCount: record.tests_failed.length, notificationRequired: record.notification_required,
+    nextServiceDate, saved: !!supabaseAdmin,
+  });
+});
+
+// POST /exit-and-egress-check — Check exit and egress compliance
+app.post("/exit-and-egress-check", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, buildingClass, state = "VIC",
+    riseInStoreys = 1, occupancyLoad,
+    numberOfExits, exitWidthMm, corridorWidthMm,
+    travelDistanceM, proposedTravelDistanceM,
+    exitDoorsSwingCorrectly = true, panicHardware = false,
+    emergencyLightingInstalled = false, exitSignsInstalled = false,
+    evacChairProvided = false, stairwellPressurisation = false,
+    disabledAccessToExits = false, notes,
+  } = req.body;
+  if (!buildingClass || !occupancyLoad || !numberOfExits) {
+    return res.status(400).json({ error: "buildingClass, occupancyLoad, and numberOfExits are required." });
+  }
+  const bc = sanitiseInput(buildingClass).toUpperCase();
+  const ocLoad = Number(occupancyLoad);
+  const exits = Number(numberOfExits);
+  const exitWidth = Number(exitWidthMm) || 0;
+  const checks = [];
+  // Number of exits: AS 1428.1 and NCC D1 — 2+ exits for >50 persons
+  const requiredExits = ocLoad > 500 ? 3 : ocLoad > 50 ? 2 : 1;
+  checks.push({ requirement: `Minimum ${requiredExits} exit(s) for ${ocLoad} persons`, status: exits >= requiredExits ? "PASS" : "FAIL", provided: exits, required: requiredExits });
+  // Exit width: min 1000mm per NCC D1.6 for most buildings
+  const minExitWidth = ocLoad > 100 ? 1000 : 850;
+  checks.push({ requirement: `Exit width ≥ ${minExitWidth}mm`, status: exitWidth >= minExitWidth ? "PASS" : (exitWidth === 0 ? "UNKNOWN" : "FAIL"), provided: exitWidth || null, required: minExitWidth });
+  // Travel distance: NCC D1.4 — varies by building class
+  const maxTravelDist = bc.startsWith("2") || bc.startsWith("3") ? 40 : 40;
+  if (proposedTravelDistanceM) {
+    checks.push({ requirement: `Travel distance ≤ ${maxTravelDist}m`, status: Number(proposedTravelDistanceM) <= maxTravelDist ? "PASS" : "FAIL", provided: Number(proposedTravelDistanceM), required: maxTravelDist });
+  }
+  // Emergency lighting
+  if (!["1A"].includes(bc)) {
+    checks.push({ requirement: "Emergency lighting (NCC E4.2)", status: emergencyLightingInstalled ? "PASS" : "FAIL" });
+  }
+  // Exit signs
+  checks.push({ requirement: "Exit signs (NCC E4.5)", status: exitSignsInstalled ? "PASS" : "FAIL" });
+  // Door swing
+  checks.push({ requirement: "Exit doors swing in direction of egress", status: exitDoorsSwingCorrectly ? "PASS" : "FAIL" });
+  const failCount = checks.filter(c => c.status === "FAIL").length;
+  const overallResult = failCount > 0 ? "NON_COMPLIANT" : checks.some(c => c.status === "UNKNOWN") ? "REQUIRES_VERIFICATION" : "COMPLIANT";
+  const checkRef = `EEC-${Date.now().toString(36).toUpperCase()}`;
+  res.json({
+    checkRef, buildingClass: bc, occupancyLoad: ocLoad, overallResult, failCount,
+    checks,
+    disclaimer: "This is a simplified parametric check. Engage a fire engineer or building surveyor for formal assessment.",
+    saved: false,
+  });
+});
+
+// POST /ai-fire-safety-report — AI generates a fire safety report for a building
+app.post("/ai-fire-safety-report", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, buildingClass, state = "VIC",
+    riseInStoreys = 1, occupancyLoad, floorAreaM2,
+    sprinklerInstalled = false, alarmSystem = false,
+    emergencyLighting = false, exitSigns = false,
+    fireExtinguishers = false, hydrantsInstalled = false,
+    lastFireSafetyStatement, knownDeficiencies = [],
+    heritageBuilding = false, certifications = [],
+  } = req.body;
+  if (!propertyAddress || !buildingClass) {
+    return res.status(400).json({ error: "propertyAddress and buildingClass are required." });
+  }
+  const sanitisedAddress = sanitiseInput(propertyAddress);
+  const sanitisedClass = sanitiseInput(buildingClass);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian fire safety engineer and building surveyor. Generate comprehensive fire safety assessment reports.`;
+  const userPrompt = `Generate a fire safety report for:
+Address: ${sanitisedAddress}
+Building class: ${sanitisedClass}
+State: ${sanitisedState}
+Rise in storeys: ${riseInStoreys}
+Occupancy load: ${occupancyLoad || "Unknown"}
+Floor area: ${floorAreaM2 ? `${floorAreaM2} m²` : "Unknown"}
+Sprinklers: ${sprinklerInstalled}
+Fire alarm: ${alarmSystem}
+Emergency lighting: ${emergencyLighting}
+Exit signs: ${exitSigns}
+Fire extinguishers: ${fireExtinguishers}
+Hydrants: ${hydrantsInstalled}
+Last fire safety statement: ${sanitiseInput(lastFireSafetyStatement || "Unknown")}
+Heritage building: ${heritageBuilding}
+Known deficiencies: ${knownDeficiencies.map(d => sanitiseInput(d)).join("; ") || "None"}
+Certifications: ${certifications.map(c => sanitiseInput(c)).join("; ") || "None"}
+
+Return JSON with:
+{
+  "overallFireSafetyRating": "ADEQUATE|INADEQUATE|AT_RISK|CRITICAL",
+  "complianceScore": 70,
+  "immediateActions": ["...", "..."],
+  "requiredUpgrades": [{"item": "...", "nccReference": "...", "urgency": "HIGH", "costEstimate": "..."}],
+  "maintenanceRequired": ["...", "..."],
+  "annualFireSafetyStatement": "...",
+  "evacuationPlanRequired": true,
+  "nccComplianceNotes": "...",
+  "applicableStandards": ["AS 1851", "AS 1668.1", "..."],
+  "recommendation": "...",
+  "nextAssessmentDate": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const report = JSON.parse(aiRes.choices[0].message.content);
+    const reportRef = `FSR-${Date.now().toString(36).toUpperCase()}`;
+    res.json({ reportRef, propertyAddress: sanitisedAddress, buildingClass: sanitisedClass, state: sanitisedState, report });
+  } catch (err) {
+    console.error("ai-fire-safety-report error:", err.message);
+    const hasCritical = !sprinklerInstalled && Number(riseInStoreys) > 2;
+    const reportRef = `FSR-FALLBACK`;
+    res.json({
+      reportRef, propertyAddress: sanitisedAddress, buildingClass: sanitisedClass, state: sanitisedState,
+      report: {
+        overallFireSafetyRating: hasCritical ? "AT_RISK" : "REQUIRES_ASSESSMENT",
+        complianceScore: 0,
+        immediateActions: hasCritical ? ["Assess fire sprinkler requirements for this building class and height"] : ["Commission fire safety audit"],
+        requiredUpgrades: [
+          ...(!emergencyLighting ? [{ item: "Emergency lighting", nccReference: "NCC E4.2", urgency: "HIGH", costEstimate: "TBD" }] : []),
+          ...(!exitSigns ? [{ item: "Exit signage", nccReference: "NCC E4.5", urgency: "HIGH", costEstimate: "TBD" }] : []),
+        ],
+        maintenanceRequired: ["Annual inspection of all fire protection systems per AS 1851"],
+        annualFireSafetyStatement: "Annual fire safety statement must be submitted to council each year.",
+        evacuationPlanRequired: true,
+        nccComplianceNotes: `${sanitisedClass} building requirements — engage building certifier for full NCC assessment.`,
+        applicableStandards: ["AS 1851 (Maintenance of fire protection systems)", "AS 2118 (Sprinklers)", "AS 1603 (Fire detectors)"],
+        recommendation: "Commission a qualified fire engineer for formal fire safety assessment.",
+        nextAssessmentDate: new Date(Date.now() + 365 * 86400000).toISOString().split("T")[0],
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
