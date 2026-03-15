@@ -32099,6 +32099,180 @@ Return a JSON object with:
   }
 });
 
+// ── Round 117: Heritage assessment, Aboriginal cultural heritage, dilapidation ─
+
+// POST /heritage-assessment — Record a heritage impact assessment for a project
+app.post("/heritage-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, siteAddress, assessedBy, assessmentDate,
+    heritageOverlay, heritageCouncilRef, buildingAge,
+    significanceLevel, significanceDescription,
+    impactType, proposedWorks, mitigationMeasures = [],
+    archivalRecordingRequired = false, reportRef,
+    approvalRequired = false, approvalObtained = false,
+    state = "VIC", notes,
+  } = req.body;
+
+  if (!projectId || !siteAddress) return res.status(400).json({ error: "projectId and siteAddress required." });
+
+  const validSignificance = ["LOCAL", "STATE", "NATIONAL", "WORLD_HERITAGE", "NONE", "UNKNOWN"];
+  const validImpactTypes = ["DEMOLITION", "ALTERATION", "ADDITION", "EXCAVATION", "MAINTENANCE", "CHANGE_OF_USE", "NONE"];
+  const sig = (significanceLevel || "UNKNOWN").toUpperCase();
+  const imp = (impactType || "NONE").toUpperCase();
+
+  const riskLevel = sig === "NATIONAL" || sig === "WORLD_HERITAGE" ? "CRITICAL"
+    : sig === "STATE" ? "HIGH"
+    : sig === "LOCAL" ? "MEDIUM"
+    : "LOW";
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    site_address: sanitiseInput(siteAddress),
+    assessed_by: sanitiseInput(assessedBy || ""),
+    assessment_date: assessmentDate || new Date().toISOString().split("T")[0],
+    heritage_overlay: sanitiseInput(heritageOverlay || ""),
+    heritage_council_ref: sanitiseInput(heritageCouncilRef || ""),
+    building_age: Number(buildingAge) || null,
+    significance_level: validSignificance.includes(sig) ? sig : "UNKNOWN",
+    significance_description: sanitiseInput(significanceDescription || ""),
+    impact_type: validImpactTypes.includes(imp) ? imp : "NONE",
+    proposed_works: sanitiseInput(proposedWorks || ""),
+    mitigation_measures: mitigationMeasures.map(m => sanitiseInput(m)),
+    archival_recording_required: Boolean(archivalRecordingRequired),
+    report_ref: sanitiseInput(reportRef || ""),
+    approval_required: Boolean(approvalRequired),
+    approval_obtained: Boolean(approvalObtained),
+    risk_level: riskLevel,
+    state: sanitiseInput(state),
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("heritage_assessments")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, assessmentId: data.id, riskLevel, ...record });
+  }
+
+  res.json({ success: true, assessmentId: null, riskLevel, ...record, saved: false });
+});
+
+// POST /ach-management-plan — Aboriginal Cultural Heritage Management Plan entry
+app.post("/ach-management-plan", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, siteDescription, rac,   // Registered Aboriginal Cultural heritage Body
+    achConsultant, consultationDate, culturalHeritageAssessmentRequired,
+    activityType, sensitivityLevel, disturbanceArea,
+    achBodies = [], monitoringRequired = false,
+    monitoringAgreement, approvalNumber,
+    restrictionAreas = [], contingencyPlan, state = "VIC",
+  } = req.body;
+
+  if (!projectId || !siteDescription) return res.status(400).json({ error: "projectId and siteDescription required." });
+
+  const validSensitivity = ["HIGH", "MEDIUM", "LOW", "UNKNOWN"];
+  const sens = (sensitivityLevel || "UNKNOWN").toUpperCase();
+
+  // In Victoria — Cultural Heritage Management Plan required for HIGH sensitivity + certain activities
+  const chmpRequired = state === "VIC" && (sens === "HIGH" || Boolean(culturalHeritageAssessmentRequired));
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    site_description: sanitiseInput(siteDescription),
+    rac: sanitiseInput(rac || ""),
+    ach_consultant: sanitiseInput(achConsultant || ""),
+    consultation_date: consultationDate || null,
+    cultural_heritage_assessment_required: Boolean(culturalHeritageAssessmentRequired) || chmpRequired,
+    chmp_required: chmpRequired,
+    activity_type: sanitiseInput(activityType || ""),
+    sensitivity_level: validSensitivity.includes(sens) ? sens : "UNKNOWN",
+    disturbance_area_m2: Number(disturbanceArea) || null,
+    ach_bodies: achBodies.map(b => sanitiseInput(b)),
+    monitoring_required: Boolean(monitoringRequired),
+    monitoring_agreement: sanitiseInput(monitoringAgreement || ""),
+    approval_number: sanitiseInput(approvalNumber || ""),
+    restriction_areas: restrictionAreas.map(r => sanitiseInput(r)),
+    contingency_plan: sanitiseInput(contingencyPlan || "Cease all ground disturbance immediately if cultural heritage material is discovered. Contact RAC and consultant."),
+    state: sanitiseInput(state),
+    status: chmpRequired && !approvalNumber ? "CHMP_REQUIRED" : "COMPLIANT",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("ach_management_plans")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, planId: data.id, chmpRequired, status: record.status, ...record });
+  }
+
+  res.json({ success: true, planId: null, chmpRequired, status: record.status, ...record, saved: false });
+});
+
+// POST /dilapidation-report — Record a pre-construction dilapidation survey
+app.post("/dilapidation-report", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, surveyedBy, surveyDate, propertyAddress,
+    propertyOwner, surveyType, existingConditions = [],
+    cracksDocumented = [], settlementObserved = false,
+    drainageIssues = false, structuralConcerns = false,
+    photosCount = 0, engineerSigned = false, notes,
+  } = req.body;
+
+  if (!projectId || !propertyAddress) return res.status(400).json({ error: "projectId and propertyAddress required." });
+
+  const validTypes = ["PRE_CONSTRUCTION", "MID_CONSTRUCTION", "POST_CONSTRUCTION", "PERIODIC"];
+  const type = (surveyType || "PRE_CONSTRUCTION").toUpperCase();
+
+  const conditionRating = structuralConcerns ? "POOR"
+    : cracksDocumented.length > 5 || settlementObserved ? "FAIR"
+    : cracksDocumented.length > 0 || drainageIssues ? "GOOD"
+    : "EXCELLENT";
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    surveyed_by: sanitiseInput(surveyedBy || ""),
+    survey_date: surveyDate || new Date().toISOString().split("T")[0],
+    property_address: sanitiseInput(propertyAddress),
+    property_owner: sanitiseInput(propertyOwner || ""),
+    survey_type: validTypes.includes(type) ? type : "PRE_CONSTRUCTION",
+    existing_conditions: existingConditions.map(c => sanitiseInput(c)),
+    cracks_documented: cracksDocumented.map(c => ({
+      location: sanitiseInput(c.location || ""),
+      width_mm: Number(c.widthMm) || null,
+      length_mm: Number(c.lengthMm) || null,
+      type: sanitiseInput(c.type || ""),
+    })),
+    settlement_observed: Boolean(settlementObserved),
+    drainage_issues: Boolean(drainageIssues),
+    structural_concerns: Boolean(structuralConcerns),
+    photos_count: Number(photosCount),
+    engineer_signed: Boolean(engineerSigned),
+    overall_condition_rating: conditionRating,
+    notes: sanitiseInput(notes || ""),
+    status: "COMPLETED",
+    surveyed_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("dilapidation_reports")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, reportId: data.id, conditionRating, ...record });
+  }
+
+  res.json({ success: true, reportId: null, conditionRating, ...record, saved: false });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
