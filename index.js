@@ -564,6 +564,14 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
   try {
     const { wallImage, mime, modelNumber } = req.body || {};
 
+    console.log("[visualise] Request received", {
+      hasWallImage: !!wallImage,
+      wallImageLen: wallImage ? wallImage.length : 0,
+      mime,
+      modelNumber,
+      hasReplicateToken: !!process.env.REPLICATE_API_TOKEN,
+    });
+
     if (!wallImage || !mime) {
       return res.status(400).json({ error: "Missing wall image." });
     }
@@ -598,12 +606,14 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
         temperature: 0.2,
       });
       roomDescription = visionResponse.choices?.[0]?.message?.content?.trim() || roomDescription;
+      console.log("[visualise] Step 1 - Room described:", roomDescription);
     } catch (visionErr) {
-      console.warn("Vision step skipped:", visionErr.message);
+      console.warn("[visualise] Step 1 - Vision step skipped:", visionErr.message);
     }
 
     // Step 2: Generate mask PNG — white rectangle in upper-center wall area
     const maskBase64 = generateMaskPNG(1024, 768);
+    console.log("[visualise] Step 2 - Mask generated, base64 length:", maskBase64.length);
 
     // Step 3: Run Stable Diffusion inpainting via Replicate
     // Only the masked (white) region is edited; everything else is preserved exactly.
@@ -611,21 +621,35 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
       `a ${modelNumber} mounted on the wall, photorealistic, natural lighting, seamlessly integrated, ` +
       `${roomDescription}, high quality photograph`;
 
-    const output = await replicate.run(
-      "stability-ai/stable-diffusion-inpainting:95b7223104132402a9ae91cc677285bc5eb997834bd2349fa486f53910fd68b3",
-      {
-        input: {
-          image:            `data:${mime};base64,${wallImage}`,
-          mask:             `data:image/png;base64,${maskBase64}`,
-          prompt,
-          negative_prompt:  "blurry, low quality, distorted, unrealistic, cartoon, sketch, watermark, text",
-          strength:         0.95,
-          guidance_scale:   7.5,
-          num_inference_steps: 30,
-          num_outputs:      1,
-        },
-      }
-    );
+    console.log("[visualise] Step 3 - Calling Replicate with prompt:", prompt);
+
+    let output;
+    try {
+      output = await replicate.run(
+        "stability-ai/stable-diffusion-inpainting:95b7223104132402a9ae91cc677285bc5eb997834bd2349fa486f53910fd68b3",
+        {
+          input: {
+            image:            `data:${mime};base64,${wallImage}`,
+            mask:             `data:image/png;base64,${maskBase64}`,
+            prompt,
+            negative_prompt:  "blurry, low quality, distorted, unrealistic, cartoon, sketch, watermark, text",
+            strength:         0.95,
+            guidance_scale:   7.5,
+            num_inference_steps: 30,
+            num_outputs:      1,
+          },
+        }
+      );
+    } catch (replicateErr) {
+      console.error("[visualise] Step 3 - Replicate call failed:");
+      console.error("  message:", replicateErr.message);
+      console.error("  status:", replicateErr.status ?? replicateErr.statusCode);
+      console.error("  stack:", replicateErr.stack);
+      throw replicateErr;
+    }
+
+    console.log("[visualise] Step 4 - Result received, output type:", typeof output, "isArray:", Array.isArray(output));
+    console.log("[visualise] Step 4 - Raw output:", JSON.stringify(output, null, 2));
 
     // Replicate SDK ≥ 1.0 returns FileOutput objects; extract URL string
     let imageUrl = Array.isArray(output) ? output[0] : output;
@@ -636,15 +660,19 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
       imageUrl = imageUrl.href;
     }
 
+    console.log("[visualise] Step 4 - Resolved imageUrl:", imageUrl);
+
     if (!imageUrl) {
       return res.status(500).json({ error: "No image returned from Replicate." });
     }
 
-    console.log(`Visualise: completed for model "${modelNumber}" → ${imageUrl}`);
+    console.log(`[visualise] Completed for model "${modelNumber}" → ${imageUrl}`);
     return res.json({ imageUrl });
 
   } catch (error) {
-    console.error("Visualiser error:", error);
+    console.error("[visualise] FATAL ERROR:");
+    console.error("  message:", error.message);
+    console.error("  stack:", error.stack);
     return res.status(500).json({
       error: "Visualisation failed",
       details: error.message || "Unknown server error",
