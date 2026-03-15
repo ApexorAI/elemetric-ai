@@ -17832,6 +17832,263 @@ app.get("/tools-register/:contractorId", apiKeyAuth, async (req, res) => {
   });
 });
 
+// ── Round 42 ──────────────────────────────────────────────────────────────────
+
+// POST /compliance-certificate  — Generate a compliance certificate document for a job
+app.post("/compliance-certificate", apiKeyAuth, (req, res) => {
+  const { jobType, jobId, contractorName, contractorLicence, contractorAbn,
+          clientName, address, completionDate, complianceScore, grade,
+          certType, standardsComplied, testResults, witnessName, notes } = req.body;
+
+  if (!jobType || !contractorName || !address) {
+    return res.status(400).json({ error: "jobType, contractorName, and address are required." });
+  }
+
+  const safeJobType    = sanitiseInput(String(jobType)).toLowerCase();
+  const safeContractor = sanitiseInput(String(contractorName));
+  const safeLicence    = sanitiseInput(String(contractorLicence || "Not provided"));
+  const safeAbn        = sanitiseInput(String(contractorAbn    || "Not provided")).replace(/\D/g, "");
+  const safeClient     = sanitiseInput(String(clientName       || "Property Owner"));
+  const safeAddress    = sanitiseInput(String(address));
+  const safeDate       = sanitiseInput(String(completionDate   || new Date().toISOString().slice(0, 10)));
+  const safeWitness    = sanitiseInput(String(witnessName      || ""));
+  const safeNotes      = sanitiseInput(String(notes            || ""));
+
+  const CERT_TYPES = {
+    plumbing:   "Certificate of Compliance — Plumbing Work (CPC)",
+    gas:        "Certificate of Compliance — Gas Work",
+    electrical: "Electrical Safety Certificate of Compliance (ESCC)",
+    drainage:   "Certificate of Compliance — Drainage Work",
+    carpentry:  "Compliance Certificate — Domestic Building Work",
+    hvac:       "Compliance Statement — HVAC/Refrigeration Work",
+  };
+
+  const REGULATOR_DETAILS = {
+    plumbing:   { authority: "Victorian Building Authority (VBA)", reference: "Building Act 1993 and Plumbing Regulations 2018" },
+    gas:        { authority: "Energy Safe Victoria (ESV)",          reference: "Gas Safety Act 1997 and Gas Safety (Gas Installation) Regulations 2008" },
+    electrical: { authority: "Energy Safe Victoria (ESV)",          reference: "Electricity Safety Act 1998 and Electricity Safety (Installations) Regulations 2009" },
+    drainage:   { authority: "Victorian Building Authority (VBA)", reference: "Building Act 1993 and Plumbing Regulations 2018" },
+    carpentry:  { authority: "Victorian Building Authority (VBA)", reference: "Building Act 1993 and Building Regulations 2018" },
+    hvac:       { authority: "ARC (ARCtick) / Energy Safe Victoria", reference: "ACEL 2012 and AS/NZS 3000" },
+  };
+
+  const certTypeName   = certType  ? sanitiseInput(String(certType)) : (CERT_TYPES[safeJobType] || "Certificate of Compliance");
+  const regulatorInfo  = REGULATOR_DETAILS[safeJobType] || REGULATOR_DETAILS.plumbing;
+  const stdList        = Array.isArray(standardsComplied) ? standardsComplied.map(s => sanitiseInput(String(s))) : [];
+  const certId         = `CERT-${Date.now().toString(36).toUpperCase()}`;
+
+  const declaration = [
+    `I, ${safeContractor}, holding licence number ${safeLicence}, declare that the ${safeJobType} work described herein was completed at the above-mentioned address on ${safeDate}.`,
+    `The work was completed in accordance with all applicable requirements of the ${regulatorInfo.reference}, the National Construction Code, and all relevant Australian Standards.`,
+    stdList.length > 0 ? `Standards complied with: ${stdList.join("; ")}.` : null,
+    testResults ? `Test results: ${sanitiseInput(String(testResults)).slice(0, 200)}` : null,
+  ].filter(Boolean);
+
+  return res.json({
+    certificateId:    certId,
+    certificateType:  certTypeName,
+    issueDate:        new Date().toISOString().slice(0, 10),
+    jobId:            jobId ? sanitiseInput(String(jobId)) : null,
+    jobType:          safeJobType,
+    contractor: {
+      name:           safeContractor,
+      licenceNumber:  safeLicence,
+      abn:            safeAbn.length === 11 ? safeAbn : null,
+    },
+    client: {
+      name:     safeClient,
+      address:  safeAddress,
+    },
+    completionDate:   safeDate,
+    complianceScore:  complianceScore ? parseFloat(complianceScore) : null,
+    grade:            grade || null,
+    regulatoryAuthority: regulatorInfo.authority,
+    regulatoryReference: regulatorInfo.reference,
+    standardsComplied:   stdList,
+    declaration,
+    witnessName:      safeWitness || null,
+    notes:            safeNotes   || null,
+    status:           "ISSUED",
+    retentionPeriod:  `Retain for minimum ${safeJobType === "carpentry" ? "10" : "7"} years`,
+    generatedAt:      new Date().toISOString(),
+  });
+});
+
+// POST /photo-sequence-validate  — Validate that a job has Before/During/After photos
+app.post("/photo-sequence-validate", apiKeyAuth, (req, res) => {
+  const { photos, jobType, strictMode } = req.body;
+
+  if (!photos || !Array.isArray(photos) || photos.length === 0) {
+    return res.status(400).json({ error: "photos array is required." });
+  }
+
+  const safeJobType = sanitiseInput(String(jobType || "general")).toLowerCase();
+  const strict      = strictMode === true || strictMode === "true";
+
+  const REQUIRED_STAGES   = ["Before", "During", "After"];
+  const REQUIRED_COUNTS = {
+    plumbing:   { Before: 2, During: 2, After: 3 },
+    gas:        { Before: 1, During: 2, After: 3 },
+    electrical: { Before: 2, During: 2, After: 3 },
+    drainage:   { Before: 1, During: 2, After: 3 },
+    carpentry:  { Before: 2, During: 2, After: 3 },
+    hvac:       { Before: 2, During: 1, After: 3 },
+  };
+
+  const requiredCounts = REQUIRED_COUNTS[safeJobType] || { Before: 1, During: 1, After: 2 };
+
+  const photosByStage = {};
+  for (const stage of REQUIRED_STAGES) photosByStage[stage] = [];
+
+  for (const p of photos) {
+    const stage = p.stage || p.Stage || "";
+    if (REQUIRED_STAGES.includes(stage)) {
+      photosByStage[stage].push(p);
+    }
+  }
+
+  const stageResults = REQUIRED_STAGES.map(stage => {
+    const count    = photosByStage[stage].length;
+    const required = requiredCounts[stage] || 1;
+    const pass     = count >= required;
+    return {
+      stage,
+      photoCount:    count,
+      requiredCount: required,
+      pass,
+      gap:           pass ? 0 : required - count,
+    };
+  });
+
+  const missingStages = stageResults.filter(s => !s.pass);
+  const passed        = missingStages.length === 0;
+  const totalRequired = Object.values(requiredCounts).reduce((a, b) => a + b, 0);
+  const totalProvided = photos.length;
+
+  return res.json({
+    jobType:        safeJobType,
+    passed,
+    strictMode:     strict,
+    verdict:        passed ? "SEQUENCE COMPLETE" : `INCOMPLETE — ${missingStages.length} stage(s) have insufficient photos`,
+    totalPhotos:    totalProvided,
+    totalRequired,
+    stageResults,
+    missingStages:  missingStages.map(s => `${s.stage}: ${s.gap} more photo(s) needed`),
+    tip:            "Take 'During' photos immediately before covering any work — they cannot be retaken.",
+    checkedAt:      new Date().toISOString(),
+  });
+});
+
+// POST /licence-verify  — Verify a licence number against expected format rules
+app.post("/licence-verify", apiKeyAuth, (req, res) => {
+  const { licenceNumber, tradeType, authority } = req.body;
+
+  if (!licenceNumber) return res.status(400).json({ error: "licenceNumber is required." });
+
+  const safeLicence  = sanitiseInput(String(licenceNumber)).trim();
+  const safeTradeType= sanitiseInput(String(tradeType || "general")).toLowerCase();
+  const safeAuthority= sanitiseInput(String(authority || "")).toLowerCase();
+
+  // Format rules per authority
+  const FORMAT_RULES = {
+    vba:        { pattern: /^(MP|GF|DR|RGF|SF|DB|CBU|DBL|DBM|SDR)\d{5,8}$/i, description: "VBA licences: prefix (MP, GF, DR, etc.) followed by 5-8 digits" },
+    esv:        { pattern: /^EE\d{4,8}$/i, description: "ESV electrician licence: EE followed by 4-8 digits" },
+    arctick:    { pattern: /^AU\d{6,9}$/i, description: "ARCtick: AU followed by 6-9 digits" },
+    worksafe:   { pattern: /^VIC\d{6,10}$/i, description: "WorkSafe high-risk: VIC followed by 6-10 digits" },
+  };
+
+  // Determine likely authority
+  const detectedAuthority = safeAuthority || (
+    safeTradeType === "hvac"       ? "arctick"  :
+    safeTradeType === "electrical" ? "esv"      :
+    "vba"
+  );
+
+  const rule    = FORMAT_RULES[detectedAuthority] || FORMAT_RULES.vba;
+  const formatOk= rule.pattern.test(safeLicence.replace(/\s/g, ""));
+
+  // Check for obviously invalid patterns
+  const tooShort = safeLicence.replace(/[^0-9]/g, "").length < 4;
+  const allDigits= /^\d+$/.test(safeLicence);
+
+  return res.json({
+    licenceNumber:     safeLicence,
+    tradeType:         safeTradeType,
+    authority:         detectedAuthority.toUpperCase(),
+    formatValid:       formatOk && !tooShort,
+    formatNote:        rule.description,
+    warnings: [
+      !formatOk   ? `Licence number does not match expected format for ${detectedAuthority.toUpperCase()}` : null,
+      tooShort    ? "Licence number appears too short — verify with the issuing authority" : null,
+      allDigits   ? "Licence number contains no letters — most Victorian licences include a letter prefix" : null,
+    ].filter(Boolean),
+    verifyUrl:   detectedAuthority === "esv"     ? "esv.vic.gov.au/licence-search"
+               : detectedAuthority === "arctick" ? "arctick.org/verify"
+               : "my.vba.vic.gov.au/s/public-licence-search",
+    disclaimer: "Format validation only. Always verify licence currency with the issuing authority before engaging a tradesperson.",
+    checkedAt:  new Date().toISOString(),
+  });
+});
+
+// GET /price-index  — Return current material price index data for Victorian trades
+app.get("/price-index", apiKeyAuth, (req, res) => {
+  const { trade, material } = req.query;
+
+  // Relative index values (100 = baseline Jan 2023)
+  const PRICE_INDEX = {
+    plumbing: [
+      { material: "Copper pipe (15mm)",         indexValue: 142, trend: "STABLE",    lastUpdated: "2025-Q4", note: "Copper prices stabilised after 2022-23 peak" },
+      { material: "PVC pipe (various)",          indexValue: 118, trend: "STABLE",    lastUpdated: "2025-Q4", note: "" },
+      { material: "Isolation valves",            indexValue: 128, trend: "RISING",    lastUpdated: "2025-Q4", note: "Import costs up 8% YTD" },
+      { material: "Hot water unit (heat pump)",  indexValue: 155, trend: "STABLE",    lastUpdated: "2025-Q4", note: "Rebates available — check your-home.gov.au" },
+    ],
+    electrical: [
+      { material: "2.5mm² TPS cable",            indexValue: 136, trend: "FALLING",   lastUpdated: "2025-Q4", note: "Copper wire prices easing" },
+      { material: "RCDs and MCBs",               indexValue: 121, trend: "STABLE",    lastUpdated: "2025-Q4", note: "" },
+      { material: "LED downlights",              indexValue: 92,  trend: "FALLING",   lastUpdated: "2025-Q4", note: "LED prices continue to fall" },
+    ],
+    hvac: [
+      { material: "Split system (3.5kW)",        indexValue: 148, trend: "RISING",    lastUpdated: "2025-Q4", note: "Shipping delays adding cost" },
+      { material: "Refrigerant R32",             indexValue: 162, trend: "RISING",    lastUpdated: "2025-Q4", note: "Phase-out of R410A driving R32 demand" },
+      { material: "Refrigerant lineset",         indexValue: 131, trend: "STABLE",    lastUpdated: "2025-Q4", note: "" },
+    ],
+    carpentry: [
+      { material: "MGP10 framing timber",        indexValue: 158, trend: "FALLING",   lastUpdated: "2025-Q4", note: "Post-COVID supply normalising" },
+      { material: "Structural steel",            indexValue: 147, trend: "STABLE",    lastUpdated: "2025-Q4", note: "" },
+      { material: "Plywood (structural)",        indexValue: 143, trend: "STABLE",    lastUpdated: "2025-Q4", note: "" },
+    ],
+    gas: [
+      { material: "Black steel pipe (DN20)",     indexValue: 130, trend: "STABLE",    lastUpdated: "2025-Q4", note: "" },
+      { material: "Gas isolation valve",         indexValue: 125, trend: "STABLE",    lastUpdated: "2025-Q4", note: "" },
+    ],
+    drainage: [
+      { material: "DN100 PVC drain pipe",        indexValue: 115, trend: "STABLE",    lastUpdated: "2025-Q4", note: "PVC raw materials stable" },
+      { material: "Rubber couplings",            indexValue: 122, trend: "RISING",    lastUpdated: "2025-Q4", note: "Rubber supply constraints" },
+    ],
+  };
+
+  if (trade) {
+    const key = sanitiseInput(String(trade)).toLowerCase();
+    const tradeData = PRICE_INDEX[key];
+    if (!tradeData) return res.status(404).json({ error: `No price index for trade: ${key}`, availableTrades: Object.keys(PRICE_INDEX) });
+
+    if (material) {
+      const mat = sanitiseInput(String(material)).toLowerCase();
+      const match = tradeData.find(m => m.material.toLowerCase().includes(mat));
+      if (!match) return res.status(404).json({ error: `No material matching: ${material}` });
+      return res.json({ trade: key, ...match });
+    }
+
+    return res.json({ trade: key, materials: tradeData, count: tradeData.length });
+  }
+
+  return res.json({
+    note:        "Index values are relative (100 = Jan 2023 baseline). For informational purposes only.",
+    trades:      Object.keys(PRICE_INDEX),
+    priceIndex:  PRICE_INDEX,
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
