@@ -49781,6 +49781,291 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /isolation-loto-record — Create a lockout/tagout isolation record (AS/NZS 4024.1603)
+app.post("/isolation-loto-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, location,
+    isolationDate, workStartTime, expectedWorkEndTime,
+    workerName, workerLicence, supervisorName,
+    equipmentDescription, equipmentId,
+    energySources, isolationPoints,
+    // Pre-isolation checks
+    equipmentStopped, controlsInOffPosition, energyReleased, residualEnergyDissipated,
+    isolationDevicesApplied, locksApplied, tagsApplied,
+    tryAndTest, zeroEnergyVerified, zeroEnergyMethod,
+    // Multi-person
+    additionalWorkers, personalLocksRequired, numberOfPersonalLocks,
+    notes,
+  } = req.body;
+
+  if (!projectId || !equipmentDescription || !isolationDate || !workerName) {
+    return res.status(400).json({ error: "projectId, equipmentDescription, isolationDate, and workerName are required." });
+  }
+
+  const sanitisedEquipment = sanitiseInput(equipmentDescription, 200);
+  const sanitisedWorker = sanitiseInput(workerName, 120);
+
+  // AS/NZS 4024.1603 energy source categories
+  const validEnergySources = ["ELECTRICAL", "HYDRAULIC", "PNEUMATIC", "MECHANICAL", "GRAVITATIONAL", "THERMAL", "CHEMICAL", "RADIATION"];
+  const processedEnergySources = Array.isArray(energySources)
+    ? energySources.slice(0, 10).map(e => ({
+        type: validEnergySources.includes((e.type || e || "").toUpperCase()) ? (e.type || e).toUpperCase() : sanitiseInput(String(e.type || e), 40),
+        isolationMethod: sanitiseInput(String(e.isolationMethod || ""), 100),
+        isolationPoint: sanitiseInput(String(e.isolationPoint || ""), 100),
+        isolated: e.isolated ?? null,
+      }))
+    : [];
+
+  // Safety checks
+  const failures = [];
+  if (!equipmentStopped) failures.push("Equipment must be fully stopped before isolation.");
+  if (!isolationDevicesApplied) failures.push("Isolation devices (locks/tags) not applied — isolation not confirmed.");
+  if (!locksApplied && !tagsApplied) failures.push("Neither locks nor tags applied — isolation not secured.");
+  if (!tryAndTest) failures.push("Try-and-test step not completed — must attempt to start equipment to verify isolation before work commences.");
+  if (!zeroEnergyVerified) failures.push("Zero energy state not verified — test with appropriate instrument before entering danger zone.");
+
+  const canCommenceWork = failures.length === 0;
+
+  const additionalWorkersArray = Array.isArray(additionalWorkers)
+    ? additionalWorkers.slice(0, 20).map(w => sanitiseInput(String(w), 100))
+    : [];
+
+  const ref = `LOTO-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectName: sanitiseInput(projectName || "", 200),
+    location: sanitiseInput(location || "", 200),
+    isolationDate,
+    workStartTime: workStartTime || null,
+    expectedWorkEndTime: expectedWorkEndTime || null,
+    personnel: {
+      workerName: sanitisedWorker,
+      workerLicence: sanitiseInput(workerLicence || "", 60),
+      supervisorName: sanitiseInput(supervisorName || "", 120),
+      additionalWorkers: additionalWorkersArray,
+    },
+    equipment: {
+      description: sanitisedEquipment,
+      id: sanitiseInput(equipmentId || "", 60),
+    },
+    energySources: processedEnergySources,
+    isolationPoints: (isolationPoints || []).map(ip => sanitiseInput(String(ip), 150)).slice(0, 20),
+    isolationChecks: {
+      equipmentStopped: !!equipmentStopped,
+      controlsInOffPosition: !!controlsInOffPosition,
+      energyReleased: !!energyReleased,
+      residualEnergyDissipated: residualEnergyDissipated ?? null,
+      isolationDevicesApplied: !!isolationDevicesApplied,
+      locksApplied: !!locksApplied,
+      tagsApplied: !!tagsApplied,
+      tryAndTest: !!tryAndTest,
+      zeroEnergyVerified: !!zeroEnergyVerified,
+      zeroEnergyMethod: sanitiseInput(zeroEnergyMethod || "", 100),
+    },
+    multiPersonLock: {
+      required: !!personalLocksRequired,
+      numberOfPersonalLocks: numberOfPersonalLocks || null,
+    },
+    canCommenceWork,
+    failures,
+    status: "ISOLATED",
+    restoredBy: null,
+    restoredAt: null,
+    restorationChecks: null,
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("isolation_loto_records").insert(record);
+      if (error) console.error("LOTO insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("LOTO DB error:", e.message);
+    }
+  }
+
+  return res.status(canCommenceWork ? 201 : 422).json({
+    success: canCommenceWork,
+    ref,
+    canCommenceWork,
+    failures,
+    message: !canCommenceWork
+      ? `ISOLATION NOT COMPLETE — ${failures[0]} Resolve all steps before commencing work.`
+      : `Isolation ${ref} complete. ${sanitisedEquipment} is LOCKED OUT — safe to commence work.`,
+    safetyReminder: "Never assume equipment is isolated. Always verify with appropriate test equipment. One lock per person for multi-person work.",
+    saved,
+    record,
+  });
+});
+
+// PATCH /isolation-loto-record/:ref/restore — Remove isolation and restore energy
+app.patch("/isolation-loto-record/:ref/restore", apiKeyAuth, async (req, res) => {
+  const { ref: lotoRef } = req.params;
+  const {
+    restoredBy, allPersonnelClear, toolsRemoved, guardsReplaced,
+    locksRemoved, tagsRemoved, controlsRestored, notes,
+  } = req.body;
+
+  if (!restoredBy) return res.status(400).json({ error: "restoredBy is required." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  const restorationFailures = [];
+  if (!allPersonnelClear) restorationFailures.push("All personnel not clear of danger zone — do not restore energy.");
+  if (!toolsRemoved) restorationFailures.push("Tools/materials still in equipment — remove before restoring energy.");
+  if (!guardsReplaced) restorationFailures.push("Guards not replaced — reinstate all guards before energising.");
+  if (!locksRemoved && !tagsRemoved) restorationFailures.push("Locks/tags not removed — confirm isolation devices are removed.");
+
+  if (restorationFailures.length > 0) {
+    return res.status(422).json({
+      success: false,
+      restorationFailures,
+      message: `Cannot restore energy — ${restorationFailures[0]}`,
+    });
+  }
+
+  try {
+    const { error: updateErr } = await supabaseAdmin
+      .from("isolation_loto_records")
+      .update({
+        status: "RESTORED",
+        restoredBy: sanitiseInput(restoredBy, 120),
+        restoredAt: new Date().toISOString(),
+        restorationChecks: {
+          allPersonnelClear: !!allPersonnelClear,
+          toolsRemoved: !!toolsRemoved,
+          guardsReplaced: !!guardsReplaced,
+          locksRemoved: !!locksRemoved,
+          tagsRemoved: !!tagsRemoved,
+          controlsRestored: !!controlsRestored,
+        },
+        notes: sanitiseInput(notes || "", 300),
+      })
+      .eq("ref", sanitiseInput(lotoRef, 60));
+
+    if (updateErr) throw updateErr;
+
+    return res.json({
+      success: true,
+      ref: lotoRef,
+      status: "RESTORED",
+      restoredBy: sanitiseInput(restoredBy, 120),
+      restoredAt: new Date().toISOString(),
+      message: `Isolation ${lotoRef} removed by ${sanitiseInput(restoredBy, 60)} — equipment restored to service.`,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to restore isolation.", detail: e.message });
+  }
+});
+
+// POST /ai-isolation-risk-assessment — AI assesses isolation requirements for equipment
+app.post("/ai-isolation-risk-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    equipmentType, energySources, voltage, pressure, workType,
+    enclosedSpace, proximityToOthers, maintenanceType, notes,
+  } = req.body;
+
+  if (!equipmentType || !workType) {
+    return res.status(400).json({ error: "equipmentType and workType are required." });
+  }
+
+  const sanitisedEquipment = sanitiseInput(equipmentType, 100);
+  const sanitisedWork = sanitiseInput(workType, 100);
+  const sanitisedEnergySources = Array.isArray(energySources)
+    ? energySources.map(e => sanitiseInput(String(e), 60)).slice(0, 10)
+    : [];
+
+  const prompt = `You are an electrical and mechanical safety specialist with expertise in lockout/tagout (LOTO) procedures per AS/NZS 4024.1603 and Victorian WHS Regulations.
+
+Assess isolation requirements for:
+- Equipment: ${sanitisedEquipment}
+- Energy sources: ${sanitisedEnergySources.join(", ") || "Unknown"}
+- Voltage (if electrical): ${voltage ? `${voltage}V` : "Not specified"}
+- Pressure (if hydraulic/pneumatic): ${pressure ? `${pressure} bar/kPa` : "Not specified"}
+- Work type: ${sanitisedWork}
+- Enclosed space: ${enclosedSpace ? "Yes" : "No"}
+- Proximity to other workers: ${sanitiseInput(proximityToOthers || "Unknown", 60)}
+- Maintenance type: ${sanitiseInput(maintenanceType || "Corrective maintenance", 60)}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Respond ONLY with a JSON object:
+{
+  "isolationLevel": "SIMPLE|COMPLEX|HIGH_RISK",
+  "lockoutRequired": boolean,
+  "tagoutSufficient": boolean,
+  "isolationSteps": [{"step": number, "action": string, "verification": string}],
+  "residualEnergyControls": [string],
+  "authorisationRequired": string,
+  "tryAndTestMethod": string,
+  "zeroEnergyVerificationMethod": string,
+  "multiPersonLockRequired": boolean,
+  "competencyRequirements": [string],
+  "regulatoryReferences": [string],
+  "summary": string (2 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      equipmentType: sanitisedEquipment,
+      isolationLevel: parsed.isolationLevel || "COMPLEX",
+      lockoutRequired: parsed.lockoutRequired ?? true,
+      tagoutSufficient: parsed.tagoutSufficient ?? false,
+      isolationSteps: parsed.isolationSteps || [],
+      residualEnergyControls: parsed.residualEnergyControls || [],
+      authorisationRequired: parsed.authorisationRequired || "Supervisor sign-off",
+      tryAndTestMethod: parsed.tryAndTestMethod || "",
+      zeroEnergyVerificationMethod: parsed.zeroEnergyVerificationMethod || "",
+      multiPersonLockRequired: parsed.multiPersonLockRequired ?? false,
+      competencyRequirements: parsed.competencyRequirements || [],
+      regulatoryReferences: parsed.regulatoryReferences || [],
+      summary: parsed.summary || "Isolation assessment complete.",
+    });
+  } catch (e) {
+    console.error("AI isolation risk error:", e.message);
+    return res.json({
+      success: true,
+      equipmentType: sanitisedEquipment,
+      isolationLevel: "COMPLEX",
+      lockoutRequired: true,
+      tagoutSufficient: false,
+      isolationSteps: [
+        { step: 1, action: "Notify all affected workers of planned isolation", verification: "Written notification or toolbox talk" },
+        { step: 2, action: "Identify all energy sources and isolation points", verification: "Review equipment drawings and manual" },
+        { step: 3, action: "Shut down equipment using normal stop controls", verification: "Visual confirmation of stopped state" },
+        { step: 4, action: "Isolate all energy sources at isolation points", verification: "Confirm position of isolators" },
+        { step: 5, action: "Apply lockout device and personal lock", verification: "Lock applied and key retained by worker" },
+        { step: 6, action: "Release/restrain stored energy (bleed hydraulics, vent pneumatics, block gravity energy)", verification: "Pressure gauges, visual confirmation" },
+        { step: 7, action: "Try and test — attempt to start equipment using normal controls", verification: "Equipment does not start" },
+        { step: 8, action: "Verify zero energy state with appropriate test equipment", verification: "Multimeter for electrical; pressure gauge for pneumatic/hydraulic" },
+      ],
+      residualEnergyControls: ["Bleed hydraulic circuits to zero pressure", "Vent pneumatic systems fully", "Block or support any suspended loads"],
+      authorisationRequired: "Supervisor sign-off required before commencing work",
+      tryAndTestMethod: "Attempt to start equipment using all normal control methods",
+      zeroEnergyVerificationMethod: "Test with calibrated test equipment appropriate for energy type",
+      multiPersonLockRequired: (proximityToOthers || "").includes("multiple") || false,
+      competencyRequirements: ["Competency in LOTO procedure for this equipment type", "Electrical isolation: licensed electrical worker for HV or complex switchgear"],
+      regulatoryReferences: ["AS/NZS 4024.1603 — Safety of machinery: lockout/tagout", "WHS Regulations 2017 reg.202 — isolation of energy sources"],
+      summary: "Complex isolation required. Follow AS/NZS 4024.1603 procedure including try-and-test verification before commencing any work.",
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
