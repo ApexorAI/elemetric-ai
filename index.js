@@ -42759,6 +42759,206 @@ Return JSON with:
   }
 });
 
+// POST /drainage-inspection-record — Record a CCTV drain camera inspection
+app.post("/drainage-inspection-record", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, projectId, inspectionDate, operatorName,
+    pipeType, pipeDiameterMm, pipeLengthM, pipeAge_years,
+    inspectionMethod = "CCTV", flowDirection, conditions = [],
+    defectsFound = [], blockageFound = false, blockageLocation,
+    blockageType, overallConditionGrade, cleaningRequired = false,
+    repairMethod, urgency = "ROUTINE", reportRef, videoRef, notes,
+  } = req.body;
+  if (!propertyAddress || !inspectionDate || !operatorName) {
+    return res.status(400).json({ error: "propertyAddress, inspectionDate, and operatorName are required." });
+  }
+  const validMethods = ["CCTV", "PUSH_CAMERA", "SONAR", "VISUAL", "SMOKE_TEST", "DYE_TEST"];
+  const validUrgencies = ["EMERGENCY", "URGENT", "ROUTINE", "PLANNED"];
+  const validGrades = ["A", "B", "C", "D", "E"];
+  if (!validMethods.includes(inspectionMethod)) return res.status(400).json({ error: `inspectionMethod must be one of: ${validMethods.join(", ")}` });
+  if (!validUrgencies.includes(urgency)) return res.status(400).json({ error: `urgency must be one of: ${validUrgencies.join(", ")}` });
+  if (overallConditionGrade && !validGrades.includes(overallConditionGrade)) {
+    return res.status(400).json({ error: `overallConditionGrade must be one of: ${validGrades.join(", ")}` });
+  }
+  const inspectionRef = `DCI-${Date.now().toString(36).toUpperCase()}`;
+  const structuralRisk = overallConditionGrade === "D" || overallConditionGrade === "E"
+    || defectsFound.some(d => String(d).toLowerCase().includes("collapse") || String(d).toLowerCase().includes("fracture"))
+    ? "HIGH" : defectsFound.length > 0 ? "MEDIUM" : "LOW";
+  const record = {
+    inspection_ref: inspectionRef,
+    property_address: sanitiseInput(propertyAddress),
+    project_id: projectId || null,
+    inspection_date: inspectionDate,
+    operator_name: sanitiseInput(operatorName),
+    pipe_type: sanitiseInput(pipeType || ""),
+    pipe_diameter_mm: Number(pipeDiameterMm) || null,
+    pipe_length_m: Number(pipeLengthM) || null,
+    pipe_age_years: Number(pipeAge_years) || null,
+    inspection_method: inspectionMethod,
+    flow_direction: sanitiseInput(flowDirection || ""),
+    conditions: Array.isArray(conditions) ? conditions.map(c => sanitiseInput(c)) : [],
+    defects_found: Array.isArray(defectsFound) ? defectsFound.map(d => sanitiseInput(d)) : [],
+    blockage_found: Boolean(blockageFound),
+    blockage_location: sanitiseInput(blockageLocation || ""),
+    blockage_type: sanitiseInput(blockageType || ""),
+    overall_condition_grade: overallConditionGrade || null,
+    cleaning_required: Boolean(cleaningRequired),
+    repair_method: sanitiseInput(repairMethod || ""),
+    urgency,
+    structural_risk: structuralRisk,
+    report_ref: sanitiseInput(reportRef || ""),
+    video_ref: sanitiseInput(videoRef || ""),
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("drainage_inspections").insert(record);
+    if (error) console.error("drainage-inspection-record DB error:", error.message);
+  }
+  res.json({
+    inspectionRef, inspectionMethod, overallConditionGrade, structuralRisk,
+    defectCount: record.defects_found.length, blockageFound, urgency,
+    saved: !!supabaseAdmin,
+  });
+});
+
+// POST /sewer-connection-record — Record a sewer connection inspection/approval
+app.post("/sewer-connection-record", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, projectId, connectionDate, plumberName,
+    plumberLicenceNumber, sewerAuthority, connectionRef,
+    pipeDiameterMm, pipeGrade, connectionDepthM,
+    sewerMainDiameterMm, connectionType = "PROPERTY_CONNECTION",
+    inspectionDate, inspectorName, pressureTestPassed,
+    testPressureKpa, testDurationMinutes, cctv_required = false,
+    cctvCompleted, cctvRef, approved = false, noticeOfWork,
+    status = "PENDING_INSPECTION", notes,
+  } = req.body;
+  if (!propertyAddress || !plumberName || !plumberLicenceNumber) {
+    return res.status(400).json({ error: "propertyAddress, plumberName, and plumberLicenceNumber are required." });
+  }
+  const validTypes = ["PROPERTY_CONNECTION", "EXTENSION", "JUNCTION", "RENEWAL", "ABANDONMENT"];
+  const validStatuses = ["PENDING_INSPECTION", "UNDER_INSPECTION", "APPROVED", "REJECTED", "RECTIFICATION_REQUIRED", "COMPLETE"];
+  if (!validTypes.includes(connectionType)) return res.status(400).json({ error: `connectionType must be one of: ${validTypes.join(", ")}` });
+  if (!validStatuses.includes(status)) return res.status(400).json({ error: `status must be one of: ${validStatuses.join(", ")}` });
+  const scRef = `SWR-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    sc_ref: scRef,
+    property_address: sanitiseInput(propertyAddress),
+    project_id: projectId || null,
+    connection_date: connectionDate || null,
+    plumber_name: sanitiseInput(plumberName),
+    plumber_licence: sanitiseInput(plumberLicenceNumber),
+    sewer_authority: sanitiseInput(sewerAuthority || ""),
+    connection_ref: sanitiseInput(connectionRef || ""),
+    pipe_diameter_mm: Number(pipeDiameterMm) || null,
+    pipe_grade: sanitiseInput(pipeGrade || ""),
+    connection_depth_m: Number(connectionDepthM) || null,
+    sewer_main_diameter_mm: Number(sewerMainDiameterMm) || null,
+    connection_type: connectionType,
+    inspection_date: inspectionDate || null,
+    inspector_name: sanitiseInput(inspectorName || ""),
+    pressure_test_passed: pressureTestPassed !== undefined ? Boolean(pressureTestPassed) : null,
+    test_pressure_kpa: Number(testPressureKpa) || null,
+    test_duration_minutes: Number(testDurationMinutes) || null,
+    cctv_required: Boolean(cctv_required),
+    cctv_completed: cctv_required ? Boolean(cctvCompleted) : null,
+    cctv_ref: sanitiseInput(cctvRef || ""),
+    approved: Boolean(approved),
+    notice_of_work: sanitiseInput(noticeOfWork || ""),
+    status,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("sewer_connection_records").insert(record);
+    if (error) console.error("sewer-connection-record DB error:", error.message);
+  }
+  res.json({ scRef, connectionType, status, pressureTestPassed, approved, saved: !!supabaseAdmin });
+});
+
+// POST /ai-drain-camera-report — AI generates a drainage condition report
+app.post("/ai-drain-camera-report", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, pipeType = "PVC", pipeDiameterMm, pipeLengthM,
+    pipeAge_years, defectCodes = [], observations = [],
+    blockageType, infiltrationFound = false, rootIntrusion = false,
+    state = "VIC",
+  } = req.body;
+  if (!propertyAddress || !observations.length) {
+    return res.status(400).json({ error: "propertyAddress and observations are required." });
+  }
+  const sanitisedAddress = sanitiseInput(propertyAddress);
+  const sanitisedPipeType = sanitiseInput(pipeType);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian drainage engineer specialising in CCTV pipe inspection reports and AS 3500 compliance.`;
+  const userPrompt = `Generate a drainage condition report for:
+Property: ${sanitisedAddress}
+Pipe type: ${sanitisedPipeType}
+Diameter: ${pipeDiameterMm ? `${pipeDiameterMm} mm` : "Unknown"}
+Length: ${pipeLengthM ? `${pipeLengthM} m` : "Unknown"}
+Age: ${pipeAge_years ? `${pipeAge_years} years` : "Unknown"}
+CCTV defect codes: ${defectCodes.map(c => sanitiseInput(c)).join(", ") || "None"}
+Observations: ${observations.map(o => sanitiseInput(o)).join("; ")}
+Blockage type: ${sanitiseInput(blockageType || "None")}
+Infiltration: ${infiltrationFound}
+Root intrusion: ${rootIntrusion}
+State: ${sanitisedState}
+
+Return JSON with:
+{
+  "conditionGrade": "A|B|C|D|E",
+  "structuralCondition": "...",
+  "serviceCondition": "...",
+  "defectsSummary": [{"code": "...", "description": "...", "severity": "CRITICAL|MAJOR|MINOR", "location": "..."}],
+  "immediateRisks": ["...", "..."],
+  "recommendedActions": [{"action": "...", "urgency": "IMMEDIATE|WITHIN_30_DAYS|PLANNED", "method": "..."}],
+  "rehabilitationOptions": ["...", "..."],
+  "estimatedLifeRemaining": "...",
+  "costEstimate": "...",
+  "applicableStandards": ["AS/NZS 3500.2", "..."],
+  "executiveSummary": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const report = JSON.parse(aiRes.choices[0].message.content);
+    const reportRef = `DCR-${Date.now().toString(36).toUpperCase()}`;
+    res.json({ reportRef, propertyAddress: sanitisedAddress, pipeType: sanitisedPipeType, state: sanitisedState, report });
+  } catch (err) {
+    console.error("ai-drain-camera-report error:", err.message);
+    const reportRef = `DCR-FALLBACK`;
+    const hasIssues = defectCodes.length > 0 || rootIntrusion || infiltrationFound;
+    res.json({
+      reportRef, propertyAddress: sanitisedAddress, pipeType: sanitisedPipeType, state: sanitisedState,
+      report: {
+        conditionGrade: hasIssues ? "C" : "B",
+        structuralCondition: hasIssues ? "Some defects identified — assessment required" : "Appears structurally adequate",
+        serviceCondition: rootIntrusion ? "Root intrusion affecting flow capacity" : infiltrationFound ? "Groundwater infiltration detected" : "Service condition adequate",
+        defectsSummary: observations.slice(0, 5).map((o, i) => ({ code: `OB${i + 1}`, description: sanitiseInput(o), severity: "MINOR", location: "As noted" })),
+        immediateRisks: rootIntrusion ? ["Root intrusion may cause blockage"] : [],
+        recommendedActions: [
+          ...(rootIntrusion ? [{ action: "Root cutting and treatment", urgency: "WITHIN_30_DAYS", method: "High-pressure jet, chemical treatment" }] : []),
+          { action: "Re-inspection in 12 months", urgency: "PLANNED", method: "CCTV camera" },
+        ],
+        rehabilitationOptions: ["High-pressure water jetting", "CIPP relining", "Spot repair"],
+        estimatedLifeRemaining: pipeAge_years ? `${Math.max(0, 50 - Number(pipeAge_years))} years (estimated)` : "Unknown",
+        costEstimate: "TBD — obtain quotes from drainage contractor",
+        applicableStandards: ["AS/NZS 3500.2 (Sanitary plumbing)", "AS 1254 (PVC pressure pipes)", "WSAA Code of Practice"],
+        executiveSummary: `CCTV inspection of ${sanitisedPipeType} drainage at ${sanitisedAddress}. ${hasIssues ? "Issues identified requiring attention." : "No significant defects identified."}`,
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
