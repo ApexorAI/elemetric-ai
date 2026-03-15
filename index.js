@@ -19692,6 +19692,235 @@ app.post("/photo-hash", apiKeyAuth, async (req, res) => {
   });
 });
 
+// ── Round 50 ──────────────────────────────────────────────────────────────────
+
+// POST /annual-compliance-review  — Generate an annual compliance review for a contractor
+app.post("/annual-compliance-review", apiKeyAuth, async (req, res) => {
+  const { contractorId, contractorName, year, jobs, licences, feedback } = req.body;
+
+  if (!contractorName || !jobs || !Array.isArray(jobs) || jobs.length === 0) {
+    return res.status(400).json({ error: "contractorName and jobs array are required." });
+  }
+
+  const safeName    = sanitiseInput(String(contractorName));
+  const safeYear    = parseInt(year) || new Date().getFullYear();
+
+  const jobCount    = jobs.length;
+  const scores      = jobs.map(j => parseFloat(j.complianceScore) || 0).filter(s => s > 0);
+  const avgScore    = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+  const minScore    = scores.length ? Math.min(...scores) : null;
+  const maxScore    = scores.length ? Math.max(...scores) : null;
+  const certRate    = Math.round((jobs.filter(j => j.certificateFiled).length / jobCount) * 100);
+  const sigRate     = Math.round((jobs.filter(j => j.signatureObtained).length / jobCount) * 100);
+  const gpsRate     = Math.round((jobs.filter(j => j.gpsRecorded).length  / jobCount) * 100);
+
+  const tradeBreakdown = {};
+  for (const j of jobs) {
+    const t = sanitiseInput(String(j.jobType || "unknown")).toLowerCase();
+    if (!tradeBreakdown[t]) tradeBreakdown[t] = { count: 0, scoreSum: 0 };
+    tradeBreakdown[t].count++;
+    tradeBreakdown[t].scoreSum += parseFloat(j.complianceScore) || 0;
+  }
+  for (const t of Object.keys(tradeBreakdown)) {
+    tradeBreakdown[t].avgScore = Math.round(tradeBreakdown[t].scoreSum / tradeBreakdown[t].count);
+  }
+
+  const ratingScores  = Array.isArray(feedback) ? feedback.map(f => parseFloat(f.rating)).filter(r => !isNaN(r)) : [];
+  const avgRating     = ratingScores.length ? Math.round((ratingScores.reduce((a, b) => a + b, 0) / ratingScores.length) * 10) / 10 : null;
+
+  const licenceStatuses = Array.isArray(licences) ? licences.map(l => {
+    const exp  = l.expiryDate ? new Date(l.expiryDate) : null;
+    const days = exp && !isNaN(exp.getTime()) ? Math.round((exp - new Date()) / (1000 * 60 * 60 * 24)) : null;
+    return { licenceType: sanitiseInput(String(l.licenceType || "General")), expiryDate: l.expiryDate || null, daysRemaining: days, current: days === null ? null : days > 0 };
+  }) : [];
+
+  let overallGrade;
+  if (avgScore !== null && certRate >= 90 && sigRate >= 80) {
+    overallGrade = avgScore >= 85 ? "A" : avgScore >= 75 ? "B" : "C";
+  } else {
+    overallGrade = avgScore !== null ? (avgScore >= 70 ? "C" : avgScore >= 60 ? "D" : "F") : "N/A";
+  }
+
+  const GRADE_LABELS = { "A": "Excellent", "B": "Good", "C": "Satisfactory", "D": "Needs Improvement", "F": "Poor", "N/A": "Insufficient Data" };
+
+  const highlights = [
+    avgScore !== null ? `Average compliance score: ${avgScore}/100 (${overallGrade})` : null,
+    `${jobCount} jobs completed in ${safeYear}`,
+    certRate < 90    ? `Certificate filing rate: ${certRate}% — below 90% target` : `Certificate filing rate: ${certRate}% — meeting target`,
+    avgRating !== null ? `Client feedback average: ${avgRating}/5 stars` : null,
+    licenceStatuses.some(l => l.current === false) ? "URGENT: One or more licences have expired" : null,
+  ].filter(Boolean);
+
+  const reviewId = `REV-${safeYear}-${Date.now().toString(36).toUpperCase()}`;
+
+  return res.json({
+    reviewId,
+    year:              safeYear,
+    contractorId:      contractorId ? sanitiseInput(String(contractorId)) : null,
+    contractorName:    safeName,
+    overallGrade,
+    gradeLabel:        GRADE_LABELS[overallGrade],
+    jobsCompleted:     jobCount,
+    complianceScores: { average: avgScore, min: minScore, max: maxScore },
+    documentationRates: { certificateFilingRate: `${certRate}%`, signatureObtainedRate: `${sigRate}%`, gpsRecordedRate: `${gpsRate}%` },
+    tradeBreakdown,
+    clientFeedback: { average: avgRating, count: ratingScores.length },
+    licenceStatuses,
+    highlights,
+    recommendations: [
+      certRate < 90    ? "Improve certificate filing rate — set a reminder to file within 3 business days of job completion"     : null,
+      sigRate  < 80    ? "Improve client signature capture — use the Elemetric app on-site for immediate digital signature"      : null,
+      gpsRate  < 70    ? "Enable GPS on all photos — ensures compliance evidence is geolocated to the correct site"              : null,
+      avgScore !== null && avgScore < 75 ? "Review common missing items by trade and update your site checklists"               : null,
+      overallGrade === "A" ? "Excellent performance — consider mentoring apprentices in compliance best practice"                 : null,
+    ].filter(Boolean),
+    generatedAt:   new Date().toISOString(),
+  });
+});
+
+// POST /job-label  — Generate a printable job label / site card for display on site
+app.post("/job-label", apiKeyAuth, (req, res) => {
+  const { jobType, contractorName, contractorLicence, address, startDate,
+          permitNumber, emergencyContact, notes } = req.body;
+
+  if (!contractorName || !address) {
+    return res.status(400).json({ error: "contractorName and address are required." });
+  }
+
+  const safeContractor = sanitiseInput(String(contractorName));
+  const safeLicence    = sanitiseInput(String(contractorLicence || "Not provided"));
+  const safeAddress    = sanitiseInput(String(address));
+  const safeJobType    = sanitiseInput(String(jobType || "Trade Work")).toLowerCase();
+  const safeStart      = sanitiseInput(String(startDate || new Date().toISOString().slice(0, 10)));
+  const safePermit     = permitNumber ? sanitiseInput(String(permitNumber)) : null;
+  const safeEmergency  = sanitiseInput(String(emergencyContact || ""));
+  const safeNotes      = sanitiseInput(String(notes || ""));
+
+  const tradeLabel = { plumbing: "Plumbing", gas: "Gas Fitting", electrical: "Electrical",
+    drainage: "Drainage", carpentry: "Building / Carpentry", hvac: "HVAC / Refrigeration" }[safeJobType] || "Trade Work";
+
+  const label = {
+    labelId:           `LBL-${Date.now().toString(36).toUpperCase()}`,
+    trade:             tradeLabel,
+    site:              safeAddress,
+    contractor:        safeContractor,
+    licenceNumber:     safeLicence,
+    startDate:         safeStart,
+    permitNumber:      safePermit,
+    emergencyContact:  safeEmergency || null,
+    notes:             safeNotes     || null,
+    regulatoryContact: safeJobType === "electrical" || safeJobType === "gas" ? "Energy Safe Victoria: 1800 652 563"
+                     : "Victorian Building Authority: 1300 815 127",
+    printText: [
+      `${tradeLabel.toUpperCase()} WORK IN PROGRESS`,
+      `Address: ${safeAddress}`,
+      `Contractor: ${safeContractor}`,
+      `Licence: ${safeLicence}`,
+      `Start date: ${safeStart}`,
+      safePermit ? `Permit: ${safePermit}` : null,
+      safeEmergency ? `Emergency contact: ${safeEmergency}` : null,
+    ].filter(Boolean).join("\n"),
+    generatedAt: new Date().toISOString(),
+  };
+
+  return res.json(label);
+});
+
+// GET /compliance-checklist/:jobType  — Return the full detailed compliance checklist for a trade
+app.get("/compliance-checklist/:jobType", apiKeyAuth, (req, res) => {
+  const safeJobType = sanitiseInput(String(req.params.jobType || "")).toLowerCase();
+
+  // Use the CHECKLISTS constant if available, otherwise fall back to VICTORIAN_CHECKLISTS
+  const checklist = (typeof CHECKLISTS !== "undefined" && CHECKLISTS[safeJobType])
+    ? CHECKLISTS[safeJobType]
+    : (typeof VICTORIAN_CHECKLISTS !== "undefined" && VICTORIAN_CHECKLISTS[safeJobType])
+      ? VICTORIAN_CHECKLISTS[safeJobType]
+      : null;
+
+  if (!checklist) {
+    const available = typeof CHECKLISTS !== "undefined" ? Object.keys(CHECKLISTS) : ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+    return res.status(404).json({ error: `No checklist for trade: ${safeJobType}`, availableTrades: available });
+  }
+
+  const items        = Array.isArray(checklist) ? checklist : Object.values(checklist).flat();
+  const requiredCount= items.filter(i => i.required !== false).length;
+
+  return res.json({
+    jobType:       safeJobType,
+    totalItems:    items.length,
+    requiredItems: requiredCount,
+    items,
+    note:          "All required items must be documented with photographic evidence to meet Victorian compliance standards.",
+  });
+});
+
+// POST /photo-evidence-summary  — Summarise photo evidence completeness for a job
+app.post("/photo-evidence-summary", apiKeyAuth, (req, res) => {
+  const { jobType, photos, requiredItems, notes } = req.body;
+
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+
+  const safeJobType = sanitiseInput(String(jobType)).toLowerCase();
+  const photoList   = Array.isArray(photos)        ? photos.slice(0, 100)       : [];
+  const required    = Array.isArray(requiredItems)  ? requiredItems.slice(0, 50) : [];
+
+  const TYPICAL_REQUIREMENTS = {
+    plumbing:   6, gas: 5, electrical: 6, drainage: 6, carpentry: 6, hvac: 6,
+  };
+
+  const photoCount      = photoList.length;
+  const minRequired     = TYPICAL_REQUIREMENTS[safeJobType] || 4;
+  const withGps         = photoList.filter(p => !!(p.gpsLat && p.gpsLng) || !!p.gpsCoords).length;
+  const withTimestamp   = photoList.filter(p => !!(p.timestamp || p.takenAt)).length;
+  const withCaption     = photoList.filter(p => !!(p.caption || p.description)).length;
+
+  const byStage = { Before: 0, During: 0, After: 0, Other: 0 };
+  for (const p of photoList) {
+    const s = p.stage || "Other";
+    byStage[["Before", "During", "After"].includes(s) ? s : "Other"]++;
+  }
+
+  const CRITICAL_STAGES = ["Before", "During", "After"];
+  const missingStages   = CRITICAL_STAGES.filter(s => byStage[s] === 0);
+
+  const coveredItems = required.filter(item =>
+    photoList.some(p => {
+      const cap = (p.caption || p.description || "").toLowerCase();
+      return cap.includes(sanitiseInput(String(item)).toLowerCase().split(" ")[0]);
+    })
+  );
+
+  const itemCoverage = required.length > 0 ? Math.round((coveredItems.length / required.length) * 100) : null;
+
+  const overallStatus =
+    photoCount < minRequired ? "INSUFFICIENT" :
+    missingStages.length > 0 ? "MISSING_STAGES" :
+    withGps < photoCount * 0.5 ? "LOW_GPS" :
+    "ADEQUATE";
+
+  return res.json({
+    jobType:       safeJobType,
+    photoCount,
+    minimumRequired: minRequired,
+    byStage,
+    missingStages,
+    metadata: {
+      withGps:        withGps,
+      gpsRate:        `${Math.round((withGps / Math.max(photoCount, 1)) * 100)}%`,
+      withTimestamp,
+      withCaption,
+    },
+    itemCoverage:   itemCoverage !== null ? `${itemCoverage}%` : null,
+    coveredItemCount: coveredItems.length,
+    totalRequiredItems: required.length,
+    overallStatus,
+    verdict:       overallStatus === "ADEQUATE" ? "Photo evidence is sufficient for compliance purposes." :
+                   `Photo evidence is incomplete — ${overallStatus.replace(/_/g, " ").toLowerCase()}.`,
+    notes:         sanitiseInput(String(notes || "")),
+    checkedAt:     new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
