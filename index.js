@@ -34796,6 +34796,187 @@ Return a JSON object with:
   }
 });
 
+// ── Round 131: Contractor profile, portfolio, certification wallet ─────────────
+
+// POST /contractor-profile — Create or update a full contractor profile
+app.post("/contractor-profile", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, businessName, abn, businessType,
+    primaryTrade, otherTrades = [], licences = [],
+    yearsExperience, employeeCount, operatesIn = [],
+    tagline, bio, portfolio = [], specialisations = [],
+    contactEmail, contactPhone, website, logoUrl,
+    averageJobValue, annualRevenueBand, preferredJobTypes = [],
+  } = req.body;
+
+  if (!contractorId || !businessName) return res.status(400).json({ error: "contractorId and businessName required." });
+  if (contactEmail && !isValidEmail(contactEmail)) return res.status(400).json({ error: "Invalid contact email." });
+
+  const validBusinessTypes = ["SOLE_TRADER", "PARTNERSHIP", "PTY_LTD", "TRUST", "OTHER"];
+  const bizType = (businessType || "SOLE_TRADER").toUpperCase();
+
+  const record = {
+    contractor_id: sanitiseInput(contractorId),
+    business_name: sanitiseInput(businessName),
+    abn: sanitiseInput(abn || ""),
+    business_type: validBusinessTypes.includes(bizType) ? bizType : "SOLE_TRADER",
+    primary_trade: sanitiseInput(primaryTrade || ""),
+    other_trades: otherTrades.map(t => sanitiseInput(t)),
+    licences: licences.map(l => ({
+      licenceType: sanitiseInput(l.licenceType || ""),
+      licenceNumber: sanitiseInput(l.licenceNumber || ""),
+      state: sanitiseInput(l.state || ""),
+      expiry: l.expiry || null,
+      isExpired: l.expiry ? new Date(l.expiry) < new Date() : false,
+    })),
+    years_experience: Number(yearsExperience) || null,
+    employee_count: Number(employeeCount) || null,
+    operates_in: Array.isArray(operatesIn) ? operatesIn.map(s => sanitiseInput(s)) : [],
+    tagline: sanitiseInput(tagline || ""),
+    bio: sanitiseInput(bio || ""),
+    portfolio: portfolio.map(p => ({
+      projectName: sanitiseInput(p.projectName || ""),
+      description: sanitiseInput(p.description || ""),
+      value: Number(p.value) || null,
+      year: Number(p.year) || null,
+      imageUrl: p.imageUrl && isSafeUrl(p.imageUrl) ? p.imageUrl : null,
+    })),
+    specialisations: specialisations.map(s => sanitiseInput(s)),
+    contact_email: sanitiseInput(contactEmail || ""),
+    contact_phone: sanitiseInput(contactPhone || ""),
+    website: website && isSafeUrl(website) ? website : null,
+    logo_url: logoUrl && isSafeUrl(logoUrl) ? logoUrl : null,
+    average_job_value: averageJobValue ? Number(averageJobValue) : null,
+    annual_revenue_band: sanitiseInput(annualRevenueBand || ""),
+    preferred_job_types: preferredJobTypes.map(t => sanitiseInput(t)),
+    profile_completeness: 0, // calculated below
+    status: "ACTIVE",
+    updated_at: new Date().toISOString(),
+  };
+
+  // Calculate profile completeness score (0-100)
+  const fields = [businessName, abn, primaryTrade, bio, tagline, contactEmail, contactPhone, yearsExperience, logoUrl];
+  const filled = fields.filter(f => f && String(f).trim()).length;
+  const bonusPoints = (licences.length > 0 ? 10 : 0) + (portfolio.length > 0 ? 10 : 0) + (specialisations.length > 0 ? 5 : 0);
+  record.profile_completeness = Math.min(100, Math.round((filled / fields.length) * 75) + bonusPoints);
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("contractor_profiles")
+      .upsert({ ...record, contractor_id: record.contractor_id }, { onConflict: "contractor_id" })
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, profileId: data.id, profileCompleteness: record.profile_completeness, ...record });
+  }
+
+  res.json({ success: true, profileId: null, profileCompleteness: record.profile_completeness, ...record, saved: false });
+});
+
+// GET /contractor-profile/:contractorId — Retrieve a contractor's full profile
+app.get("/contractor-profile/:contractorId", apiKeyAuth, async (req, res) => {
+  const { contractorId } = req.params;
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("contractor_profiles")
+      .select("*")
+      .eq("contractor_id", contractorId)
+      .single();
+
+    if (error) return res.status(404).json({ error: "Contractor profile not found." });
+    return res.json(data);
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /certification-wallet — Store a trade certification or licence document in digital wallet
+app.post("/certification-wallet", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, certificationType, certificationName, issuingBody,
+    certificationNumber, issueDate, expiryDate,
+    state, cpd_points, fileUrl, verified = false, notes,
+  } = req.body;
+
+  if (!contractorId || !certificationType || !certificationName)
+    return res.status(400).json({ error: "contractorId, certificationType, certificationName required." });
+
+  const validTypes = [
+    "TRADE_LICENCE", "WHITE_CARD", "FIRST_AID", "CPR", "ELEVATED_WORK_PLATFORM",
+    "FORKLIFT_LICENCE", "RIGGING_LICENCE", "CRANE_LICENCE", "ASBESTOS_REMOVAL",
+    "ELECTRICAL_LICENCE", "PLUMBING_LICENCE", "GAS_LICENCE", "BUILDERS_LICENCE",
+    "PESTICIDE_LICENCE", "CONFINED_SPACE", "TRAFFIC_CONTROL", "CPD", "OTHER",
+  ];
+  const type = (certificationType || "OTHER").toUpperCase();
+
+  const expiry = expiryDate ? new Date(expiryDate) : null;
+  const daysToExpiry = expiry ? Math.ceil((expiry - new Date()) / (1000 * 60 * 60 * 24)) : null;
+  const isExpired = daysToExpiry !== null && daysToExpiry < 0;
+  const alertStatus = isExpired ? "EXPIRED" : daysToExpiry !== null && daysToExpiry <= 30 ? "EXPIRING_SOON" : "VALID";
+
+  const record = {
+    contractor_id: sanitiseInput(contractorId),
+    certification_type: validTypes.includes(type) ? type : "OTHER",
+    certification_name: sanitiseInput(certificationName),
+    issuing_body: sanitiseInput(issuingBody || ""),
+    certification_number: sanitiseInput(certificationNumber || ""),
+    issue_date: issueDate || null,
+    expiry_date: expiryDate || null,
+    days_to_expiry: daysToExpiry,
+    is_expired: isExpired,
+    alert_status: alertStatus,
+    state: sanitiseInput(state || ""),
+    cpd_points: cpd_points ? Number(cpd_points) : null,
+    file_url: fileUrl && isSafeUrl(fileUrl) ? fileUrl : null,
+    verified: Boolean(verified),
+    notes: sanitiseInput(notes || ""),
+    status: isExpired ? "EXPIRED" : "ACTIVE",
+    added_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("certification_wallet")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, certId: data.id, alertStatus, daysToExpiry, ...record });
+  }
+
+  res.json({ success: true, certId: null, alertStatus, daysToExpiry, ...record, saved: false });
+});
+
+// GET /certification-wallet/:contractorId — Get all certifications for a contractor
+app.get("/certification-wallet/:contractorId", apiKeyAuth, async (req, res) => {
+  const { contractorId } = req.params;
+  const { type, alertStatus } = req.query;
+
+  if (supabaseAdmin) {
+    let query = supabaseAdmin
+      .from("certification_wallet")
+      .select("*")
+      .eq("contractor_id", contractorId)
+      .order("expiry_date", { ascending: true });
+
+    if (type) query = query.eq("certification_type", type.toUpperCase());
+    if (alertStatus) query = query.eq("alert_status", alertStatus.toUpperCase());
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "DB error." });
+
+    const certs = data || [];
+    const expired = certs.filter(c => c.is_expired).length;
+    const expiringSoon = certs.filter(c => c.alert_status === "EXPIRING_SOON").length;
+    const totalCpdPoints = certs.reduce((s, c) => s + (c.cpd_points || 0), 0);
+
+    return res.json({ contractorId, certifications: certs, count: certs.length, expiredCount: expired, expiringSoonCount: expiringSoon, totalCpdPoints });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
