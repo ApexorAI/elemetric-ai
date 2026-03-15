@@ -84384,6 +84384,480 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 292 ─────────────────────────────────────────────────────────────────
+
+// POST /aged-care-safety-inspection — Record aged care facility safety and compliance inspection
+app.post("/aged-care-safety-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      facilityId, facilityName, address, inspectionDate, inspectedBy,
+      agedCareActRegistration, registrationExpiry, residentCount, bedsApproved,
+      fireSystemsOk, fireDoorsClosed, emergencyLightingOk, exitSignsOk,
+      fireDrillLastDate, evacuationPlanCurrent,
+      callBellSystemFunctional, wanderManagementOk,
+      slipHazardsFound, slipHazardDetails,
+      handrailsOk, rampAccessOk, doorWidthsAdequate,
+      accessibilityCompliant,
+      medicationStorageSecure, medicationFridgeTemp,
+      infectionControlProcedures, ppeAccessible,
+      handHygieneStations, handHygieneAudited,
+      cleaningScheduleCompliant, laundryFacilitiesOk,
+      kitchenFoodSafetyOk, kitchenTemp,
+      waterTemperatureAntiScaldOk, hotWaterMaxC,
+      bedsideCallSystemOk, bathroomCallSystemOk,
+      outdoorSpaceAccessible, outdoorSafetyOk,
+      staffRatiosMet, trainedStaffOnDuty, rnOnDuty,
+      incidentReportingCurrent, residentSafetyIncidents,
+      defectsFound, defectDetails, nextInspectionDue, certRef, notes
+    } = req.body;
+
+    if (!facilityId || !address || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "facilityId, address, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeFacilityId = sanitiseInput(String(facilityId));
+    const safeAddress = sanitiseInput(String(address));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const criticalIssues = [];
+    const warnings = [];
+
+    const medFridgeTemp = parseFloat(medicationFridgeTemp) || null;
+    const hotWaterMax = parseFloat(hotWaterMaxC) || null;
+    const kitchenT = parseFloat(kitchenTemp) || null;
+
+    // Aged Care Quality and Safety Commission Act 2018 (Cth)
+    // Aged Care Act 1997 (Cth) / Aged Care Quality Standards
+    // Building Regulations 2018 (Vic) / NCC 2022
+    if (!fireSystemsOk) {
+      criticalIssues.push("Fire safety systems not fully operational — aged care facilities require full AS 1851 maintenance compliance. Non-compliant facilities must be reported to Aged Care Quality and Safety Commission.");
+    }
+
+    if (!emergencyLightingOk) {
+      criticalIssues.push("Emergency lighting not functional — required for safe evacuation of residents with mobility impairments (Building Regulations 2018 (Vic) / NCC 2022 Spec E4.4).");
+    }
+
+    if (!evacuationPlanCurrent) {
+      criticalIssues.push("Evacuation plan not current — facilities accommodating residents requiring assistance to evacuate must have current PEEP/evacuation procedures (Building Regulations 2018 (Vic) / Aged Care Quality Standard 8).");
+    }
+
+    if (hotWaterMax !== null && hotWaterMax > 45) {
+      criticalIssues.push(`Hot water at outlet exceeds 45°C (${hotWaterMax}°C) — scalding risk for elderly residents with reduced sensation. Install tempering valves to limit outlet temperature to 45°C maximum (AS/NZS 3500.4).`);
+    }
+
+    if (!medicationStorageSecure) {
+      criticalIssues.push("Medication storage not secure — medications must be stored securely to prevent unauthorised access (Aged Care Quality Standard 3 — Personal Care and Clinical Care).");
+    }
+
+    if (medFridgeTemp !== null && (medFridgeTemp < 2 || medFridgeTemp > 8)) {
+      criticalIssues.push(`Medication refrigerator temperature ${medFridgeTemp}°C outside 2–8°C required range — refrigerated medications may be compromised. Check all affected medicines (Therapeutic Goods Administration guidelines).`);
+    }
+
+    if (!infectionControlProcedures) {
+      criticalIssues.push("Infection control procedures not confirmed in place — mandatory requirement under Aged Care Quality Standard 3 and infection prevention obligations.");
+    }
+
+    if (!callBellSystemFunctional) {
+      criticalIssues.push("Call bell/nurse call system not fully functional — resident safety at risk if residents cannot summon assistance (Aged Care Quality Standard 3).");
+    }
+
+    if (!accessibilityCompliant) {
+      criticalIssues.push("Accessibility non-compliance identified — aged care facilities must meet NCC 2022 Class 9c accessibility requirements including AS 1428.1 provisions.");
+    }
+
+    if (!handrailsOk) {
+      criticalIssues.push("Handrail deficiency — handrails in corridors, bathrooms, and circulation areas are critical for fall prevention for elderly residents. Repair immediately.");
+    }
+
+    if (slipHazardsFound === true || slipHazardsFound === "true") {
+      criticalIssues.push(`Slip hazards identified — falls are the leading cause of injury in aged care. Rectify immediately. Details: ${slipHazardDetails || "not specified"}`);
+    }
+
+    if (!staffRatiosMet) {
+      criticalIssues.push("Staff ratios not confirmed met — Aged Care Act 1997 (Cth) mandates minimum staffing levels including 24/7 registered nurse requirement.");
+    }
+
+    if (kitchenT !== null && kitchenT > 5 && kitchenT < 60) {
+      warnings.push(`Kitchen temperature danger zone — check food temperature monitoring records. Food held between 5°C and 60°C is in the temperature danger zone (FSANZ Standard 3.2.2).`);
+    }
+
+    if (!fireDrillLastDate) {
+      warnings.push("No fire drill date recorded — aged care facilities must conduct regular fire evacuation drills including non-ambulatory resident procedures.");
+    }
+
+    if (!wanderManagementOk) {
+      warnings.push("Wander management system issue — facilities accommodating residents with dementia must have appropriate wander management controls (Aged Care Quality Standard 2).");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "CONDITIONAL" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("aged_care_inspections")
+        .insert({
+          facility_id: safeFacilityId,
+          facility_name: facilityName ? sanitiseInput(String(facilityName)) : null,
+          address: safeAddress,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          registration: agedCareActRegistration ? sanitiseInput(String(agedCareActRegistration)) : null,
+          registration_expiry: registrationExpiry || null,
+          resident_count: parseInt(residentCount) || null,
+          beds_approved: parseInt(bedsApproved) || null,
+          fire_systems_ok: fireSystemsOk !== false && fireSystemsOk !== "false",
+          emergency_lighting_ok: emergencyLightingOk !== false && emergencyLightingOk !== "false",
+          evacuation_plan_current: evacuationPlanCurrent !== false && evacuationPlanCurrent !== "false",
+          slip_hazards: slipHazardsFound || false,
+          handrails_ok: handrailsOk !== false && handrailsOk !== "false",
+          accessibility_compliant: accessibilityCompliant !== false && accessibilityCompliant !== "false",
+          medication_storage_secure: medicationStorageSecure !== false && medicationStorageSecure !== "false",
+          medication_fridge_temp_c: medFridgeTemp,
+          infection_control_ok: infectionControlProcedures !== false && infectionControlProcedures !== "false",
+          hot_water_max_c: hotWaterMax,
+          call_bell_ok: callBellSystemFunctional !== false && callBellSystemFunctional !== "false",
+          staff_ratios_met: staffRatiosMet !== false && staffRatiosMet !== "false",
+          resident_incidents: parseInt(residentSafetyIncidents) || 0,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          next_inspection_due: nextInspectionDue || null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          defect_details: Array.isArray(defectDetails) ? defectDetails : [],
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Aged care facility compliance failures — resident safety at risk. Notify Aged Care Quality and Safety Commission if required.",
+        standards: ["Aged Care Quality and Safety Commission Act 2018 (Cth)", "Aged Care Quality Standards", "NCC 2022", "AS 1851"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      facilityId: safeFacilityId,
+      nextInspectionDue: nextInspectionDue || null,
+      standards: ["Aged Care Quality and Safety Commission Act 2018 (Cth)", "Aged Care Quality Standards"],
+    });
+  } catch (err) {
+    console.error("POST /aged-care-safety-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record aged care inspection." });
+  }
+});
+
+// POST /healthcare-facility-inspection — Record hospital/healthcare facility physical compliance inspection
+app.post("/healthcare-facility-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      facilityId, facilityName, address, inspectionDate, inspectedBy,
+      facilityType, acreditationBody, acreditationStatus, acreditationExpiry,
+      fireSystemsOk, emergencyLightingOk, exitSignsOk, fireDoorGapsOk,
+      medicalGasSystemsOk, oxygenStorageOk, vacuumSystemOk,
+      isolationRoomsOk, negPressureRoomsCount, negPressureVerified,
+      hvacZoningOk, acHChangesPerHr, hepaFiltersCurrents,
+      handHygienePostsPerBed, handHygieneCompliancePercent,
+      theatreCleanlinessOk, lastTheatreAirCountDate,
+      medicalEquipmentCalibrationCurrent, aedLocationsAdequate,
+      backupPowerForCriticalAreas, generatorTestedOk,
+      waterSafetyPlanInPlace, legionellaTestCurrent,
+      wasteSegregationOk, sharpsDisposalOk, clinicalWasteContractCurrent,
+      patientHandlingEquipmentOk, bedsInspectionCurrent,
+      accessibilityCompliant, emergencyDepartmentFlowOk,
+      defectsFound, defectDetails, nextInspectionDue, notes
+    } = req.body;
+
+    if (!facilityId || !address || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "facilityId, address, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeFacilityId = sanitiseInput(String(facilityId));
+    const safeAddress = sanitiseInput(String(address));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const criticalIssues = [];
+    const warnings = [];
+
+    const acChanges = parseFloat(acHChangesPerHr) || null;
+    const hygienePosts = parseFloat(handHygienePostsPerBed) || null;
+    const hygieneCompliance = parseFloat(handHygieneCompliancePercent) || null;
+
+    // Health Services Act 1988 (Vic) / National Safety and Quality Health Service (NSQHS) Standards
+    // Infection Control — NHMRC guidelines
+    // AS 3816 (management of clinical and related wastes)
+    if (!fireSystemsOk) {
+      criticalIssues.push("Fire safety systems defective — healthcare facilities must maintain full fire system compliance per AS 1851. Critical patients may be unable to self-evacuate.");
+    }
+
+    if (!emergencyLightingOk) {
+      criticalIssues.push("Emergency lighting fault — clinical areas including operating theatres and ICU must have emergency lighting to maintain patient care during power failure (NCC 2022 Spec E4.4).");
+    }
+
+    if (!medicalGasSystemsOk) {
+      criticalIssues.push("Medical gas system fault — defective medical gas (oxygen/vacuum/anaesthetic gas) systems directly endanger patient lives. Engage HTM-certified engineer immediately (AS 2896).");
+    }
+
+    if (negPressureRoomsCount > 0 && !negPressureVerified) {
+      criticalIssues.push("Negative pressure isolation rooms not verified — rooms designated for airborne infection control must be pressure-verified before patient placement (NHMRC Infection Control Guidelines).");
+    }
+
+    if (acChanges !== null && acChanges < 6) {
+      criticalIssues.push(`Air changes per hour ${acChanges} ACH below minimum 6 ACH for clinical areas — infection control risk. Review HVAC system immediately (AS 1668.2 / NHMRC guidelines).`);
+    }
+
+    if (!backupPowerForCriticalAreas) {
+      criticalIssues.push("Backup power not confirmed for critical clinical areas — ICU, operating theatres, and life support areas must have generator-backed power supply (NCC 2022 / HTM guidance).");
+    }
+
+    if (!waterSafetyPlanInPlace) {
+      criticalIssues.push("Water safety plan not in place — healthcare facilities are high-risk for Legionella due to immunocompromised patients. WSP required under Health (Legionella) Regulations 2016 (Vic).");
+    }
+
+    if (!legionellaTestCurrent) {
+      criticalIssues.push("Legionella testing not current — healthcare facilities must maintain current Legionella testing per Health (Legionella) Regulations 2016 (Vic) and AS 3666.2.");
+    }
+
+    if (!wasteSegregationOk || !sharpsDisposalOk) {
+      criticalIssues.push("Clinical waste segregation deficiency — incorrect segregation of clinical waste (sharps, infectious waste) poses infection risk and regulatory breach (AS 3816 / Environment Protection Act 2017 (Vic)).");
+    }
+
+    if (!clinicalWasteContractCurrent) {
+      criticalIssues.push("Clinical waste management contract not current — healthcare facilities must use licensed clinical waste transporters and disposal facilities (Environment Protection Act 2017 (Vic)).");
+    }
+
+    if (hygieneCompliance !== null && hygieneCompliance < 70) {
+      warnings.push(`Hand hygiene compliance ${hygieneCompliance}% below 70% minimum — WHO recommends >80% compliance. Increase hand hygiene training and monitoring (NSQHS Standard 3).`);
+    }
+
+    if (!hepaFiltersCurrents) {
+      warnings.push("HEPA filters not confirmed current — theatres, ICU, and isolation rooms require HEPA filtration with regular testing and replacement.");
+    }
+
+    if (!accessibilityCompliant) {
+      warnings.push("Accessibility non-compliance — healthcare facilities must meet NCC 2022 Class 9a access requirements including AS 1428.1.");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "CONDITIONAL" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("healthcare_inspections")
+        .insert({
+          facility_id: safeFacilityId,
+          facility_name: facilityName ? sanitiseInput(String(facilityName)) : null,
+          address: safeAddress,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          facility_type: facilityType ? sanitiseInput(String(facilityType)) : null,
+          accreditation_body: acreditationBody ? sanitiseInput(String(acreditationBody)) : null,
+          accreditation_status: acreditationStatus ? sanitiseInput(String(acreditationStatus)) : null,
+          accreditation_expiry: acreditationExpiry || null,
+          fire_systems_ok: fireSystemsOk !== false && fireSystemsOk !== "false",
+          emergency_lighting_ok: emergencyLightingOk !== false && emergencyLightingOk !== "false",
+          medical_gas_ok: medicalGasSystemsOk !== false && medicalGasSystemsOk !== "false",
+          neg_pressure_rooms: parseInt(negPressureRoomsCount) || 0,
+          neg_pressure_verified: negPressureVerified !== false && negPressureVerified !== "false",
+          ac_changes_per_hr: acChanges,
+          hepa_filters_current: hepaFiltersCurrents !== false && hepaFiltersCurrents !== "false",
+          hand_hygiene_compliance_pct: hygieneCompliance,
+          backup_power_critical: backupPowerForCriticalAreas !== false && backupPowerForCriticalAreas !== "false",
+          water_safety_plan: waterSafetyPlanInPlace !== false && waterSafetyPlanInPlace !== "false",
+          legionella_test_current: legionellaTestCurrent !== false && legionellaTestCurrent !== "false",
+          waste_segregation_ok: wasteSegregationOk !== false && wasteSegregationOk !== "false",
+          sharps_disposal_ok: sharpsDisposalOk !== false && sharpsDisposalOk !== "false",
+          clinical_waste_contract: clinicalWasteContractCurrent !== false && clinicalWasteContractCurrent !== "false",
+          accessibility_compliant: accessibilityCompliant !== false && accessibilityCompliant !== "false",
+          next_inspection_due: nextInspectionDue || null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          defect_details: Array.isArray(defectDetails) ? defectDetails : [],
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Healthcare facility compliance failures — patient safety at risk. Notify facility management and accreditation body.",
+        standards: ["NSQHS Standards", "Health Services Act 1988 (Vic)", "AS 2896", "AS 3666.2", "Health (Legionella) Regulations 2016 (Vic)"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      facilityId: safeFacilityId,
+      nextInspectionDue: nextInspectionDue || null,
+      standards: ["NSQHS Standards", "Health Services Act 1988 (Vic)", "AS 2896"],
+    });
+  } catch (err) {
+    console.error("POST /healthcare-facility-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record healthcare facility inspection." });
+  }
+});
+
+// POST /ai-healthcare-compliance-assessment — AI assesses healthcare facility safety and compliance
+app.post("/ai-healthcare-compliance-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      facilityId, facilityType, bedCount, specialties,
+      nsqhsAccreditationStatus, nsqhsLastSurveyDate,
+      infectionControlCompliance, handhygieneCompliance,
+      fallsRatePer1000Days, pressureInjuryRate,
+      medicationErrorRate, adverseEventReporting,
+      fireComplianceStatus, buildingCertificateOfOccupancy,
+      legionellaManagementStatus, airQualityCompliance,
+      clinicalWasteManagement, medicalDeviceCalibration,
+      staffCredentialing, staffTrainingCompliance,
+      patientFeedbackScore, complaintsTrend,
+      dataBreachesLast12Months, cyberSecurityMaturity,
+      deficienciesNoted, notes
+    } = req.body;
+
+    if (!facilityId) {
+      return res.status(400).json({ error: "facilityId is required." });
+    }
+
+    const safeFacilityId = sanitiseInput(String(facilityId));
+    const deficiencies = Array.isArray(deficienciesNoted) ? deficienciesNoted : [];
+    const specialtyList = Array.isArray(specialties) ? specialties : [];
+
+    const prompt = `You are an expert in healthcare facility compliance and clinical governance. Assess this healthcare facility's safety and regulatory compliance under Australian/Victorian standards.
+
+Facility ID: ${safeFacilityId}
+Facility type: ${facilityType || "Unknown"}
+Bed count: ${bedCount || "Unknown"}
+Clinical specialties: ${specialtyList.join(", ") || "Not specified"}
+
+ACCREDITATION:
+- NSQHS accreditation: ${nsqhsAccreditationStatus || "Unknown"} (last survey: ${nsqhsLastSurveyDate || "Unknown"})
+
+CLINICAL SAFETY:
+- Infection control compliance: ${infectionControlCompliance || "Unknown"}%
+- Hand hygiene compliance: ${handhygieneCompliance || "Unknown"}%
+- Falls rate: ${fallsRatePer1000Days || "Unknown"} per 1,000 patient days
+- Pressure injury rate: ${pressureInjuryRate || "Unknown"}
+- Medication error rate: ${medicationErrorRate || "Unknown"}
+- Adverse event reporting: ${adverseEventReporting || "Unknown"}
+
+FACILITY COMPLIANCE:
+- Fire compliance: ${fireComplianceStatus || "Unknown"}
+- Certificate of occupancy: ${buildingCertificateOfOccupancy || "Unknown"}
+- Legionella management: ${legionellaManagementStatus || "Unknown"}
+- Air quality compliance: ${airQualityCompliance || "Unknown"}
+- Clinical waste management: ${clinicalWasteManagement || "Unknown"}
+- Medical device calibration: ${medicalDeviceCalibration || "Unknown"}
+
+WORKFORCE:
+- Staff credentialing: ${staffCredentialing || "Unknown"}
+- Training compliance: ${staffTrainingCompliance || "Unknown"}%
+
+PATIENT EXPERIENCE:
+- Patient feedback score: ${patientFeedbackScore || "Unknown"}
+- Complaints trend: ${complaintsTrend || "Unknown"}
+
+SECURITY:
+- Data breaches (12 months): ${dataBreachesLast12Months || 0}
+- Cyber security maturity: ${cyberSecurityMaturity || "Unknown"}
+
+Deficiencies: ${deficiencies.join("; ") || "None"}
+
+Assess under:
+- National Safety and Quality Health Service (NSQHS) Standards (2nd edition)
+- Health Services Act 1988 (Vic)
+- AS 2896 (medical gas pipeline systems)
+- Health (Legionella) Regulations 2016 (Vic)
+- AS 3666.2 (air handling systems — Legionella)
+- AS 3816 (clinical waste management)
+- NHMRC Australian Guidelines for the Prevention and Control of Infection in Healthcare
+- My Health Record Act 2012 (Cth) — data security
+- Critical Infrastructure Act 2022 (Cth)
+
+Provide:
+1. Overall healthcare compliance risk rating
+2. Clinical safety assessment
+3. Infection control assessment
+4. Facility/building compliance
+5. Accreditation risk
+6. Priority quality improvement actions
+
+Respond ONLY in JSON:
+{
+  "overallRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "clinicalSafetyRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "infectionControlRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "facilityComplianceRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "accreditationRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "dataSecurityRisk": "LOW|MODERATE|HIGH",
+  "clinicalSafetyFindings": ["string"],
+  "infectionControlFindings": ["string"],
+  "facilityFindings": ["string"],
+  "priorityActions": ["string"],
+  "qualityImprovementActions": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 900,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallRisk: "MODERATE",
+        clinicalSafetyRisk: "MODERATE",
+        infectionControlRisk: "MODERATE",
+        facilityComplianceRisk: "MODERATE",
+        accreditationRisk: "LOW",
+        dataSecurityRisk: "MODERATE",
+        clinicalSafetyFindings: ["AI assessment unavailable — review NSQHS Standard compliance with accreditation advisors"],
+        infectionControlFindings: ["Verify hand hygiene compliance meets NHMRC >80% target and infection control program is current"],
+        facilityFindings: ["Ensure Legionella water safety plan is current per Health (Legionella) Regulations 2016 (Vic)"],
+        priorityActions: ["Review NSQHS Standards action plan", "Audit hand hygiene compliance"],
+        qualityImprovementActions: ["Implement real-time adverse event reporting", "Review medication reconciliation processes"],
+        applicableStandards: ["NSQHS Standards (2nd edition)", "Health Services Act 1988 (Vic)", "AS 2896", "Health (Legionella) Regulations 2016 (Vic)"],
+        summary: "AI healthcare compliance assessment unavailable. Engage clinical governance and accreditation specialists for formal review.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      facilityId: safeFacilityId,
+      standards: ["NSQHS Standards (2nd edition)", "Health Services Act 1988 (Vic)", "NHMRC Infection Prevention Guidelines", "AS 2896"],
+    });
+  } catch (err) {
+    console.error("POST /ai-healthcare-compliance-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess healthcare compliance." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
