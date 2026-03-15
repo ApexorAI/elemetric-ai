@@ -22431,6 +22431,195 @@ app.post("/labour-allocation", apiKeyAuth, async (req, res) => {
   return res.json({ jobId: safeJobId, totalHours, totalLabourCost: totalCost, allocations: items, savedAt: new Date().toISOString() });
 });
 
+// POST /ai-job-description  — AI generates a professional job description from bullet points
+app.post("/ai-job-description", apiKeyAuth, async (req, res) => {
+  const { jobType, bulletPoints = [], propertyType, address } = req.body || {};
+  if (!jobType || !Array.isArray(bulletPoints) || bulletPoints.length === 0) return res.status(400).json({ error: "jobType and bulletPoints required." });
+
+  const safeType    = sanitiseInput(String(jobType)).slice(0, 40);
+  const safeProp    = propertyType ? sanitiseInput(String(propertyType)).slice(0, 60) : null;
+  const safeAddress = address ? sanitiseInput(String(address)).slice(0, 200) : null;
+  const safeBullets = bulletPoints.slice(0, 20).map(b => sanitiseInput(String(b)).slice(0, 200));
+
+  const prompt = `You are a professional trade documentation writer in Victoria, Australia.
+
+Write a clear, professional job description for the following ${safeType} job${safeProp ? ` at a ${safeProp}` : ""}${safeAddress ? ` at ${safeAddress}` : ""}.
+
+Work items:
+${safeBullets.map((b, i) => `${i + 1}. ${b}`).join("\n")}
+
+Respond with JSON:
+{
+  "title": "concise job title",
+  "description": "2-3 paragraph professional description",
+  "scope": ["specific scope item 1", "specific scope item 2", ...],
+  "exclusions": ["what is NOT included"],
+  "estimatedDuration": "e.g. 1 day, 3-4 hours"
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 600 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      jobType: safeType,
+      title:             parsed.title || `${safeType} works`,
+      description:       parsed.description || "",
+      scope:             Array.isArray(parsed.scope) ? parsed.scope : [],
+      exclusions:        Array.isArray(parsed.exclusions) ? parsed.exclusions : [],
+      estimatedDuration: parsed.estimatedDuration || null,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      jobType: safeType,
+      title: `${safeType.charAt(0).toUpperCase() + safeType.slice(1)} works`,
+      description: safeBullets.join(". "),
+      scope: safeBullets, exclusions: [],
+      estimatedDuration: null,
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /inspection-booking  — Book an inspection with date/time/inspector
+app.post("/inspection-booking", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, inspectorName, inspectionDate, inspectionTime, inspectionType, notes, address } = req.body || {};
+  if (!jobId || !inspectionDate) return res.status(400).json({ error: "jobId and inspectionDate required." });
+
+  const VALID_INSPECTION_TYPES = ["pre-pour", "frame", "waterproofing", "final", "certificate-of-occupancy", "re-inspection", "progress", "handover"];
+  const safeJobId   = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeType    = jobType ? sanitiseInput(String(jobType)).toLowerCase().slice(0, 40) : null;
+  const safeInspType = sanitiseInput(String(inspectionType || "final")).toLowerCase();
+  const validType   = VALID_INSPECTION_TYPES.includes(safeInspType) ? safeInspType : "final";
+
+  const booking = {
+    jobId: safeJobId, jobType: safeType, inspectionType: validType,
+    inspectorName:   inspectorName ? sanitiseInput(String(inspectorName)).slice(0, 100) : null,
+    inspectionDate:  sanitiseInput(String(inspectionDate)).slice(0, 20),
+    inspectionTime:  inspectionTime ? sanitiseInput(String(inspectionTime)).slice(0, 10) : null,
+    address:         address ? sanitiseInput(String(address)).slice(0, 200) : null,
+    notes:           notes ? sanitiseInput(String(notes)).slice(0, 300) : null,
+    status:          "BOOKED",
+    bookingRef: `INS-${safeJobId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    createdAt:   new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("inspection_bookings").insert({
+        job_id: booking.jobId, job_type: booking.jobType, inspection_type: booking.inspectionType,
+        inspector_name: booking.inspectorName, inspection_date: booking.inspectionDate,
+        inspection_time: booking.inspectionTime, address: booking.address,
+        notes: booking.notes, status: booking.status, booking_ref: booking.bookingRef,
+        created_at: booking.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...booking, saved: !!supabaseAdmin });
+});
+
+// GET /inspection-booking/:jobId  — Get upcoming inspections for a job
+app.get("/inspection-booking/:jobId", apiKeyAuth, async (req, res) => {
+  const jobId = sanitiseInput(String(req.params.jobId || "")).slice(0, 80);
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  let bookings = [];
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin
+        .from("inspection_bookings")
+        .select("*")
+        .eq("job_id", jobId)
+        .order("inspection_date", { ascending: true })
+        .limit(20);
+      bookings = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const now = new Date().toISOString().split("T")[0];
+  const upcoming = bookings.filter(b => b.inspection_date >= now);
+  const past     = bookings.filter(b => b.inspection_date < now);
+
+  return res.json({ jobId, totalBookings: bookings.length, upcoming: upcoming.length, past: past.length, bookings, generatedAt: new Date().toISOString() });
+});
+
+// POST /compliance-waiver  — Log a compliance waiver request
+app.post("/compliance-waiver", apiKeyAuth, async (req, res) => {
+  const { jobId, contractorId, requirement, justification, requestedBy, approvalAuthority } = req.body || {};
+  if (!jobId || !requirement || !justification) return res.status(400).json({ error: "jobId, requirement, and justification required." });
+
+  const safeJobId   = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeCId     = contractorId ? sanitiseInput(String(contractorId)).slice(0, 80) : null;
+  const safeReq     = sanitiseInput(String(requirement)).slice(0, 200);
+  const safeJust    = sanitiseInput(String(justification)).slice(0, 1000);
+  const safeReqBy   = requestedBy ? sanitiseInput(String(requestedBy)).slice(0, 100) : null;
+  const safeAuth    = approvalAuthority ? sanitiseInput(String(approvalAuthority)).slice(0, 100) : null;
+
+  const waiver = {
+    jobId: safeJobId, contractorId: safeCId,
+    requirement: safeReq, justification: safeJust,
+    requestedBy: safeReqBy, approvalAuthority: safeAuth,
+    status: "PENDING",
+    waiverRef: `WVR-${safeJobId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    createdAt: new Date().toISOString(),
+    warning: "Compliance waivers must be reviewed and approved by the appropriate authority before proceeding.",
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("compliance_waivers").insert({
+        job_id: waiver.jobId, contractor_id: waiver.contractorId, requirement: waiver.requirement,
+        justification: waiver.justification, requested_by: waiver.requestedBy,
+        approval_authority: waiver.approvalAuthority, status: waiver.status,
+        waiver_ref: waiver.waiverRef, created_at: waiver.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...waiver, saved: !!supabaseAdmin });
+});
+
+// POST /cost-centre  — Track costs against a cost centre or budget code
+app.post("/cost-centre", apiKeyAuth, async (req, res) => {
+  const { projectId, costCentreCode, description, budget, spent, category, notes } = req.body || {};
+  if (!projectId || !costCentreCode) return res.status(400).json({ error: "projectId and costCentreCode required." });
+
+  const VALID_CATEGORIES = ["labour", "materials", "equipment", "subcontractors", "permits", "travel", "overhead", "other"];
+  const safeProjectId = sanitiseInput(String(projectId)).slice(0, 80);
+  const safeCode      = sanitiseInput(String(costCentreCode)).slice(0, 40);
+  const safeDesc      = description ? sanitiseInput(String(description)).slice(0, 200) : null;
+  const safeCategory  = VALID_CATEGORIES.includes(String(category || "").toLowerCase()) ? String(category).toLowerCase() : "other";
+  const safeBudget    = Math.max(0, parseFloat(budget) || 0);
+  const safeSpent     = Math.max(0, parseFloat(spent) || 0);
+  const safeNotes     = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const remaining  = parseFloat((safeBudget - safeSpent).toFixed(2));
+  const utilisedPct = safeBudget > 0 ? parseFloat(((safeSpent / safeBudget) * 100).toFixed(1)) : null;
+
+  const record = {
+    projectId: safeProjectId, costCentreCode: safeCode, description: safeDesc,
+    category: safeCategory, budget: safeBudget, spent: safeSpent,
+    remaining, utilisedPercent: utilisedPct,
+    status: utilisedPct === null ? "NO_BUDGET_SET" : utilisedPct > 110 ? "OVER_BUDGET" : utilisedPct > 90 ? "NEAR_LIMIT" : "ON_TRACK",
+    notes: safeNotes,
+    updatedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("cost_centres").upsert({
+        project_id: safeProjectId, cost_centre_code: safeCode, description: safeDesc,
+        category: safeCategory, budget: safeBudget, spent: safeSpent, remaining,
+        status: record.status, notes: safeNotes, updated_at: record.updatedAt,
+      }, { onConflict: "project_id,cost_centre_code" });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.json(record);
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
