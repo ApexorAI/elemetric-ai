@@ -16500,6 +16500,263 @@ app.post("/scope-of-works", apiKeyAuth, async (req, res) => {
   });
 });
 
+// ── Round 36 ──────────────────────────────────────────────────────────────────
+
+// POST /material-checklist  — Generate a pre-job material checklist for a trade job
+app.post("/material-checklist", apiKeyAuth, (req, res) => {
+  const { jobType, scopeItems, complexity, propertyType } = req.body;
+
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+
+  const safeJobType  = sanitiseInput(String(jobType)).toLowerCase();
+  const safeComplexity = sanitiseInput(String(complexity || "medium")).toLowerCase();
+  const safePropType = sanitiseInput(String(propertyType || "residential"));
+
+  const BASE_MATERIALS = {
+    plumbing: [
+      { item: "Copper pipe (15mm)",            unit: "m",    notes: "Allow 20% waste" },
+      { item: "Copper pipe (20mm)",            unit: "m",    notes: "For mains supply" },
+      { item: "Isolation valves (ball valve)", unit: "each", notes: "One per appliance minimum" },
+      { item: "Compression fittings (assorted)", unit: "pack", notes: "Elbows, tees, couplings" },
+      { item: "PTFE tape",                     unit: "roll", notes: "All threaded connections" },
+      { item: "Flux and solder",               unit: "set",  notes: "For copper soldering" },
+      { item: "Water meter joiner (if required)", unit: "each", notes: "" },
+      { item: "Flexible hose connectors",      unit: "pair", notes: "Hot + cold per fixture" },
+      { item: "P-traps or S-traps",            unit: "each", notes: "Per waste outlet" },
+      { item: "Silicone sealant (white)",       unit: "tube", notes: "Around fixtures" },
+    ],
+    gas: [
+      { item: "Black steel pipe (DN20)",        unit: "m",    notes: "For new gas runs" },
+      { item: "Gas isolation valve",            unit: "each", notes: "At appliance and branch" },
+      { item: "Gas flexible connector",         unit: "each", notes: "Max 5 year life — new only" },
+      { item: "Pressure test gauge",            unit: "each", notes: "1.5× WP minimum" },
+      { item: "Pipe jointing compound",         unit: "tube", notes: "Approved gas-grade compound" },
+      { item: "Thread seal tape (yellow)",      unit: "roll", notes: "Gas-approved PTFE only" },
+      { item: "Gas leak detection spray",       unit: "bottle", notes: "Test all connections" },
+    ],
+    electrical: [
+      { item: "2.5mm² TPS cable",               unit: "m",    notes: "General lighting and power" },
+      { item: "4mm² TPS cable",                 unit: "m",    notes: "Circuits >20A" },
+      { item: "GPO (double power outlet)",       unit: "each", notes: "" },
+      { item: "Clipsal or equivalent switch",    unit: "each", notes: "" },
+      { item: "Circuit breakers (assorted)",     unit: "each", notes: "Match existing brand if extending" },
+      { item: "RCD — 2-pole 30mA",              unit: "each", notes: "Required for all new circuits" },
+      { item: "Conduit (20mm PVC)",             unit: "m",    notes: "Concealed cable runs" },
+      { item: "Cable clips (assorted)",          unit: "pack", notes: "" },
+      { item: "Earth sleeving (green/yellow)",   unit: "m",    notes: "" },
+      { item: "Electrical tape (various colours)", unit: "roll", notes: "" },
+    ],
+    drainage: [
+      { item: "DN100 PVC drain pipe",            unit: "m",    notes: "Graded minimum 1:40" },
+      { item: "DN100 45° bends",                 unit: "each", notes: "Two 45s instead of one 90" },
+      { item: "DN100 inspection opening",        unit: "each", notes: "At every change of direction" },
+      { item: "Rubber couplings (assorted)",     unit: "each", notes: "Fernco or similar" },
+      { item: "PVC primer and cement",           unit: "set",  notes: "Match pipe spec" },
+      { item: "Drain grate (100mm)",             unit: "each", notes: "" },
+      { item: "Silicone (grey — drainage grade)", unit: "tube", notes: "" },
+    ],
+    carpentry: [
+      { item: "90×45mm MGP10 framing timber",   unit: "m",    notes: "Allow 15% waste" },
+      { item: "70×35mm MGP10 framing timber",   unit: "m",    notes: "Noggings and plates" },
+      { item: "M12 structural bolts",           unit: "each", notes: "For beam connections" },
+      { item: "Joist hangers (assorted)",       unit: "each", notes: "Match joist size" },
+      { item: "90×3.75mm framing nails",        unit: "kg",   notes: "For nailgun" },
+      { item: "Stud adhesive",                  unit: "tube", notes: "" },
+      { item: "Damp course (if required)",      unit: "m",    notes: "At base of frames on slab" },
+    ],
+    hvac: [
+      { item: "Refrigerant lineset (insulated)",unit: "m",    notes: "Match system Btus — no joins" },
+      { item: "3-core + earth cable (2.5mm²)",  unit: "m",    notes: "For indoor/outdoor wiring" },
+      { item: "Condensate drain pipe (20mm)",   unit: "m",    notes: "Continuous fall to discharge" },
+      { item: "Wall/ceiling mounting bracket",  unit: "each", notes: "Rated for unit weight" },
+      { item: "Electrical isolator (lockable)", unit: "each", notes: "Within sight of outdoor unit" },
+      { item: "Pipe insulation (foam)",         unit: "m",    notes: "Both liquid and suction lines" },
+      { item: "Refrigerant recovery cylinder",  unit: "each", notes: "For decommission if required" },
+    ],
+  };
+
+  const materials = BASE_MATERIALS[safeJobType] || [];
+
+  const customItems = Array.isArray(scopeItems)
+    ? scopeItems.slice(0, 10).map(s => ({
+        item: sanitiseInput(String(s)),
+        unit: "each",
+        notes: "Verify quantity on site",
+        custom: true,
+      }))
+    : [];
+
+  const allMaterials = [...materials, ...customItems];
+
+  return res.json({
+    jobType:        safeJobType,
+    propertyType:   safePropType,
+    complexity:     safeComplexity,
+    totalItems:     allMaterials.length,
+    materials:      allMaterials,
+    orderTip:       "Order 15–20% extra on pipe and cable to account for waste and offcuts. Confirm exact quantities from site measurements before ordering.",
+    generatedAt:    new Date().toISOString(),
+  });
+});
+
+// POST /quality-hold  — Place or release a quality hold on a job pending inspection
+app.post("/quality-hold", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, action, reason, holdType, approvedBy, notes } = req.body;
+
+  if (!jobId || !action) {
+    return res.status(400).json({ error: "jobId and action (place|release) are required." });
+  }
+
+  const safeAction   = sanitiseInput(String(action)).toLowerCase();
+  if (!["place", "release"].includes(safeAction)) {
+    return res.status(400).json({ error: "action must be 'place' or 'release'." });
+  }
+
+  const safeJobId    = sanitiseInput(String(jobId));
+  const safeJobType  = sanitiseInput(String(jobType || "general")).toLowerCase();
+  const safeReason   = sanitiseInput(String(reason   || "Pending inspection"));
+  const safeHoldType = sanitiseInput(String(holdType || "compliance_review")).toLowerCase();
+  const safeApproved = sanitiseInput(String(approvedBy || "Supervisor"));
+  const safeNotes    = sanitiseInput(String(notes || ""));
+
+  const holdId  = `QH-${Date.now().toString(36).toUpperCase()}`;
+  const status  = safeAction === "place" ? "ON_HOLD" : "RELEASED";
+
+  const record = {
+    holdId,
+    jobId:       safeJobId,
+    jobType:     safeJobType,
+    action:      safeAction.toUpperCase(),
+    status,
+    holdType:    safeHoldType,
+    reason:      safeReason,
+    approvedBy:  safeApproved,
+    notes:       safeNotes || null,
+    actionTaken: safeAction === "place"
+      ? "Job placed on hold. No further work may proceed on this job until the hold is released."
+      : "Hold released. Work may resume subject to any outstanding conditions.",
+    timestamp:   new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    await supabaseAdmin.from("quality_holds").insert({
+      hold_id:    holdId,
+      job_id:     safeJobId,
+      job_type:   safeJobType,
+      action:     safeAction,
+      status,
+      reason:     safeReason,
+      approved_by: safeApproved,
+      created_at: new Date().toISOString(),
+    }).then(() => {}).catch(() => {});
+  }
+
+  return res.json(record);
+});
+
+// POST /bulk-photo-check  — Quick compliance flag check for a batch of photo metadata records
+app.post("/bulk-photo-check", apiKeyAuth, (req, res) => {
+  const { photos, requiredMinPhotos } = req.body;
+
+  if (!photos || !Array.isArray(photos) || photos.length === 0) {
+    return res.status(400).json({ error: "photos array is required." });
+  }
+
+  const minPhotos = parseInt(requiredMinPhotos) || 4;
+
+  const results = photos.slice(0, 50).map((p, i) => {
+    const hasGps       = !!(p.gpsLat && p.gpsLng) || !!p.gpsCoords;
+    const hasTimestamp = !!p.timestamp || !!p.takenAt || !!p.createdAt;
+    const hasCaption   = !!(p.caption || p.description);
+    const resolution   = parseInt(p.resolutionMp) || parseInt(p.width && p.height ? Math.round(p.width * p.height / 1000000) : 0) || null;
+    const lowRes       = resolution !== null && resolution < 2;
+
+    const flags = [];
+    if (!hasGps)       flags.push("no_gps");
+    if (!hasTimestamp) flags.push("no_timestamp");
+    if (!hasCaption)   flags.push("no_caption");
+    if (lowRes)        flags.push("low_resolution");
+
+    return {
+      photoIndex:     i + 1,
+      filename:       p.filename ? sanitiseInput(String(p.filename)) : null,
+      hasGps,
+      hasTimestamp,
+      hasCaption,
+      resolutionMp:   resolution,
+      flags,
+      compliant:      flags.length === 0,
+    };
+  });
+
+  const compliantCount   = results.filter(r => r.compliant).length;
+  const withGps          = results.filter(r => r.hasGps).length;
+  const withTimestamp    = results.filter(r => r.hasTimestamp).length;
+  const belowMinimum     = results.length < minPhotos;
+
+  const allFlags = results.flatMap(r => r.flags);
+  const flagFrequency = allFlags.reduce((acc, f) => { acc[f] = (acc[f] || 0) + 1; return acc; }, {});
+
+  return res.json({
+    photoCount:        results.length,
+    minimumRequired:   minPhotos,
+    belowMinimum,
+    compliantCount,
+    gpsRate:           `${Math.round((withGps / results.length) * 100)}%`,
+    timestampRate:     `${Math.round((withTimestamp / results.length) * 100)}%`,
+    flagFrequency,
+    overallStatus:     belowMinimum ? "INSUFFICIENT_PHOTOS" : compliantCount === results.length ? "ALL_COMPLIANT" : "ISSUES_FOUND",
+    results,
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+// GET /trade-contacts  — Return industry association contacts for each trade in Victoria
+app.get("/trade-contacts", apiKeyAuth, (req, res) => {
+  const { trade } = req.query;
+
+  const CONTACTS = {
+    plumbing: [
+      { org: "Master Plumbers Australia (Victoria)", phone: "1800 133 181", web: "plumber.com.au",   role: "Industry association, training, insurance" },
+      { org: "Plumbing Industry Climate Action Centre (PICAC)", phone: "03 9356 9100", web: "picac.com.au", role: "Training and apprenticeships" },
+    ],
+    electrical: [
+      { org: "National Electrical and Communications Association (NECA)", phone: "1300 361 099", web: "necansw.com.au", role: "Industry association, training" },
+      { org: "Electrical Trades Union (ETU Victoria)", phone: "03 9693 3666", web: "etu.net.au", role: "Union and workplace rights" },
+    ],
+    gas: [
+      { org: "Master Plumbers Australia (Victoria)", phone: "1800 133 181", web: "plumber.com.au", role: "Gasfitter licencing and insurance" },
+      { org: "Australian Gas Networks",              phone: "1800 898 220", web: "agn.com.au",    role: "Network operator — gas emergencies" },
+    ],
+    drainage: [
+      { org: "Stormwater Victoria",                  phone: "03 9606 0119", web: "stormwatervic.com.au", role: "Stormwater industry body" },
+      { org: "Master Plumbers Australia (Victoria)", phone: "1800 133 181", web: "plumber.com.au",       role: "Drainage licence and insurance" },
+    ],
+    carpentry: [
+      { org: "Housing Industry Association (HIA)",   phone: "1902 224 224", web: "hia.com.au",        role: "Residential builder association" },
+      { org: "Master Builders Victoria",             phone: "03 9411 4555", web: "mbav.com.au",        role: "Commercial and residential builders" },
+      { org: "Timber and Building Materials Association (TABMA)", phone: "02 9890 3000", web: "tabma.com.au", role: "Timber products industry" },
+    ],
+    hvac: [
+      { org: "Air Conditioning and Mechanical Contractors Association (AMCA)", phone: "03 9326 6506", web: "amca.com.au", role: "HVAC contractors industry body" },
+      { org: "Australian Refrigeration Association (ARA)", phone: "03 9897 4468", web: "ara.com.au", role: "Refrigeration industry" },
+    ],
+  };
+
+  if (trade) {
+    const key = sanitiseInput(String(trade)).toLowerCase();
+    const tradeContacts = CONTACTS[key];
+    if (!tradeContacts) return res.status(404).json({ error: `No contacts for trade: ${key}`, availableTrades: Object.keys(CONTACTS) });
+    return res.json({ trade: key, contacts: tradeContacts, count: tradeContacts.length });
+  }
+
+  return res.json({
+    trades:   Object.keys(CONTACTS),
+    contacts: CONTACTS,
+    count:    Object.values(CONTACTS).reduce((n, a) => n + a.length, 0),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
