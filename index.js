@@ -37707,6 +37707,193 @@ Return JSON with:
   }
 });
 
+// POST /tender-evaluation — Score tender submissions against weighted criteria
+app.post("/tender-evaluation", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, tenderRef,
+    evaluationCriteria = [],
+    tenderers = [],
+  } = req.body;
+  if (!tenderRef || !evaluationCriteria.length || !tenderers.length) {
+    return res.status(400).json({ error: "tenderRef, evaluationCriteria, and tenderers are required." });
+  }
+  const totalWeight = evaluationCriteria.reduce((s, c) => s + (Number(c.weight) || 0), 0);
+  if (Math.abs(totalWeight - 100) > 0.01) {
+    return res.status(400).json({ error: `Evaluation criteria weights must sum to 100. Current sum: ${totalWeight}` });
+  }
+  const evaluated = tenderers.map(t => {
+    const scores = evaluationCriteria.map(c => {
+      const rawScore = Number((t.scores || {})[c.id] || 0);
+      const maxScore = Number(c.maxScore) || 10;
+      const weighted = (rawScore / maxScore) * Number(c.weight);
+      return { criterionId: c.id, name: sanitiseInput(c.name || ""), rawScore, maxScore, weight: Number(c.weight), weighted: +weighted.toFixed(2) };
+    });
+    const totalWeightedScore = scores.reduce((s, sc) => s + sc.weighted, 0);
+    return {
+      tendererName: sanitiseInput(t.name || ""),
+      priceExGst: Number(t.priceExGst) || null,
+      scores,
+      totalWeightedScore: +totalWeightedScore.toFixed(2),
+    };
+  });
+  evaluated.sort((a, b) => b.totalWeightedScore - a.totalWeightedScore);
+  const ranked = evaluated.map((e, i) => ({ ...e, rank: i + 1 }));
+  const evalRef = `EVAL-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    eval_ref: evalRef,
+    project_id: projectId || null,
+    project_name: sanitiseInput(projectName || ""),
+    tender_ref: sanitiseInput(tenderRef),
+    evaluation_criteria: evaluationCriteria,
+    results: ranked,
+    recommended_tenderer: ranked[0]?.tendererName || null,
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("tender_evaluations").insert(record);
+    if (error) console.error("tender-evaluation DB error:", error.message);
+  }
+  res.json({
+    evalRef, tenderRef, tendererCount: ranked.length,
+    recommendedTenderer: ranked[0]?.tendererName,
+    topScore: ranked[0]?.totalWeightedScore,
+    ranked,
+    saved: !!supabaseAdmin,
+  });
+});
+
+// POST /prequalification-check — Record contractor prequalification assessment
+app.post("/prequalification-check", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, contractorName, trade, abn, licenceNumber,
+    publicLiabilityExpiry, workersCompExpiry, safetyMgmtSystem = false,
+    safetyRecord = {}, references = [], financialCapacity,
+    whsInductionDate, iso9001Certified = false, iso45001Certified = false,
+    previousProjectValue, assessedBy, notes,
+  } = req.body;
+  if (!contractorName || !trade) {
+    return res.status(400).json({ error: "contractorName and trade are required." });
+  }
+  const now = new Date();
+  const plExpiry = publicLiabilityExpiry ? new Date(publicLiabilityExpiry) : null;
+  const wcExpiry = workersCompExpiry ? new Date(workersCompExpiry) : null;
+  const plValid = plExpiry ? plExpiry > now : false;
+  const wcValid = wcExpiry ? wcExpiry > now : false;
+  let score = 0;
+  if (abn) score += 10;
+  if (licenceNumber) score += 15;
+  if (plValid) score += 20;
+  if (wcValid) score += 20;
+  if (safetyMgmtSystem) score += 10;
+  if (iso9001Certified) score += 5;
+  if (iso45001Certified) score += 10;
+  if (references.length >= 2) score += 10;
+  const ltifr = Number(safetyRecord.ltifr) || 0;
+  if (ltifr === 0) score += 10;
+  else if (ltifr < 5) score += 5;
+  const status = score >= 75 ? "APPROVED" : score >= 50 ? "CONDITIONAL" : "REJECTED";
+  const prequalRef = `PQ-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    prequal_ref: prequalRef,
+    contractor_id: contractorId || null,
+    contractor_name: sanitiseInput(contractorName),
+    trade: sanitiseInput(trade),
+    abn: sanitiseInput(abn || ""),
+    licence_number: sanitiseInput(licenceNumber || ""),
+    public_liability_expiry: publicLiabilityExpiry || null,
+    workers_comp_expiry: workersCompExpiry || null,
+    pl_valid: plValid, wc_valid: wcValid,
+    safety_mgt_system: Boolean(safetyMgmtSystem),
+    safety_record: safetyRecord,
+    references: Array.isArray(references) ? references.map(r => sanitiseInput(r)) : [],
+    financial_capacity: sanitiseInput(financialCapacity || ""),
+    whs_induction_date: whsInductionDate || null,
+    iso9001: Boolean(iso9001Certified),
+    iso45001: Boolean(iso45001Certified),
+    score, status,
+    assessed_by: sanitiseInput(assessedBy || ""),
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("prequalifications").insert(record);
+    if (error) console.error("prequalification-check DB error:", error.message);
+  }
+  res.json({
+    prequalRef, contractorName, trade, score, status,
+    breakdown: { abn: !!abn, licence: !!licenceNumber, publicLiability: plValid, workersComp: wcValid, safetySystem: safetyMgmtSystem, certifications: { iso9001: iso9001Certified, iso45001: iso45001Certified } },
+    saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-tender-recommendation — AI recommends which tenderer to select
+app.post("/ai-tender-recommendation", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectDescription, budget, ranked = [],
+    localContentRequired = false, specialRequirements = [],
+  } = req.body;
+  if (!ranked.length) {
+    return res.status(400).json({ error: "ranked tenderers array is required." });
+  }
+  const systemPrompt = `You are an Australian construction procurement expert providing independent tender evaluation recommendations.`;
+  const userPrompt = `Review these ranked tender results and provide a recommendation:
+Project: ${sanitiseInput(projectDescription || "Not specified")}
+Budget: ${budget ? `$${budget} AUD` : "Not disclosed"}
+Local content required: ${localContentRequired}
+Special requirements: ${specialRequirements.map(r => sanitiseInput(r)).join(", ")}
+
+Ranked tenderers: ${JSON.stringify(ranked.slice(0, 5).map(t => ({
+  rank: t.rank,
+  name: t.tendererName,
+  score: t.totalWeightedScore,
+  price: t.priceExGst,
+})))}
+
+Return JSON with:
+{
+  "recommendation": "...",
+  "recommendedTenderer": "...",
+  "justification": "...",
+  "riskFactors": ["...", "..."],
+  "negotiationPoints": ["...", "..."],
+  "alternativeOption": "...",
+  "valueForMoneyAssessment": "...",
+  "conditionsOfAward": ["...", "..."],
+  "probityConsiderations": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const recommendation = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ projectId, tendererCount: ranked.length, recommendation });
+  } catch (err) {
+    console.error("ai-tender-recommendation error:", err.message);
+    const top = ranked[0] || {};
+    res.json({
+      projectId, tendererCount: ranked.length,
+      recommendation: {
+        recommendation: "Award to highest-ranked tenderer subject to satisfactory reference checks.",
+        recommendedTenderer: top.tendererName || "Rank 1 tenderer",
+        justification: `${top.tendererName || "The highest-ranked tenderer"} achieved the best weighted evaluation score of ${top.totalWeightedScore || "N/A"}.`,
+        riskFactors: ["Verify financial capacity before award", "Confirm licence and insurance currency"],
+        negotiationPoints: ["Confirm programme commitments", "Agree on key personnel"],
+        alternativeOption: ranked[1]?.tendererName ? `${ranked[1].tendererName} (Rank 2) is a viable alternative.` : "No alternative identified.",
+        valueForMoneyAssessment: "Subject to detailed review of pricing breakdown.",
+        conditionsOfAward: ["Insurance verification", "Reference checks", "Programme submission within 10 days of award"],
+        probityConsiderations: "Evaluation must be documented. Unsuccessful tenderers may request a debrief.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
