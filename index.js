@@ -44093,6 +44093,262 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /inspection-test-plan — Create an ITP with hold/witness point line items
+app.post("/inspection-test-plan", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, tradePackage, revisionNumber,
+    preparedBy, approvedBy, lineItems,
+  } = req.body;
+
+  if (!projectId || !tradePackage || !Array.isArray(lineItems) || lineItems.length === 0) {
+    return res.status(400).json({ error: "projectId, tradePackage, and lineItems[] are required." });
+  }
+
+  const sanitisedTrade = sanitiseInput(tradePackage, 120);
+  const sanitisedPreparer = sanitiseInput(preparedBy || "", 120);
+  const sanitisedApprover = sanitiseInput(approvedBy || "", 120);
+
+  const validPointTypes = ["HOLD", "WITNESS", "REVIEW", "MONITOR"];
+
+  const processedItems = lineItems.slice(0, 100).map((item, idx) => {
+    const pointType = validPointTypes.includes((item.pointType || "").toUpperCase())
+      ? item.pointType.toUpperCase()
+      : "REVIEW";
+    return {
+      lineNumber: idx + 1,
+      activity: sanitiseInput(String(item.activity || ""), 200),
+      referenceDoc: sanitiseInput(String(item.referenceDoc || ""), 100),
+      acceptanceCriteria: sanitiseInput(String(item.acceptanceCriteria || ""), 300),
+      pointType,
+      frequency: sanitiseInput(String(item.frequency || "Each occurrence"), 80),
+      responsibleParty: sanitiseInput(String(item.responsibleParty || "Contractor"), 80),
+      verifyingParty: sanitiseInput(String(item.verifyingParty || ""), 80),
+      status: "PENDING",
+      signedOffBy: null,
+      signedOffAt: null,
+      signedOffNotes: null,
+    };
+  });
+
+  const holdPointCount = processedItems.filter(i => i.pointType === "HOLD").length;
+  const witnessPointCount = processedItems.filter(i => i.pointType === "WITNESS").length;
+
+  const itpRef = `ITP-${sanitiseInput(String(projectId), 20)}-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    itpRef,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectName: sanitiseInput(projectName || "", 200),
+    tradePackage: sanitisedTrade,
+    revisionNumber: revisionNumber || "A",
+    status: "ACTIVE",
+    preparedBy: sanitisedPreparer,
+    approvedBy: sanitisedApprover,
+    holdPointCount,
+    witnessPointCount,
+    totalLineItems: processedItems.length,
+    completedLineItems: 0,
+    lineItems: processedItems,
+    createdAt: new Date().toISOString(),
+    lastUpdatedAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("inspection_test_plans").insert(record);
+      if (error) console.error("ITP insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("ITP DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    itpRef,
+    holdPointCount,
+    witnessPointCount,
+    totalLineItems: processedItems.length,
+    message: `ITP created with ${holdPointCount} hold point(s) and ${witnessPointCount} witness point(s). Hold points require formal sign-off before proceeding.`,
+    saved,
+    record,
+  });
+});
+
+// PATCH /inspection-test-plan/:itpRef/sign-off — Sign off a line item (or release a hold point)
+app.patch("/inspection-test-plan/:itpRef/sign-off", apiKeyAuth, async (req, res) => {
+  const { itpRef } = req.params;
+  const { lineNumber, signedOffBy, signedOffNotes, status } = req.body;
+
+  if (!lineNumber || !signedOffBy) {
+    return res.status(400).json({ error: "lineNumber and signedOffBy are required." });
+  }
+
+  const validStatuses = ["PASSED", "FAILED", "CONDITIONAL_PASS"];
+  const resolvedStatus = validStatuses.includes((status || "").toUpperCase()) ? status.toUpperCase() : "PASSED";
+
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: "Database not configured." });
+  }
+
+  try {
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("inspection_test_plans")
+      .select("lineItems, completedLineItems, totalLineItems")
+      .eq("itpRef", sanitiseInput(itpRef, 60))
+      .single();
+
+    if (fetchErr || !existing) {
+      return res.status(404).json({ error: "ITP not found." });
+    }
+
+    const items = existing.lineItems || [];
+    const itemIndex = items.findIndex(i => i.lineNumber === Number(lineNumber));
+    if (itemIndex === -1) return res.status(404).json({ error: "Line item not found." });
+
+    const item = items[itemIndex];
+    if (item.pointType === "HOLD" && resolvedStatus !== "PASSED" && resolvedStatus !== "CONDITIONAL_PASS") {
+      return res.status(422).json({ error: "Hold points must receive PASSED or CONDITIONAL_PASS to proceed." });
+    }
+
+    items[itemIndex] = {
+      ...item,
+      status: resolvedStatus,
+      signedOffBy: sanitiseInput(signedOffBy, 120),
+      signedOffAt: new Date().toISOString(),
+      signedOffNotes: sanitiseInput(signedOffNotes || "", 300),
+    };
+
+    const completedCount = items.filter(i => i.status !== "PENDING").length;
+    const allComplete = completedCount === existing.totalLineItems;
+
+    const { error: updateErr } = await supabaseAdmin
+      .from("inspection_test_plans")
+      .update({
+        lineItems: items,
+        completedLineItems: completedCount,
+        status: allComplete ? "COMPLETE" : "ACTIVE",
+        lastUpdatedAt: new Date().toISOString(),
+      })
+      .eq("itpRef", sanitiseInput(itpRef, 60));
+
+    if (updateErr) throw updateErr;
+
+    return res.json({
+      success: true,
+      itpRef,
+      lineNumber: Number(lineNumber),
+      status: resolvedStatus,
+      completedLineItems: completedCount,
+      totalLineItems: existing.totalLineItems,
+      itpComplete: allComplete,
+      message: item.pointType === "HOLD"
+        ? `Hold point ${lineNumber} released — work may proceed.`
+        : `Line item ${lineNumber} signed off as ${resolvedStatus}.`,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to sign off ITP line item.", detail: e.message });
+  }
+});
+
+// POST /ai-itp-generator — AI generates an Inspection & Test Plan for a scope of works
+app.post("/ai-itp-generator", apiKeyAuth, async (req, res) => {
+  const { tradePackage, scopeOfWorks, contractType, qualityStandards, projectClass, notes } = req.body;
+
+  if (!tradePackage || !scopeOfWorks) {
+    return res.status(400).json({ error: "tradePackage and scopeOfWorks are required." });
+  }
+
+  const sanitisedTrade = sanitiseInput(tradePackage, 120);
+  const sanitisedScope = sanitiseInput(scopeOfWorks, 600);
+  const sanitisedStandards = Array.isArray(qualityStandards)
+    ? qualityStandards.map(s => sanitiseInput(String(s), 80)).slice(0, 10)
+    : [];
+
+  const prompt = `You are an experienced quality manager for a Victorian construction company.
+
+Generate a comprehensive Inspection & Test Plan (ITP) for:
+- Trade package: ${sanitisedTrade}
+- Scope: ${sanitisedScope}
+- Contract type: ${sanitiseInput(contractType || "Design & Construct", 60)}
+- Project class: ${sanitiseInput(projectClass || "Class 2-9 building", 60)}
+- Quality standards: ${sanitisedStandards.join(", ") || "AS/NZS ISO 9001, NCC 2022, applicable Australian Standards"}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Assign point types:
+- HOLD = Must stop and await formal sign-off before proceeding (critical quality gates)
+- WITNESS = Inspector must be present; work can proceed if unavailable with notice
+- REVIEW = Inspector reviews records/documentation
+- MONITOR = Ongoing observation, no formal hold
+
+Respond ONLY with a JSON object:
+{
+  "itpTitle": string,
+  "applicableStandards": [string],
+  "lineItems": [
+    {
+      "activity": string,
+      "referenceDoc": string (standard or spec clause),
+      "acceptanceCriteria": string,
+      "pointType": "HOLD|WITNESS|REVIEW|MONITOR",
+      "frequency": string,
+      "responsibleParty": "Contractor|Subcontractor|Superintendent|Engineer",
+      "verifyingParty": string
+    }
+  ],
+  "specialInspections": [string],
+  "holdPointsSummary": string,
+  "qualityRisks": [{"risk": string, "mitigation": string}]
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1600,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+    const items = (parsed.lineItems || []).slice(0, 50);
+
+    return res.json({
+      success: true,
+      itpTitle: parsed.itpTitle || `${sanitisedTrade} ITP`,
+      applicableStandards: parsed.applicableStandards || [],
+      lineItems: items,
+      holdPointCount: items.filter(i => i.pointType === "HOLD").length,
+      witnessPointCount: items.filter(i => i.pointType === "WITNESS").length,
+      specialInspections: parsed.specialInspections || [],
+      holdPointsSummary: parsed.holdPointsSummary || "",
+      qualityRisks: parsed.qualityRisks || [],
+      note: "Review and customise this AI-generated ITP before issuing for construction.",
+    });
+  } catch (e) {
+    console.error("AI ITP generator error:", e.message);
+    return res.json({
+      success: true,
+      itpTitle: `${sanitisedTrade} ITP`,
+      applicableStandards: ["NCC 2022", "AS/NZS ISO 9001", "AS 3000"],
+      lineItems: [
+        { activity: "Pre-commencement inspection", referenceDoc: "Contract specifications", acceptanceCriteria: "Site ready, materials approved", pointType: "HOLD", frequency: "Once", responsibleParty: "Contractor", verifyingParty: "Superintendent" },
+        { activity: "Materials delivery inspection", referenceDoc: "Approved submittal", acceptanceCriteria: "Materials match approved submittals, no damage", pointType: "WITNESS", frequency: "Each delivery", responsibleParty: "Contractor", verifyingParty: "Superintendent" },
+        { activity: "In-progress inspection", referenceDoc: "NCC 2022", acceptanceCriteria: "Work conforms to specifications and drawings", pointType: "WITNESS", frequency: "As required", responsibleParty: "Contractor", verifyingParty: "Superintendent" },
+        { activity: "Final inspection", referenceDoc: "Contract specifications", acceptanceCriteria: "Works complete, all defects rectified", pointType: "HOLD", frequency: "Once", responsibleParty: "Contractor", verifyingParty: "Superintendent" },
+      ],
+      holdPointCount: 2,
+      witnessPointCount: 2,
+      specialInspections: ["Third-party inspection may be required for structural elements"],
+      holdPointsSummary: "2 hold points at pre-commencement and final inspection.",
+      qualityRisks: [{ risk: "Non-conforming materials used", mitigation: "Require material submittals prior to delivery" }],
+      note: "AI generation failed — generic ITP returned. Please customise before use.",
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
