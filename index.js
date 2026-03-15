@@ -664,24 +664,56 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
       throw replicateErr;
     }
 
-    console.log("[visualise] Step 4 - Result received, output type:", typeof output, "isArray:", Array.isArray(output));
-    console.log("[visualise] Step 4 - Raw output:", JSON.stringify(output, null, 2));
-
-    // Replicate SDK ≥ 1.0 returns FileOutput objects; extract URL string
-    let imageUrl = Array.isArray(output) ? output[0] : output;
-    if (imageUrl && typeof imageUrl === "object" && typeof imageUrl.url === "function") {
-      imageUrl = imageUrl.url();
-    }
-    if (imageUrl && typeof imageUrl === "object" && imageUrl.href) {
-      imageUrl = imageUrl.href;
+    // Step 4: Resolve output → imageUrl
+    // Replicate SDK ≥ 1.0 wraps results in FileOutput objects (not plain strings),
+    // so JSON.stringify shows {} — log the raw value explicitly instead.
+    console.log("[visualise] Step 4 - Raw output type:", typeof output, "| isArray:", Array.isArray(output), "| isNull:", output === null);
+    console.log("[visualise] Step 4 - Raw output (String):", String(output));
+    if (output && typeof output === "object") {
+      console.log("[visualise] Step 4 - Output keys:", Object.keys(output));
     }
 
-    console.log("[visualise] Step 4 - Resolved imageUrl:", imageUrl);
+    let imageUrl = null;
 
-    if (!imageUrl) {
-      return res.status(500).json({ error: "No image returned from Replicate." });
+    if (output === null || output === undefined) {
+      console.error("[visualise] Step 4 - Replicate returned null/undefined output.");
+      return res.status(500).json({ error: "Replicate returned no output. The model may have rejected the input." });
     }
 
+    // Array response — take the first element (most common case)
+    if (Array.isArray(output)) {
+      console.log("[visualise] Step 4 - Array of length:", output.length);
+      const first = output[0];
+      if (!first) {
+        console.error("[visualise] Step 4 - Array was empty.");
+        return res.status(500).json({ error: "Replicate returned an empty array." });
+      }
+      imageUrl = first;
+    } else {
+      imageUrl = output;
+    }
+
+    // Unwrap Replicate FileOutput objects (SDK ≥ 1.0)
+    if (imageUrl && typeof imageUrl === "object") {
+      if (typeof imageUrl.url === "function") {
+        imageUrl = imageUrl.url();
+        console.log("[visualise] Step 4 - Unwrapped via .url():", imageUrl);
+      } else if (typeof imageUrl.href === "string") {
+        imageUrl = imageUrl.href;
+        console.log("[visualise] Step 4 - Unwrapped via .href:", imageUrl);
+      } else {
+        console.error("[visualise] Step 4 - Unknown object shape:", Object.keys(imageUrl));
+        return res.status(500).json({ error: "Replicate returned an unrecognised output format.", detail: Object.keys(imageUrl) });
+      }
+    }
+
+    // Final check — must be a non-empty string
+    if (typeof imageUrl !== "string" || !imageUrl) {
+      console.error("[visualise] Step 4 - imageUrl is not a valid string:", imageUrl);
+      return res.status(500).json({ error: "Could not extract a valid image URL from Replicate output.", received: String(imageUrl) });
+    }
+
+    console.log(`[visualise] Step 4 - Resolved imageUrl: ${imageUrl}`);
     console.log(`[visualise] Completed for model "${modelNumber}" → ${imageUrl}`);
     return res.json({ imageUrl });
 
