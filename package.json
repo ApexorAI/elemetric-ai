@@ -19,6 +19,7 @@
     "express": "^5.2.1",
     "express-rate-limit": "^8.3.1",
     "helmet": "^8.1.0",
+    "lru-cache": "^11.2.7",
     "openai": "^6.25.0",
     "replicate": "^1.4.0",
     "resend": "^6.9.3",

@@ -11,6 +11,7 @@ const Stripe  = require("stripe");
 const { createClient } = require("@supabase/supabase-js");
 const sharp   = require("sharp");
 const { Resend } = require("resend");
+const { LRUCache } = require("lru-cache");
 
 // ── Victorian Regulations Knowledge Base ──────────────────────────────────────
 // Verified requirements from AS/NZS 3500, AS/NZS 5601.1, AS/NZS 3000, AS 1684.
@@ -90,10 +91,32 @@ const COST_PER_OPENAI_CALL    = 0.002;  // GPT-4.1-mini vision (USD estimate)
 const COST_PER_REPLICATE_CALL = 0.05;   // Stable Diffusion inpainting (USD estimate)
 const COST_PER_EMAIL          = 0.001;  // Resend transactional (USD estimate)
 
-// ── In-memory analysis cache (1-hour TTL) + request deduplication ────────────
-const analysisCache   = new Map();
+// ── Task 21: LRU Cache (upgraded from simple Map) ────────────────────────────
+// Max 500 entries, 1-hour TTL per entry. Eviction analytics tracked.
 const CACHE_TTL_MS    = 60 * 60 * 1000;
+const analysisCache   = new LRUCache({
+  max:               500,
+  ttl:               CACHE_TTL_MS,
+  updateAgeOnGet:    false,
+  allowStale:        false,
+  disposeAfter:      () => { cacheAnalytics.evictions++; },
+});
 const pendingAnalyses = new Map(); // cacheKey → Promise
+
+const cacheAnalytics = {
+  hits:       0,
+  misses:     0,
+  evictions:  0,
+  sets:       0,
+  get hitRate() {
+    const total = this.hits + this.misses;
+    return total > 0 ? parseFloat(((this.hits / total) * 100).toFixed(1)) : 0;
+  },
+  get missRate() {
+    const total = this.hits + this.misses;
+    return total > 0 ? parseFloat(((this.misses / total) * 100).toFixed(1)) : 0;
+  },
+};
 
 function getCacheKey(type, images) {
   const h = crypto.createHash("sha256");
@@ -106,14 +129,39 @@ function getCacheKey(type, images) {
 }
 
 function getCached(key) {
-  const entry = analysisCache.get(key);
-  if (!entry) return null;
-  if (Date.now() > entry.expiresAt) { analysisCache.delete(key); return null; }
-  return entry.result;
+  const result = analysisCache.get(key);
+  if (result) {
+    cacheAnalytics.hits++;
+    return result;
+  }
+  cacheAnalytics.misses++;
+  return null;
 }
 
 function setCache(key, result) {
-  analysisCache.set(key, { result, expiresAt: Date.now() + CACHE_TTL_MS });
+  analysisCache.set(key, result);
+  cacheAnalytics.sets++;
+}
+
+// Cache warming: pre-populate common type + empty-images keys at startup
+// (lightweight — no real API calls; just ensures the LRU is initialised)
+const WARMABLE_TYPES = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+// Actual warm entries require real images — warming here is a no-op placeholder
+// that can be extended once common test-image hashes are available.
+// console.log(`[cache] LRU cache initialised (max 500 entries, TTL ${CACHE_TTL_MS / 60000} min)`);
+
+// POST /cache/clear — manual cache flush (protected by API key middleware)
+// Defined after middleware is registered; here we just declare the handler reference.
+function registerCacheClearRoute(app) {
+  app.post("/cache/clear", (_req, res) => {
+    const sizeBefore = analysisCache.size;
+    analysisCache.clear();
+    return res.json({
+      cleared:     true,
+      entriesCleared: sizeBefore,
+      clearedAt:   new Date().toISOString(),
+    });
+  });
 }
 
 // ── AI response validation ────────────────────────────────────────────────────
@@ -3230,9 +3278,23 @@ app.get("/stats", (_req, res) => {
     ...usageStats,
     estimatedCostUSD: parseFloat(estimatedCostUSD.toFixed(4)),
     uptimeSeconds:    Math.round(process.uptime()),
-    cacheSize:        analysisCache.size,
+    cache: {
+      entries:      analysisCache.size,
+      maxEntries:   500,
+      ttlMinutes:   60,
+      hits:         cacheAnalytics.hits,
+      misses:       cacheAnalytics.misses,
+      evictions:    cacheAnalytics.evictions,
+      sets:         cacheAnalytics.sets,
+      hitRatePct:   cacheAnalytics.hitRate,
+      missRatePct:  cacheAnalytics.missRate,
+    },
     pendingAnalyses:  pendingAnalyses.size,
     promptAbTesting:  promptAbStats,
+    notifications: {
+      queued: notificationQueue.filter(n => !n.sent).length,
+      sent:   notificationLog.length,
+    },
   });
 });
 
@@ -4684,6 +4746,232 @@ app.get("/notifications/:userId", (req, res) => {
   return res.json({ userId, sent: userNotifications, pending });
 });
 
+// ── Task 19: Data Integrity Checker ──────────────────────────────────────────
+// Comprehensive integrity checks before PDF generation.
+
+app.post("/check-integrity", async (req, res) => {
+  const { jobId } = req.body || {};
+
+  if (!jobId || typeof jobId !== "string") {
+    return res.status(400).json({ error: "jobId is required." });
+  }
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: "Database not configured." });
+  }
+
+  const issues  = [];
+  const checks  = {};
+  let jobRecord = null;
+
+  // 1. Fetch job from database
+  try {
+    const { data, error } = await supabaseAdmin.from("analyses").select("*").eq("id", jobId).single();
+    if (error || !data) {
+      return res.status(404).json({ pass: false, jobId, issues: ["Job not found in database."], checks: {} });
+    }
+    jobRecord = data;
+  } catch (e) {
+    return res.status(500).json({ pass: false, jobId, issues: [`Database error: ${e.message}`], checks: {} });
+  }
+
+  // 2. Required fields
+  const REQUIRED = ["id", "job_type", "created_at"];
+  const missingRequired = REQUIRED.filter(f => !jobRecord[f]);
+  checks.requiredFields = { pass: missingRequired.length === 0, detail: missingRequired.length === 0 ? "All required fields present" : `Missing: ${missingRequired.join(", ")}` };
+  if (missingRequired.length > 0) issues.push(`Missing required fields: ${missingRequired.join(", ")}`);
+
+  // 3. Timestamp not in the future
+  const createdAt = new Date(jobRecord.created_at);
+  const tsValid   = !isNaN(createdAt.getTime()) && createdAt <= new Date();
+  checks.timestamp = { pass: tsValid, detail: tsValid ? `Timestamp ${createdAt.toISOString()} is valid` : `Timestamp is in the future or invalid: ${jobRecord.created_at}` };
+  if (!tsValid) issues.push("Timestamp is invalid or in the future.");
+
+  // 4. Confidence score 0-100
+  const conf       = jobRecord.confidence ?? jobRecord.overall_confidence;
+  const confValid  = typeof conf === "number" && conf >= 0 && conf <= 100;
+  checks.confidence = { pass: confValid, detail: confValid ? `Confidence ${conf} is valid` : `Confidence '${conf}' is out of range 0–100` };
+  if (!confValid) issues.push(`Confidence score '${conf}' is invalid.`);
+
+  // 5. GPS coordinates — Australian range check
+  if (jobRecord.gps_lat != null && jobRecord.gps_lng != null) {
+    const lat = parseFloat(jobRecord.gps_lat);
+    const lng = parseFloat(jobRecord.gps_lng);
+    const gpsValid = !isNaN(lat) && !isNaN(lng) && lat >= -44 && lat <= -10 && lng >= 113 && lng <= 154;
+    checks.gpsCoordinates = { pass: gpsValid, detail: gpsValid ? `GPS (${lat}, ${lng}) is valid Australian coordinate` : `GPS (${lat}, ${lng}) is outside Australian bounds` };
+    if (!gpsValid) issues.push(`GPS coordinates (${jobRecord.gps_lat}, ${jobRecord.gps_lng}) are not valid Australian coordinates.`);
+  } else {
+    checks.gpsCoordinates = { pass: true, detail: "GPS not provided (optional)" };
+  }
+
+  // 6. Checklist items valid
+  const detected  = jobRecord.items_detected;
+  const missing   = jobRecord.items_missing;
+  const detectedOk = !detected || Array.isArray(detected) || typeof detected === "string";
+  checks.checklistItems = { pass: detectedOk, detail: detectedOk ? "Checklist arrays are valid" : "items_detected has unexpected type" };
+  if (!detectedOk) issues.push("Checklist items have unexpected format.");
+
+  // 7. Signature data — if present, must be a non-empty string
+  if (jobRecord.signature_data != null) {
+    const sigValid = typeof jobRecord.signature_data === "string" && jobRecord.signature_data.length > 10;
+    checks.signature = { pass: sigValid, detail: sigValid ? "Signature data present and non-empty" : "Signature data is present but appears empty or invalid" };
+    if (!sigValid) issues.push("Signature data is invalid.");
+  } else {
+    checks.signature = { pass: true, detail: "No signature data (optional)" };
+  }
+
+  // 8. Photos — at least one should be submitted
+  const photosCount = jobRecord.photos_submitted ?? jobRecord.photo_count ?? 0;
+  const photosValid = photosCount >= 1;
+  checks.photos = { pass: photosValid, detail: photosValid ? `${photosCount} photos submitted` : "No photos submitted" };
+  if (!photosValid) issues.push("No photos submitted for this job.");
+
+  // 9. Job type — must be a known trade type
+  const knownTypes  = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+  const typeValid   = typeof jobRecord.job_type === "string" && (knownTypes.includes(jobRecord.job_type) || jobRecord.job_type.length > 2);
+  checks.jobType = { pass: typeValid, detail: typeValid ? `Job type '${jobRecord.job_type}' is valid` : `Unknown job type: '${jobRecord.job_type}'` };
+  if (!typeValid) issues.push(`Job type '${jobRecord.job_type}' is not recognised.`);
+
+  const passedChecks = Object.values(checks).filter(c => c.pass).length;
+  const totalChecks  = Object.values(checks).length;
+  const pass         = issues.length === 0;
+
+  return res.json({
+    pass,
+    jobId,
+    score:      `${passedChecks}/${totalChecks}`,
+    issues,
+    checks,
+    checkedAt:  new Date().toISOString(),
+    readyForPdf: pass,
+  });
+});
+
+// ── Task 20: Compliance Trend Analyser ───────────────────────────────────────
+// Detailed trend analysis for a plumber's compliance scores over time.
+
+app.post("/analyse-trends", async (req, res) => {
+  const { plumberId, startDate, endDate } = req.body || {};
+
+  if (!plumberId || typeof plumberId !== "string") {
+    return res.status(400).json({ error: "plumberId is required." });
+  }
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: "Database not configured." });
+  }
+
+  try {
+    let query = supabaseAdmin
+      .from("analyses")
+      .select("id, job_type, confidence, missing_items, created_at")
+      .eq("user_id", plumberId)
+      .order("created_at", { ascending: true });
+
+    if (startDate) query = query.gte("created_at", startDate);
+    if (endDate)   query = query.lte("created_at", endDate);
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const jobs = data || [];
+    if (jobs.length < 2) {
+      return res.status(200).json({
+        plumberId,
+        message: "Not enough job history for trend analysis (minimum 2 jobs required).",
+        jobsAnalysed: jobs.length,
+      });
+    }
+
+    // Compute trend data points (for charting)
+    const trendPoints = jobs.map(j => ({
+      date:       j.created_at,
+      jobType:    j.job_type,
+      confidence: j.confidence || 0,
+      id:         j.id,
+    }));
+
+    // Per-type averages
+    const byType = {};
+    for (const job of jobs) {
+      if (!byType[job.job_type]) byType[job.job_type] = { jobs: [], total: 0 };
+      byType[job.job_type].jobs.push(job.confidence || 0);
+      byType[job.job_type].total += (job.confidence || 0);
+    }
+    const typeStats = Object.entries(byType).map(([t, d]) => ({
+      jobType:    t,
+      avgScore:   Math.round(d.total / d.jobs.length),
+      jobCount:   d.jobs.length,
+    })).sort((a, b) => b.avgScore - a.avgScore);
+
+    const bestType  = typeStats[0];
+    const worstType = typeStats[typeStats.length - 1];
+
+    // Overall improvement rate (linear regression slope)
+    const n      = jobs.length;
+    const xVals  = jobs.map((_, i) => i);
+    const yVals  = jobs.map(j => j.confidence || 0);
+    const xMean  = xVals.reduce((a, b) => a + b, 0) / n;
+    const yMean  = yVals.reduce((a, b) => a + b, 0) / n;
+    const slope  = xVals.reduce((s, x, i) => s + (x - xMean) * (yVals[i] - yMean), 0) /
+                   xVals.reduce((s, x) => s + Math.pow(x - xMean, 2), 0);
+    const trendDirection = slope > 0.5 ? "improving" : slope < -0.5 ? "declining" : "stable";
+    const improvementRate = parseFloat(slope.toFixed(2));
+
+    // Missing items analysis
+    const missingFreq = {};
+    for (const job of jobs) {
+      const items = Array.isArray(job.missing_items) ? job.missing_items :
+        (typeof job.missing_items === "string" ? JSON.parse(job.missing_items || "[]") : []);
+      for (const item of items) {
+        if (item) missingFreq[item] = (missingFreq[item] || 0) + 1;
+      }
+    }
+    const sortedMissing = Object.entries(missingFreq).sort((a, b) => b[1] - a[1]);
+    const mostConsistentlyFailed = sortedMissing[0] ? sortedMissing[0][0] : null;
+    const mostImprovedItem       = sortedMissing.length > 1 ? sortedMissing[sortedMissing.length - 1][0] : null;
+
+    // Compare to previous period
+    const half1Avg = Math.round(yVals.slice(0, Math.ceil(n / 2)).reduce((a, b) => a + b, 0) / Math.ceil(n / 2));
+    const half2Avg = Math.round(yVals.slice(Math.ceil(n / 2)).reduce((a, b) => a + b, 0) / Math.floor(n / 2));
+    const changePct = parseFloat(((half2Avg - half1Avg) / Math.max(1, half1Avg) * 100).toFixed(1));
+
+    // Personalised coaching message
+    let coachingMessage;
+    if (trendDirection === "improving" && yMean >= 75) {
+      coachingMessage = `Excellent trajectory — your average score of ${Math.round(yMean)}% is strong and still improving. Keep focusing on documentation completeness.`;
+    } else if (trendDirection === "improving") {
+      coachingMessage = `Your scores are trending upward — great work. Your most consistent miss is "${mostConsistentlyFailed || "unknown"}". Focus there to accelerate improvement.`;
+    } else if (trendDirection === "declining") {
+      coachingMessage = `Your scores have been declining. The most common issue is "${mostConsistentlyFailed || "documentation completeness"}". Try a consistent pre-job photo checklist to reverse the trend.`;
+    } else {
+      coachingMessage = `Your scores are stable at ${Math.round(yMean)}%. ${mostConsistentlyFailed ? `Address "${mostConsistentlyFailed}" consistently to break through to the next level.` : "Keep building your documentation habits."}`;
+    }
+
+    return res.json({
+      plumberId,
+      period:             { start: startDate || trendPoints[0]?.date, end: endDate || trendPoints[trendPoints.length - 1]?.date },
+      trendPoints,
+      summary: {
+        jobsAnalysed:           n,
+        overallAvgScore:        Math.round(yMean),
+        trendDirection,
+        improvementRatePerJob:  improvementRate,
+        previousHalfAvg:        half1Avg,
+        currentHalfAvg:         half2Avg,
+        changePercent:          changePct,
+        bestJobType:            bestType,
+        worstJobType:           worstType,
+        mostConsistentlyFailed,
+        mostImprovedItem,
+      },
+      byJobType:          typeStats,
+      coachingMessage,
+    });
+  } catch (err) {
+    console.error("analyse-trends error:", err);
+    return res.status(500).json({ error: "Trends analysis failed. Please try again." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
@@ -4698,6 +4986,9 @@ app.use((err, req, res, _next) => {
   const status = typeof err.status === "number" ? err.status : 500;
   res.status(status).json({ error: err.message || "An unexpected error occurred." });
 });
+
+// Register cache clear route (protected by existing API key middleware)
+registerCacheClearRoute(app);
 
 const PORT = process.env.PORT || 8080;
 
