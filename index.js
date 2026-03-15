@@ -36746,6 +36746,190 @@ app.get("/client-survey", apiKeyAuth, async (req, res) => {
   });
 });
 
+// POST /plant-equipment-log — Register plant and equipment for a project
+app.post("/plant-equipment-log", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, assetName, assetType, make, model, serialNumber, registrationNumber,
+    yearOfManufacture, lastInspectionDate, nextInspectionDue, operatorLicenceRequired,
+    operatorName, operatorLicenceNumber, safeWorkingLoad, swmsRequired = false,
+    status = "ACTIVE", notes,
+  } = req.body;
+  if (!assetName || !assetType) {
+    return res.status(400).json({ error: "assetName and assetType are required." });
+  }
+  const validStatuses = ["ACTIVE", "IDLE", "OUT_OF_SERVICE", "DISPOSED"];
+  if (!validStatuses.includes(status)) return res.status(400).json({ error: `status must be one of: ${validStatuses.join(", ")}` });
+  const assetRef = `PLT-${Date.now().toString(36).toUpperCase()}`;
+  const daysUntilInspection = nextInspectionDue
+    ? Math.ceil((new Date(nextInspectionDue) - new Date()) / (1000 * 60 * 60 * 24))
+    : null;
+  const inspectionStatus = daysUntilInspection === null ? "UNKNOWN"
+    : daysUntilInspection < 0 ? "OVERDUE"
+    : daysUntilInspection <= 14 ? "DUE_SOON"
+    : "CURRENT";
+  const record = {
+    asset_ref: assetRef,
+    project_id: projectId || null,
+    asset_name: sanitiseInput(assetName),
+    asset_type: sanitiseInput(assetType),
+    make: sanitiseInput(make || ""),
+    model: sanitiseInput(model || ""),
+    serial_number: sanitiseInput(serialNumber || ""),
+    registration_number: sanitiseInput(registrationNumber || ""),
+    year_of_manufacture: Number(yearOfManufacture) || null,
+    last_inspection_date: lastInspectionDate || null,
+    next_inspection_due: nextInspectionDue || null,
+    operator_licence_required: Boolean(operatorLicenceRequired),
+    operator_name: sanitiseInput(operatorName || ""),
+    operator_licence_number: sanitiseInput(operatorLicenceNumber || ""),
+    safe_working_load: sanitiseInput(safeWorkingLoad || ""),
+    swms_required: Boolean(swmsRequired),
+    status,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("plant_equipment").insert(record);
+    if (error) console.error("plant-equipment-log DB error:", error.message);
+  }
+  res.json({
+    assetRef, assetName, assetType, status, inspectionStatus,
+    daysUntilInspection, swmsRequired, saved: !!supabaseAdmin,
+  });
+});
+
+// GET /plant-equipment-log — List plant and equipment for a project
+app.get("/plant-equipment-log", apiKeyAuth, async (req, res) => {
+  const { projectId, status, assetType } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("plant_equipment").select("*").order("created_at", { ascending: false });
+  if (projectId) query = query.eq("project_id", projectId);
+  if (status) query = query.eq("status", status);
+  if (assetType) query = query.eq("asset_type", assetType);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  const now = new Date();
+  const overdueInspections = data.filter(a => a.next_inspection_due && new Date(a.next_inspection_due) < now).length;
+  res.json({ count: data.length, overdueInspections, assets: data });
+});
+
+// POST /maintenance-schedule — Create a preventive maintenance schedule
+app.post("/maintenance-schedule", apiKeyAuth, async (req, res) => {
+  const {
+    assetId, assetName, assetType, maintenanceTasks = [],
+    lastServiceDate, serviceIntervalDays, nextServiceDue,
+    assignedTechnician, estimatedDurationHours, partsCost, labourCost,
+    maintenanceType = "PREVENTIVE", notes,
+  } = req.body;
+  if (!assetName || !maintenanceTasks.length) {
+    return res.status(400).json({ error: "assetName and at least one maintenanceTask are required." });
+  }
+  const validTypes = ["PREVENTIVE", "CORRECTIVE", "CONDITION_BASED", "SCHEDULED", "EMERGENCY"];
+  if (!validTypes.includes(maintenanceType)) return res.status(400).json({ error: `maintenanceType must be one of: ${validTypes.join(", ")}` });
+  const scheduleRef = `MNT-${Date.now().toString(36).toUpperCase()}`;
+  const calculatedNextService = nextServiceDue || (lastServiceDate && serviceIntervalDays
+    ? new Date(new Date(lastServiceDate).getTime() + Number(serviceIntervalDays) * 86400000).toISOString().split("T")[0]
+    : null);
+  const daysUntilService = calculatedNextService
+    ? Math.ceil((new Date(calculatedNextService) - new Date()) / (1000 * 60 * 60 * 24))
+    : null;
+  const totalCost = (Number(partsCost) || 0) + (Number(labourCost) || 0);
+  const record = {
+    schedule_ref: scheduleRef,
+    asset_id: assetId || null,
+    asset_name: sanitiseInput(assetName),
+    asset_type: sanitiseInput(assetType || ""),
+    maintenance_tasks: Array.isArray(maintenanceTasks) ? maintenanceTasks.map(t => sanitiseInput(t)) : [],
+    last_service_date: lastServiceDate || null,
+    service_interval_days: Number(serviceIntervalDays) || null,
+    next_service_due: calculatedNextService,
+    assigned_technician: sanitiseInput(assignedTechnician || ""),
+    estimated_duration_hours: Number(estimatedDurationHours) || null,
+    parts_cost: Number(partsCost) || 0,
+    labour_cost: Number(labourCost) || 0,
+    total_cost: +totalCost.toFixed(2),
+    maintenance_type: maintenanceType,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("maintenance_schedules").insert(record);
+    if (error) console.error("maintenance-schedule DB error:", error.message);
+  }
+  res.json({
+    scheduleRef, assetName, maintenanceType, taskCount: record.maintenance_tasks.length,
+    nextServiceDue: calculatedNextService, daysUntilService,
+    totalCost: +totalCost.toFixed(2), saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-defect-diagnosis — AI diagnoses a defect and suggests remediation
+app.post("/ai-defect-diagnosis", apiKeyAuth, async (req, res) => {
+  const {
+    trade, defectDescription, location, age_years, symptoms = [],
+    previousRepairs = [], urgency = "ROUTINE",
+  } = req.body;
+  if (!trade || !defectDescription) {
+    return res.status(400).json({ error: "trade and defectDescription are required." });
+  }
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedDesc = sanitiseInput(defectDescription);
+  const sanitisedLocation = sanitiseInput(location || "");
+  const systemPrompt = `You are an experienced Australian trade diagnostician. Analyse defects and recommend remediation.`;
+  const userPrompt = `Diagnose this ${sanitisedTrade} defect and recommend remediation:
+Description: ${sanitisedDesc}
+Location: ${sanitisedLocation || "Not specified"}
+Asset age: ${age_years ? `${age_years} years` : "Unknown"}
+Symptoms: ${symptoms.map(s => sanitiseInput(s)).join("; ") || "As described"}
+Previous repairs: ${previousRepairs.map(r => sanitiseInput(r)).join("; ") || "None known"}
+Urgency: ${urgency}
+
+Return JSON with:
+{
+  "likelyCause": "...",
+  "diagnosisConfidence": "HIGH|MEDIUM|LOW",
+  "rootCauses": ["...", "..."],
+  "remediationSteps": [{"step": 1, "action": "...", "specialist": "...", "estimatedCost": "..."}],
+  "safetyRisks": ["...", "..."],
+  "urgencyAssessment": "...",
+  "preventionMeasures": ["...", "..."],
+  "applicableStandards": ["...", "..."],
+  "estimatedLifeExtension": "...",
+  "replacementTriggers": ["...", "..."]
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const diagnosis = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ trade: sanitisedTrade, defectDescription: sanitisedDesc, urgency, diagnosis });
+  } catch (err) {
+    console.error("ai-defect-diagnosis error:", err.message);
+    res.json({
+      trade: sanitisedTrade, defectDescription: sanitisedDesc, urgency,
+      diagnosis: {
+        likelyCause: "Unable to determine — manual inspection required.",
+        diagnosisConfidence: "LOW",
+        rootCauses: ["Requires on-site assessment"],
+        remediationSteps: [{ step: 1, action: "Engage qualified tradesperson for on-site inspection", specialist: sanitisedTrade, estimatedCost: "TBD" }],
+        safetyRisks: ["Do not use affected system until inspected"],
+        urgencyAssessment: urgency,
+        preventionMeasures: ["Regular scheduled maintenance", "Annual compliance inspections"],
+        applicableStandards: [],
+        estimatedLifeExtension: "Subject to inspection findings",
+        replacementTriggers: ["If repair cost exceeds 50% of replacement cost"],
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
