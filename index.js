@@ -81179,6 +81179,456 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 285 ─────────────────────────────────────────────────────────────────
+
+// POST /asbestos-register-entry — Record asbestos register entry per OHS Regulations 2017 (Vic) / AS 2601
+app.post("/asbestos-register-entry", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, buildingId, itemId, location, assessmentDate, assessedBy,
+      asbestosType, asbestosForm, condition, friable,
+      materialDescription, areaSqm, accessibilitY,
+      samplingConducted, sampleLabRef, confirmed,
+      removalRequired, removalPriority, removalMethod,
+      encapsulationApplied, encapsulationDate,
+      lastInspectionDate, nextReviewDate,
+      accessRestrictionInPlace, signageDisplayed,
+      removedDate, removedBy, removalLicenceNumber,
+      certRef, notes
+    } = req.body;
+
+    if (!buildingId || !location || !assessmentDate || !assessedBy) {
+      return res.status(400).json({ error: "buildingId, location, assessmentDate, assessedBy are required." });
+    }
+
+    const safeBuildingId = sanitiseInput(String(buildingId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeAssessor = sanitiseInput(String(assessedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const criticalIssues = [];
+    const warnings = [];
+
+    const asbestosCondition = String(condition || "").toUpperCase();
+    const isFriable = friable === true || friable === "true";
+    const isConfirmed = confirmed === true || confirmed === "true";
+
+    // OHS Regulations 2017 (Vic) regs 4.5.1–4.5.20 / AS 2601
+    if (isFriable && isConfirmed) {
+      criticalIssues.push("Confirmed friable asbestos identified — highest priority for removal by Class A licensed removalist. Restrict access immediately (OHS Regulations 2017 (Vic) reg 4.5.11).");
+    }
+
+    if (asbestosCondition === "POOR" || asbestosCondition === "DAMAGED") {
+      if (!removalRequired) {
+        criticalIssues.push(`Asbestos in ${asbestosCondition.toLowerCase()} condition — removal required. Damaged/deteriorating asbestos poses airborne fibre risk (OHS Regulations 2017 (Vic) reg 4.5.12).`);
+      }
+    }
+
+    if (isConfirmed && !accessRestrictionInPlace) {
+      criticalIssues.push("Access restriction not in place for confirmed asbestos location — must restrict access to prevent disturbance (OHS Regulations 2017 (Vic) reg 4.5.13).");
+    }
+
+    if (removalRequired === true || removalRequired === "true") {
+      const priority = String(removalPriority || "").toUpperCase();
+      if (priority === "HIGH" || priority === "URGENT") {
+        if (!removalLicenceNumber && !removedDate) {
+          criticalIssues.push("High/urgent priority asbestos removal required — engage a licensed asbestos removalist (Class A for friable, Class B for non-friable >10m²) immediately.");
+        }
+      }
+    }
+
+    if (!samplingConducted && !isConfirmed) {
+      warnings.push("No sampling conducted — suspected asbestos-containing material must be sampled by a competent person or treated as confirmed asbestos (OHS Regulations 2017 (Vic) reg 4.5.5).");
+    }
+
+    if (isConfirmed && !signageDisplayed) {
+      warnings.push("Asbestos warning signage not displayed — required at all confirmed asbestos locations (OHS Regulations 2017 (Vic) reg 4.5.13).");
+    }
+
+    const areaValue = parseFloat(areaSqm) || null;
+    if (isConfirmed && !isFriable && areaValue !== null && areaValue > 10 && !removalLicenceNumber) {
+      warnings.push(`Non-friable asbestos area ${areaValue} m² exceeds 10 m² — Class B licensed removalist required for removal (OHS Regulations 2017 (Vic) reg 4.5.18).`);
+    }
+
+    if (nextReviewDate) {
+      const review = new Date(nextReviewDate);
+      if (review < new Date()) {
+        warnings.push(`Register review date ${nextReviewDate} has passed — asbestos register must be reviewed and updated by a competent person (OHS Regulations 2017 (Vic) reg 4.5.8).`);
+      }
+    } else if (!removedDate) {
+      warnings.push("No next review date set — asbestos register must be reviewed whenever circumstances change or at minimum annually.");
+    }
+
+    const registerStatus = criticalIssues.length > 0 ? "ACTION_REQUIRED" : warnings.length > 0 ? "REVIEW_NEEDED" : "MANAGED";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("asbestos_register")
+        .insert({
+          project_id: safeProject,
+          building_id: safeBuildingId,
+          item_id: itemId ? sanitiseInput(String(itemId)) : null,
+          location: safeLocation,
+          assessment_date: assessmentDate,
+          assessed_by: safeAssessor,
+          asbestos_type: asbestosType ? sanitiseInput(String(asbestosType)) : null,
+          asbestos_form: asbestosForm ? sanitiseInput(String(asbestosForm)) : null,
+          condition: asbestosCondition || null,
+          friable: isFriable,
+          material_description: materialDescription ? sanitiseInput(String(materialDescription)) : null,
+          area_sqm: areaValue,
+          accessibility: accessibilitY ? sanitiseInput(String(accessibilitY)) : null,
+          sampling_conducted: samplingConducted !== false && samplingConducted !== "false",
+          sample_lab_ref: sampleLabRef ? sanitiseInput(String(sampleLabRef)) : null,
+          confirmed: isConfirmed,
+          removal_required: removalRequired !== false && removalRequired !== "false",
+          removal_priority: removalPriority ? sanitiseInput(String(removalPriority)) : null,
+          removal_method: removalMethod ? sanitiseInput(String(removalMethod)) : null,
+          encapsulation_applied: encapsulationApplied || false,
+          encapsulation_date: encapsulationDate || null,
+          last_inspection_date: lastInspectionDate || null,
+          next_review_date: nextReviewDate || null,
+          access_restriction: accessRestrictionInPlace !== false && accessRestrictionInPlace !== "false",
+          signage_displayed: signageDisplayed !== false && signageDisplayed !== "false",
+          removed_date: removedDate || null,
+          removed_by: removedBy ? sanitiseInput(String(removedBy)) : null,
+          removal_licence: removalLicenceNumber ? sanitiseInput(String(removalLicenceNumber)) : null,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          register_status: registerStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        registerStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Asbestos management action required — immediate steps needed to protect worker and occupant health.",
+        standards: ["OHS Regulations 2017 (Vic) Part 4.5", "AS 2601", "Occupational Health and Safety Act 2004 (Vic)"],
+      });
+    }
+
+    res.json({
+      registerStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      buildingId: safeBuildingId,
+      nextReviewDate: nextReviewDate || null,
+      standards: ["OHS Regulations 2017 (Vic) Part 4.5", "AS 2601"],
+    });
+  } catch (err) {
+    console.error("POST /asbestos-register-entry error:", err.message);
+    res.status(500).json({ error: "Failed to record asbestos register entry." });
+  }
+});
+
+// POST /demolition-pre-works-checklist — Pre-demolition hazardous materials and structural checklist per AS 2601
+app.post("/demolition-pre-works-checklist", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, structureId, structureAddress, checklistDate, assessedBy,
+      demolitionMethod, plannedStartDate,
+      asbestosRegisterObtained, asbestosRemovalComplete, asbestosClearanceCert,
+      leadPaintSurveyed, leadPaintPresent, leadPaintRemoved,
+      pcbsIdentified, pcbsRemoved,
+      odsContainersIdentified, odsRemoved,
+      contaminatedSoil, contaminatedSoilAssessed,
+      structuralEngineerSignedOff, demolitionPlanPrepared, demolitionPlanApproved,
+      buildingPermitObtained, buildingPermitNumber,
+      neighbourNotified, hoardingPermitObtained,
+      servicesDisconnected, gasDisconnected, electricalDisconnected, waterDisconnected, sewerCapped,
+      explosiveOrdinanceSurvey, undergroundServicesLocated,
+      siteSecured, dustSuppressionPlanInPlace,
+      emergencyPlanInPlace, notes
+    } = req.body;
+
+    if (!structureId || !structureAddress || !checklistDate || !assessedBy) {
+      return res.status(400).json({ error: "structureId, structureAddress, checklistDate, assessedBy are required." });
+    }
+
+    const safeStructureId = sanitiseInput(String(structureId));
+    const safeAddress = sanitiseInput(String(structureAddress));
+    const safeAssessor = sanitiseInput(String(assessedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const criticalIssues = [];
+    const warnings = [];
+
+    // AS 2601 — Demolition of structures
+    // OHS Regulations 2017 (Vic) Part 4.5 (asbestos)
+    // Environment Protection Act 2017 (Vic)
+    if (!asbestosRegisterObtained) {
+      criticalIssues.push("Asbestos register/survey not obtained — all pre-demolition works require identification of all asbestos-containing materials before any demolition commences (OHS Regulations 2017 (Vic) reg 4.5.6).");
+    }
+
+    if (asbestosRegisterObtained && !asbestosRemovalComplete) {
+      criticalIssues.push("Asbestos removal not confirmed complete — all asbestos must be removed by a licensed removalist before demolition commences (AS 2601 cl.3.2).");
+    }
+
+    if (asbestosRemovalComplete && !asbestosClearanceCert) {
+      criticalIssues.push("Asbestos clearance certificate not obtained — post-removal clearance inspection is mandatory before structure is made available for demolition (OHS Regulations 2017 (Vic) reg 4.5.28).");
+    }
+
+    if (!gasDisconnected) {
+      criticalIssues.push("Gas service not disconnected — demolition must not commence until gas supply is disconnected and capped by the network operator (AS 2601 cl.5.1).");
+    }
+
+    if (!electricalDisconnected) {
+      criticalIssues.push("Electrical service not disconnected — demolition must not commence until supply authority confirms disconnection (AS 2601 cl.5.1).");
+    }
+
+    if (!structuralEngineerSignedOff) {
+      criticalIssues.push("Structural engineer has not signed off on demolition sequence — required for any structure that may affect adjacent structures or workers (AS 2601 cl.4.2).");
+    }
+
+    if (!buildingPermitObtained) {
+      criticalIssues.push("Building permit not obtained — demolition requires a building permit under Building Regulations 2018 (Vic) reg 43. Do not commence without permit.");
+    }
+
+    if (!undergroundServicesLocated) {
+      criticalIssues.push("Underground services not located — excavation and demolition near ground level must identify all underground services (AS 5488 / Dial Before You Dig).");
+    }
+
+    if (pcbsIdentified === true || pcbsIdentified === "true") {
+      if (!pcbsRemoved) {
+        criticalIssues.push("PCBs identified but not removed — PCB removal requires licensed specialist under Environment Protection Act 2017 (Vic). Cannot proceed until removed.");
+      }
+    }
+
+    if (!waterDisconnected) {
+      warnings.push("Water service not disconnected — confirm water is isolated before demolition to prevent flooding.");
+    }
+
+    if (leadPaintPresent === true || leadPaintPresent === "true") {
+      if (!leadPaintRemoved) {
+        warnings.push("Lead paint identified but not removed — lead paint disturbance during demolition requires appropriate controls and PPE (OHS Regulations 2017 (Vic)).");
+      }
+    }
+
+    if (!leadPaintSurveyed) {
+      warnings.push("Lead paint survey not conducted — structures built before 1978 should be surveyed for lead paint before demolition (OHS Regulations 2017 (Vic)).");
+    }
+
+    if (!neighbourNotified) {
+      warnings.push("Adjacent occupiers not notified — AS 2601 recommends notification to affected neighbours before demolition commences.");
+    }
+
+    if (!dustSuppressionPlanInPlace) {
+      warnings.push("Dust suppression plan not recorded — dust from demolition must be controlled under Environment Protection Act 2017 (Vic) and local EPA requirements.");
+    }
+
+    if (!emergencyPlanInPlace) {
+      warnings.push("Emergency plan not confirmed in place — OHS Regulations 2017 (Vic) require an emergency response plan for demolition works.");
+    }
+
+    const checklistStatus = criticalIssues.length > 0 ? "WORKS_PROHIBITED" : warnings.length > 0 ? "CONDITIONAL_APPROVAL" : "APPROVED_TO_PROCEED";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("demolition_pre_works_checklists")
+        .insert({
+          project_id: safeProject,
+          structure_id: safeStructureId,
+          structure_address: safeAddress,
+          checklist_date: checklistDate,
+          assessed_by: safeAssessor,
+          demolition_method: demolitionMethod ? sanitiseInput(String(demolitionMethod)) : null,
+          planned_start_date: plannedStartDate || null,
+          asbestos_register_obtained: asbestosRegisterObtained !== false && asbestosRegisterObtained !== "false",
+          asbestos_removal_complete: asbestosRemovalComplete !== false && asbestosRemovalComplete !== "false",
+          asbestos_clearance_cert: asbestosClearanceCert !== false && asbestosClearanceCert !== "false",
+          lead_paint_surveyed: leadPaintSurveyed !== false && leadPaintSurveyed !== "false",
+          lead_paint_present: leadPaintPresent || false,
+          lead_paint_removed: leadPaintRemoved !== false && leadPaintRemoved !== "false",
+          pcbs_identified: pcbsIdentified || false,
+          pcbs_removed: pcbsRemoved !== false && pcbsRemoved !== "false",
+          gas_disconnected: gasDisconnected !== false && gasDisconnected !== "false",
+          electrical_disconnected: electricalDisconnected !== false && electricalDisconnected !== "false",
+          water_disconnected: waterDisconnected !== false && waterDisconnected !== "false",
+          sewer_capped: sewerCapped !== false && sewerCapped !== "false",
+          structural_engineer_signoff: structuralEngineerSignedOff !== false && structuralEngineerSignedOff !== "false",
+          demolition_plan_prepared: demolitionPlanPrepared !== false && demolitionPlanPrepared !== "false",
+          demolition_plan_approved: demolitionPlanApproved !== false && demolitionPlanApproved !== "false",
+          building_permit_obtained: buildingPermitObtained !== false && buildingPermitObtained !== "false",
+          building_permit_number: buildingPermitNumber ? sanitiseInput(String(buildingPermitNumber)) : null,
+          neighbour_notified: neighbourNotified !== false && neighbourNotified !== "false",
+          hoarding_permit: hoardingPermitObtained !== false && hoardingPermitObtained !== "false",
+          underground_services_located: undergroundServicesLocated !== false && undergroundServicesLocated !== "false",
+          site_secured: siteSecured !== false && siteSecured !== "false",
+          dust_suppression_plan: dustSuppressionPlanInPlace !== false && dustSuppressionPlanInPlace !== "false",
+          emergency_plan: emergencyPlanInPlace !== false && emergencyPlanInPlace !== "false",
+          checklist_status: checklistStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        checklistStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Demolition works PROHIBITED — critical pre-works conditions not met. Resolve all critical issues before commencing demolition.",
+        standards: ["AS 2601", "OHS Regulations 2017 (Vic) Part 4.5", "Building Regulations 2018 (Vic)"],
+      });
+    }
+
+    res.json({
+      checklistStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      structureId: safeStructureId,
+      standards: ["AS 2601", "OHS Regulations 2017 (Vic)", "Building Regulations 2018 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /demolition-pre-works-checklist error:", err.message);
+    res.status(500).json({ error: "Failed to record demolition pre-works checklist." });
+  }
+});
+
+// POST /ai-hazardous-materials-assessment — AI assesses hazardous materials management compliance
+app.post("/ai-hazardous-materials-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      siteId, buildingAge, buildingType, occupancy,
+      asbestosRegisterCurrent, confirmedAsbestosItems, friableAsbestosItems,
+      asbestosManagementPlanInPlace, lastAsbestosReviewDate,
+      leadPaintPresent, leadManagementPlanInPlace,
+      pcbsPresent, pcbsQuantityKg,
+      odsEquipmentCount, odsManagementPlanInPlace,
+      chemicalStorageAreas, sdsSheetsAvailable, dangerousGoodsLicence,
+      wasteManagementPlanInPlace, epaRegistered,
+      incidentsRelatedToHazmat, workerTrainingCurrent,
+      deficienciesNoted, notes
+    } = req.body;
+
+    if (!siteId) {
+      return res.status(400).json({ error: "siteId is required." });
+    }
+
+    const safeSite = sanitiseInput(String(siteId));
+    const deficiencies = Array.isArray(deficienciesNoted) ? deficienciesNoted : [];
+
+    const prompt = `You are a hazardous materials management expert. Assess this site's hazardous materials compliance and risk under Victorian and Australian regulations.
+
+Site ID: ${safeSite}
+Building age: ${buildingAge ? buildingAge + " years" : "Unknown"}
+Building type: ${buildingType || "Unknown"}
+Occupancy: ${occupancy || "Unknown"}
+
+ASBESTOS:
+- Register current: ${asbestosRegisterCurrent ? "Yes" : "No"}
+- Confirmed ACM items: ${confirmedAsbestosItems || 0}
+- Friable asbestos items: ${friableAsbestosItems || 0}
+- Management plan in place: ${asbestosManagementPlanInPlace ? "Yes" : "No"}
+- Last review: ${lastAsbestosReviewDate || "Unknown"}
+
+OTHER HAZARDOUS MATERIALS:
+- Lead paint present: ${leadPaintPresent ? "Yes" : "No"}
+- Lead management plan: ${leadManagementPlanInPlace ? "Yes" : "No/NA"}
+- PCBs present: ${pcbsPresent ? "Yes — " + (pcbsQuantityKg || "quantity unknown") + " kg" : "No"}
+- ODS equipment: ${odsEquipmentCount || 0} items, management plan: ${odsManagementPlanInPlace ? "Yes" : "No/NA"}
+
+CHEMICAL MANAGEMENT:
+- Chemical storage areas: ${chemicalStorageAreas || 0}
+- SDS sheets available: ${sdsSheetsAvailable ? "Yes" : "No"}
+- Dangerous goods licence: ${dangerousGoodsLicence ? "Yes" : "No/NA"}
+
+WASTE AND ENVIRONMENT:
+- Waste management plan: ${wasteManagementPlanInPlace ? "Yes" : "No"}
+- EPA registered: ${epaRegistered ? "Yes" : "No/NA"}
+
+MANAGEMENT:
+- Hazmat incidents (12 months): ${incidentsRelatedToHazmat || 0}
+- Worker training current: ${workerTrainingCurrent ? "Yes" : "No"}
+
+Deficiencies: ${deficiencies.join("; ") || "None"}
+
+Assess under:
+- OHS Regulations 2017 (Vic) Part 4.5 (asbestos)
+- Environment Protection Act 2017 (Vic)
+- Dangerous Goods Act 1985 (Vic)
+- AS 2601 (demolition of structures)
+- GHS/SDS requirements (Safe Work Australia)
+- Ozone Protection and Synthetic Greenhouse Gas Management Act 1989 (Cth)
+- National Environment Protection (Assessment of Site Contamination) Measure
+
+Provide:
+1. Overall hazardous materials risk rating
+2. Asbestos compliance assessment
+3. Chemical management compliance
+4. Environmental compliance risk
+5. Immediate priority actions
+6. Long-term management recommendations
+
+Respond ONLY in JSON:
+{
+  "overallRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "asbestosComplianceRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "chemicalManagementRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "environmentalRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "immediateActions": ["string"],
+  "asbestosFindings": ["string"],
+  "chemicalFindings": ["string"],
+  "environmentalFindings": ["string"],
+  "longTermRecommendations": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 900,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallRisk: "MODERATE",
+        asbestosComplianceRisk: "MODERATE",
+        chemicalManagementRisk: "MODERATE",
+        environmentalRisk: "MODERATE",
+        immediateActions: ["Review asbestos register currency per OHS Regulations 2017 (Vic) reg 4.5.8", "Ensure all SDS sheets are current and accessible to workers"],
+        asbestosFindings: ["AI assessment unavailable — engage licensed asbestos assessor for formal review"],
+        chemicalFindings: ["AI assessment unavailable — review chemical inventory against Dangerous Goods Act 1985 (Vic) thresholds"],
+        environmentalFindings: ["AI assessment unavailable — engage environmental consultant for site review"],
+        longTermRecommendations: ["Establish formal hazardous materials management plan", "Schedule annual asbestos register review"],
+        applicableStandards: ["OHS Regulations 2017 (Vic) Part 4.5", "Environment Protection Act 2017 (Vic)", "AS 2601"],
+        summary: "AI hazardous materials assessment unavailable. Engage qualified hygienist and environmental consultant for formal site audit.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      siteId: safeSite,
+      standards: ["OHS Regulations 2017 (Vic) Part 4.5", "Environment Protection Act 2017 (Vic)", "AS 2601", "Dangerous Goods Act 1985 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /ai-hazardous-materials-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess hazardous materials." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
