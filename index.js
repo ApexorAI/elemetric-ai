@@ -58105,6 +58105,311 @@ Return a JSON object with:
   }
 });
 
+// POST /contaminated-soil-record — Record contaminated soil excavation, classification, and disposal
+app.post("/contaminated-soil-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      recordRef,
+      date,
+      supervisor,
+      location,
+      excavationAreaM2,
+      excavationDepthM,
+      estimatedVolumeM3,
+      soilDescription,
+      contaminantsIdentified,
+      contaminantConcentrations,
+      epaClassification,
+      samplesCollected,
+      sampleCount,
+      labRef,
+      disposalLicensee,
+      disposalFacility,
+      epaFacilityLicenceNumber,
+      wasteTrackingRef,
+      truckCount,
+      docketNumbers,
+      contamResidualSoilManagement,
+      remedialAction,
+      postRemediationSamplingRequired,
+      postRemediationRef,
+      workerHazcomBriefed,
+      dustSuppressionMeasures,
+      groundwaterMonitoring,
+      epaSiteManagementPlanRef,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !supervisor || !location || !epaClassification) {
+      return res.status(400).json({ error: "projectId, date, supervisor, location, and epaClassification are required" });
+    }
+
+    const flags = [];
+    // EPA Victoria: fill classifications CLEAN, PRESCRIBED INDUSTRIAL WASTE (PIW), CATEGORY A/B/C
+    if (["PIW", "PRESCRIBED INDUSTRIAL WASTE"].includes(String(epaClassification || "").toUpperCase())) {
+      flags.push("Soil classified as Prescribed Industrial Waste (PIW) — must be disposed to a licensed PIW facility. EPA Works Approval required for storage > 50 m³.");
+    }
+    if (["CATEGORY A", "CAT A", "A"].includes(String(epaClassification || "").toUpperCase())) {
+      flags.push("Category A contaminated soil — restricted disposal, consult EPA Victoria and engage environmental consultant");
+    }
+    if (!disposalFacility) flags.push("Disposal facility not specified — contaminated soil must be disposed to an EPA-licensed facility per EPA Victoria Waste Management Policy");
+    if (!wasteTrackingRef && !["CLEAN", "VIRGIN EXCAVATED NATURAL MATERIAL", "VENM"].includes(String(epaClassification || "").toUpperCase())) {
+      flags.push("Waste tracking documentation not recorded — required for all regulated fill disposal under EPA Victoria regulations");
+    }
+    if (!workerHazcomBriefed) flags.push("Workers not briefed on contamination hazards — HAZCOM briefing required for all workers handling contaminated materials");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      record_ref: sanitiseInput(recordRef || `CS-${Date.now()}`),
+      date,
+      supervisor: sanitiseInput(supervisor),
+      location: sanitiseInput(location),
+      excavation_area_m2: excavationAreaM2 || null,
+      excavation_depth_m: excavationDepthM || null,
+      estimated_volume_m3: estimatedVolumeM3 || null,
+      soil_description: sanitiseInput(soilDescription || ""),
+      contaminants_identified: Array.isArray(contaminantsIdentified) ? contaminantsIdentified.map(c => sanitiseInput(c)) : [],
+      contaminant_concentrations: sanitiseInput(contaminantConcentrations || ""),
+      epa_classification: sanitiseInput(epaClassification),
+      samples_collected: !!samplesCollected,
+      sample_count: sampleCount || null,
+      lab_ref: sanitiseInput(labRef || ""),
+      disposal_licensee: sanitiseInput(disposalLicensee || ""),
+      disposal_facility: sanitiseInput(disposalFacility || ""),
+      epa_facility_licence_number: sanitiseInput(epaFacilityLicenceNumber || ""),
+      waste_tracking_ref: sanitiseInput(wasteTrackingRef || ""),
+      truck_count: truckCount || null,
+      docket_numbers: Array.isArray(docketNumbers) ? docketNumbers.map(d => sanitiseInput(d)) : [],
+      contam_residual_soil_management: sanitiseInput(contamResidualSoilManagement || ""),
+      remedial_action: sanitiseInput(remedialAction || ""),
+      post_remediation_sampling_required: !!postRemediationSamplingRequired,
+      post_remediation_ref: sanitiseInput(postRemediationRef || ""),
+      worker_hazcom_briefed: !!workerHazcomBriefed,
+      dust_suppression_measures: sanitiseInput(dustSuppressionMeasures || ""),
+      groundwater_monitoring: !!groundwaterMonitoring,
+      epa_site_management_plan_ref: sanitiseInput(epaSiteManagementPlanRef || ""),
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("contaminated_soil_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      epaClassification,
+      flags,
+      disposalRequired: !["CLEAN", "VENM", "VIRGIN EXCAVATED NATURAL MATERIAL"].includes(String(epaClassification || "").toUpperCase()),
+      applicableRegulations: ["Environment Protection Act 2017 (Vic)", "EPA Victoria Waste Management Policy (Industrial Waste)", "National Environment Protection Measure (NEPM) for Site Contamination"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/contaminated-soil-record error:", err.message);
+    res.status(500).json({ error: "Failed to record contaminated soil" });
+  }
+});
+
+// POST /glass-glazing-inspection — Record a glass and glazing installation inspection per AS 1288
+app.post("/glass-glazing-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      inspectionRef,
+      date,
+      inspector,
+      location,
+      glassType,
+      glassThicknessMm,
+      glassAreaM2,
+      frameMaterial,
+      frameType,
+      safetyGlassRequired,
+      safetyGlassComplied,
+      safetyGlassMarkingPresent,
+      glazingSystemRef,
+      designWindPressure,
+      actualGlassSpecification,
+      edgeClearanceOk,
+      faceClearanceOk,
+      settingBlocksOk,
+      sealantsOk,
+      sealantType,
+      weatherSealOk,
+      thermalBreakInstalled,
+      unitSealIntact,
+      noCondensationWithinUnit,
+      overallResult,
+      defects,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !inspector || !glassType || !overallResult) {
+      return res.status(400).json({ error: "projectId, date, inspector, glassType, and overallResult are required" });
+    }
+
+    const failures = [];
+    if (safetyGlassRequired && !safetyGlassComplied) {
+      failures.push("Safety glazing required but not installed — AS 1288 Table D1 requires safety glass in critical locations (doors, low-level panels, bathrooms, stairs)");
+    }
+    if (safetyGlassRequired && safetyGlassComplied && !safetyGlassMarkingPresent) {
+      failures.push("Safety glass marking not visible — AS/NZS 4666 requires permanent marking identifying glass type on each pane");
+    }
+    if (!settingBlocksOk) failures.push("Setting blocks missing or incorrectly positioned — required per AS 1288 to prevent glass contact with frame at base");
+    if (!sealantsOk) failures.push("Sealants non-compliant — inadequate sealant application can cause water ingress and premature glass failure");
+    if (unitSealIntact === false) failures.push("Insulated glazing unit seal failed — fogging/condensation within unit, replacement required");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      inspection_ref: sanitiseInput(inspectionRef || `GG-${Date.now()}`),
+      date,
+      inspector: sanitiseInput(inspector),
+      location: sanitiseInput(location || ""),
+      glass_type: sanitiseInput(glassType),
+      glass_thickness_mm: glassThicknessMm || null,
+      glass_area_m2: glassAreaM2 || null,
+      frame_material: sanitiseInput(frameMaterial || ""),
+      frame_type: sanitiseInput(frameType || ""),
+      safety_glass_required: !!safetyGlassRequired,
+      safety_glass_complied: !!safetyGlassComplied,
+      safety_glass_marking_present: safetyGlassRequired ? !!safetyGlassMarkingPresent : null,
+      glazing_system_ref: sanitiseInput(glazingSystemRef || ""),
+      design_wind_pressure: designWindPressure || null,
+      actual_glass_specification: sanitiseInput(actualGlassSpecification || ""),
+      edge_clearance_ok: !!edgeClearanceOk,
+      face_clearance_ok: !!faceClearanceOk,
+      setting_blocks_ok: !!settingBlocksOk,
+      sealants_ok: !!sealantsOk,
+      sealant_type: sanitiseInput(sealantType || ""),
+      weather_seal_ok: !!weatherSealOk,
+      thermal_break_installed: !!thermalBreakInstalled,
+      unit_seal_intact: unitSealIntact !== undefined ? !!unitSealIntact : null,
+      no_condensation_within_unit: noCondensationWithinUnit !== undefined ? !!noCondensationWithinUnit : null,
+      overall_result: sanitiseInput(overallResult),
+      defects: Array.isArray(defects) ? defects.map(d => sanitiseInput(d)) : [],
+      failures,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("glass_glazing_inspections").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (failures.length > 0) {
+      return res.status(422).json({ passed: false, failures, message: "Glazing inspection failed. Rectify all failures before accepting the installation.", record, saved });
+    }
+
+    res.json({
+      passed: true,
+      inspectionRef: record.inspection_ref,
+      failures: [],
+      applicableStandards: ["AS 1288 Glass in buildings — selection and installation", "AS/NZS 4666 Insulating glass units", "NCC 2022 — safety glazing requirements"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/glass-glazing-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record glazing inspection" });
+  }
+});
+
+// POST /ai-contaminated-land-assessment — AI assesses contaminated land risk and remediation requirements
+app.post("/ai-contaminated-land-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      siteAddress,
+      previousLandUse,
+      currentLandUse,
+      proposedLandUse,
+      contaminantsOfConcern,
+      sampleResults,
+      groundwaterDepthM,
+      soilType,
+      siteArea,
+    } = req.body;
+
+    if (!siteAddress || !previousLandUse || !proposedLandUse) {
+      return res.status(400).json({ error: "siteAddress, previousLandUse, and proposedLandUse are required" });
+    }
+
+    const prompt = `You are an environmental consultant with expertise in Victorian contaminated land management, EPA Victoria guidance, the National Environment Protection Measure (NEPM) for Site Contamination, and the Environment Protection Act 2017 (Vic).
+
+Assess contaminated land risk for:
+- Site address: ${sanitiseInput(siteAddress)}
+- Previous land use: ${sanitiseInput(previousLandUse)}
+- Current land use: ${sanitiseInput(currentLandUse || "vacant")}
+- Proposed land use: ${sanitiseInput(proposedLandUse)}
+- Contaminants of concern: ${sanitiseInput(contaminantsOfConcern || "unknown")}
+- Sample results: ${sanitiseInput(sampleResults || "not yet available")}
+- Groundwater depth: ${sanitiseInput(String(groundwaterDepthM || "unknown"))} m
+- Soil type: ${sanitiseInput(soilType || "not specified")}
+- Site area: ${sanitiseInput(String(siteArea || "not specified"))} m²
+
+Return a JSON object with:
+{
+  "riskLevel": "LOW|MEDIUM|HIGH|EXTREME",
+  "phaseOneDeskStudyRecommended": boolean,
+  "phaseTwoInvestigationRequired": boolean,
+  "keyContaminantsOfConcern": [string],
+  "receptorPathways": [string],
+  "remediationApproachOptions": [string],
+  "epaNotificationRequired": boolean,
+  "siteAuditRequired": boolean,
+  "certificateOfEnvironmentalAuditRequired": boolean,
+  "healthRisks": string,
+  "groundwaterImpact": string,
+  "disposalConsiderations": string,
+  "workerProtectionMeasures": [string],
+  "applicableGuidance": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ siteAddress, previousLandUse, proposedLandUse, assessment });
+  } catch (err) {
+    console.error("/ai-contaminated-land-assessment error:", err.message);
+    res.json({
+      siteAddress: req.body.siteAddress || "",
+      previousLandUse: req.body.previousLandUse || "",
+      proposedLandUse: req.body.proposedLandUse || "",
+      assessment: {
+        riskLevel: "HIGH",
+        phaseOneDeskStudyRecommended: true,
+        phaseTwoInvestigationRequired: true,
+        keyContaminantsOfConcern: ["Petroleum hydrocarbons (TPH, BTEX)", "Heavy metals (lead, arsenic)", "Chlorinated solvents (if industrial use)", "Asbestos in fill"],
+        receptorPathways: ["Dermal contact during excavation", "Vapour intrusion to buildings", "Groundwater as drinking water receptor if shallow", "Dust inhalation during earthworks"],
+        remediationApproachOptions: ["Excavation and disposal to licensed facility", "In-situ bioremediation for petroleum hydrocarbons", "Capping and risk-based land use controls", "Monitored natural attenuation for low-concentration plumes"],
+        epaNotificationRequired: true,
+        siteAuditRequired: true,
+        certificateOfEnvironmentalAuditRequired: true,
+        healthRisks: "High-sensitivity land uses (residential, childcare, schools) have lowest contamination criteria. Industrial/commercial uses have higher acceptable thresholds per NEPM Site Contamination.",
+        groundwaterImpact: "If groundwater is within 3 m of surface, vapour intrusion and aquifer contamination are significant risks. Install monitoring wells and sample quarterly.",
+        disposalConsiderations: "All excavated contaminated material must be characterised by laboratory analysis before disposal. PIW requires licensed PIW facility. VENM/clean fill may be reused or disposed to general fill sites.",
+        workerProtectionMeasures: ["H&S management plan for contaminated site works", "HAZCOM briefing for all workers", "PPE: nitrile gloves, respirator (P2 for dust, organic vapour for solvents), Tyvek suits", "Air monitoring during excavation"],
+        applicableGuidance: ["EPA Victoria Waste Management Policy (Industrial Waste) 2009", "NEPM Site Contamination 2013", "EPA Victoria Contaminated Land Guidance: Investigating and Remediating Contaminated Soil and Groundwater", "Environment Protection Act 2017 (Vic)"],
+        recommendation: "Engage an EPA-accredited environmental auditor. Commission Phase 1 desk study immediately, followed by Phase 2 site investigation if previous industrial use is confirmed. Do not excavate without a site management plan.",
+        summary: "Previous industrial land use creates elevated contamination risk. A site contamination investigation and EPA audit may be required before occupation or redevelopment of the site.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
