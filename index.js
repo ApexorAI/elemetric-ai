@@ -23751,6 +23751,163 @@ Provide a compliance summary in JSON:
   }
 });
 
+// POST /job-delay-log  — Log a delay event for a job
+app.post("/job-delay-log", apiKeyAuth, async (req, res) => {
+  const { jobId, delayType, description, daysDelayed, responsibleParty, costImpact, notifiedClient, recoveryPlan, notes } = req.body || {};
+  if (!jobId || !delayType) return res.status(400).json({ error: "jobId and delayType required." });
+
+  const VALID_DELAY_TYPES = ["weather", "materials-shortage", "subcontractor", "client-variation", "council-approval", "rework", "design-change", "access-denied", "labour-shortage", "financial", "other"];
+  const RESPONSIBLE = ["client", "contractor", "subcontractor", "council", "weather", "supplier", "shared", "other"];
+
+  const safeJobId  = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeType   = VALID_DELAY_TYPES.includes(String(delayType || "").toLowerCase().replace(/ /g, "-")) ? String(delayType).toLowerCase().replace(/ /g, "-") : "other";
+  const safeDesc   = description ? sanitiseInput(String(description)).slice(0, 500) : null;
+  const safeParty  = RESPONSIBLE.includes(String(responsibleParty || "").toLowerCase()) ? String(responsibleParty).toLowerCase() : "other";
+  const safePlan   = recoveryPlan ? sanitiseInput(String(recoveryPlan)).slice(0, 300) : null;
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+  const days       = Math.max(0, parseFloat(daysDelayed) || 0);
+  const cost       = costImpact ? Math.max(0, parseFloat(costImpact) || 0) : null;
+
+  const record = {
+    delayId: `DLY-${safeJobId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    jobId: safeJobId, delayType: safeType, description: safeDesc,
+    daysDelayed: days, responsibleParty: safeParty,
+    costImpact: cost, notifiedClient: notifiedClient === true,
+    recoveryPlan: safePlan, notes: safeNotes,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("job_delay_log").insert({
+        delay_id: record.delayId, job_id: safeJobId, delay_type: safeType,
+        description: safeDesc, days_delayed: days, responsible_party: safeParty,
+        cost_impact: cost, notified_client: record.notifiedClient,
+        recovery_plan: safePlan, notes: safeNotes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// GET /job-delay-log/:jobId  — Get all delay records for a job
+app.get("/job-delay-log/:jobId", apiKeyAuth, async (req, res) => {
+  const jobId = sanitiseInput(String(req.params.jobId || "")).slice(0, 80);
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  let delays = [];
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin.from("job_delay_log").select("*").eq("job_id", jobId).order("created_at", { ascending: false }).limit(50);
+      delays = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const totalDays = delays.reduce((s, d) => s + (d.days_delayed || 0), 0);
+  const totalCost = parseFloat(delays.reduce((s, d) => s + (d.cost_impact || 0), 0).toFixed(2));
+
+  return res.json({ jobId, delayCount: delays.length, totalDaysDelayed: totalDays, totalCostImpact: totalCost, delays, generatedAt: new Date().toISOString() });
+});
+
+// POST /asbestos-register  — Log ACM (asbestos-containing material) found at a site
+app.post("/asbestos-register", apiKeyAuth, async (req, res) => {
+  const { siteId, address, material, location, condition, asbestosType, areaSquareMetres, sampled, labReport, managementAction, notes } = req.body || {};
+  if (!siteId) return res.status(400).json({ error: "siteId required." });
+
+  const VALID_CONDITIONS = ["good", "fair", "poor", "damaged", "friable"];
+  const VALID_TYPES      = ["chrysotile", "amosite", "crocidolite", "unknown"];
+  const VALID_ACTIONS    = ["encapsulate", "remove", "monitor", "leave-in-place", "remove-urgently"];
+
+  const safeSiteId = sanitiseInput(String(siteId)).slice(0, 80);
+  const safeMat    = sanitiseInput(String(material || "Unknown material")).slice(0, 150);
+  const safeLoc    = location ? sanitiseInput(String(location)).slice(0, 200) : null;
+  const safeCond   = VALID_CONDITIONS.includes(String(condition || "").toLowerCase()) ? String(condition).toLowerCase() : "unknown";
+  const safeType   = VALID_TYPES.includes(String(asbestosType || "").toLowerCase()) ? String(asbestosType).toLowerCase() : "unknown";
+  const safeAction = VALID_ACTIONS.includes(String(managementAction || "").toLowerCase().replace(/ /g, "-")) ? String(managementAction).toLowerCase().replace(/ /g, "-") : "monitor";
+  const safeArea   = areaSquareMetres ? Math.max(0, parseFloat(areaSquareMetres) || 0) : null;
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const record = {
+    acmId: `ACM-${safeSiteId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId,
+    address: address ? sanitiseInput(String(address)).slice(0, 200) : null,
+    material: safeMat, location: safeLoc, condition: safeCond, asbestosType: safeType,
+    areaSquareMetres: safeArea, sampled: sampled === true,
+    labReport: labReport ? sanitiseInput(String(labReport)).slice(0, 100) : null,
+    managementAction: safeAction,
+    priority: (safeCond === "friable" || safeCond === "damaged") ? "HIGH" : safeCond === "poor" ? "MEDIUM" : "LOW",
+    notes: safeNotes,
+    warning: "All ACM work must be performed by a licensed asbestos removalist. Notify WorkSafe for removal >10m².",
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("asbestos_register").insert({
+        acm_id: record.acmId, site_id: safeSiteId, address: record.address,
+        material: safeMat, location: safeLoc, condition: safeCond, asbestos_type: safeType,
+        area_square_metres: safeArea, sampled: record.sampled, lab_report: record.labReport,
+        management_action: safeAction, priority: record.priority, notes: safeNotes,
+        created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// POST /confined-space-entry  — Log a confined space entry record
+app.post("/confined-space-entry", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, location, entryDate, entrant, standby, supervisor, gasTestsBefore, gasTestsDuring, oxygenPercent, cosPpm, h2sPpm, meLeLPercent, rescuePlanConfirmed, entryPermitRef, exitTime, notes } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeLoc    = location ? sanitiseInput(String(location)).slice(0, 200) : null;
+  const safeEntrant = entrant ? sanitiseInput(String(entrant)).slice(0, 100) : null;
+  const safeStandby = standby ? sanitiseInput(String(standby)).slice(0, 100) : null;
+  const safeSupervisor = supervisor ? sanitiseInput(String(supervisor)).slice(0, 100) : null;
+
+  const o2 = oxygenPercent !== undefined ? parseFloat(oxygenPercent) : null;
+  const co = cosPpm !== undefined ? parseFloat(cosPpm) : null;
+  const h2s = h2sPpm !== undefined ? parseFloat(h2sPpm) : null;
+  const lel = meLeLPercent !== undefined ? parseFloat(meLeLPercent) : null;
+
+  const atmosphericSafe = (o2 === null || (o2 >= 19.5 && o2 <= 23.5)) &&
+    (co === null || co < 25) && (h2s === null || h2s < 1) && (lel === null || lel < 10);
+
+  const record = {
+    entryId: `CSE-${(safeSiteId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId, jobId: safeJobId, location: safeLoc,
+    entryDate: entryDate ? sanitiseInput(String(entryDate)).slice(0, 20) : new Date().toISOString().split("T")[0],
+    entrant: safeEntrant, standby: safeStandby, supervisor: safeSupervisor,
+    gasTestsBefore: gasTestsBefore !== false, gasTestsDuring: gasTestsDuring === true,
+    atmosphericReadings: { oxygenPercent: o2, coPpm: co, h2sPpm: h2s, lelPercent: lel },
+    atmosphericSafe, rescuePlanConfirmed: rescuePlanConfirmed === true,
+    entryPermitRef: entryPermitRef ? sanitiseInput(String(entryPermitRef)).slice(0, 80) : null,
+    exitTime: exitTime ? sanitiseInput(String(exitTime)).slice(0, 20) : null,
+    safetyWarnings: !atmosphericSafe ? ["ATMOSPHERE NOT WITHIN SAFE LIMITS — DO NOT ENTER"] : [],
+    notes: notes ? sanitiseInput(String(notes)).slice(0, 300) : null,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("confined_space_entries").insert({
+        entry_id: record.entryId, site_id: safeSiteId, job_id: safeJobId, location: safeLoc,
+        entry_date: record.entryDate, entrant: safeEntrant, standby: safeStandby, supervisor: safeSupervisor,
+        gas_tests_before: record.gasTestsBefore, gas_tests_during: record.gasTestsDuring,
+        atmospheric_readings: record.atmosphericReadings, atmospheric_safe: atmosphericSafe,
+        rescue_plan_confirmed: record.rescuePlanConfirmed, entry_permit_ref: record.entryPermitRef,
+        exit_time: record.exitTime, notes: record.notes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
