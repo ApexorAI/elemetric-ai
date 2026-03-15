@@ -34396,6 +34396,194 @@ app.get("/event-log/:actorId", apiKeyAuth, async (req, res) => {
   res.status(503).json({ error: "Database not configured." });
 });
 
+// ── Round 129: Service agreements, maintenance contracts, renewal reminders ───
+
+// POST /service-agreement — Create a recurring service or maintenance agreement
+app.post("/service-agreement", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, clientName, clientEmail, propertyAddress,
+    serviceType, description, startDate, endDate,
+    frequency, frequencyUnit = "months", calloutIncluded = false,
+    calloutFee, annualValue, paymentTerms = "30",
+    autoRenew = true, reminderDaysBefore = 30, state = "VIC",
+    notes,
+  } = req.body;
+
+  if (!contractorId || !serviceType || !startDate)
+    return res.status(400).json({ error: "contractorId, serviceType, startDate required." });
+
+  if (clientEmail && !isValidEmail(clientEmail)) return res.status(400).json({ error: "Invalid client email." });
+
+  const validFrequencyUnits = ["weeks", "months", "years"];
+  const validTypes = ["HVAC_SERVICE", "PLUMBING_MAINTENANCE", "ELECTRICAL_INSPECTION", "FIRE_SAFETY", "PEST_CONTROL", "CLEANING", "GROUNDS", "GENERAL", "OTHER"];
+  const type = (serviceType || "OTHER").toUpperCase();
+  const freqUnit = validFrequencyUnits.includes(frequencyUnit) ? frequencyUnit : "months";
+
+  // Calculate next service date
+  const start = new Date(startDate);
+  const nextService = new Date(start);
+  if (freqUnit === "weeks") nextService.setDate(nextService.getDate() + Number(frequency) * 7);
+  else if (freqUnit === "months") nextService.setMonth(nextService.getMonth() + Number(frequency));
+  else nextService.setFullYear(nextService.getFullYear() + Number(frequency));
+
+  const agreementNumber = `SA-${Date.now().toString(36).toUpperCase().slice(-8)}`;
+
+  const record = {
+    agreement_number: agreementNumber,
+    contractor_id: sanitiseInput(contractorId),
+    client_name: sanitiseInput(clientName || ""),
+    client_email: sanitiseInput(clientEmail || ""),
+    property_address: sanitiseInput(propertyAddress || ""),
+    service_type: validTypes.includes(type) ? type : "OTHER",
+    description: sanitiseInput(description || ""),
+    start_date: startDate,
+    end_date: endDate || null,
+    frequency: Number(frequency) || 1,
+    frequency_unit: freqUnit,
+    next_service_date: nextService.toISOString().split("T")[0],
+    callout_included: Boolean(calloutIncluded),
+    callout_fee: calloutFee ? Number(calloutFee) : null,
+    annual_value: Number(annualValue) || null,
+    payment_terms_days: Number(paymentTerms),
+    auto_renew: Boolean(autoRenew),
+    reminder_days_before: Number(reminderDaysBefore),
+    state: sanitiseInput(state),
+    notes: sanitiseInput(notes || ""),
+    status: "ACTIVE",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("service_agreements")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, agreementId: data.id, agreementNumber, nextServiceDate: record.next_service_date, ...record });
+  }
+
+  res.json({ success: true, agreementId: null, agreementNumber, nextServiceDate: record.next_service_date, ...record, saved: false });
+});
+
+// GET /service-agreements/:contractorId — List service agreements for a contractor
+app.get("/service-agreements/:contractorId", apiKeyAuth, async (req, res) => {
+  const { contractorId } = req.params;
+  const { status, dueSoon } = req.query;
+
+  if (supabaseAdmin) {
+    let query = supabaseAdmin
+      .from("service_agreements")
+      .select("*")
+      .eq("contractor_id", contractorId)
+      .order("next_service_date", { ascending: true });
+
+    if (status) query = query.eq("status", status.toUpperCase());
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "DB error." });
+
+    const agreements = data || [];
+    const dueSoonCount = agreements.filter(a => {
+      const nextDate = new Date(a.next_service_date);
+      const daysUntil = Math.ceil((nextDate - new Date()) / (1000 * 60 * 60 * 24));
+      return daysUntil >= 0 && daysUntil <= 14;
+    }).length;
+    const totalAnnualValue = agreements.reduce((s, a) => s + (a.annual_value || 0), 0);
+
+    return res.json({ contractorId, agreements, count: agreements.length, dueSoonCount, totalAnnualValue });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /service-job-log — Log a completed service visit against an agreement
+app.post("/service-job-log", apiKeyAuth, async (req, res) => {
+  const {
+    agreementId, technicianName, serviceDate,
+    workPerformed = [], partsReplaced = [],
+    nextServiceDate, clientSignOff = false,
+    issues = [], recommendations = [],
+    labourMinutes, notes,
+  } = req.body;
+
+  if (!agreementId || !serviceDate) return res.status(400).json({ error: "agreementId and serviceDate required." });
+
+  const record = {
+    agreement_id: sanitiseInput(agreementId),
+    technician_name: sanitiseInput(technicianName || ""),
+    service_date: serviceDate,
+    work_performed: workPerformed.map(w => sanitiseInput(w)),
+    parts_replaced: partsReplaced.map(p => ({
+      part: sanitiseInput(p.part || ""),
+      quantity: Number(p.quantity) || 1,
+      cost: Number(p.cost) || null,
+    })),
+    next_service_date: nextServiceDate || null,
+    client_sign_off: Boolean(clientSignOff),
+    issues: issues.map(i => sanitiseInput(i)),
+    recommendations: recommendations.map(r => sanitiseInput(r)),
+    labour_minutes: Number(labourMinutes) || null,
+    notes: sanitiseInput(notes || ""),
+    status: clientSignOff ? "COMPLETED_SIGNED" : "COMPLETED",
+    logged_at: new Date().toISOString(),
+  };
+
+  // Update next service date on the agreement
+  if (supabaseAdmin) {
+    const [logResult] = await Promise.all([
+      supabaseAdmin.from("service_job_logs").insert(record).select().single(),
+      nextServiceDate
+        ? supabaseAdmin.from("service_agreements").update({ next_service_date: nextServiceDate }).eq("id", agreementId)
+        : Promise.resolve(),
+    ]);
+
+    const { data, error } = logResult;
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, logId: data.id, status: record.status, nextServiceDate, ...record });
+  }
+
+  res.json({ success: true, logId: null, status: record.status, nextServiceDate, ...record, saved: false });
+});
+
+// GET /service-due — List all service jobs due in the next N days across all agreements
+app.get("/service-due", apiKeyAuth, async (req, res) => {
+  const { days = 14, contractorId } = req.query;
+  const horizon = new Date();
+  horizon.setDate(horizon.getDate() + Number(days));
+
+  if (supabaseAdmin) {
+    let query = supabaseAdmin
+      .from("service_agreements")
+      .select("*")
+      .eq("status", "ACTIVE")
+      .lte("next_service_date", horizon.toISOString().split("T")[0])
+      .order("next_service_date", { ascending: true });
+
+    if (contractorId) query = query.eq("contractor_id", contractorId);
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "DB error." });
+
+    const results = (data || []).map(a => ({
+      agreementId: a.id,
+      agreementNumber: a.agreement_number,
+      clientName: a.client_name,
+      propertyAddress: a.property_address,
+      serviceType: a.service_type,
+      nextServiceDate: a.next_service_date,
+      daysUntilDue: Math.ceil((new Date(a.next_service_date) - new Date()) / (1000 * 60 * 60 * 24)),
+      isOverdue: new Date(a.next_service_date) < new Date(),
+      annualValue: a.annual_value,
+    }));
+
+    const overdue = results.filter(r => r.isOverdue).length;
+    return res.json({ dueInDays: Number(days), jobCount: results.length, overdueCount: overdue, jobs: results });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
