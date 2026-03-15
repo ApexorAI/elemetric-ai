@@ -181,6 +181,62 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── Auth header hardening ──────────────────────────────────────────────────────
+// If an Authorization header is present it must be a non-empty, non-blank
+// string with no null bytes. Requests with obviously malformed auth headers
+// are rejected before they reach any handler.
+
+app.use((req, res, next) => {
+  const auth = req.headers["authorization"];
+  if (auth !== undefined) {
+    if (
+      typeof auth !== "string" ||
+      auth.trim().length === 0 ||
+      auth.includes("\x00")
+    ) {
+      return res.status(400).json({ error: "Invalid Authorization header." });
+    }
+  }
+  next();
+});
+
+// ── Input sanitisation ────────────────────────────────────────────────────────
+// Strip null bytes (\x00) and ASCII control characters (except \t \n \r) from
+// all string values in request body and query string before any handler runs.
+// This prevents null-byte injection and related control-character attacks.
+
+function sanitiseString(s) {
+  if (typeof s !== "string") return s;
+  // Remove C0 control chars except HT (\x09), LF (\x0a), CR (\x0d)
+  // and also remove DEL (\x7f)
+  return s.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+}
+
+function sanitiseValue(v) {
+  if (typeof v === "string") return sanitiseString(v);
+  if (Array.isArray(v)) return v.map(sanitiseValue);
+  if (v !== null && typeof v === "object") {
+    const out = {};
+    for (const key of Object.keys(v)) {
+      out[sanitiseString(key)] = sanitiseValue(v[key]);
+    }
+    return out;
+  }
+  return v;
+}
+
+app.use((req, _res, next) => {
+  if (req.body && typeof req.body === "object") {
+    req.body = sanitiseValue(req.body);
+  }
+  if (req.query && typeof req.query === "object") {
+    req.query = sanitiseValue(req.query);
+  }
+  next();
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 const client = new OpenAI({
 apiKey: process.env.OPENAI_API_KEY,
 });
