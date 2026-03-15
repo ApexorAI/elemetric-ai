@@ -11288,6 +11288,363 @@ app.get("/model-info", (_req, res) => {
   });
 });
 
+// ── POST /pre-job-risk-brief ──────────────────────────────────────────────────
+// Generates a pre-job risk briefing document. Intended to be read aloud to
+// the crew at site start — covers hazards, controls, and emergency contacts.
+app.post("/pre-job-risk-brief", (req, res) => {
+  const {
+    jobType,
+    siteAddress,
+    siteConditions  = [],
+    crewNames       = [],
+    supervisorName,
+    supervisorPhone,
+    dateOfBrief,
+  } = req.body || {};
+
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+  if (!jobType || !SUPPORTED.includes(jobType.toLowerCase())) {
+    return res.status(400).json({ error: `jobType required. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+
+  const briefDate = dateOfBrief
+    ? new Date(dateOfBrief).toLocaleDateString("en-AU", { weekday: "long", day: "numeric", month: "long", year: "numeric" })
+    : new Date().toLocaleDateString("en-AU", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+
+  const TRADE_HAZARDS = {
+    plumbing:   ["Hot water scalding risk", "Slip hazard from water spills", "Manual handling — heavy pipes and equipment", "Legionella risk in warm water systems"],
+    gas:        ["Uncontrolled gas release — explosion/fire risk", "Carbon monoxide poisoning from incomplete combustion", "Inadequate ventilation — oxygen depletion", "High-pressure line rupture"],
+    electrical: ["Electrocution from live conductors", "Arc flash during switchboard work", "Fire from overloaded circuits", "Electrical shock from faulty tools"],
+    drainage:   ["Trench collapse — fatal crushing risk", "Biological hazard from sewage exposure", "Hydrogen sulfide in sewer pits", "Underground service strike"],
+    carpentry:  ["Fall from height — leading cause of fatal injuries in construction", "Power tool kickback", "Silica dust from cement sheet cutting", "Structural collapse during propping removal"],
+    hvac:       ["Refrigerant release — A2L ignition risk or asphyxiation", "Electrocution during refrigerant circuit work", "Manual handling — heavy outdoor units", "Fall from rooftop installations"],
+  };
+
+  const TRADE_CONTROLS = {
+    plumbing:   ["Dry surfaces before work, non-slip mats in wet areas", "Mechanical aids for heavy pipe handling", "Isolate hot water supply before working on HWS", "Legionella risk assessment for warm water systems > 20°C"],
+    gas:        ["Gas isolation and leak test before opening any fitting", "Electronic gas detector operational at all times", "No ignition sources within 3 m of gas work", "Ventilate all enclosed spaces before work"],
+    electrical: ["LOTO applied and tested before any electrical work", "All tools tested and tagged", "RCD in use on all extension leads", "Insulated PPE worn during switchboard access"],
+    drainage:   ["Dial Before You Dig confirmation on file", "Trench shored or battered to stable angle before entry", "Atmospheric test before confined space entry", "PPE: gloves, eye protection, face mask for sewage work"],
+    carpentry:  ["Working at heights plan in place for all work above 2 m", "Temporary propping plan reviewed before any load removal", "Wet-cutting for all fibre cement and masonry products", "P2 respirator for all cutting operations"],
+    hvac:       ["ARC licence sighted and confirmed for refrigerant handler", "LOTO applied before opening refrigerant circuit", "Refrigerant type confirmed — A2L protocol if applicable", "Lift plan in place for equipment > 20 kg on rooftop"],
+  };
+
+  const hazards  = TRADE_HAZARDS[jobType.toLowerCase()]  || [];
+  const controls = TRADE_CONTROLS[jobType.toLowerCase()] || [];
+
+  // Site condition extra hazards
+  const extraHazards = [];
+  const siteLower = siteConditions.map(s => String(s).toLowerCase());
+  if (siteLower.some(s => s.includes("asbestos") || s.includes("fibro"))) extraHazards.push("ASBESTOS present on site — no disturbance without licensed assessor and removalist");
+  if (siteLower.some(s => s.includes("roof") || s.includes("height"))) extraHazards.push("Work at height — harness, edge protection, or scaffold required");
+  if (siteLower.some(s => s.includes("confined"))) extraHazards.push("Confined space entry — entry permit, atmospheric testing, and standby person mandatory");
+  if (siteLower.some(s => s.includes("wet") || s.includes("rain"))) extraHazards.push("Wet conditions — increased slip, fall, and electrical hazard risk");
+
+  const brief = `PRE-JOB RISK BRIEFING
+═══════════════════════════════════════
+Date: ${briefDate}
+Site: ${siteAddress || "[Site Address]"}
+Trade: ${jobType.charAt(0).toUpperCase() + jobType.slice(1)}
+Supervisor: ${supervisorName || "[Supervisor Name]"}
+${supervisorPhone ? `Contact: ${supervisorPhone}` : ""}
+═══════════════════════════════════════
+
+CREW IN ATTENDANCE:
+${crewNames.length > 0 ? crewNames.map((n, i) => `  ${i + 1}. ${n}`).join("\n") : "  [Record crew names here]"}
+
+TODAY'S KEY HAZARDS:
+${[...hazards, ...extraHazards].map(h => `  ⚠  ${h}`).join("\n")}
+
+CONTROLS IN PLACE:
+${controls.map(c => `  ✓  ${c}`).join("\n")}
+
+EMERGENCY PROCEDURES:
+  • Medical emergency: Call 000 immediately
+  • Gas emergency: Evacuate and call 13 67 07 (Gas Emergency)
+  • Electrical emergency: Call 000 — do not touch victim
+  • First aid kit location: [record on site]
+  • Nearest hospital: [record on site]
+  • Site supervisor: ${supervisorName || "[Name]"} — ${supervisorPhone || "[Phone]"}
+
+ACKNOWLEDGEMENT:
+All crew members confirm they have been briefed on today's hazards and controls.
+[Record crew signatures on paper copy before commencing work]
+═══════════════════════════════════════`;
+
+  return res.json({
+    documentType:   "Pre-Job Risk Briefing",
+    jobType,
+    siteAddress:    siteAddress   || null,
+    briefDate,
+    crewCount:      crewNames.length,
+    hazardCount:    hazards.length + extraHazards.length,
+    brief,
+    siteConditionAdjustments: extraHazards,
+    generatedAt:    new Date().toISOString(),
+  });
+});
+
+// ── GET /compliance-score-history/:userId ─────────────────────────────────────
+// Returns a timeline of compliance scores for a user from Supabase.
+// Useful for trend charting in mobile/web dashboard.
+app.get("/compliance-score-history/:userId", async (req, res) => {
+  const { userId } = req.params;
+  const { jobType, limit: limitParam = 30 } = req.query;
+
+  if (!userId) return res.status(400).json({ error: "userId is required." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  const limit = Math.min(Number(limitParam) || 30, 100);
+
+  try {
+    let query = supabaseAdmin
+      .from("analyses")
+      .select("id, job_type, compliance_score, confidence, created_at, suburb")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: true })
+      .limit(limit);
+
+    if (jobType) query = query.eq("job_type", jobType.toLowerCase());
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "Failed to retrieve score history." });
+
+    const history = (data || []).map(j => ({
+      id:         j.id,
+      jobType:    j.job_type,
+      score:      j.compliance_score ?? j.confidence ?? null,
+      date:       j.created_at,
+      suburb:     j.suburb || null,
+    }));
+
+    const scores = history.map(h => h.score).filter(s => s !== null);
+    const avgScore = scores.length > 0 ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length * 10) / 10 : null;
+
+    // Calculate rolling average (3-job window)
+    const withRolling = history.map((h, idx) => {
+      const window = history.slice(Math.max(0, idx - 2), idx + 1).map(w => w.score).filter(s => s !== null);
+      return {
+        ...h,
+        rollingAvg3: window.length > 0 ? Math.round(window.reduce((a, b) => a + b, 0) / window.length * 10) / 10 : null,
+      };
+    });
+
+    return res.json({
+      userId,
+      jobType:   jobType || "all",
+      dataPoints: history.length,
+      avgScore,
+      minScore:  scores.length > 0 ? Math.min(...scores) : null,
+      maxScore:  scores.length > 0 ? Math.max(...scores) : null,
+      history:   withRolling,
+      retrievedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("compliance-score-history error:", err);
+    return res.status(500).json({ error: "Failed to retrieve history." });
+  }
+});
+
+// ── POST /property-risk-profile ───────────────────────────────────────────────
+// Builds a risk profile for a property by aggregating all historical job data
+// from Supabase for a given address or GPS location.
+app.post("/property-risk-profile", async (req, res) => {
+  const { address, gpsLat, gpsLng } = req.body || {};
+
+  if (!address && (gpsLat === undefined || gpsLng === undefined)) {
+    return res.status(400).json({ error: "Provide either address or gpsLat + gpsLng." });
+  }
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  try {
+    let query = supabaseAdmin
+      .from("analyses")
+      .select("id, job_type, compliance_score, confidence, missing_items, risk_rating, created_at, address, suburb")
+      .order("created_at", { ascending: false })
+      .limit(50);
+
+    if (address) query = query.ilike("address", `%${sanitiseInput(address).substring(0, 100)}%`);
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "Failed to retrieve property history." });
+
+    const jobs = data || [];
+
+    if (jobs.length === 0) {
+      return res.json({ address, message: "No job history found for this property.", riskLevel: "unknown" });
+    }
+
+    const scores = jobs.map(j => j.compliance_score ?? j.confidence).filter(s => typeof s === "number");
+    const avgScore = scores.length > 0 ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length * 10) / 10 : null;
+
+    const allMissing = jobs.flatMap(j => {
+      if (!j.missing_items) return [];
+      return Array.isArray(j.missing_items) ? j.missing_items : (typeof j.missing_items === "string" ? [j.missing_items] : []);
+    });
+    const missingFreq = {};
+    for (const item of allMissing) {
+      missingFreq[item] = (missingFreq[item] || 0) + 1;
+    }
+    const topMissing = Object.entries(missingFreq).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([item, count]) => ({ item, count }));
+
+    const tradeHistory = {};
+    for (const job of jobs) {
+      const t = (job.job_type || "unknown").toLowerCase();
+      if (!tradeHistory[t]) tradeHistory[t] = { count: 0, lastDate: null, scores: [] };
+      tradeHistory[t].count++;
+      if (!tradeHistory[t].lastDate || job.created_at > tradeHistory[t].lastDate) tradeHistory[t].lastDate = job.created_at;
+      const s = job.compliance_score ?? job.confidence;
+      if (typeof s === "number") tradeHistory[t].scores.push(s);
+    }
+
+    const riskLevel = avgScore === null ? "unknown"
+      : avgScore >= 80 ? "low"
+      : avgScore >= 65 ? "medium"
+      : "high";
+
+    return res.json({
+      property:       address || `${gpsLat},${gpsLng}`,
+      jobCount:       jobs.length,
+      avgComplianceScore: avgScore,
+      riskLevel,
+      riskSummary:    riskLevel === "high" ? "High risk — property has a history of below-standard compliance. Thorough inspection recommended."
+        : riskLevel === "medium" ? "Moderate risk — some compliance gaps in history. Review before purchasing or leasing."
+        : "Low risk — property has consistently good compliance history.",
+      tradeHistory:   Object.entries(tradeHistory).map(([trade, d]) => ({
+        trade, jobCount: d.count, lastDate: d.lastDate,
+        avgScore: d.scores.length > 0 ? Math.round(d.scores.reduce((a, b) => a + b, 0) / d.scores.length * 10) / 10 : null,
+      })),
+      topMissingItems: topMissing,
+      mostRecentJob:  jobs[0] ? { id: jobs[0].id, jobType: jobs[0].job_type, date: jobs[0].created_at } : null,
+      generatedAt:    new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("property-risk-profile error:", err);
+    return res.status(500).json({ error: "Failed to build property risk profile." });
+  }
+});
+
+// ── POST /job-tags ────────────────────────────────────────────────────────────
+// Stores custom metadata tags against a job analysis in Supabase.
+// Useful for employer workflows (e.g., "requires re-inspection", "premium client").
+app.post("/job-tags", async (req, res) => {
+  const { analysisId, userId, tags = [] } = req.body || {};
+
+  if (!analysisId || !Array.isArray(tags) || tags.length === 0) {
+    return res.status(400).json({ error: "analysisId and a non-empty tags array are required." });
+  }
+  if (tags.length > 10) {
+    return res.status(400).json({ error: "Maximum 10 tags per job." });
+  }
+
+  const sanitisedTags = tags.map(t => sanitiseInput(String(t)).substring(0, 50).toLowerCase().replace(/\s+/g, "-"));
+  const record = {
+    analysis_id: analysisId,
+    user_id:     userId || null,
+    tags:        sanitisedTags,
+    tagged_at:   new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("job_tags").upsert(record, { onConflict: "analysis_id" });
+      if (error) {
+        console.error("job-tags upsert error:", error);
+        return res.status(500).json({ error: "Failed to save tags." });
+      }
+      return res.json({ saved: true, analysisId, tags: sanitisedTags, taggedAt: record.tagged_at });
+    } catch (err) {
+      console.error("job-tags unexpected error:", err);
+      return res.status(500).json({ error: "Failed to save tags." });
+    }
+  }
+
+  return res.json({ saved: false, reason: "Database not configured.", analysisId, tags: sanitisedTags });
+});
+
+// ── POST /contractor-agreement ────────────────────────────────────────────────
+// Generates a simple principal contractor / subcontractor agreement template.
+// Covers scope, compliance obligations, payment, and defects liability.
+app.post("/contractor-agreement", (req, res) => {
+  const {
+    jobType,
+    principalContractor,
+    subContractor,
+    siteAddress,
+    scopeOfWork,
+    agreedPrice,
+    startDate,
+    completionDate,
+    paymentTerms = "14 days from invoice",
+    retentionPct = 5,
+  } = req.body || {};
+
+  if (!principalContractor || !subContractor || !jobType) {
+    return res.status(400).json({ error: "principalContractor, subContractor, and jobType are required." });
+  }
+
+  const LIABILITY = LIABILITY_PERIODS[jobType?.toLowerCase()] || { defects: 7, statute: "Domestic Building Contracts Act 1995 (Vic)" };
+  const tradeLabel = { plumbing: "Plumbing", gas: "Gas Fitting", electrical: "Electrical", drainage: "Drainage", carpentry: "Carpentry / Building", hvac: "HVAC / Refrigeration" }[jobType?.toLowerCase()] || jobType;
+  const today = new Date().toLocaleDateString("en-AU", { day: "numeric", month: "long", year: "numeric" });
+
+  const agreement = `SUBCONTRACTOR AGREEMENT
+═══════════════════════════════════════
+Date: ${today}
+Trade: ${tradeLabel}
+Site: ${siteAddress || "[Site Address]"}
+═══════════════════════════════════════
+
+PARTIES:
+Principal Contractor: ${principalContractor}
+Subcontractor:        ${subContractor}
+
+SCOPE OF WORK:
+${scopeOfWork || "[Describe scope of work in detail]"}
+
+PRICE AND PAYMENT:
+Agreed price: ${agreedPrice ? `AUD $${agreedPrice} (inc. GST)` : "[To be agreed]"}
+Payment terms: ${paymentTerms}
+Retention: ${retentionPct}% held for ${LIABILITY.defects} months post-completion
+
+PROGRAMME:
+Start date:       ${startDate       || "[To be agreed]"}
+Completion date:  ${completionDate  || "[To be agreed]"}
+
+COMPLIANCE OBLIGATIONS:
+The Subcontractor agrees to:
+1. Hold all required Victorian licences for the work (${tradeLabel})
+2. Complete and lodge all required compliance certificates within statutory timeframes
+3. Comply with all applicable Australian Standards and Victorian legislation
+4. Maintain adequate public liability insurance (minimum $20 million)
+5. Carry current WorkCover insurance for all personnel
+6. Comply with the site SWMS and OHS Regulations 2017 (Vic)
+7. Provide all compliance documentation to the Principal Contractor on completion
+
+DEFECTS LIABILITY:
+The Subcontractor is liable for defects in the work for ${LIABILITY.defects} years from practical completion, pursuant to the ${LIABILITY.statute}.
+
+DISPUTE RESOLUTION:
+Disputes shall first be referred to good-faith negotiation. If unresolved within 10 business days, either party may refer the dispute to the Victorian Civil and Administrative Tribunal (VCAT) or Domestic Building Dispute Resolution Victoria (DBDRV).
+
+SIGNATURES:
+Principal Contractor: _________________________  Date: ___________
+Subcontractor:        _________________________  Date: ___________
+
+═══════════════════════════════════════
+NOTE: This agreement is a template only. Consult a construction lawyer for complex subcontract arrangements. For building work > $10,000, formal Domestic Building Contract requirements may apply.`;
+
+  return res.json({
+    documentType:   "Subcontractor Agreement",
+    jobType:        tradeLabel,
+    principalContractor,
+    subContractor,
+    agreedPrice:    agreedPrice || null,
+    agreement,
+    generatedAt:    new Date().toISOString(),
+    note: "Review with a construction lawyer before signing. This template does not substitute for legal advice.",
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
