@@ -51170,6 +51170,342 @@ app.post("/thermal-performance-test", apiKeyAuth, async (req, res) => {
   });
 });
 
+// POST /pressure-vessel-inspection — Log a pressure vessel inspection (WorkSafe Victoria)
+app.post("/pressure-vessel-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, facilityName, facilityAddress,
+    vesselRef, vesselType, manufacturer, serialNumber,
+    designPressureKpa, designTemperatureC, volumeLitres,
+    workSafeRegistrationNumber, nextInspectionDate,
+    inspectionDate, inspectorName, inspectorLicenceNumber,
+    // Inspection checks
+    shellConditionOk, headConditionOk, nozzlesConditionOk,
+    valvesOperational, safetyValveTestedDate, safetyValveSetPressureKpa,
+    pressureGaugeCalibrated, gaugeCalibrationDate,
+    insulationCondition, supportConditionOk, foundationOk,
+    corrosionEvident, corrosionSeverity, corrosionLocations,
+    leaksEvident, leakLocations,
+    // NDT if conducted
+    ndtConducted, ndtMethod, ndtResults,
+    // Results
+    maxAllowableWorkingPressureKpa, measureThicknessMin,
+    operatingPressureKpa, hydrostaticTestConducted, hydrostaticTestPressureKpa,
+    overallResult, condemnation, notes,
+  } = req.body;
+
+  if (!projectId || !vesselRef || !vesselType || !inspectionDate || !inspectorName) {
+    return res.status(400).json({ error: "projectId, vesselRef, vesselType, inspectionDate, and inspectorName are required." });
+  }
+
+  const sanitisedVesselRef = sanitiseInput(vesselRef, 60);
+  const sanitisedInspector = sanitiseInput(inspectorName, 120);
+
+  // Safety valve check — critical safety device
+  const failures = [];
+  const criticalFailures = [];
+
+  if (!valvesOperational) criticalFailures.push("Safety/relief valves not operational — vessel must not be operated until valves are repaired and tested.");
+  if (leaksEvident) criticalFailures.push(`Leaks detected${leakLocations ? ` at: ${sanitiseInput(String(leakLocations), 150)}` : ""} — shut down vessel immediately.`);
+  if (condemnation) criticalFailures.push("Vessel CONDEMNED — remove from service permanently. WorkSafe notification may be required.");
+
+  if (corrosionEvident) {
+    const severity = (corrosionSeverity || "MINOR").toUpperCase();
+    if (severity === "MAJOR" || severity === "SEVERE") {
+      criticalFailures.push(`Major corrosion detected${corrosionLocations ? ` at ${sanitiseInput(String(corrosionLocations), 100)}` : ""} — engineering assessment required before continued use.`);
+    } else {
+      failures.push(`Corrosion present (${severity}) — monitor and assess progression.`);
+    }
+  }
+
+  if (!pressureGaugeCalibrated) failures.push("Pressure gauge not calibrated — gauge must be calibrated by a certified instrument technician.");
+  if (!safetyValveTestedDate) failures.push("Safety valve test date not recorded — safety valve must be tested at prescribed intervals.");
+
+  // Check operating vs design pressure
+  const opPressure = operatingPressureKpa ? Number(operatingPressureKpa) : null;
+  const maxAwp = maxAllowableWorkingPressureKpa ? Number(maxAllowableWorkingPressureKpa) : null;
+  const designPressure = designPressureKpa ? Number(designPressureKpa) : null;
+
+  if (opPressure && maxAwp && opPressure > maxAwp) {
+    criticalFailures.push(`Operating pressure ${opPressure} kPa exceeds MAWP of ${maxAwp} kPa — reduce pressure immediately.`);
+  }
+  if (opPressure && designPressure && opPressure > designPressure) {
+    failures.push(`Operating pressure ${opPressure} kPa exceeds design pressure ${designPressure} kPa — investigate.`);
+  }
+
+  const allFailures = [...criticalFailures, ...failures];
+  const resolvedResult = overallResult || (allFailures.length === 0 ? "PASS" : criticalFailures.length > 0 ? "FAIL_CRITICAL" : "FAIL");
+  const safeToOperate = !condemnation && criticalFailures.length === 0;
+
+  const ref = `PVI-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    facilityName: sanitiseInput(facilityName || "", 200),
+    facilityAddress: sanitiseInput(facilityAddress || "", 300),
+    vessel: {
+      ref: sanitisedVesselRef,
+      type: sanitiseInput(vesselType, 60),
+      manufacturer: sanitiseInput(manufacturer || "", 100),
+      serialNumber: sanitiseInput(serialNumber || "", 60),
+      designPressureKpa: designPressure,
+      designTemperatureC: designTemperatureC || null,
+      volumeLitres: volumeLitres || null,
+      worksafeRegistrationNumber: sanitiseInput(workSafeRegistrationNumber || "", 60),
+    },
+    inspection: {
+      date: inspectionDate,
+      inspectorName: sanitisedInspector,
+      inspectorLicence: sanitiseInput(inspectorLicenceNumber || "", 60),
+      nextInspectionDate: nextInspectionDate || null,
+    },
+    checks: {
+      shellOk: shellConditionOk ?? null,
+      headOk: headConditionOk ?? null,
+      nozzlesOk: nozzlesConditionOk ?? null,
+      valvesOperational: !!valvesOperational,
+      safetyValveTestedDate: safetyValveTestedDate || null,
+      safetyValveSetPressureKpa: safetyValveSetPressureKpa || null,
+      gaugeCalibrated: !!pressureGaugeCalibrated,
+      gaugeCalibrationDate: gaugeCalibrationDate || null,
+      insulationCondition: sanitiseInput(insulationCondition || "", 20),
+      supportOk: supportConditionOk ?? null,
+      foundationOk: foundationOk ?? null,
+    },
+    corrosion: { evident: !!corrosionEvident, severity: sanitiseInput(corrosionSeverity || "", 20), locations: sanitiseInput(String(corrosionLocations || ""), 200) },
+    leaks: { evident: !!leaksEvident, locations: sanitiseInput(String(leakLocations || ""), 200) },
+    ndt: { conducted: !!ndtConducted, method: sanitiseInput(ndtMethod || "", 60), results: sanitiseInput(ndtResults || "", 200) },
+    pressureData: {
+      maxAwpKpa: maxAwp,
+      operatingKpa: opPressure,
+      minThicknessMm: measureThicknessMin || null,
+      hydrostaticTest: { conducted: !!hydrostaticTestConducted, pressureKpa: hydrostaticTestPressureKpa || null },
+    },
+    result: resolvedResult,
+    safeToOperate,
+    condemned: !!condemnation,
+    criticalFailures,
+    failures,
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("pressure_vessel_inspections").insert(record);
+      if (error) console.error("Pressure vessel inspection insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Pressure vessel inspection DB error:", e.message);
+    }
+  }
+
+  if (criticalFailures.length > 0) {
+    console.warn(`[SAFETY CRITICAL] Pressure vessel ${sanitisedVesselRef}: ${criticalFailures[0]}`);
+  }
+
+  return res.status(safeToOperate ? 201 : 422).json({
+    success: safeToOperate,
+    ref,
+    vesselRef: sanitisedVesselRef,
+    result: resolvedResult,
+    safeToOperate,
+    criticalFailureCount: criticalFailures.length,
+    criticalFailures,
+    failures,
+    message: !safeToOperate
+      ? `VESSEL UNSAFE — ${criticalFailures[0] || "Inspection failed."} Do not operate until rectified.`
+      : `Pressure vessel ${sanitisedVesselRef} inspection ${resolvedResult}. ${failures.length > 0 ? `${failures.length} minor item(s) noted.` : "No deficiencies noted."}`,
+    saved,
+    record,
+  });
+});
+
+// POST /boiler-log-book — Log a boiler log book entry (mandatory per OHS Equipment (Plant) Regulations)
+app.post("/boiler-log-book", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, boilerRef, logDate, operatorName, operatorCertificate,
+    startupTimeH, shutdownTimeH, operatingHours,
+    steamPressureKpa, feedWaterTempC, steamTempC,
+    waterLevelOk, safetyValveTestConducted,
+    fuelConsumptionL, fuelType,
+    chemicalDosing, blowdownConducted,
+    faultsObserved, faultDescription, maintenanceNoted,
+    notes,
+  } = req.body;
+
+  if (!projectId || !boilerRef || !logDate || !operatorName) {
+    return res.status(400).json({ error: "projectId, boilerRef, logDate, and operatorName are required." });
+  }
+
+  const sanitisedBoilerRef = sanitiseInput(boilerRef, 60);
+  const sanitisedOperator = sanitiseInput(operatorName, 120);
+
+  const safetyFlags = [];
+  if (!waterLevelOk) safetyFlags.push("CRITICAL: Water level not normal — shut down boiler and investigate immediately.");
+  if (faultsObserved) safetyFlags.push(`Fault observed: ${sanitiseInput(faultDescription || "See notes", 200)}`);
+
+  const ref = `BLG-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    boilerRef: sanitisedBoilerRef,
+    logDate,
+    operator: {
+      name: sanitisedOperator,
+      certificate: sanitiseInput(operatorCertificate || "", 60),
+    },
+    operations: {
+      startupTimeH: startupTimeH || null,
+      shutdownTimeH: shutdownTimeH || null,
+      operatingHours: operatingHours || null,
+    },
+    readings: {
+      steamPressureKpa: steamPressureKpa ? Number(steamPressureKpa) : null,
+      feedWaterTempC: feedWaterTempC ? Number(feedWaterTempC) : null,
+      steamTempC: steamTempC ? Number(steamTempC) : null,
+      waterLevelOk: !!waterLevelOk,
+    },
+    maintenance: {
+      safetyValveTestConducted: !!safetyValveTestConducted,
+      fuelConsumptionL: fuelConsumptionL || null,
+      fuelType: sanitiseInput(fuelType || "", 40),
+      chemicalDosing: sanitiseInput(chemicalDosing || "", 100),
+      blowdownConducted: !!blowdownConducted,
+    },
+    faults: {
+      observed: !!faultsObserved,
+      description: sanitiseInput(faultDescription || "", 300),
+    },
+    maintenanceNoted: sanitiseInput(maintenanceNoted || "", 300),
+    safetyFlags,
+    notes: sanitiseInput(notes || "", 300),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("boiler_log_book").insert(record);
+      if (error) console.error("Boiler log insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Boiler log DB error:", e.message);
+    }
+  }
+
+  if (safetyFlags.some(f => f.startsWith("CRITICAL"))) {
+    console.warn(`[SAFETY CRITICAL] Boiler ${sanitisedBoilerRef}: ${safetyFlags[0]}`);
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    boilerRef: sanitisedBoilerRef,
+    safetyFlags,
+    message: safetyFlags.length > 0
+      ? `Boiler log recorded with ${safetyFlags.length} safety flag(s). ${safetyFlags[0]}`
+      : `Boiler log entry recorded for ${sanitisedBoilerRef} on ${logDate}.`,
+    saved,
+    record,
+  });
+});
+
+// POST /ai-pressure-vessel-risk — AI assesses compliance risk for a pressure vessel
+app.post("/ai-pressure-vessel-risk", apiKeyAuth, async (req, res) => {
+  const {
+    vesselType, age, designPressureKpa, designTemperatureC,
+    fluid, corrosionHistory, maintenanceHistory,
+    inspectionFrequency, operatingConditions, notes,
+  } = req.body;
+
+  if (!vesselType) {
+    return res.status(400).json({ error: "vesselType is required." });
+  }
+
+  const sanitisedVesselType = sanitiseInput(vesselType, 100);
+
+  const prompt = `You are a pressure vessel inspection engineer with expertise in AS 1210, AS 3788, and Victorian OHS Equipment (Plant) Regulations 2007.
+
+Assess compliance risk for:
+- Vessel type: ${sanitisedVesselType}
+- Age: ${age || "Unknown"} years
+- Design pressure: ${designPressureKpa ? `${designPressureKpa} kPa` : "Unknown"}
+- Design temperature: ${designTemperatureC ? `${designTemperatureC}°C` : "Unknown"}
+- Working fluid: ${sanitiseInput(fluid || "Unknown", 60)}
+- Corrosion history: ${sanitiseInput(corrosionHistory || "Unknown", 100)}
+- Maintenance history: ${sanitiseInput(maintenanceHistory || "Unknown", 100)}
+- Inspection frequency: ${sanitiseInput(inspectionFrequency || "Unknown", 60)}
+- Operating conditions: ${sanitiseInput(operatingConditions || "Normal", 100)}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Respond ONLY with a JSON object:
+{
+  "riskLevel": "LOW|MEDIUM|HIGH|CRITICAL",
+  "registrationRequired": boolean,
+  "designRegistrationNumber": string,
+  "inspectionFrequencyRequired": string,
+  "inspectionTypeRequired": string,
+  "keyRisks": [string],
+  "mandatoryChecks": [string],
+  "corrosionAllowanceAdequate": string,
+  "safetyDevicesRequired": [string],
+  "regulatoryObligations": [string],
+  "recommendation": string,
+  "summary": string (2 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      vesselType: sanitisedVesselType,
+      riskLevel: parsed.riskLevel || "MEDIUM",
+      registrationRequired: parsed.registrationRequired ?? true,
+      designRegistrationNumber: parsed.designRegistrationNumber || "",
+      inspectionFrequencyRequired: parsed.inspectionFrequencyRequired || "As per AS 3788",
+      inspectionTypeRequired: parsed.inspectionTypeRequired || "",
+      keyRisks: parsed.keyRisks || [],
+      mandatoryChecks: parsed.mandatoryChecks || [],
+      corrosionAllowanceAdequate: parsed.corrosionAllowanceAdequate || "",
+      safetyDevicesRequired: parsed.safetyDevicesRequired || [],
+      regulatoryObligations: parsed.regulatoryObligations || [],
+      recommendation: parsed.recommendation || "",
+      summary: parsed.summary || "Pressure vessel compliance assessment complete.",
+    });
+  } catch (e) {
+    console.error("AI pressure vessel risk error:", e.message);
+    return res.json({
+      success: true,
+      vesselType: sanitisedVesselType,
+      riskLevel: "MEDIUM",
+      registrationRequired: true,
+      designRegistrationNumber: "Confirm with WorkSafe Victoria if design registration is required",
+      inspectionFrequencyRequired: "AS 3788 — typically annual external, 5-yearly internal for lower-hazard vessels",
+      inspectionTypeRequired: "Visual inspection by competent inspector; NDT for vessels showing corrosion",
+      keyRisks: ["Brittle fracture at low temperatures", "Stress corrosion cracking", "Overpressure if safety relief valve fails", "Corrosion thinning beyond minimum wall thickness"],
+      mandatoryChecks: ["Safety/relief valve test — annually or as per manufacturer", "Pressure gauge calibration", "Wall thickness measurement — NDT or UT", "Safety interlock function test"],
+      corrosionAllowanceAdequate: "Verify current wall thickness against original design minimum thickness + corrosion allowance",
+      safetyDevicesRequired: ["Safety relief valve set ≤ MAWP", "Pressure gauge readable from operating position", "Low-water-level protection (if applicable)"],
+      regulatoryObligations: ["OHS Equipment (Plant) Regulations 2007 (Vic) — registered plant requirements", "AS 3788 — Pressure equipment in-service inspection", "WorkSafe plant registration required for prescribed pressure vessels"],
+      recommendation: "Engage a licensed pressure vessel inspector to conduct AS 3788 in-service inspection and confirm compliance.",
+      summary: "Pressure vessel requires regular inspection per AS 3788 and WorkSafe Victoria registration. Engage a licensed pressure equipment inspector for all compliance assessments.",
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
