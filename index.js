@@ -14347,6 +14347,340 @@ app.post("/non-conformance-report", apiKeyAuth, (req, res) => {
   return res.json(ncr);
 });
 
+// ── Round 28 ──────────────────────────────────────────────────────────────────
+
+// POST /audit-schedule  — Create a compliance audit schedule for a contractor
+app.post("/audit-schedule", apiKeyAuth, (req, res) => {
+  const { contractorId, contractorName, tradeTypes, auditFrequency, startDate } = req.body;
+
+  if (!contractorName || !tradeTypes || !Array.isArray(tradeTypes) || tradeTypes.length === 0) {
+    return res.status(400).json({ error: "contractorName and tradeTypes array are required." });
+  }
+
+  const safeName    = sanitiseInput(String(contractorName));
+  const safeId      = contractorId ? sanitiseInput(String(contractorId)) : null;
+  const trades      = tradeTypes.map(t => sanitiseInput(String(t)).toLowerCase());
+  const frequency   = sanitiseInput(String(auditFrequency || "quarterly")).toLowerCase();
+  const freqMonths  = { monthly: 1, quarterly: 3, biannual: 6, annual: 12 }[frequency] || 3;
+  const baseDate    = startDate ? new Date(startDate) : new Date();
+
+  const AUDIT_TYPES = {
+    plumbing:   ["Licence currency check", "Certificate of compliance review", "Photo documentation audit", "Tool calibration check"],
+    gas:        ["Licence currency check", "Gas compliance certificate audit", "Combustion analyser calibration", "Emergency procedure review"],
+    electrical: ["Licence currency check", "Electrical safety certificate review", "Testing equipment calibration", "RCD test log review"],
+    drainage:   ["Licence currency check", "CCTV inspection record review", "Permit compliance audit", "Disposal records check"],
+    carpentry:  ["Builder registration check", "Structural documentation review", "Site safety audit", "Subcontractor record check"],
+    hvac:       ["ARCtick licence check", "Refrigerant handling log audit", "Equipment calibration check", "System commissioning record review"],
+  };
+
+  const schedule = [];
+  for (let i = 0; i < 4; i++) {
+    const auditDate = new Date(baseDate);
+    auditDate.setMonth(auditDate.getMonth() + i * freqMonths);
+
+    const auditItems = [];
+    for (const trade of trades) {
+      const items = AUDIT_TYPES[trade] || [];
+      for (const item of items) {
+        auditItems.push({ trade, auditItem: item });
+      }
+    }
+
+    schedule.push({
+      auditNumber: i + 1,
+      scheduledDate: auditDate.toISOString().slice(0, 10),
+      status: i === 0 ? "UPCOMING" : "SCHEDULED",
+      tradesAudited: trades,
+      auditItems,
+      totalItems: auditItems.length,
+    });
+  }
+
+  return res.json({
+    contractorId: safeId,
+    contractorName: safeName,
+    frequency,
+    auditCount: schedule.length,
+    trades,
+    schedule,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /reinspection-request  — Log a re-inspection request after rectification
+app.post("/reinspection-request", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, originalNcrId, rectificationDetails, rectifiedBy,
+          rectifiedDate, photosAttached, notes } = req.body;
+
+  if (!jobId || !rectificationDetails) {
+    return res.status(400).json({ error: "jobId and rectificationDetails are required." });
+  }
+
+  const safeJobId      = sanitiseInput(String(jobId));
+  const safeJobType    = sanitiseInput(String(jobType || "general")).toLowerCase();
+  const safeRectDetail = sanitiseInput(String(rectificationDetails));
+  const safeRectBy     = sanitiseInput(String(rectifiedBy || "Contractor"));
+  const safeNotes      = sanitiseInput(String(notes || ""));
+
+  const reinspectionId = `RI-${Date.now().toString(36).toUpperCase()}`;
+  const requestedDate  = new Date().toISOString().slice(0, 10);
+
+  // Estimate reinspection date (3 business days from now)
+  const inspDate = new Date();
+  let businessDays = 0;
+  while (businessDays < 3) {
+    inspDate.setDate(inspDate.getDate() + 1);
+    const day = inspDate.getDay();
+    if (day !== 0 && day !== 6) businessDays++;
+  }
+
+  const request = {
+    reinspectionId,
+    status: "PENDING",
+    jobId: safeJobId,
+    jobType: safeJobType,
+    originalNcrId: originalNcrId || null,
+    rectificationDetails: safeRectDetail,
+    rectifiedBy: safeRectBy,
+    rectifiedDate: sanitiseInput(String(rectifiedDate || requestedDate)),
+    photosAttached: !!photosAttached,
+    notes: safeNotes,
+    requestedAt: new Date().toISOString(),
+    estimatedInspectionDate: inspDate.toISOString().slice(0, 10),
+    nextSteps: [
+      "Inspector will review rectification photos",
+      "Site re-inspection will be scheduled within 3 business days",
+      "You will be notified of the outcome by email",
+      photosAttached ? null : "IMPORTANT: Please attach photos of the rectified work to expedite the review",
+    ].filter(Boolean),
+  };
+
+  if (supabaseAdmin) {
+    await supabaseAdmin.from("reinspection_requests").insert({
+      reinspection_id: reinspectionId,
+      job_id: safeJobId,
+      status: "PENDING",
+      rectification_details: safeRectDetail,
+      photos_attached: !!photosAttached,
+      estimated_date: inspDate.toISOString().slice(0, 10),
+      created_at: new Date().toISOString(),
+    }).then(() => {}).catch(() => {});
+  }
+
+  return res.status(201).json(request);
+});
+
+// GET /compliance-matrix  — Cross-reference matrix of compliance requirements by trade and building class
+app.get("/compliance-matrix", apiKeyAuth, (req, res) => {
+  const MATRIX = [
+    { requirement: "Certificate of Compliance",    plumbing: true, gas: true, electrical: true, drainage: true, carpentry: false, hvac: false, buildingClasses: "All", authority: "VBA / ESV" },
+    { requirement: "Permit required",              plumbing: true, gas: true, electrical: true, drainage: true, carpentry: true,  hvac: false, buildingClasses: "Class 1–9", authority: "VBA" },
+    { requirement: "As-built drawings",            plumbing: true, gas: false, electrical: false, drainage: true, carpentry: true, hvac: false, buildingClasses: "Class 2–9", authority: "VBA" },
+    { requirement: "Test report retained",         plumbing: true, gas: true, electrical: true, drainage: false, carpentry: false, hvac: false, buildingClasses: "All", authority: "VBA / ESV" },
+    { requirement: "Photo documentation",          plumbing: true, gas: true, electrical: true, drainage: true, carpentry: true,  hvac: true,  buildingClasses: "All", authority: "Elemetric best practice" },
+    { requirement: "Licence number on invoice",    plumbing: true, gas: true, electrical: true, drainage: true, carpentry: true,  hvac: true,  buildingClasses: "All", authority: "Consumer Affairs Vic" },
+    { requirement: "Safety data sheets on site",   plumbing: false, gas: true, electrical: false, drainage: false, carpentry: false, hvac: true, buildingClasses: "All", authority: "WorkSafe Vic" },
+    { requirement: "ARCtick certificate required", plumbing: false, gas: false, electrical: false, drainage: false, carpentry: false, hvac: true, buildingClasses: "All", authority: "ARC" },
+    { requirement: "NCC compliance statement",     plumbing: true, gas: true, electrical: true, drainage: true, carpentry: true,  hvac: true,  buildingClasses: "Class 1–9", authority: "VBA" },
+    { requirement: "SWMS for high-risk work",      plumbing: true, gas: true, electrical: true, drainage: true, carpentry: true,  hvac: true,  buildingClasses: "All", authority: "WorkSafe Vic" },
+    { requirement: "Defects liability period",     plumbing: true, gas: false, electrical: false, drainage: true, carpentry: true,  hvac: false, buildingClasses: "Class 1–2", authority: "DBCA 1995" },
+    { requirement: "Owner-builder disclosure",     plumbing: false, gas: false, electrical: false, drainage: false, carpentry: true, hvac: false, buildingClasses: "Class 1–2", authority: "VBA" },
+  ];
+
+  const { trade } = req.query;
+  if (trade) {
+    const key = sanitiseInput(String(trade)).toLowerCase();
+    const filtered = MATRIX.filter(r => r[key] === true).map(r => ({
+      requirement: r.requirement,
+      buildingClasses: r.buildingClasses,
+      authority: r.authority,
+    }));
+    if (filtered.length === 0) return res.status(404).json({ error: `No compliance matrix data for trade: ${key}` });
+    return res.json({ trade: key, requirements: filtered, count: filtered.length });
+  }
+
+  return res.json({
+    matrix: MATRIX,
+    trades: ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"],
+    totalRequirements: MATRIX.length,
+    note: "Requirements apply in Victoria. Always verify current requirements with the relevant authority.",
+  });
+});
+
+// POST /site-photo-plan  — Generate a recommended photo plan for a job before starting
+app.post("/site-photo-plan", apiKeyAuth, (req, res) => {
+  const { jobType, scopeItems, propertyType, complexity } = req.body;
+
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+  const safeJobType     = sanitiseInput(String(jobType)).toLowerCase();
+  const safePropType    = sanitiseInput(String(propertyType || "residential"));
+  const safeComplexity  = sanitiseInput(String(complexity || "medium")).toLowerCase();
+
+  const PHOTO_PLANS = {
+    plumbing: [
+      { stage: "Before", description: "Overall view of existing plumbing layout", required: true },
+      { stage: "Before", description: "Close-up of existing isolation valves", required: true },
+      { stage: "Before", description: "Existing hot water unit (nameplate visible)", required: true },
+      { stage: "During", description: "All new pipe runs before concealment", required: true },
+      { stage: "During", description: "All new fittings and joints", required: true },
+      { stage: "During", description: "New isolation valve installation", required: true },
+      { stage: "After",  description: "Completed installation — full view", required: true },
+      { stage: "After",  description: "Tempering valve installed and labelled", required: true },
+      { stage: "After",  description: "All penetrations sealed", required: true },
+      { stage: "After",  description: "TPR relief valve discharge pipe", required: true },
+    ],
+    gas: [
+      { stage: "Before", description: "Gas meter location and regulator", required: true },
+      { stage: "Before", description: "Existing appliance and isolation valve", required: true },
+      { stage: "During", description: "New gas pipe run before concealment", required: true },
+      { stage: "During", description: "Pressure test gauge in place", required: true },
+      { stage: "After",  description: "Completed appliance installation", required: true },
+      { stage: "After",  description: "New isolation valve location", required: true },
+      { stage: "After",  description: "Ventilation provision", required: true },
+      { stage: "After",  description: "Gas compliance certificate (photo of signed copy)", required: true },
+    ],
+    electrical: [
+      { stage: "Before", description: "Switchboard before work commences", required: true },
+      { stage: "Before", description: "Existing circuit arrangement", required: true },
+      { stage: "During", description: "Cable run before concealment", required: true },
+      { stage: "During", description: "Earthing connections before covering", required: true },
+      { stage: "After",  description: "Completed switchboard with labels", required: true },
+      { stage: "After",  description: "RCD installed and labelled", required: true },
+      { stage: "After",  description: "All outlets and fittings completed", required: true },
+      { stage: "After",  description: "ESCC (Electrical Safety Certificate) photo", required: true },
+    ],
+    drainage: [
+      { stage: "Before", description: "Existing drain layout and pit locations", required: true },
+      { stage: "Before", description: "Existing pipe condition at work area", required: true },
+      { stage: "During", description: "New pipe in trench — show gradient", required: true },
+      { stage: "During", description: "Junction connections and fittings", required: true },
+      { stage: "During", description: "Inspection opening installation", required: true },
+      { stage: "After",  description: "Completed drain — all inspection openings visible", required: true },
+      { stage: "After",  description: "Water test in progress or completed", required: true },
+      { stage: "After",  description: "Trench backfill and compaction", required: true },
+    ],
+    carpentry: [
+      { stage: "Before", description: "Existing structural layout", required: true },
+      { stage: "Before", description: "Floor plan or framing before new work", required: true },
+      { stage: "During", description: "New framing members — show sizes", required: true },
+      { stage: "During", description: "Connection details — show fixing types", required: true },
+      { stage: "During", description: "Bracing installation", required: true },
+      { stage: "After",  description: "Completed framing — overall view", required: true },
+      { stage: "After",  description: "All members labelled with sizes if possible", required: false },
+      { stage: "After",  description: "Anchor bolts or hold-downs", required: true },
+    ],
+    hvac: [
+      { stage: "Before", description: "Existing unit and connections", required: true },
+      { stage: "Before", description: "Indoor and outdoor unit location", required: true },
+      { stage: "During", description: "Refrigerant pipe run — show size and insulation", required: true },
+      { stage: "During", description: "Electrical wiring to unit", required: true },
+      { stage: "After",  description: "Completed indoor unit installation", required: true },
+      { stage: "After",  description: "Completed outdoor unit installation", required: true },
+      { stage: "After",  description: "Condensate drain pipe outlet", required: true },
+      { stage: "After",  description: "Nameplate of outdoor unit showing model and refrigerant", required: true },
+    ],
+  };
+
+  const plan = PHOTO_PLANS[safeJobType] || [];
+
+  const additionalPhotos = [];
+  if (scopeItems && Array.isArray(scopeItems)) {
+    for (const item of scopeItems.slice(0, 5)) {
+      additionalPhotos.push({
+        stage: "After",
+        description: `Completed: ${sanitiseInput(String(item))}`,
+        required: true,
+      });
+    }
+  }
+
+  const allPhotos = [...plan, ...additionalPhotos];
+  const requiredCount = allPhotos.filter(p => p.required).length;
+  const byStage = ["Before", "During", "After"].map(stage => ({
+    stage,
+    photos: allPhotos.filter(p => p.stage === stage),
+  }));
+
+  return res.json({
+    jobType: safeJobType,
+    propertyType: safePropType,
+    complexity: safeComplexity,
+    totalPhotos: allPhotos.length,
+    requiredPhotos: requiredCount,
+    byStage,
+    tip: "Take all 'During' photos before closing walls, trenches, or ceilings. Photos taken after concealment provide no compliance value.",
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /contractor-scorecard  — Score a contractor's overall performance from a set of job records
+app.post("/contractor-scorecard", apiKeyAuth, (req, res) => {
+  const { contractorId, contractorName, jobs } = req.body;
+
+  if (!jobs || !Array.isArray(jobs) || jobs.length === 0) {
+    return res.status(400).json({ error: "jobs array is required and must not be empty." });
+  }
+
+  const safeName = sanitiseInput(String(contractorName || "Unknown"));
+
+  const jobCount          = jobs.length;
+  const scores            = jobs.map(j => parseFloat(j.complianceScore) || 0).filter(s => s > 0);
+  const avgScore          = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+  const minScore          = scores.length ? Math.min(...scores) : null;
+  const maxScore          = scores.length ? Math.max(...scores) : null;
+
+  const certFiled         = jobs.filter(j => j.certificateFiled).length;
+  const sigObtained       = jobs.filter(j => j.signatureObtained).length;
+  const gpsRecorded       = jobs.filter(j => j.gpsRecorded).length;
+
+  const certRate          = Math.round((certFiled / jobCount) * 100);
+  const sigRate           = Math.round((sigObtained / jobCount) * 100);
+  const gpsRate           = Math.round((gpsRecorded / jobCount) * 100);
+
+  const tradeBreakdown    = {};
+  for (const j of jobs) {
+    const t = sanitiseInput(String(j.jobType || "unknown")).toLowerCase();
+    if (!tradeBreakdown[t]) tradeBreakdown[t] = { count: 0, totalScore: 0 };
+    tradeBreakdown[t].count++;
+    tradeBreakdown[t].totalScore += parseFloat(j.complianceScore) || 0;
+  }
+  for (const t of Object.keys(tradeBreakdown)) {
+    tradeBreakdown[t].avgScore = Math.round(tradeBreakdown[t].totalScore / tradeBreakdown[t].count);
+  }
+
+  // Overall scorecard rating
+  let rating = "C";
+  if (avgScore >= 90 && certRate >= 95 && sigRate >= 90) rating = "A+";
+  else if (avgScore >= 85 && certRate >= 90) rating = "A";
+  else if (avgScore >= 75 && certRate >= 80) rating = "B";
+  else if (avgScore >= 65) rating = "C";
+  else rating = "D";
+
+  const GRADE_LABEL = { "A+": "Excellent", "A": "Good", "B": "Satisfactory", "C": "Needs Improvement", "D": "Poor" };
+
+  return res.json({
+    contractorId: contractorId || null,
+    contractorName: safeName,
+    jobsAnalysed: jobCount,
+    overallRating: rating,
+    ratingLabel: GRADE_LABEL[rating],
+    complianceScores: { average: avgScore, min: minScore, max: maxScore },
+    documentationRates: {
+      certificatesFiledRate:  `${certRate}%`,
+      signatureObtainedRate:  `${sigRate}%`,
+      gpsRecordedRate:        `${gpsRate}%`,
+    },
+    tradeBreakdown,
+    areasForImprovement: [
+      certRate < 90 ? "Certificate filing rate is below 90% — file certificates promptly after job completion" : null,
+      sigRate  < 80 ? "Client signature capture rate is low — obtain signature before leaving site" : null,
+      gpsRate  < 70 ? "GPS recording rate is low — enable location on all photos" : null,
+      avgScore !== null && avgScore < 70 ? "Average compliance score is below 70 — review common missing items" : null,
+    ].filter(Boolean),
+    generatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
