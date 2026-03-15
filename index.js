@@ -21750,6 +21750,224 @@ Respond with JSON:
   }
 });
 
+// POST /job-handover-sign  — Generate a digital handover sign-off record
+app.post("/job-handover-sign", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, contractorId, clientName, clientEmail, signedByClient, signedByContractor, notes, address } = req.body || {};
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  const safeJobId   = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeType    = sanitiseInput(String(jobType || "general")).slice(0, 40);
+  const safeCId     = contractorId ? sanitiseInput(String(contractorId)).slice(0, 80) : null;
+  const safeName    = clientName ? sanitiseInput(String(clientName)).slice(0, 100) : null;
+  const safeEmail   = clientEmail && isValidEmail(clientEmail) ? clientEmail.toLowerCase() : null;
+  const safeAddress = address ? sanitiseInput(String(address)).slice(0, 200) : null;
+  const safeNotes   = notes ? sanitiseInput(String(notes)).slice(0, 500) : null;
+
+  const record = {
+    jobId: safeJobId,
+    jobType: safeType,
+    contractorId: safeCId,
+    clientName: safeName,
+    clientEmail: safeEmail,
+    address: safeAddress,
+    signedByClient: signedByClient === true,
+    signedByContractor: signedByContractor === true,
+    notes: safeNotes,
+    status: (signedByClient && signedByContractor) ? "FULLY_SIGNED" : (signedByClient || signedByContractor) ? "PARTIALLY_SIGNED" : "UNSIGNED",
+    handoverRef: `HO-${safeJobId.slice(0, 8).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("job_handovers").insert({
+        job_id: record.jobId, job_type: record.jobType, contractor_id: record.contractorId,
+        client_name: record.clientName, client_email: record.clientEmail,
+        signed_by_client: record.signedByClient, signed_by_contractor: record.signedByContractor,
+        status: record.status, handover_ref: record.handoverRef, notes: record.notes,
+        created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.json(record);
+});
+
+// GET /site-safety-brief/:jobType  — Return a pre-start safety briefing for a trade
+app.get("/site-safety-brief/:jobType", apiKeyAuth, (req, res) => {
+  const jobType = sanitiseInput(String(req.params.jobType || "")).toLowerCase();
+
+  const SAFETY_BRIEFS = {
+    plumbing: {
+      hazards: ["Pressurised pipes", "Hot water scalding", "Confined spaces", "Chemical exposure from pipe cleaners", "Manual handling of heavy pipes"],
+      ppe: ["Safety boots", "Gloves", "Safety glasses", "Hard hat (if overhead work)", "Hearing protection (power tools)"],
+      preStartChecks: ["Isolate water supply before cutting", "Check for asbestos in older properties (pre-1990)", "Verify pipe material before soldering", "Test water pressure before opening joints", "Ensure adequate ventilation in confined spaces"],
+      emergencyProcedures: ["Water isolation valve location must be known before starting", "Nearest first aid kit location confirmed", "Emergency contact numbers posted on site"],
+    },
+    gas: {
+      hazards: ["Gas leaks and explosion risk", "Carbon monoxide poisoning", "Burns from ignition", "Oxygen depletion in confined spaces", "High-pressure gas release"],
+      ppe: ["Safety boots", "Flame-resistant gloves", "Safety glasses", "Gas detector", "Hard hat"],
+      preStartChecks: ["Check gas detector reading (0% LEL required before work)", "Locate and test gas isolation valve", "Ensure adequate ventilation", "No ignition sources within 3m", "Verify licence and ESV registration current"],
+      emergencyProcedures: ["Evacuate if gas detected — do not use electrical switches", "Call emergency gas line 132 771", "Do not re-enter until cleared by qualified technician"],
+    },
+    electrical: {
+      hazards: ["Electric shock and electrocution", "Arc flash", "Fire from faulty wiring", "Falls from working at height", "Burns from hot conductors"],
+      ppe: ["Insulated gloves (1000V rated)", "Safety glasses (arc flash rated)", "Safety boots", "Non-conductive tools", "Hi-vis if near traffic"],
+      preStartChecks: ["Isolate and lock out / tag out circuit", "Test for voltage before touching conductors (live test)", "Verify switchboard labelling is current", "Check RCD is operational", "Confirm work is within licence scope"],
+      emergencyProcedures: ["Do not touch a person in contact with live electricity — isolate supply first", "Call 000 for electrocution", "Know location of nearest defibrillator"],
+    },
+    drainage: {
+      hazards: ["Confined space entry hazards", "Biological contamination from sewage", "Cave-in risk for excavations", "Toxic gases (H2S, methane) in drains", "High-pressure jet equipment"],
+      ppe: ["Full face shield", "Chemical-resistant gloves", "Waterproof overalls", "Safety boots", "Gas detector for confined spaces"],
+      preStartChecks: ["Gas test confined spaces before entry", "Shore excavations >1.5m depth", "Decontaminate tools after sewage contact", "Notify council/authority for drain connections", "Locate underground services before excavating"],
+      emergencyProcedures: ["Never enter a confined space alone", "Retrieval line required for confined space entry", "Emergency shower/eyewash location confirmed"],
+    },
+    carpentry: {
+      hazards: ["Power saw lacerations", "Nail gun penetration injuries", "Falls from height (scaffolding, ladders)", "Splinters and wood dust", "Manual handling injuries"],
+      ppe: ["Safety boots with nail penetration protection", "Safety glasses", "Hearing protection", "Dust mask (P2 for treated timber)", "Hard hat on active construction sites"],
+      preStartChecks: ["Inspect all power tool guards", "Check scaffold and ladder stability", "Locate underground services before post-hole drilling", "Verify structural drawings on site", "Confirm asbestos survey complete for demolition"],
+      emergencyProcedures: ["Nearest hospital with trauma unit identified", "First aid kit stocked and accessible", "Emergency stop procedures for all power tools"],
+    },
+    hvac: {
+      hazards: ["Refrigerant handling (ODC risk, cold burns)", "Electrical hazards at switchboards", "Falls from rooftop or ladder work", "Manual handling of heavy equipment", "Noise from commissioning"],
+      ppe: ["Refrigerant-resistant gloves", "Safety glasses", "Safety boots", "Hard hat (rooftop)", "Hearing protection"],
+      preStartChecks: ["Isolate electrical supply before working on unit", "Check refrigerant type and recover safely (EPA licence required)", "Verify roof load capacity for heavy units", "Confirm crane/lift plan for rooftop installations", "Check for asbestos in ceiling cavities"],
+      emergencyProcedures: ["Refrigerant leak — evacuate and ventilate, avoid skin contact", "Notify EPA for significant refrigerant releases (>3kg R410A)", "Emergency eyewash for refrigerant exposure"],
+    },
+  };
+
+  const brief = SAFETY_BRIEFS[jobType] || SAFETY_BRIEFS.carpentry;
+
+  return res.json({
+    jobType,
+    hazards:            brief.hazards,
+    ppe:                brief.ppe,
+    preStartChecks:     brief.preStartChecks,
+    emergencyProcedures: brief.emergencyProcedures,
+    briefVersion: "2025.1",
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /defect-severity  — Classify defects by severity and urgency
+app.post("/defect-severity", apiKeyAuth, (req, res) => {
+  const { defects = [], jobType } = req.body || {};
+  if (!Array.isArray(defects) || defects.length === 0) return res.status(400).json({ error: "defects array required." });
+
+  const SEVERITY_RULES = [
+    { keywords: ["gas leak", "live wire", "exposed conductor", "structural collapse", "fire", "electrocution", "explosion"], severity: "CRITICAL", urgency: "IMMEDIATE", sla: "0-4 hours" },
+    { keywords: ["no earthing", "no rcd", "no certificate", "permit not obtained", "sewage leak", "asbestos", "carbon monoxide"], severity: "HIGH", urgency: "URGENT", sla: "24 hours" },
+    { keywords: ["missing test", "incomplete documentation", "unlabelled", "broken seal", "incorrect material", "no backflow"], severity: "MEDIUM", urgency: "SCHEDULED", sla: "7 days" },
+    { keywords: ["cosmetic", "minor scratch", "label fading", "minor alignment", "paint", "dirt"], severity: "LOW", urgency: "MONITOR", sla: "30 days" },
+  ];
+
+  const classified = defects.slice(0, 50).map(d => {
+    const desc = sanitiseInput(String(d.description || d || "")).toLowerCase();
+    let matched = { severity: "MEDIUM", urgency: "SCHEDULED", sla: "7 days" };
+    for (const rule of SEVERITY_RULES) {
+      if (rule.keywords.some(k => desc.includes(k))) { matched = rule; break; }
+    }
+    return {
+      description: desc,
+      severity:    matched.severity,
+      urgency:     matched.urgency,
+      sla:         matched.sla,
+      action:      matched.severity === "CRITICAL" ? "Stop work immediately, evacuate if necessary, notify regulator"
+                 : matched.severity === "HIGH"     ? "Rectify before job sign-off, notify client in writing"
+                 : matched.severity === "MEDIUM"   ? "Schedule rectification within SLA"
+                 :                                   "Document and monitor at next inspection",
+    };
+  });
+
+  const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+  classified.forEach(c => counts[c.severity]++);
+
+  return res.json({
+    jobType: jobType ? sanitiseInput(String(jobType)).slice(0, 40) : "general",
+    totalDefects: classified.length,
+    severityCounts: counts,
+    overallRisk: counts.CRITICAL > 0 ? "CRITICAL" : counts.HIGH > 0 ? "HIGH" : counts.MEDIUM > 0 ? "MEDIUM" : "LOW",
+    defects: classified,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /contractor-rating  — Submit a client rating for a contractor
+app.post("/contractor-rating", apiKeyAuth, async (req, res) => {
+  const { contractorId, jobId, clientId, overall, quality, timeliness, communication, compliance, comment } = req.body || {};
+  if (!contractorId) return res.status(400).json({ error: "contractorId required." });
+
+  const clamp = (v, min = 1, max = 5) => Math.min(max, Math.max(min, Math.round(parseFloat(v) || 3)));
+
+  const rating = {
+    contractorId:  sanitiseInput(String(contractorId)).slice(0, 80),
+    jobId:         jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null,
+    clientId:      clientId ? sanitiseInput(String(clientId)).slice(0, 80) : null,
+    overall:       clamp(overall),
+    quality:       clamp(quality),
+    timeliness:    clamp(timeliness),
+    communication: clamp(communication),
+    compliance:    clamp(compliance),
+    comment:       comment ? sanitiseInput(String(comment)).slice(0, 500) : null,
+    createdAt:     new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("contractor_ratings").insert({
+        contractor_id: rating.contractorId, job_id: rating.jobId, client_id: rating.clientId,
+        overall: rating.overall, quality: rating.quality, timeliness: rating.timeliness,
+        communication: rating.communication, compliance: rating.compliance,
+        comment: rating.comment, created_at: rating.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  usageStats.requests++;
+  return res.status(201).json({ ...rating, saved: true });
+});
+
+// GET /contractor-rating/:contractorId  — Get average ratings for a contractor
+app.get("/contractor-rating/:contractorId", apiKeyAuth, async (req, res) => {
+  const contractorId = sanitiseInput(String(req.params.contractorId || "")).slice(0, 80);
+  if (!contractorId) return res.status(400).json({ error: "contractorId required." });
+
+  let ratings = [];
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin
+        .from("contractor_ratings")
+        .select("*")
+        .eq("contractor_id", contractorId)
+        .order("created_at", { ascending: false })
+        .limit(100);
+      ratings = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  if (ratings.length === 0) {
+    return res.json({ contractorId, ratingCount: 0, averages: null, message: "No ratings found." });
+  }
+
+  const avg = field => parseFloat((ratings.reduce((s, r) => s + (r[field] || 0), 0) / ratings.length).toFixed(2));
+
+  return res.json({
+    contractorId,
+    ratingCount: ratings.length,
+    averages: {
+      overall:       avg("overall"),
+      quality:       avg("quality"),
+      timeliness:    avg("timeliness"),
+      communication: avg("communication"),
+      compliance:    avg("compliance"),
+    },
+    recentRatings: ratings.slice(0, 10).map(r => ({
+      overall: r.overall, comment: r.comment, createdAt: r.created_at,
+    })),
+    generatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
