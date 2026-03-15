@@ -8104,6 +8104,341 @@ app.post("/document-checklist", (req, res) => {
   });
 });
 
+// ── POST /job-notes ───────────────────────────────────────────────────────────
+// Stores a free-text note against a job analysis. Notes are inserted into the
+// `job_notes` table in Supabase for audit trail and handover documentation.
+app.post("/job-notes", async (req, res) => {
+  const { analysisId, userId, note, noteType = "general" } = req.body || {};
+  const VALID_TYPES = ["general", "safety", "compliance", "handover", "defect", "remediation"];
+
+  if (!analysisId || !note) {
+    return res.status(400).json({ error: "analysisId and note are required." });
+  }
+  if (!VALID_TYPES.includes(noteType)) {
+    return res.status(400).json({ error: `noteType must be one of: ${VALID_TYPES.join(", ")}` });
+  }
+
+  const sanitisedNote = sanitiseInput(String(note)).substring(0, 2000);
+
+  const record = {
+    analysis_id: analysisId,
+    user_id:     userId     || null,
+    note:        sanitisedNote,
+    note_type:   noteType,
+    created_at:  new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      const { data, error } = await supabaseAdmin.from("job_notes").insert(record).select("id").single();
+      if (error) {
+        console.error("job-notes insert error:", error);
+        return res.status(500).json({ error: "Failed to save note." });
+      }
+      return res.status(201).json({ saved: true, noteId: data?.id || null, analysisId, noteType, createdAt: record.created_at });
+    } catch (err) {
+      console.error("job-notes unexpected error:", err);
+      return res.status(500).json({ error: "Failed to save note." });
+    }
+  }
+
+  // Graceful degradation without DB
+  return res.status(201).json({ saved: false, reason: "Database not configured — note not persisted.", analysisId, noteType, createdAt: record.created_at });
+});
+
+// ── GET /job-notes/:analysisId ────────────────────────────────────────────────
+// Retrieves all notes for a specific job analysis from Supabase.
+app.get("/job-notes/:analysisId", async (req, res) => {
+  const { analysisId } = req.params;
+  const { noteType } = req.query;
+
+  if (!analysisId) {
+    return res.status(400).json({ error: "analysisId is required." });
+  }
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: "Database not configured." });
+  }
+
+  try {
+    let query = supabaseAdmin.from("job_notes").select("*").eq("analysis_id", analysisId).order("created_at", { ascending: true });
+    if (noteType) query = query.eq("note_type", noteType);
+
+    const { data, error } = await query;
+    if (error) {
+      console.error("job-notes fetch error:", error);
+      return res.status(500).json({ error: "Failed to retrieve notes." });
+    }
+
+    return res.json({ analysisId, noteCount: (data || []).length, notes: data || [] });
+  } catch (err) {
+    console.error("job-notes fetch unexpected error:", err);
+    return res.status(500).json({ error: "Failed to retrieve notes." });
+  }
+});
+
+// ── POST /digital-handover ────────────────────────────────────────────────────
+// Generates a complete digital handover package summary. Aggregates all job
+// data into a single document for the property owner's records.
+app.post("/digital-handover", (req, res) => {
+  const {
+    jobType,
+    traderName,
+    traderLicence,
+    traderPhone,
+    traderEmail,
+    siteAddress,
+    jobDate,
+    complianceScore,
+    confidence,
+    itemsDetected   = [],
+    itemsMissing    = [],
+    certificateNumber,
+    certificateFiledAt,
+    permitNumber,
+    testResults     = {},
+    warrantyDetails = {},
+    maintenanceTips = [],
+    ownerName,
+    ownerEmail,
+    analysisId,
+  } = req.body || {};
+
+  if (!jobType || !siteAddress) {
+    return res.status(400).json({ error: "jobType and siteAddress are required." });
+  }
+
+  const tradeLabel = {
+    plumbing: "Plumbing", gas: "Gas Fitting", electrical: "Electrical",
+    drainage: "Drainage", carpentry: "Carpentry / Building", hvac: "HVAC / Refrigeration",
+  }[jobType?.toLowerCase()] || jobType;
+
+  const liability = LIABILITY_PERIODS[jobType?.toLowerCase()] || { defects: 7, statute: "Domestic Building Contracts Act 1995 (Vic)" };
+  const liabilityExpiryDate = jobDate
+    ? new Date(new Date(jobDate).getTime() + liability.defects * 365.25 * 24 * 3_600_000).toISOString().split("T")[0]
+    : null;
+
+  // Auto-populate maintenance tips from CHECKLISTS if not provided
+  const defaultTips = (CHECKLISTS[jobType?.toLowerCase()] || [])
+    .filter(c => c.tip)
+    .slice(0, 5)
+    .map(c => c.tip);
+  const finalTips = maintenanceTips.length > 0 ? maintenanceTips : defaultTips;
+
+  const EMERGENCY_CONTACTS = {
+    plumbing:   { name: "VBA Plumbing Complaints", phone: "1300 815 127" },
+    gas:        { name: "Energy Safe Victoria (Gas Emergency)", phone: "13 67 07" },
+    electrical: { name: "Energy Safe Victoria (Electrical)", phone: "1800 000 540" },
+    drainage:   { name: "VBA", phone: "1300 815 127" },
+    carpentry:  { name: "Victorian Building Authority", phone: "1300 815 127" },
+    hvac:       { name: "ARC (Refrigerant Enquiries)", phone: "1300 884 483" },
+  };
+
+  const emergency = EMERGENCY_CONTACTS[jobType?.toLowerCase()] || { name: "Victorian Building Authority", phone: "1300 815 127" };
+
+  return res.json({
+    documentType:   "Digital Handover Package",
+    platform:       "Elemetric AI Compliance Platform",
+    jurisdiction:   "Victoria, Australia",
+    generatedAt:    new Date().toISOString(),
+    analysisId:     analysisId || null,
+
+    property: {
+      ownerName:    ownerName   || null,
+      ownerEmail:   ownerEmail  || null,
+      siteAddress,
+    },
+
+    workCompleted: {
+      tradeType:    tradeLabel,
+      jobDate:      jobDate     || null,
+      traderName:   traderName  || null,
+      traderLicence: traderLicence || null,
+      traderPhone:  traderPhone || null,
+      traderEmail:  traderEmail || null,
+    },
+
+    complianceResult: {
+      score:             complianceScore ?? null,
+      confidence:        confidence      ?? null,
+      passOrFail:        complianceScore != null ? (complianceScore >= 70 ? "PASS" : "FAIL") : null,
+      itemsDetected,
+      itemsMissing,
+    },
+
+    certificates: {
+      certificateNumber:  certificateNumber   || null,
+      certificateFiledAt: certificateFiledAt  || null,
+      permitNumber:       permitNumber        || null,
+    },
+
+    testResults,
+    warrantyDetails,
+
+    liability: {
+      defectsLiabilityYears: liability.defects,
+      statute:               liability.statute,
+      notificationDeadline:  `Owner must notify defects by ${liabilityExpiryDate || "7 years from job completion"}`,
+      liabilityExpiryDate,
+    },
+
+    maintenanceTips: finalTips,
+    emergencyContact: emergency,
+
+    importantNote: "Keep this document with your property records. The compliance certificate is a legal document — store the original safely.",
+  });
+});
+
+// ── POST /price-estimate ──────────────────────────────────────────────────────
+// Generates a rough price estimate for common Victorian trade jobs based on
+// complexity, hours, and materials from the MATERIALS_PRICING database.
+app.post("/price-estimate", (req, res) => {
+  const {
+    jobType,
+    complexity = "medium",
+    estimatedHours,
+    materialsBudget,
+    includeGST = true,
+    callOutFee = 0,
+    scopeItems = [],
+  } = req.body || {};
+
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+  if (!jobType || !SUPPORTED.includes(jobType.toLowerCase())) {
+    return res.status(400).json({ error: `jobType required. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+
+  const tradeData = AWARD_RATES[jobType.toLowerCase()];
+  const hourlyRate = tradeData?.rate || 60;
+
+  const COMPLEXITY_HOURS = {
+    simple:  { min: 1, max: 3,  multiplier: 1.0 },
+    medium:  { min: 3, max: 8,  multiplier: 1.2 },
+    complex: { min: 8, max: 20, multiplier: 1.4 },
+  };
+
+  const complexityData = COMPLEXITY_HOURS[complexity] || COMPLEXITY_HOURS.medium;
+  const hoursLow  = estimatedHours ? estimatedHours * 0.8 : complexityData.min;
+  const hoursHigh = estimatedHours ? estimatedHours * 1.2 : complexityData.max;
+
+  // Labour cost range
+  const labourLow  = Math.round(hoursLow  * hourlyRate * complexityData.multiplier);
+  const labourHigh = Math.round(hoursHigh * hourlyRate * complexityData.multiplier);
+
+  // Materials — use provided budget or derive from MATERIALS_PRICING
+  let matsLow  = materialsBudget ? materialsBudget * 0.85 : labourLow  * 0.3;
+  let matsHigh = materialsBudget ? materialsBudget * 1.15 : labourHigh * 0.5;
+  matsLow  = Math.round(matsLow);
+  matsHigh = Math.round(matsHigh);
+
+  const subtotalLow  = labourLow  + matsLow  + callOutFee;
+  const subtotalHigh = labourHigh + matsHigh + callOutFee;
+  const gstLow       = includeGST ? Math.round(subtotalLow  * 0.1) : 0;
+  const gstHigh      = includeGST ? Math.round(subtotalHigh * 0.1) : 0;
+  const totalLow     = subtotalLow  + gstLow;
+  const totalHigh    = subtotalHigh + gstHigh;
+
+  // Scope-triggered additions
+  const scopeAddons = [];
+  const scopeLower = scopeItems.map(s => String(s).toLowerCase());
+  if (scopeLower.some(s => s.includes("permit") || s.includes("certificate"))) {
+    scopeAddons.push({ item: "Permit / certificate fees", estimatedCost: "~$150–$300" });
+  }
+  if (scopeLower.some(s => s.includes("council") || s.includes("approval"))) {
+    scopeAddons.push({ item: "Council approval fees", estimatedCost: "~$300–$1,500" });
+  }
+  if (scopeLower.some(s => s.includes("asbestos"))) {
+    scopeAddons.push({ item: "Asbestos testing and removal", estimatedCost: "~$500–$3,000" });
+  }
+
+  return res.json({
+    jobType,
+    complexity,
+    estimatedHoursRange: `${hoursLow.toFixed(1)}–${hoursHigh.toFixed(1)} hours`,
+    breakdown: {
+      labourRange:    `$${labourLow}–$${labourHigh}`,
+      materialsRange: `$${matsLow}–$${matsHigh}`,
+      callOutFee:     callOutFee > 0 ? `$${callOutFee}` : null,
+      gst:            includeGST ? `$${gstLow}–$${gstHigh}` : "Not included",
+    },
+    totalEstimate:  `$${totalLow}–$${totalHigh} ${includeGST ? "inc. GST" : "ex. GST"}`,
+    totalLow,
+    totalHigh,
+    hourlyRate:     `$${hourlyRate}/hr (Victorian Award rate)`,
+    scopeAddons,
+    disclaimer: "This is a rough estimate only. Actual costs vary significantly by site conditions, materials selected, and tradesperson. Always obtain a written quote.",
+    estimatedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /nearby-suppliers ────────────────────────────────────────────────────
+// Returns a static list of Victorian trade suppliers near a given suburb or
+// region. Useful for tradies sourcing materials quickly on-site.
+app.post("/nearby-suppliers", (req, res) => {
+  const { jobType, suburb, region = "metro" } = req.body || {};
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+
+  if (!jobType || !SUPPORTED.includes(jobType.toLowerCase())) {
+    return res.status(400).json({ error: `jobType required. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+
+  // Static Victorian supplier database by trade
+  const SUPPLIERS = {
+    plumbing: [
+      { name: "Reece Plumbing",         type: "National chain",  coverage: ["metro", "regional"], website: "reece.com.au",          specialties: ["Hot water", "Tapware", "Pipes", "Valves"] },
+      { name: "Tradelink",              type: "National chain",  coverage: ["metro", "regional"], website: "tradelink.com.au",       specialties: ["Plumbing supplies", "Drainage", "Waterproofing"] },
+      { name: "Reece Plumbing & Bathroom", type: "Showroom",    coverage: ["metro"],             website: "reece.com.au",           specialties: ["Bathroom suites", "Tapware", "Baths"] },
+      { name: "Burdens Plumbing",       type: "Victorian chain", coverage: ["metro", "regional"], website: "burdens.com.au",         specialties: ["Commercial", "Industrial", "Hot water"] },
+      { name: "Fowler & Thomas",        type: "Independent",     coverage: ["metro"],             website: "fowlerandthomas.com.au", specialties: ["Hard to find fittings", "Trade parts"] },
+    ],
+    gas: [
+      { name: "Rexel",                  type: "National chain",  coverage: ["metro", "regional"], website: "rexel.com.au",           specialties: ["Gas appliances", "Regulators", "Fittings"] },
+      { name: "Elgas",                  type: "LPG supplier",    coverage: ["metro", "regional"], website: "elgas.com.au",           specialties: ["LPG bulk", "Cylinder supply", "Regulators"] },
+      { name: "Reece Plumbing",         type: "National chain",  coverage: ["metro", "regional"], website: "reece.com.au",           specialties: ["Gas fittings", "Appliances", "Flue products"] },
+      { name: "Tradelink",              type: "National chain",  coverage: ["metro", "regional"], website: "tradelink.com.au",       specialties: ["Gas fitting consumables", "Pressure testing equipment"] },
+    ],
+    electrical: [
+      { name: "Rexel",                  type: "National chain",  coverage: ["metro", "regional"], website: "rexel.com.au",           specialties: ["Switchgear", "Cable", "Lighting", "RCDs"] },
+      { name: "NHP Electrical",         type: "Specialist",      coverage: ["metro"],             website: "nhp.com.au",             specialties: ["Switchboards", "Motor control", "Industrial"] },
+      { name: "Ideal Electrical",       type: "Victorian chain", coverage: ["metro"],             website: "idealelectrical.com.au", specialties: ["Residential supplies", "Data cable", "Lighting"] },
+      { name: "Electric123",            type: "Online/Metro",    coverage: ["metro"],             website: "electric123.com.au",     specialties: ["Energy management", "Solar components"] },
+      { name: "Winnings",               type: "Appliance",       coverage: ["metro"],             website: "winnings.com.au",        specialties: ["Appliances", "Lighting fixtures"] },
+    ],
+    drainage: [
+      { name: "Iplex Pipelines",        type: "Manufacturer",    coverage: ["metro", "regional"], website: "iplex.com.au",           specialties: ["PVC pressure pipe", "Drainage pipe", "Fittings"] },
+      { name: "Vinidex",                type: "Manufacturer",    coverage: ["metro", "regional"], website: "vinidex.com.au",         specialties: ["PVC drainage", "Stormwater", "Sewer pipe"] },
+      { name: "Reece Plumbing",         type: "National chain",  coverage: ["metro", "regional"], website: "reece.com.au",           specialties: ["Drainage products", "Pits", "Grates"] },
+      { name: "Everhard Industries",    type: "Manufacturer",    coverage: ["metro", "regional"], website: "everhard.com.au",        specialties: ["Stormwater pits", "Grates", "Tanks"] },
+    ],
+    carpentry: [
+      { name: "Bunnings Warehouse",     type: "National chain",  coverage: ["metro", "regional"], website: "bunnings.com.au",        specialties: ["Structural timber", "Sheet products", "Hardware"] },
+      { name: "Bowens",                 type: "Victorian chain", coverage: ["metro", "regional"], website: "bowens.com.au",          specialties: ["Framing timber", "Engineered wood", "Roofing"] },
+      { name: "Carter Holt Harvey",     type: "Manufacturer",    coverage: ["metro", "regional"], website: "chh.com.au",             specialties: ["LVL beams", "Structural plywood", "I-joists"] },
+      { name: "Hyne Timber",            type: "Manufacturer",    coverage: ["regional"],          website: "hyne.com.au",            specialties: ["Seasoned timber", "Hardwood", "Pergola products"] },
+      { name: "AFS Systems",            type: "Specialist",      coverage: ["metro"],             website: "afs.com.au",             specialties: ["Permanent formwork", "Concrete panels"] },
+    ],
+    hvac: [
+      { name: "Temperzone",             type: "Manufacturer",    coverage: ["metro", "regional"], website: "temperzone.com",         specialties: ["Commercial HVAC", "Air handling units"] },
+      { name: "Airmark Trade Supplies", type: "Victorian chain", coverage: ["metro"],             website: "airmark.com.au",         specialties: ["Split system parts", "Ducting", "Refrigerants"] },
+      { name: "Clipsal / Schneider",    type: "National chain",  coverage: ["metro", "regional"], website: "clipsal.com",            specialties: ["Controls", "Thermostats", "Building automation"] },
+      { name: "Actrol",                 type: "Refrigerant dist",coverage: ["metro", "regional"], website: "actrol.com.au",          specialties: ["Refrigerants", "Recovery equipment", "HVAC parts"] },
+      { name: "Lennox International",   type: "Manufacturer",    coverage: ["metro"],             website: "lennox.com.au",          specialties: ["Commercial rooftop units", "Chillers"] },
+    ],
+  };
+
+  const suppliers = (SUPPLIERS[jobType.toLowerCase()] || [])
+    .filter(s => !region || s.coverage.includes(region.toLowerCase()) || s.coverage.includes("metro"));
+
+  return res.json({
+    jobType,
+    suburb:         suburb || null,
+    region,
+    supplierCount:  suppliers.length,
+    suppliers,
+    note: "This is a reference list only. Contact suppliers directly for current stock, pricing, and branch locations near you.",
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
