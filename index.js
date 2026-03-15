@@ -76884,6 +76884,312 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 274 ─────────────────────────────────────────────────────────────────
+
+// POST /itp-record — Record Inspection and Test Plan (ITP) hold/witness point results
+app.post("/itp-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, itpId, activityDescription, inspectionDate, inspectedBy,
+      holdOrWitness, specificationRef, drawingRef,
+      acceptanceCriteria, testMethod, resultValue, resultUnit,
+      passFailStatus, witnessedBy, principalNotified,
+      nonConformanceRaised, ncrRef, reworkRequired,
+      closedOut, closedDate, closedBy, notes
+    } = req.body;
+
+    if (!projectId || !itpId || !activityDescription || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "projectId, itpId, activityDescription, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeITPId = sanitiseInput(String(itpId));
+    const safeActivity = sanitiseInput(String(activityDescription));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+
+    const pointType = String(holdOrWitness || "WITNESS").toUpperCase();
+    const passFailResult = String(passFailStatus || "").toUpperCase();
+    const criticalIssues = [];
+    const warnings = [];
+
+    // Hold points require principal/superintendent witness — work cannot proceed until signed off
+    if (pointType === "HOLD" && !witnessedBy && !(closedOut === true || closedOut === "true")) {
+      criticalIssues.push("HOLD point — work must not proceed until witnessed and signed off by Principal's Representative.");
+    }
+
+    if (passFailResult === "FAIL") {
+      criticalIssues.push("ITP inspection FAILED — do not proceed with follow-on work until non-conformance is resolved.");
+      if (!nonConformanceRaised) {
+        criticalIssues.push("Non-conformance not raised for failed inspection — NCR mandatory for all ITP failures.");
+      }
+    }
+
+    if (passFailResult === "CONDITIONAL_PASS" || reworkRequired === true || reworkRequired === "true") {
+      warnings.push("Rework or conditions applied to ITP sign-off — document clearly and re-inspect after rework.");
+    }
+
+    if (!specificationRef) {
+      warnings.push("Specification reference not recorded — required to verify acceptance criteria.");
+    }
+
+    if (!acceptanceCriteria) {
+      warnings.push("Acceptance criteria not documented — add for clear pass/fail determination.");
+    }
+
+    const itpStatus = criticalIssues.length > 0 ? "HOLD" : warnings.length > 0 ? "CONDITIONAL" : passFailResult || "PENDING";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("itp_records")
+        .insert({
+          project_id: safeProject,
+          itp_id: safeITPId,
+          activity_description: safeActivity,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          hold_or_witness: pointType,
+          specification_ref: specificationRef ? sanitiseInput(String(specificationRef)) : null,
+          drawing_ref: drawingRef ? sanitiseInput(String(drawingRef)) : null,
+          acceptance_criteria: acceptanceCriteria ? sanitiseInput(String(acceptanceCriteria)) : null,
+          test_method: testMethod ? sanitiseInput(String(testMethod)) : null,
+          result_value: resultValue || null,
+          result_unit: resultUnit ? sanitiseInput(String(resultUnit)) : null,
+          pass_fail_status: passFailResult || null,
+          witnessed_by: witnessedBy ? sanitiseInput(String(witnessedBy)) : null,
+          principal_notified: principalNotified || false,
+          non_conformance_raised: nonConformanceRaised || false,
+          ncr_ref: ncrRef ? sanitiseInput(String(ncrRef)) : null,
+          rework_required: reworkRequired || false,
+          closed_out: closedOut || false,
+          closed_date: closedDate || null,
+          closed_by: closedBy ? sanitiseInput(String(closedBy)) : null,
+          itp_status: itpStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        itpStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "ITP hold point or failure — work must not proceed until resolved.",
+        standards: ["AS/NZS ISO 9001:2016", "ISO 21500"],
+      });
+    }
+
+    res.json({
+      itpStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      itpId: safeITPId,
+      holdOrWitness: pointType,
+      standards: ["AS/NZS ISO 9001:2016"],
+    });
+  } catch (err) {
+    console.error("POST /itp-record error:", err.message);
+    res.status(500).json({ error: "Failed to record ITP." });
+  }
+});
+
+// POST /site-diary — Record daily site diary entry for construction contract administration
+app.post("/site-diary", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, diaryDate, recordedBy,
+      weatherConditions, temperature, rainfall,
+      workableDay, reasonNotWorkable,
+      tradesonSite, workActivities, visitorsOnSite,
+      inspectionsAttended, correspondenceReceived, instructionsIssued,
+      delaysNoted, delayReasons, progressNotes,
+      resourceCount, plantOnSite, materialsDelivered,
+      safetyConcerns, environmentalConcerns, notes
+    } = req.body;
+
+    if (!projectId || !diaryDate || !recordedBy) {
+      return res.status(400).json({ error: "projectId, diaryDate, recordedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeRecordedBy = sanitiseInput(String(recordedBy));
+
+    const trades = Array.isArray(tradesonSite) ? tradesonSite : [];
+    const activities = Array.isArray(workActivities) ? workActivities : [];
+    const visitors = Array.isArray(visitorsOnSite) ? visitorsOnSite : [];
+    const deliveries = Array.isArray(materialsDelivered) ? materialsDelivered : [];
+    const instructions = Array.isArray(instructionsIssued) ? instructionsIssued : [];
+    const warnings = [];
+
+    const isWorkable = workableDay !== false && workableDay !== "false";
+
+    if (!isWorkable && !reasonNotWorkable) {
+      warnings.push("Non-workable day but reason not recorded — document for programme and EOT purposes.");
+    }
+
+    if (delaysNoted === true || delaysNoted === "true") {
+      if (!delayReasons) {
+        warnings.push("Delays noted but reasons not documented — record all delays for Extension of Time entitlement preservation.");
+      }
+    }
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("site_diaries")
+        .insert({
+          project_id: safeProject,
+          diary_date: diaryDate,
+          recorded_by: safeRecordedBy,
+          weather_conditions: weatherConditions ? sanitiseInput(String(weatherConditions)) : null,
+          temperature_deg_c: temperature || null,
+          rainfall_mm: rainfall || null,
+          workable_day: isWorkable,
+          reason_not_workable: reasonNotWorkable ? sanitiseInput(String(reasonNotWorkable)) : null,
+          trades_on_site: trades,
+          work_activities: activities,
+          visitors_on_site: visitors,
+          inspections_attended: inspectionsAttended ? sanitiseInput(String(inspectionsAttended)) : null,
+          correspondence_received: correspondenceReceived ? sanitiseInput(String(correspondenceReceived)) : null,
+          instructions_issued: instructions,
+          delays_noted: delaysNoted || false,
+          delay_reasons: delayReasons ? sanitiseInput(String(delayReasons)) : null,
+          progress_notes: progressNotes ? sanitiseInput(String(progressNotes)) : null,
+          resource_count: resourceCount || null,
+          plant_on_site: plantOnSite || null,
+          materials_delivered: deliveries,
+          safety_concerns: safetyConcerns ? sanitiseInput(String(safetyConcerns)) : null,
+          environmental_concerns: environmentalConcerns ? sanitiseInput(String(environmentalConcerns)) : null,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    res.json({
+      savedId,
+      warnings,
+      diaryDate,
+      isWorkableDay: isWorkable,
+      tradeCount: trades.length,
+      activityCount: activities.length,
+      standards: ["AS 4000-1997", "AS 4902-2000"],
+    });
+  } catch (err) {
+    console.error("POST /site-diary error:", err.message);
+    res.status(500).json({ error: "Failed to record site diary." });
+  }
+});
+
+// POST /ai-construction-programme-review — AI reviews construction programme for risks and critical path issues
+app.post("/ai-construction-programme-review", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectType, programDurationMonths, criticalPathActivities,
+      totalActivities, floatDays, resourceConstraints,
+      milestones, highRiskActivities, weatherSensitiveActivities,
+      permitActivities, siteContext
+    } = req.body;
+
+    if (!projectType || !programDurationMonths) {
+      return res.status(400).json({ error: "projectType and programDurationMonths are required." });
+    }
+
+    const safeProjectType = sanitiseInput(String(projectType));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const critPath = Array.isArray(criticalPathActivities) ? criticalPathActivities.map(a => sanitiseInput(String(a))) : [];
+    const milestoneList = Array.isArray(milestones) ? milestones.map(m => sanitiseInput(String(m))) : [];
+    const highRisk = Array.isArray(highRiskActivities) ? highRiskActivities.map(h => sanitiseInput(String(h))) : [];
+    const weatherSensitive = Array.isArray(weatherSensitiveActivities) ? weatherSensitiveActivities.map(w => sanitiseInput(String(w))) : [];
+    const permits = Array.isArray(permitActivities) ? permitActivities.map(p => sanitiseInput(String(p))) : [];
+
+    const prompt = `You are a construction programme planner reviewing a programme for a Victorian construction project.
+
+Project type: ${safeProjectType}
+Program duration: ${programDurationMonths} months
+Total activities: ${totalActivities || "Unknown"}
+Critical path activities: ${critPath.join(", ") || "Not provided"}
+Total float available: ${floatDays != null ? floatDays + " days" : "Unknown"}
+Resource constraints: ${resourceConstraints || "None identified"}
+Key milestones: ${milestoneList.join(", ") || "Not specified"}
+High-risk activities: ${highRisk.join(", ") || "None identified"}
+Weather-sensitive activities: ${weatherSensitive.join(", ") || "None identified"}
+Activities requiring permits/approvals: ${permits.join(", ") || "None identified"}
+Location: ${safeSite}
+
+Review programme for:
+1. Overall programme risk (is duration realistic?)
+2. Critical path vulnerabilities
+3. Float adequacy
+4. Sequencing risks (trades interdependency)
+5. Weather allowances (Victorian climate — 40+ hot days Dec-Feb, winter rain)
+6. Long-lead item risks (procurement)
+7. Permit/approval timing risks
+
+Respond ONLY in JSON:
+{
+  "programmeRisk": "LOW|MODERATE|HIGH|EXTREME",
+  "durationAssessment": "REALISTIC|TIGHT|AGGRESSIVE|UNREALISTIC",
+  "criticalPathRisks": ["string"],
+  "floatAdequacy": "ADEQUATE|MARGINAL|INSUFFICIENT",
+  "sequencingRisks": ["string"],
+  "procurementRisks": ["string"],
+  "weatherAllowanceAdequate": true|false|null,
+  "permitRisks": ["string"],
+  "programmeImprovements": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        programmeRisk: "MODERATE",
+        durationAssessment: "REALISTIC",
+        criticalPathRisks: ["AI analysis unavailable — manual programme review required"],
+        floatAdequacy: "MARGINAL",
+        sequencingRisks: ["Review trade sequencing with subcontractors"],
+        procurementRisks: ["Identify long-lead items and place orders early"],
+        weatherAllowanceAdequate: null,
+        permitRisks: ["Confirm permit timeline with relevant authorities"],
+        programmeImprovements: ["Develop detailed 4-week lookahead programme"],
+        applicableStandards: ["AS 4000-1997", "AS 4902-2000"],
+        summary: "AI programme review unavailable. Engage project planner for critical path analysis.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      projectType: safeProjectType,
+      programDurationMonths,
+      standards: ["AS 4000-1997", "AS 4902-2000"],
+    });
+  } catch (err) {
+    console.error("POST /ai-construction-programme-review error:", err.message);
+    res.status(500).json({ error: "Failed to review construction programme." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
