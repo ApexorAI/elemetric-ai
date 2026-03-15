@@ -9,6 +9,7 @@ const rateLimit = require("express-rate-limit");
 const Stripe  = require("stripe");
 const { createClient } = require("@supabase/supabase-js");
 const sharp   = require("sharp");
+const { Resend } = require("resend");
 
 const app = express();
 
@@ -1248,6 +1249,316 @@ app.get("/property-passport", async (req, res) => {
     return res.status(500).json({
       error: "Property passport lookup failed. Please try again.",
     });
+  }
+});
+
+// ── Resend email client ────────────────────────────────────────────────────────
+
+const resend = process.env.RESEND_API_KEY
+  ? new Resend(process.env.RESEND_API_KEY)
+  : null;
+
+const EMAIL_FROM = process.env.EMAIL_FROM || "Elemetric <noreply@elemetric.app>";
+
+/**
+ * buildEmailHtml — wraps body content in the shared branded shell.
+ *
+ * Brand:  navy background (#0f172a), orange accent (#f97316), white body card.
+ * @param {string} title   — shown in the <title> tag
+ * @param {string} content — inner HTML placed inside the white body card
+ */
+function buildEmailHtml(title, content) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${title}</title>
+</head>
+<body style="margin:0;padding:0;background:#0f172a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
+    <tr>
+      <td align="center">
+        <!-- Header -->
+        <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+          <tr>
+            <td style="background:#0f172a;padding:32px 40px 24px;border-radius:12px 12px 0 0;text-align:center;">
+              <span style="font-size:26px;font-weight:800;color:#f97316;letter-spacing:2px;text-transform:uppercase;">ELEMETRIC</span>
+              <span style="display:block;font-size:11px;color:#94a3b8;letter-spacing:3px;text-transform:uppercase;margin-top:4px;">Compliance Platform</span>
+            </td>
+          </tr>
+          <!-- Body card -->
+          <tr>
+            <td style="background:#ffffff;padding:40px;border-radius:0 0 12px 12px;">
+              ${content}
+              <!-- Footer -->
+              <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:40px;border-top:1px solid #e2e8f0;padding-top:24px;">
+                <tr>
+                  <td style="font-size:12px;color:#94a3b8;text-align:center;line-height:1.6;">
+                    Elemetric &mdash; Built for Australian trade professionals.<br/>
+                    If you didn't expect this email, you can safely ignore it.
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+}
+
+// ── POST /send-welcome ─────────────────────────────────────────────────────────
+// Body: { to: string, name: string }
+
+app.post("/send-welcome", async (req, res) => {
+  try {
+    if (!resend) {
+      return res.status(503).json({ error: "Email service not configured." });
+    }
+
+    const { to, name } = req.body || {};
+    if (!to || typeof to !== "string") {
+      return res.status(400).json({ error: "Missing recipient email address." });
+    }
+    if (!name || typeof name !== "string") {
+      return res.status(400).json({ error: "Missing recipient name." });
+    }
+
+    const firstName = name.split(" ")[0];
+
+    const content = `
+      <h1 style="margin:0 0 8px;font-size:24px;font-weight:700;color:#0f172a;">Welcome to Elemetric, ${firstName}.</h1>
+      <p style="margin:0 0 24px;font-size:14px;color:#64748b;">Your account is ready.</p>
+
+      <p style="margin:0 0 16px;font-size:15px;color:#1e293b;line-height:1.7;">
+        You're now part of a platform built specifically for Australian trade professionals.
+        Elemetric helps you capture compliance evidence, generate job reports, and keep your
+        certifications bulletproof &mdash; all from your phone on the job site.
+      </p>
+
+      <table width="100%" cellpadding="0" cellspacing="0" style="margin:32px 0;">
+        <tr>
+          <td style="background:#fff7ed;border-left:4px solid #f97316;padding:16px 20px;border-radius:0 8px 8px 0;">
+            <p style="margin:0;font-size:13px;font-weight:600;color:#c2410c;text-transform:uppercase;letter-spacing:0.5px;">Get started</p>
+            <p style="margin:6px 0 0;font-size:14px;color:#1e293b;line-height:1.6;">
+              Create your first job, add photos as you work, and let Elemetric validate your compliance evidence in seconds.
+            </p>
+          </td>
+        </tr>
+      </table>
+
+      <table cellpadding="0" cellspacing="0" style="margin:0 0 24px;">
+        <tr>
+          <td style="background:#f97316;border-radius:8px;padding:14px 32px;">
+            <a href="https://elemetric.app" style="font-size:15px;font-weight:700;color:#ffffff;text-decoration:none;display:block;">
+              Open Elemetric &rarr;
+            </a>
+          </td>
+        </tr>
+      </table>
+
+      <p style="margin:0;font-size:14px;color:#64748b;line-height:1.7;">
+        Questions? Reply to this email or reach us at
+        <a href="mailto:support@elemetric.app" style="color:#f97316;text-decoration:none;">support@elemetric.app</a>.
+      </p>`;
+
+    const { data, error: sendError } = await resend.emails.send({
+      from: EMAIL_FROM,
+      to,
+      subject: `Welcome to Elemetric, ${firstName}`,
+      html: buildEmailHtml(`Welcome to Elemetric, ${firstName}`, content),
+    });
+
+    if (sendError) {
+      console.error("Resend /send-welcome error:", sendError);
+      return res.status(500).json({ error: "Failed to send welcome email." });
+    }
+
+    return res.json({ sent: true, id: data?.id });
+  } catch (error) {
+    console.error("send-welcome error:", error);
+    return res.status(500).json({ error: "Failed to send welcome email." });
+  }
+});
+
+// ── POST /send-job-complete ────────────────────────────────────────────────────
+// Body: { to: string, name: string, jobName: string, jobType: string,
+//         confidence: number, pdfUrl: string }
+
+app.post("/send-job-complete", async (req, res) => {
+  try {
+    if (!resend) {
+      return res.status(503).json({ error: "Email service not configured." });
+    }
+
+    const { to, name, jobName, jobType, confidence, pdfUrl } = req.body || {};
+    if (!to || typeof to !== "string") {
+      return res.status(400).json({ error: "Missing recipient email address." });
+    }
+    if (!name || typeof name !== "string") {
+      return res.status(400).json({ error: "Missing recipient name." });
+    }
+    if (!jobName || typeof jobName !== "string") {
+      return res.status(400).json({ error: "Missing job name." });
+    }
+
+    const firstName  = name.split(" ")[0];
+    const tradeLabel = typeof jobType === "string"
+      ? jobType.charAt(0).toUpperCase() + jobType.slice(1)
+      : "Trade";
+    const confidenceNum = typeof confidence === "number"
+      ? Math.max(0, Math.min(100, Math.round(confidence)))
+      : null;
+    const confidenceColour = confidenceNum === null ? "#64748b"
+      : confidenceNum >= 80 ? "#16a34a"
+      : confidenceNum >= 60 ? "#d97706"
+      : "#dc2626";
+
+    const content = `
+      <h1 style="margin:0 0 8px;font-size:24px;font-weight:700;color:#0f172a;">Job complete.</h1>
+      <p style="margin:0 0 24px;font-size:14px;color:#64748b;">Your compliance record is ready.</p>
+
+      <table width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 28px;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;">
+        <tr style="background:#f8fafc;">
+          <td style="padding:12px 20px;font-size:12px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;" width="40%">Job</td>
+          <td style="padding:12px 20px;font-size:14px;color:#1e293b;font-weight:600;">${jobName}</td>
+        </tr>
+        <tr>
+          <td style="padding:12px 20px;font-size:12px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;border-top:1px solid #e2e8f0;">Type</td>
+          <td style="padding:12px 20px;font-size:14px;color:#1e293b;border-top:1px solid #e2e8f0;">${tradeLabel}</td>
+        </tr>
+        ${confidenceNum !== null ? `
+        <tr>
+          <td style="padding:12px 20px;font-size:12px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;border-top:1px solid #e2e8f0;">Confidence</td>
+          <td style="padding:12px 20px;font-size:14px;font-weight:700;color:${confidenceColour};border-top:1px solid #e2e8f0;">${confidenceNum}%</td>
+        </tr>` : ""}
+      </table>
+
+      <p style="margin:0 0 20px;font-size:15px;color:#1e293b;line-height:1.7;">
+        Hi ${firstName}, your job <strong>${jobName}</strong> has been marked complete and your
+        compliance record has been saved to Elemetric.
+        ${pdfUrl ? "Your PDF report is attached below &mdash; keep it on file for your records." : ""}
+      </p>
+
+      ${pdfUrl ? `
+      <table cellpadding="0" cellspacing="0" style="margin:0 0 24px;">
+        <tr>
+          <td style="background:#f97316;border-radius:8px;padding:14px 32px;">
+            <a href="${pdfUrl}" style="font-size:15px;font-weight:700;color:#ffffff;text-decoration:none;display:block;">
+              Download PDF Report &darr;
+            </a>
+          </td>
+        </tr>
+      </table>` : ""}
+
+      <p style="margin:0;font-size:14px;color:#64748b;line-height:1.7;">
+        View the full job record in the app at any time or share it directly with your inspector.
+      </p>`;
+
+    const { data, error: sendError } = await resend.emails.send({
+      from: EMAIL_FROM,
+      to,
+      subject: `Job complete: ${jobName}`,
+      html: buildEmailHtml(`Job complete: ${jobName}`, content),
+    });
+
+    if (sendError) {
+      console.error("Resend /send-job-complete error:", sendError);
+      return res.status(500).json({ error: "Failed to send job completion email." });
+    }
+
+    return res.json({ sent: true, id: data?.id });
+  } catch (error) {
+    console.error("send-job-complete error:", error);
+    return res.status(500).json({ error: "Failed to send job completion email." });
+  }
+});
+
+// ── POST /send-team-invite ─────────────────────────────────────────────────────
+// Body: { to: string, invitedBy: string, teamName: string, joinCode: string }
+
+app.post("/send-team-invite", async (req, res) => {
+  try {
+    if (!resend) {
+      return res.status(503).json({ error: "Email service not configured." });
+    }
+
+    const { to, invitedBy, teamName, joinCode } = req.body || {};
+    if (!to || typeof to !== "string") {
+      return res.status(400).json({ error: "Missing recipient email address." });
+    }
+    if (!invitedBy || typeof invitedBy !== "string") {
+      return res.status(400).json({ error: "Missing invitedBy name." });
+    }
+    if (!teamName || typeof teamName !== "string") {
+      return res.status(400).json({ error: "Missing team name." });
+    }
+    if (!joinCode || typeof joinCode !== "string") {
+      return res.status(400).json({ error: "Missing join code." });
+    }
+
+    const content = `
+      <h1 style="margin:0 0 8px;font-size:24px;font-weight:700;color:#0f172a;">You've been invited.</h1>
+      <p style="margin:0 0 24px;font-size:14px;color:#64748b;">${invitedBy} has invited you to join their team on Elemetric.</p>
+
+      <p style="margin:0 0 20px;font-size:15px;color:#1e293b;line-height:1.7;">
+        <strong>${invitedBy}</strong> has added you to the <strong>${teamName}</strong> team on Elemetric.
+        Use the code below when you sign up or log in to join the team and start collaborating on jobs.
+      </p>
+
+      <table width="100%" cellpadding="0" cellspacing="0" style="margin:32px 0;">
+        <tr>
+          <td align="center" style="background:#0f172a;border-radius:12px;padding:28px 20px;">
+            <p style="margin:0 0 8px;font-size:11px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:2px;">Your join code</p>
+            <p style="margin:0;font-size:36px;font-weight:800;color:#f97316;letter-spacing:8px;font-family:'Courier New',Courier,monospace;">${joinCode}</p>
+          </td>
+        </tr>
+      </table>
+
+      <table width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 28px;">
+        <tr>
+          <td style="background:#f0fdf4;border-left:4px solid #16a34a;padding:14px 20px;border-radius:0 8px 8px 0;">
+            <p style="margin:0;font-size:13px;color:#15803d;line-height:1.6;">
+              <strong>How to join:</strong> Open Elemetric, go to Team Settings, tap &ldquo;Join a team&rdquo; and enter the code above.
+            </p>
+          </td>
+        </tr>
+      </table>
+
+      <table cellpadding="0" cellspacing="0" style="margin:0 0 24px;">
+        <tr>
+          <td style="background:#f97316;border-radius:8px;padding:14px 32px;">
+            <a href="https://elemetric.app" style="font-size:15px;font-weight:700;color:#ffffff;text-decoration:none;display:block;">
+              Open Elemetric &rarr;
+            </a>
+          </td>
+        </tr>
+      </table>
+
+      <p style="margin:0;font-size:13px;color:#94a3b8;line-height:1.6;">
+        This invite was sent by ${invitedBy}. If you don't know this person, you can ignore this email.
+        The join code expires once used or after 7 days.
+      </p>`;
+
+    const { data, error: sendError } = await resend.emails.send({
+      from: EMAIL_FROM,
+      to,
+      subject: `${invitedBy} invited you to join ${teamName} on Elemetric`,
+      html: buildEmailHtml(`Team invitation — ${teamName}`, content),
+    });
+
+    if (sendError) {
+      console.error("Resend /send-team-invite error:", sendError);
+      return res.status(500).json({ error: "Failed to send team invite email." });
+    }
+
+    return res.json({ sent: true, id: data?.id });
+  } catch (error) {
+    console.error("send-team-invite error:", error);
+    return res.status(500).json({ error: "Failed to send team invite email." });
   }
 });
 
