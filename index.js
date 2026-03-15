@@ -39160,6 +39160,217 @@ Return JSON with:
   }
 });
 
+// POST /electrical-test-record — Record an electrical test and tag entry
+app.post("/electrical-test-record", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, projectId, assetDescription, assetId,
+    testDate, nextTestDue, testResult = "PASS",
+    earthLeakageCurrentMa, insulationResistanceMOhm, earthContinuityOhm,
+    tagColour, tagNumber, testedBy, electricianLicenceNumber,
+    testStandard = "AS/NZS 3760", outOfService = false, notes,
+  } = req.body;
+  if (!assetDescription || !testDate || !testedBy) {
+    return res.status(400).json({ error: "assetDescription, testDate, and testedBy are required." });
+  }
+  const validResults = ["PASS", "FAIL", "RETEST"];
+  if (!validResults.includes(testResult)) {
+    return res.status(400).json({ error: `testResult must be one of: ${validResults.join(", ")}` });
+  }
+  const testRef = `ETR-${Date.now().toString(36).toUpperCase()}`;
+  const daysUntilRetest = nextTestDue
+    ? Math.ceil((new Date(nextTestDue) - new Date()) / (1000 * 60 * 60 * 24))
+    : null;
+  const retestStatus = daysUntilRetest === null ? "UNKNOWN"
+    : daysUntilRetest < 0 ? "OVERDUE"
+    : daysUntilRetest <= 14 ? "DUE_SOON"
+    : "CURRENT";
+  const record = {
+    test_ref: testRef,
+    property_address: sanitiseInput(propertyAddress || ""),
+    project_id: projectId || null,
+    asset_description: sanitiseInput(assetDescription),
+    asset_id: sanitiseInput(assetId || ""),
+    test_date: testDate,
+    next_test_due: nextTestDue || null,
+    test_result: testResult,
+    earth_leakage_ma: Number(earthLeakageCurrentMa) || null,
+    insulation_resistance_mohm: Number(insulationResistanceMOhm) || null,
+    earth_continuity_ohm: Number(earthContinuityOhm) || null,
+    tag_colour: sanitiseInput(tagColour || ""),
+    tag_number: sanitiseInput(tagNumber || ""),
+    tested_by: sanitiseInput(testedBy),
+    electrician_licence: sanitiseInput(electricianLicenceNumber || ""),
+    test_standard: sanitiseInput(testStandard),
+    out_of_service: testResult === "FAIL" || Boolean(outOfService),
+    retest_status: retestStatus,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("electrical_test_records").insert(record);
+    if (error) console.error("electrical-test-record DB error:", error.message);
+  }
+  res.json({
+    testRef, assetDescription, testResult, retestStatus, daysUntilRetest,
+    outOfService: record.out_of_service, saved: !!supabaseAdmin,
+  });
+});
+
+// GET /electrical-test-record — List test records
+app.get("/electrical-test-record", apiKeyAuth, async (req, res) => {
+  const { projectId, propertyAddress, retestStatus } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("electrical_test_records").select("*").order("next_test_due", { ascending: true });
+  if (projectId) query = query.eq("project_id", projectId);
+  if (propertyAddress) query = query.ilike("property_address", `%${propertyAddress}%`);
+  if (retestStatus) query = query.eq("retest_status", retestStatus);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({
+    count: data.length,
+    outOfService: data.filter(r => r.out_of_service).length,
+    overdue: data.filter(r => r.retest_status === "OVERDUE").length,
+    records: data,
+  });
+});
+
+// POST /rcd-test-record — Record an RCD (safety switch) test
+app.post("/rcd-test-record", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, projectId, circuitName, circuitNumber,
+    rcdType = "TYPE_1", ratingMa = 30, testDate, nextTestDue,
+    tripTimeMs, testCurrentMa, testResult,
+    testedBy, electricianLicenceNumber, panelLocation, notes,
+  } = req.body;
+  if (!circuitName || !testDate || !testedBy) {
+    return res.status(400).json({ error: "circuitName, testDate, and testedBy are required." });
+  }
+  const validTypes = ["TYPE_1", "TYPE_2", "TYPE_3", "TYPE_S"];
+  if (!validTypes.includes(rcdType)) {
+    return res.status(400).json({ error: `rcdType must be one of: ${validTypes.join(", ")}` });
+  }
+  // Per AS/NZS 3760 and AS/NZS 3000: Type 1 (30mA) must trip within 300ms at rated current
+  const maxTripTimeMs = rcdType === "TYPE_S" ? 500 : 300;
+  const autoResult = testResult || (Number(tripTimeMs) > 0 && Number(tripTimeMs) <= maxTripTimeMs ? "PASS" : testResult || "INCONCLUSIVE");
+  const testRef = `RCD-${Date.now().toString(36).toUpperCase()}`;
+  const daysUntilRetest = nextTestDue
+    ? Math.ceil((new Date(nextTestDue) - new Date()) / (1000 * 60 * 60 * 24))
+    : null;
+  const record = {
+    test_ref: testRef,
+    property_address: sanitiseInput(propertyAddress || ""),
+    project_id: projectId || null,
+    circuit_name: sanitiseInput(circuitName),
+    circuit_number: sanitiseInput(String(circuitNumber || "")),
+    rcd_type: rcdType,
+    rating_ma: Number(ratingMa),
+    test_date: testDate,
+    next_test_due: nextTestDue || null,
+    trip_time_ms: Number(tripTimeMs) || null,
+    test_current_ma: Number(testCurrentMa) || null,
+    test_result: autoResult,
+    max_allowed_trip_time_ms: maxTripTimeMs,
+    tested_by: sanitiseInput(testedBy),
+    electrician_licence: sanitiseInput(electricianLicenceNumber || ""),
+    panel_location: sanitiseInput(panelLocation || ""),
+    days_until_retest: daysUntilRetest,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("rcd_test_records").insert(record);
+    if (error) console.error("rcd-test-record DB error:", error.message);
+  }
+  res.json({
+    testRef, circuitName, rcdType, ratingMa: Number(ratingMa),
+    tripTimeMs: Number(tripTimeMs) || null, testResult: autoResult,
+    maxAllowedTripTimeMs: maxTripTimeMs, passed: autoResult === "PASS",
+    saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-electrical-compliance-summary — AI summarises electrical compliance for a premises
+app.post("/ai-electrical-compliance-summary", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, propertyType = "commercial", state = "VIC", buildYear,
+    lastElectricalAuditDate, rcdProtected = false, rcdsInstalled = 0,
+    testAndTagCurrent = false, switchboardAge_years, knownDeficiencies = [],
+    certifications = [], occupancyLoad,
+  } = req.body;
+  if (!propertyAddress) {
+    return res.status(400).json({ error: "propertyAddress is required." });
+  }
+  const sanitisedAddress = sanitiseInput(propertyAddress);
+  const sanitisedType = sanitiseInput(propertyType);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian electrical compliance specialist. Assess electrical compliance for commercial and residential premises.`;
+  const userPrompt = `Assess electrical compliance for:
+Address: ${sanitisedAddress}
+Property type: ${sanitisedType}
+State: ${sanitisedState}
+Build year: ${buildYear || "Unknown"}
+Last audit: ${sanitiseInput(lastElectricalAuditDate || "Unknown")}
+RCD protected: ${rcdProtected} | RCDs installed: ${rcdsInstalled}
+Test & tag current: ${testAndTagCurrent}
+Switchboard age: ${switchboardAge_years ? `${switchboardAge_years} years` : "Unknown"}
+Occupancy: ${sanitiseInput(occupancyLoad || "Not specified")}
+Known deficiencies: ${knownDeficiencies.map(d => sanitiseInput(d)).join("; ") || "None"}
+Certifications: ${certifications.map(c => sanitiseInput(c)).join("; ") || "None"}
+
+Return JSON with:
+{
+  "overallComplianceStatus": "COMPLIANT|PARTIALLY_COMPLIANT|NON_COMPLIANT|UNKNOWN",
+  "complianceScore": 75,
+  "criticalRisks": ["...", "..."],
+  "immediateActions": ["...", "..."],
+  "scheduledActions": [{"action": "...", "timeframe": "...", "priority": "HIGH|MEDIUM|LOW"}],
+  "regulatoryChecklist": [{"requirement": "...", "status": "MET|NOT_MET|UNKNOWN"}],
+  "applicableStandards": ["AS/NZS ...", "..."],
+  "switchboardAssessment": "...",
+  "rcdAssessment": "...",
+  "testAndTagAssessment": "...",
+  "estimatedUpgradeCost": "...",
+  "nextAuditRecommended": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const summary = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ propertyAddress: sanitisedAddress, propertyType: sanitisedType, state: sanitisedState, summary });
+  } catch (err) {
+    console.error("ai-electrical-compliance-summary error:", err.message);
+    res.json({
+      propertyAddress: sanitisedAddress, propertyType: sanitisedType, state: sanitisedState,
+      summary: {
+        overallComplianceStatus: "UNKNOWN",
+        complianceScore: 0,
+        criticalRisks: !rcdProtected ? ["No RCD protection — immediate fire and electrocution risk"] : [],
+        immediateActions: !rcdProtected ? ["Install RCD protection on all circuits immediately"] : ["Conduct full electrical audit"],
+        scheduledActions: [{ action: "Commission electrical compliance audit", timeframe: "Within 3 months", priority: "HIGH" }],
+        regulatoryChecklist: [
+          { requirement: "RCD protection on all circuits", status: rcdProtected ? "MET" : "NOT_MET" },
+          { requirement: "Test and tag current", status: testAndTagCurrent ? "MET" : "NOT_MET" },
+          { requirement: "Electrical safety certificate current", status: certifications.length > 0 ? "UNKNOWN" : "NOT_MET" },
+        ],
+        applicableStandards: ["AS/NZS 3000:2018 (Wiring Rules)", "AS/NZS 3760 (Test & Tag)", `${sanitisedState} Electrical Safety Act`],
+        switchboardAssessment: switchboardAge_years >= 25 ? "Switchboard is aged — replacement recommended." : "Switchboard age within acceptable range.",
+        rcdAssessment: !rcdProtected ? "No RCD protection detected — urgent upgrade required." : `${rcdsInstalled} RCDs installed.`,
+        testAndTagAssessment: testAndTagCurrent ? "Test and tag current." : "Test and tag overdue — arrange immediately.",
+        estimatedUpgradeCost: "TBD — requires electrical audit",
+        nextAuditRecommended: "Within 12 months",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
