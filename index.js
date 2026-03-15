@@ -40816,6 +40816,212 @@ Return JSON with:
   }
 });
 
+// POST /timesheet — Record a worker timesheet entry
+app.post("/timesheet", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, workerId, workerName, trade, workDate,
+    startTime, endTime, breakMinutes = 30,
+    activities = [], costCode, overtimeHours = 0,
+    travelHours = 0, allowances = {}, supervisorName,
+    approved = false, notes,
+  } = req.body;
+  if (!workerId || !workDate || !startTime || !endTime) {
+    return res.status(400).json({ error: "workerId, workDate, startTime, and endTime are required." });
+  }
+  // Calculate hours worked
+  const startParts = startTime.split(":").map(Number);
+  const endParts = endTime.split(":").map(Number);
+  const startMins = startParts[0] * 60 + (startParts[1] || 0);
+  const endMins = endParts[0] * 60 + (endParts[1] || 0);
+  const grossMins = (endMins > startMins ? endMins - startMins : endMins + 1440 - startMins);
+  const netMinutes = grossMins - Number(breakMinutes);
+  const ordinaryHours = Math.max(0, Math.min(netMinutes / 60, 8));
+  const otHours = Number(overtimeHours) || Math.max(0, netMinutes / 60 - 8);
+  const totalHours = +(ordinaryHours + otHours + Number(travelHours)).toFixed(2);
+  const timesheetRef = `TS-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    timesheet_ref: timesheetRef,
+    project_id: projectId || null,
+    worker_id: sanitiseInput(workerId),
+    worker_name: sanitiseInput(workerName || ""),
+    trade: sanitiseInput(trade || ""),
+    work_date: workDate,
+    start_time: startTime,
+    end_time: endTime,
+    break_minutes: Number(breakMinutes),
+    ordinary_hours: +ordinaryHours.toFixed(2),
+    overtime_hours: +otHours.toFixed(2),
+    travel_hours: Number(travelHours) || 0,
+    total_hours: totalHours,
+    activities: Array.isArray(activities) ? activities.map(a => sanitiseInput(a)) : [],
+    cost_code: sanitiseInput(costCode || ""),
+    allowances,
+    supervisor_name: sanitiseInput(supervisorName || ""),
+    approved: Boolean(approved),
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("timesheets").insert(record);
+    if (error) console.error("timesheet DB error:", error.message);
+  }
+  res.json({
+    timesheetRef, workDate, workerName, totalHours, ordinaryHours: +ordinaryHours.toFixed(2),
+    overtimeHours: +otHours.toFixed(2), travelHours: Number(travelHours) || 0,
+    approved, saved: !!supabaseAdmin,
+  });
+});
+
+// GET /timesheet — Get timesheet summary for a worker and period
+app.get("/timesheet", apiKeyAuth, async (req, res) => {
+  const { workerId, projectId, from, to, approved } = req.query;
+  if (!workerId && !projectId) return res.status(400).json({ error: "workerId or projectId is required." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("timesheets").select("*").order("work_date", { ascending: false });
+  if (workerId) query = query.eq("worker_id", workerId);
+  if (projectId) query = query.eq("project_id", projectId);
+  if (from) query = query.gte("work_date", from);
+  if (to) query = query.lte("work_date", to);
+  if (approved !== undefined) query = query.eq("approved", approved === "true");
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  const totalHours = data.reduce((s, t) => s + (t.total_hours || 0), 0);
+  const totalOT = data.reduce((s, t) => s + (t.overtime_hours || 0), 0);
+  res.json({
+    count: data.length, totalHours: +totalHours.toFixed(2),
+    totalOvertimeHours: +totalOT.toFixed(2),
+    pendingApproval: data.filter(t => !t.approved).length,
+    timesheets: data,
+  });
+});
+
+// POST /job-cost-code — Create a cost code for project cost management
+app.post("/job-cost-code", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, code, description, category,
+    budgetAud, unit = "LS", measurementBasis, notes,
+  } = req.body;
+  if (!projectId || !code || !description) {
+    return res.status(400).json({ error: "projectId, code, and description are required." });
+  }
+  const validCategories = ["LABOUR", "MATERIALS", "PLANT", "SUBCONTRACTORS", "PRELIMINARIES", "OVERHEAD", "CONTINGENCY"];
+  if (category && !validCategories.includes(category)) {
+    return res.status(400).json({ error: `category must be one of: ${validCategories.join(", ")}` });
+  }
+  const record = {
+    project_id: projectId,
+    code: sanitiseInput(code),
+    description: sanitiseInput(description),
+    category: category || null,
+    budget_aud: Number(budgetAud) || null,
+    unit: sanitiseInput(unit),
+    measurement_basis: sanitiseInput(measurementBasis || ""),
+    spent_aud: 0,
+    committed_aud: 0,
+    forecast_aud: Number(budgetAud) || 0,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("job_cost_codes").upsert(record, { onConflict: "project_id,code" });
+    if (error) console.error("job-cost-code DB error:", error.message);
+  }
+  res.json({ projectId, code, description, category, budgetAud: Number(budgetAud) || null, saved: !!supabaseAdmin });
+});
+
+// GET /job-cost-code/:projectId — Get cost codes and spend for a project
+app.get("/job-cost-code/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { category } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("job_cost_codes").select("*").eq("project_id", projectId).order("code", { ascending: true });
+  if (category) query = query.eq("category", category);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  const totalBudget = data.reduce((s, c) => s + (c.budget_aud || 0), 0);
+  const totalSpent = data.reduce((s, c) => s + (c.spent_aud || 0), 0);
+  const totalCommitted = data.reduce((s, c) => s + (c.committed_aud || 0), 0);
+  res.json({
+    projectId, codeCount: data.length,
+    totals: {
+      budget: +totalBudget.toFixed(2), spent: +totalSpent.toFixed(2),
+      committed: +totalCommitted.toFixed(2), available: +(totalBudget - totalSpent - totalCommitted).toFixed(2),
+    },
+    codes: data,
+  });
+});
+
+// POST /ai-timesheet-validation — AI validates a timesheet claim for reasonableness
+app.post("/ai-timesheet-validation", apiKeyAuth, async (req, res) => {
+  const {
+    trade, workDescription, hoursOrdinary, hoursOvertime,
+    hoursTravel, allowancesClaimed = {},
+    workDate, projectType, taskComplexity = "MEDIUM",
+  } = req.body;
+  if (!trade || !workDescription || hoursOrdinary === undefined) {
+    return res.status(400).json({ error: "trade, workDescription, and hoursOrdinary are required." });
+  }
+  const totalHours = (Number(hoursOrdinary) || 0) + (Number(hoursOvertime) || 0) + (Number(hoursTravel) || 0);
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedDesc = sanitiseInput(workDescription);
+  const systemPrompt = `You are an Australian construction cost controller. Validate timesheet claims for reasonableness.`;
+  const userPrompt = `Validate this timesheet claim:
+Trade: ${sanitisedTrade}
+Work description: ${sanitisedDesc}
+Ordinary hours: ${hoursOrdinary}
+Overtime hours: ${hoursOvertime || 0}
+Travel hours: ${hoursTravel || 0}
+Total hours: ${totalHours}
+Allowances claimed: ${JSON.stringify(allowancesClaimed)}
+Work date: ${sanitiseInput(workDate || "Not specified")}
+Project type: ${sanitiseInput(projectType || "general construction")}
+Task complexity: ${taskComplexity}
+
+Return JSON with:
+{
+  "validationResult": "APPROVED|QUERIED|REJECTED",
+  "confidence": "HIGH|MEDIUM|LOW",
+  "hoursAssessment": "REASONABLE|HIGH|LOW",
+  "flags": ["...", "..."],
+  "allowanceFlags": ["...", "..."],
+  "benchmarkHours": 8,
+  "recommendation": "...",
+  "queryDetails": "...",
+  "auditNotes": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 1000,
+    });
+    usageStats.openaiCalls++;
+    const validation = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ trade: sanitisedTrade, workDescription: sanitisedDesc, totalHours, validation });
+  } catch (err) {
+    console.error("ai-timesheet-validation error:", err.message);
+    const hoursFlag = totalHours > 14;
+    res.json({
+      trade: sanitisedTrade, workDescription: sanitisedDesc, totalHours,
+      validation: {
+        validationResult: hoursFlag ? "QUERIED" : "APPROVED",
+        confidence: "LOW",
+        hoursAssessment: totalHours > 12 ? "HIGH" : "REASONABLE",
+        flags: hoursFlag ? [`Total hours (${totalHours}) exceeds typical daily maximum`] : [],
+        allowanceFlags: [],
+        benchmarkHours: 8,
+        recommendation: hoursFlag ? "Review total hours with supervisor before approving." : "Appears reasonable — approve at supervisor discretion.",
+        queryDetails: "",
+        auditNotes: "AI validation unavailable — manual review applied.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
