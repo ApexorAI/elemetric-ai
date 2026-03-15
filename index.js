@@ -23414,6 +23414,173 @@ app.get("/payment-summary/:projectId", apiKeyAuth, async (req, res) => {
   });
 });
 
+// POST /regulatory-breach  — Log a regulatory breach incident
+app.post("/regulatory-breach", apiKeyAuth, async (req, res) => {
+  const { contractorId, jobId, breachType, regulation, description, discoveredBy, discoveredDate, rectificationRequired, notes } = req.body || {};
+  if (!contractorId || !breachType || !description) return res.status(400).json({ error: "contractorId, breachType, and description required." });
+
+  const VALID_BREACH_TYPES = ["licence-lapse", "permit-violation", "safety-breach", "code-non-compliance", "false-documentation", "unlicensed-work", "inspection-avoidance", "other"];
+  const safeCId    = sanitiseInput(String(contractorId)).slice(0, 80);
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeType   = VALID_BREACH_TYPES.includes(String(breachType || "").toLowerCase().replace(/ /g, "-")) ? String(breachType).toLowerCase().replace(/ /g, "-") : "other";
+  const safeReg    = regulation ? sanitiseInput(String(regulation)).slice(0, 200) : null;
+  const safeDesc   = sanitiseInput(String(description)).slice(0, 1000);
+  const safeDiscBy = discoveredBy ? sanitiseInput(String(discoveredBy)).slice(0, 100) : null;
+  const safeDate   = discoveredDate ? sanitiseInput(String(discoveredDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 500) : null;
+
+  const SEVERITY_MAP = {
+    "licence-lapse": "HIGH", "permit-violation": "HIGH", "safety-breach": "CRITICAL",
+    "code-non-compliance": "MEDIUM", "false-documentation": "HIGH",
+    "unlicensed-work": "CRITICAL", "inspection-avoidance": "MEDIUM", "other": "LOW",
+  };
+
+  const record = {
+    breachId:              `BRE-${safeCId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    contractorId:          safeCId, jobId: safeJobId, breachType: safeType,
+    regulation:            safeReg, description: safeDesc,
+    severity:              SEVERITY_MAP[safeType] || "MEDIUM",
+    discoveredBy:          safeDiscBy, discoveredDate: safeDate,
+    rectificationRequired: rectificationRequired !== false,
+    status:                "OPEN", notes: safeNotes,
+    createdAt:             new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("regulatory_breaches").insert({
+        breach_id: record.breachId, contractor_id: safeCId, job_id: safeJobId,
+        breach_type: safeType, regulation: safeReg, description: safeDesc,
+        severity: record.severity, discovered_by: safeDiscBy, discovered_date: safeDate,
+        rectification_required: record.rectificationRequired, status: "OPEN",
+        notes: safeNotes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// GET /regulatory-breach/:contractorId  — Get breach history for a contractor
+app.get("/regulatory-breach/:contractorId", apiKeyAuth, async (req, res) => {
+  const contractorId = sanitiseInput(String(req.params.contractorId || "")).slice(0, 80);
+  const status       = req.query.status ? sanitiseInput(String(req.query.status)).toUpperCase() : null;
+  if (!contractorId) return res.status(400).json({ error: "contractorId required." });
+
+  let breaches = [];
+  if (supabaseAdmin) {
+    try {
+      let q = supabaseAdmin.from("regulatory_breaches").select("*").eq("contractor_id", contractorId).order("discovered_date", { ascending: false }).limit(100);
+      if (status) q = q.eq("status", status);
+      const { data } = await q;
+      breaches = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+  const statuses = { OPEN: 0, UNDER_REVIEW: 0, RECTIFIED: 0, CLOSED: 0 };
+  breaches.forEach(b => {
+    if (counts[b.severity] !== undefined) counts[b.severity]++;
+    if (statuses[b.status] !== undefined) statuses[b.status]++;
+  });
+
+  return res.json({ contractorId, totalBreaches: breaches.length, severityCounts: counts, statusCounts: statuses, breaches, generatedAt: new Date().toISOString() });
+});
+
+// POST /ai-safety-briefing  — AI generates a task-specific safety briefing
+app.post("/ai-safety-briefing", apiKeyAuth, async (req, res) => {
+  const { jobType, taskDescription, siteConditions, workerCount } = req.body || {};
+  if (!jobType || !taskDescription) return res.status(400).json({ error: "jobType and taskDescription required." });
+
+  const safeType    = sanitiseInput(String(jobType)).slice(0, 40);
+  const safeTask    = sanitiseInput(String(taskDescription)).slice(0, 1500);
+  const safeSite    = siteConditions ? sanitiseInput(String(siteConditions)).slice(0, 300) : null;
+  const safeWorkers = workerCount ? Math.max(1, parseInt(workerCount) || 1) : null;
+
+  const prompt = `You are a workplace health and safety expert for the ${safeType} trade in Victoria, Australia.
+
+Generate a pre-task safety briefing for the following:
+Task: ${safeTask}
+${safeSite ? `Site conditions: ${safeSite}` : ""}
+${safeWorkers ? `Workers present: ${safeWorkers}` : ""}
+
+Respond with JSON:
+{
+  "taskRiskLevel": "LOW|MEDIUM|HIGH|CRITICAL",
+  "hazards": [{"hazard": "...", "control": "..."}],
+  "requiredPpe": ["ppe item"],
+  "preTaskChecklist": ["check item"],
+  "emergencyProcedures": ["procedure"],
+  "briefingPoints": ["key talking point for toolbox meeting"],
+  "estimatedRiskScore": 1-10
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 700 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      jobType: safeType, task: safeTask.slice(0, 100) + (safeTask.length > 100 ? "..." : ""),
+      taskRiskLevel:      parsed.taskRiskLevel || "MEDIUM",
+      hazards:            Array.isArray(parsed.hazards) ? parsed.hazards : [],
+      requiredPpe:        Array.isArray(parsed.requiredPpe) ? parsed.requiredPpe : [],
+      preTaskChecklist:   Array.isArray(parsed.preTaskChecklist) ? parsed.preTaskChecklist : [],
+      emergencyProcedures: Array.isArray(parsed.emergencyProcedures) ? parsed.emergencyProcedures : [],
+      briefingPoints:     Array.isArray(parsed.briefingPoints) ? parsed.briefingPoints : [],
+      estimatedRiskScore: typeof parsed.estimatedRiskScore === "number" ? Math.min(10, Math.max(1, parsed.estimatedRiskScore)) : 5,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      jobType: safeType, taskRiskLevel: "MEDIUM",
+      hazards: [], requiredPpe: ["PPE appropriate to task"], preTaskChecklist: ["Conduct JSA before starting"],
+      emergencyProcedures: ["Call 000 in emergencies"], briefingPoints: ["Safety briefing temporarily unavailable"],
+      estimatedRiskScore: 5, generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /noise-complaint  — Log a noise or nuisance complaint from a neighbour
+app.post("/noise-complaint", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, complaintDate, complaintTime, complainantName, complainantPhone, noiseType, description, actionTaken, notes } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+
+  const VALID_NOISE_TYPES = ["general-construction", "machinery", "early-morning", "late-night", "weekend", "dust", "vibration", "other"];
+  const safeSiteId  = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId   = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeDate    = complaintDate ? sanitiseInput(String(complaintDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeTime    = complaintTime ? sanitiseInput(String(complaintTime)).slice(0, 10) : null;
+  const safeName    = complainantName ? sanitiseInput(String(complainantName)).slice(0, 100) : "Anonymous";
+  const safePhone   = complainantPhone ? sanitiseInput(String(complainantPhone)).replace(/[^0-9+ ()-]/g, "").slice(0, 20) : null;
+  const safeType    = VALID_NOISE_TYPES.includes(String(noiseType || "").toLowerCase().replace(/ /g, "-")) ? String(noiseType).toLowerCase().replace(/ /g, "-") : "general-construction";
+  const safeDesc    = description ? sanitiseInput(String(description)).slice(0, 500) : null;
+  const safeAction  = actionTaken ? sanitiseInput(String(actionTaken)).slice(0, 300) : null;
+  const safeNotes   = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const complaint = {
+    complaintId: `NCL-${(safeSiteId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId, jobId: safeJobId, complaintDate: safeDate, complaintTime: safeTime,
+    complainantName: safeName, complainantPhone: safePhone, noiseType: safeType,
+    description: safeDesc, actionTaken: safeAction, notes: safeNotes,
+    status: safeAction ? "ACTION_TAKEN" : "LOGGED",
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("noise_complaints").insert({
+        complaint_id: complaint.complaintId, site_id: safeSiteId, job_id: safeJobId,
+        complaint_date: safeDate, complaint_time: safeTime,
+        complainant_name: safeName, complainant_phone: safePhone, noise_type: safeType,
+        description: safeDesc, action_taken: safeAction, notes: safeNotes,
+        status: complaint.status, created_at: complaint.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...complaint, saved: !!supabaseAdmin });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
