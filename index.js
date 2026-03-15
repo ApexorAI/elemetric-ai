@@ -38513,6 +38513,241 @@ Return JSON with:
   }
 });
 
+// POST /defect-notice — Issue a formal defect notice
+app.post("/defect-notice", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, contractorName, contractorEmail, trade,
+    defectLocation, defectDescription, severity = "MEDIUM",
+    rectificationDeadlineDays = 14, photoEvidence = false,
+    issuedBy, applicableContractClause, rectificationInstructions,
+    reinspectionRequired = true,
+  } = req.body;
+  if (!contractorName || !defectDescription || !issuedBy) {
+    return res.status(400).json({ error: "contractorName, defectDescription, and issuedBy are required." });
+  }
+  const validSeverities = ["CRITICAL", "MAJOR", "MEDIUM", "MINOR"];
+  if (!validSeverities.includes(severity)) {
+    return res.status(400).json({ error: `severity must be one of: ${validSeverities.join(", ")}` });
+  }
+  const noticeRef = `DN-${Date.now().toString(36).toUpperCase()}`;
+  const deadlineDays = severity === "CRITICAL" ? Math.min(Number(rectificationDeadlineDays), 2)
+    : severity === "MAJOR" ? Math.min(Number(rectificationDeadlineDays), 7)
+    : Number(rectificationDeadlineDays);
+  const deadlineDate = new Date(Date.now() + deadlineDays * 86400000).toISOString().split("T")[0];
+  const record = {
+    notice_ref: noticeRef,
+    project_id: projectId || null,
+    contractor_name: sanitiseInput(contractorName),
+    contractor_email: contractorEmail && isValidEmail(contractorEmail) ? contractorEmail : null,
+    trade: sanitiseInput(trade || ""),
+    defect_location: sanitiseInput(defectLocation || ""),
+    defect_description: sanitiseInput(defectDescription),
+    severity,
+    rectification_deadline_days: deadlineDays,
+    deadline_date: deadlineDate,
+    photo_evidence: Boolean(photoEvidence),
+    issued_by: sanitiseInput(issuedBy),
+    applicable_contract_clause: sanitiseInput(applicableContractClause || ""),
+    rectification_instructions: sanitiseInput(rectificationInstructions || ""),
+    reinspection_required: Boolean(reinspectionRequired),
+    status: "OPEN",
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("defect_notices").insert(record);
+    if (error) console.error("defect-notice DB error:", error.message);
+  }
+  res.json({
+    noticeRef, contractorName, severity, deadlineDate, deadlineDays,
+    reinspectionRequired, status: "OPEN", saved: !!supabaseAdmin,
+  });
+});
+
+// PATCH /defect-notice/:noticeRef/close — Close a defect notice after rectification
+app.patch("/defect-notice/:noticeRef/close", apiKeyAuth, async (req, res) => {
+  const { noticeRef } = req.params;
+  const { closedBy, reinspectionPassed, closedDate, closureNotes } = req.body;
+  if (!closedBy) return res.status(400).json({ error: "closedBy is required." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  const { error } = await supabaseAdmin.from("defect_notices").update({
+    status: reinspectionPassed === false ? "REINSPECTION_FAILED" : "CLOSED",
+    closed_by: sanitiseInput(closedBy),
+    reinspection_passed: reinspectionPassed !== undefined ? Boolean(reinspectionPassed) : null,
+    closed_date: closedDate || new Date().toISOString(),
+    closure_notes: sanitiseInput(closureNotes || ""),
+    updated_at: new Date().toISOString(),
+  }).eq("notice_ref", noticeRef);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({
+    noticeRef,
+    status: reinspectionPassed === false ? "REINSPECTION_FAILED" : "CLOSED",
+    closedBy, closedDate: closedDate || new Date().toISOString(),
+  });
+});
+
+// POST /ai-inspection-report — AI drafts a formal inspection report from observations
+app.post("/ai-inspection-report", apiKeyAuth, async (req, res) => {
+  const {
+    trade, inspectionType = "STAGE_INSPECTION", projectName, projectAddress,
+    inspectorName, inspectionDate, stage, observations = [],
+    defectsFound = [], passed, holdPoints = [], weatherAtInspection,
+  } = req.body;
+  if (!trade || !observations.length || !inspectorName || !inspectionDate) {
+    return res.status(400).json({ error: "trade, observations, inspectorName, and inspectionDate are required." });
+  }
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedInspector = sanitiseInput(inspectorName);
+  const systemPrompt = `You are a construction quality inspector. Write formal, professional inspection reports for Australian construction projects.`;
+  const userPrompt = `Draft a formal ${sanitiseInput(inspectionType)} inspection report:
+Trade: ${sanitisedTrade}
+Inspector: ${sanitisedInspector}
+Date: ${sanitiseInput(inspectionDate)}
+Project: ${sanitiseInput(projectName || "Not specified")}
+Address: ${sanitiseInput(projectAddress || "Not specified")}
+Stage: ${sanitiseInput(stage || "General")}
+Weather: ${sanitiseInput(weatherAtInspection || "Not recorded")}
+Overall result: ${passed ? "PASSED" : "FAILED/CONDITIONAL"}
+Observations: ${observations.map(o => sanitiseInput(o)).join("; ")}
+Defects found: ${defectsFound.map(d => sanitiseInput(d)).join("; ") || "None"}
+Hold points: ${holdPoints.map(h => sanitiseInput(h)).join("; ") || "None"}
+
+Return JSON with:
+{
+  "reportTitle": "...",
+  "executiveSummary": "...",
+  "scopeOfInspection": "...",
+  "methodologyStatement": "...",
+  "findings": [{"item": "...", "observation": "...", "result": "CONFORMING|NON-CONFORMING|ACCEPTABLE", "recommendation": "..."}],
+  "defectsSchedule": [{"defect": "...", "location": "...", "severity": "...", "rectification": "...", "deadline": "..."}],
+  "holdPointStatus": "...",
+  "conclusion": "...",
+  "certificationStatement": "...",
+  "nextInspectionRequired": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2500,
+    });
+    usageStats.openaiCalls++;
+    const report = JSON.parse(aiRes.choices[0].message.content);
+    const reportRef = `IR-${Date.now().toString(36).toUpperCase()}`;
+    res.json({ reportRef, trade: sanitisedTrade, inspectionDate, inspectorName: sanitisedInspector, passed, report });
+  } catch (err) {
+    console.error("ai-inspection-report error:", err.message);
+    res.json({
+      reportRef: "IR-FALLBACK", trade: sanitisedTrade, inspectionDate,
+      inspectorName: sanitisedInspector, passed,
+      report: {
+        reportTitle: `${sanitisedTrade} Inspection Report — ${sanitiseInput(inspectionDate)}`,
+        executiveSummary: `Inspection conducted by ${sanitisedInspector} on ${sanitiseInput(inspectionDate)}.`,
+        scopeOfInspection: observations.join("; "),
+        methodologyStatement: "Visual inspection conducted in accordance with relevant Australian Standards.",
+        findings: observations.map((o, i) => ({
+          item: `Item ${i + 1}`, observation: sanitiseInput(o),
+          result: "CONFORMING", recommendation: "No action required.",
+        })),
+        defectsSchedule: defectsFound.map((d, i) => ({
+          defect: `Defect ${i + 1}`, location: "As noted", severity: "MINOR",
+          rectification: sanitiseInput(d), deadline: "Within 14 days",
+        })),
+        holdPointStatus: holdPoints.length ? "Hold points identified — see above." : "No hold points identified.",
+        conclusion: passed ? "Works conform to specification and relevant standards." : "Non-conformances identified. Rectification required prior to re-inspection.",
+        certificationStatement: `Certified by ${sanitisedInspector} on ${sanitiseInput(inspectionDate)}.`,
+        nextInspectionRequired: defectsFound.length > 0 ? "Re-inspection required after defect rectification." : "Next scheduled stage inspection.",
+      },
+    });
+  }
+});
+
+// POST /ai-scope-change-impact — AI analyses the impact of a scope change
+app.post("/ai-scope-change-impact", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, trade, scopeChangeDescription, changeType = "ADDITION",
+    currentProgrammeDays, estimatedAdditionalDays, estimatedCostImpactAud,
+    criticalPathAffected = false, resourcesRequired = [],
+    precedingActivities = [], affectedSubcontractors = [],
+  } = req.body;
+  if (!trade || !scopeChangeDescription) {
+    return res.status(400).json({ error: "trade and scopeChangeDescription are required." });
+  }
+  const validTypes = ["ADDITION", "OMISSION", "SUBSTITUTION", "REDESIGN", "CLIENT_INSTRUCTION"];
+  if (!validTypes.includes(changeType)) {
+    return res.status(400).json({ error: `changeType must be one of: ${validTypes.join(", ")}` });
+  }
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedChange = sanitiseInput(scopeChangeDescription);
+  const systemPrompt = `You are an Australian construction project manager specialising in scope change management and variations.`;
+  const userPrompt = `Analyse the impact of this scope change:
+Trade: ${sanitisedTrade}
+Change type: ${changeType}
+Description: ${sanitisedChange}
+Current programme duration: ${currentProgrammeDays || "Unknown"} days
+Estimated time impact: ${estimatedAdditionalDays || "TBD"} days
+Estimated cost impact: ${estimatedCostImpactAud ? `$${estimatedCostImpactAud} AUD` : "TBD"}
+Critical path affected: ${criticalPathAffected}
+Resources needed: ${resourcesRequired.map(r => sanitiseInput(r)).join(", ")}
+Preceding activities impacted: ${precedingActivities.map(a => sanitiseInput(a)).join("; ")}
+Subcontractors affected: ${affectedSubcontractors.map(s => sanitiseInput(s)).join(", ")}
+
+Return JSON with:
+{
+  "impactSummary": "...",
+  "programmeImpact": {"days": 5, "assessment": "...", "criticalPath": true},
+  "costImpact": {"direct": 0, "indirect": 0, "total": 0, "assessment": "..."},
+  "resourceImpact": "...",
+  "riskAssessment": "HIGH|MEDIUM|LOW",
+  "subcontractorNotifications": ["...", "..."],
+  "contractualEntitlement": "...",
+  "variationDocumentationRequired": ["...", "..."],
+  "recommendedApprovalPath": "...",
+  "executiveSummary": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const impact = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ projectId, trade: sanitisedTrade, changeType, scopeChangeDescription: sanitisedChange, criticalPathAffected, impact });
+  } catch (err) {
+    console.error("ai-scope-change-impact error:", err.message);
+    res.json({
+      projectId, trade: sanitisedTrade, changeType, scopeChangeDescription: sanitisedChange, criticalPathAffected,
+      impact: {
+        impactSummary: `Scope change identified: ${changeType} to ${sanitisedTrade} works.`,
+        programmeImpact: {
+          days: Number(estimatedAdditionalDays) || 0,
+          assessment: criticalPathAffected ? "Critical path affected — programme delay likely." : "Non-critical activity — float may absorb delay.",
+          criticalPath: criticalPathAffected,
+        },
+        costImpact: {
+          direct: Number(estimatedCostImpactAud) || 0, indirect: 0,
+          total: Number(estimatedCostImpactAud) || 0,
+          assessment: "Detailed pricing required from relevant subcontractors.",
+        },
+        resourceImpact: resourcesRequired.length > 0 ? `Additional resources required: ${resourcesRequired.join(", ")}` : "No additional resources identified.",
+        riskAssessment: criticalPathAffected ? "HIGH" : "MEDIUM",
+        subcontractorNotifications: affectedSubcontractors.length > 0 ? affectedSubcontractors.map(s => `Notify ${s}`) : ["No subcontractor notifications required."],
+        variationDocumentationRequired: ["Scope change notice", "Revised programme", "Pricing submission", "Instruction to proceed"],
+        recommendedApprovalPath: "Obtain written instruction before proceeding. Submit variation claim within contract timeframe.",
+        executiveSummary: `This ${changeType} scope change affects ${sanitisedTrade} works and requires a formal variation. ${criticalPathAffected ? "Critical path is affected." : ""}`,
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
