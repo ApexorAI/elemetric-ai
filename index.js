@@ -36086,6 +36086,206 @@ app.post("/import-validation", apiKeyAuth, async (req, res) => {
   });
 });
 
+// ── Round 138: Insurance claim support, incident investigation, near-miss AI ──
+
+// POST /insurance-claim-log — Log an insurance claim event
+app.post("/insurance-claim-log", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, projectId, claimType, incidentDate, incidentDescription,
+    estimatedLossAud, insurerName, policyNumber,
+    claimNumber, claimStatus = "LODGED",
+    thirdPartyInvolved = false, thirdPartyDetails,
+    injuriesInvolved = false, propertyDamage = false,
+    policeReportNumber, witnessNames = [],
+    photosAttached = 0, notes,
+  } = req.body;
+
+  if (!contractorId || !claimType || !incidentDate)
+    return res.status(400).json({ error: "contractorId, claimType, incidentDate required." });
+
+  const validClaimTypes = ["PUBLIC_LIABILITY", "WORKERS_COMPENSATION", "PLANT_EQUIPMENT", "PROPERTY_DAMAGE", "PRODUCT_LIABILITY", "PROFESSIONAL_INDEMNITY", "CONTRACT_WORKS", "OTHER"];
+  const validStatuses = ["LODGED", "UNDER_ASSESSMENT", "APPROVED", "REJECTED", "SETTLED", "WITHDRAWN", "APPEALED"];
+  const type = (claimType || "OTHER").toUpperCase();
+  const status = (claimStatus || "LODGED").toUpperCase();
+
+  const claimRef = `CLM-${Date.now().toString(36).toUpperCase().slice(-8)}`;
+
+  const record = {
+    claim_ref: claimRef,
+    contractor_id: sanitiseInput(contractorId),
+    project_id: sanitiseInput(projectId || ""),
+    claim_type: validClaimTypes.includes(type) ? type : "OTHER",
+    incident_date: incidentDate,
+    incident_description: sanitiseInput(incidentDescription || ""),
+    estimated_loss_aud: Number(estimatedLossAud) || null,
+    insurer_name: sanitiseInput(insurerName || ""),
+    policy_number: sanitiseInput(policyNumber || ""),
+    claim_number: sanitiseInput(claimNumber || ""),
+    claim_status: validStatuses.includes(status) ? status : "LODGED",
+    third_party_involved: Boolean(thirdPartyInvolved),
+    third_party_details: thirdPartyInvolved ? sanitiseInput(thirdPartyDetails || "") : "",
+    injuries_involved: Boolean(injuriesInvolved),
+    property_damage: Boolean(propertyDamage),
+    police_report_number: sanitiseInput(policeReportNumber || ""),
+    witness_names: witnessNames.map(w => sanitiseInput(w)),
+    photos_attached: Number(photosAttached),
+    notes: sanitiseInput(notes || ""),
+    status: "ACTIVE",
+    lodged_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("insurance_claims")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, claimId: data.id, claimRef, claimStatus: status, ...record });
+  }
+
+  res.json({ success: true, claimId: null, claimRef, claimStatus: status, ...record, saved: false });
+});
+
+// POST /incident-investigation — Record a formal incident investigation
+app.post("/incident-investigation", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, incidentId, investigatorName, investigationDate,
+    incidentType, incidentDescription, injuredParty,
+    immediateFactors = [], underlyingFactors = [],
+    rootCauses = [], contributingFactors = [],
+    immediateActions = [], correctiveActions = [],
+    systemicFailures = [], recommendations = [],
+    investigationMethod = "5_WHY",
+    preventable = true, reportableToRegulator = false,
+    regulatorNotified = false, notificationRef,
+    daysLostWork = 0, estimatedCostAud,
+    investigationStatus = "IN_PROGRESS", notes,
+  } = req.body;
+
+  if (!siteId || !incidentType) return res.status(400).json({ error: "siteId and incidentType required." });
+
+  const validMethods = ["5_WHY", "FISHBONE", "BOW_TIE", "SCAT", "TAPROOT", "FAULT_TREE", "OTHER"];
+  const validTypes = ["NEAR_MISS", "FIRST_AID", "MEDICAL_TREATMENT", "LOST_TIME", "SERIOUS", "DANGEROUS_OCCURRENCE", "FATALITY"];
+  const validStatuses = ["IN_PROGRESS", "COMPLETE", "AWAITING_REVIEW", "CLOSED"];
+  const type = (incidentType || "NEAR_MISS").toUpperCase();
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    incident_id: sanitiseInput(incidentId || ""),
+    investigator_name: sanitiseInput(investigatorName || ""),
+    investigation_date: investigationDate || new Date().toISOString().split("T")[0],
+    incident_type: validTypes.includes(type) ? type : "NEAR_MISS",
+    incident_description: sanitiseInput(incidentDescription || ""),
+    injured_party: sanitiseInput(injuredParty || ""),
+    immediate_factors: immediateFactors.map(f => sanitiseInput(f)),
+    underlying_factors: underlyingFactors.map(f => sanitiseInput(f)),
+    root_causes: rootCauses.map(c => sanitiseInput(c)),
+    contributing_factors: contributingFactors.map(f => sanitiseInput(f)),
+    immediate_actions: immediateActions.map(a => sanitiseInput(a)),
+    corrective_actions: correctiveActions.map(a => ({
+      action: sanitiseInput(a.action || a),
+      responsible: sanitiseInput(a.responsible || ""),
+      dueDate: a.dueDate || null,
+      status: "OPEN",
+    })),
+    systemic_failures: systemicFailures.map(f => sanitiseInput(f)),
+    recommendations: recommendations.map(r => sanitiseInput(r)),
+    investigation_method: validMethods.includes((investigationMethod || "").toUpperCase()) ? investigationMethod.toUpperCase() : "5_WHY",
+    preventable: Boolean(preventable),
+    reportable_to_regulator: Boolean(reportableToRegulator),
+    regulator_notified: Boolean(regulatorNotified),
+    notification_ref: sanitiseInput(notificationRef || ""),
+    days_lost_work: Number(daysLostWork),
+    estimated_cost_aud: estimatedCostAud ? Number(estimatedCostAud) : null,
+    investigation_status: validStatuses.includes((investigationStatus || "").toUpperCase()) ? investigationStatus.toUpperCase() : "IN_PROGRESS",
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("incident_investigations")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, investigationId: data.id, ...record });
+  }
+
+  res.json({ success: true, investigationId: null, ...record, saved: false });
+});
+
+// POST /ai-near-miss-analysis — AI analyses a near-miss incident and generates prevention recommendations
+app.post("/ai-near-miss-analysis", apiKeyAuth, async (req, res) => {
+  const {
+    nearMissDescription, trade, location, activity,
+    equipmentInvolved = [], environmentalFactors = [],
+    humanFactors = [], previousSimilarIncidents = 0,
+    state = "VIC",
+  } = req.body;
+
+  if (!nearMissDescription) return res.status(400).json({ error: "nearMissDescription required." });
+
+  const prompt = `You are a senior WHS investigator and safety expert specialising in Australian construction. Analyse this near-miss incident.
+
+Near-miss description: ${sanitiseInput(nearMissDescription)}
+Trade: ${sanitiseInput(trade || "General construction")}
+Location on site: ${sanitiseInput(location || "Not specified")}
+Activity being performed: ${sanitiseInput(activity || "Not specified")}
+Equipment involved: ${equipmentInvolved.map(e => sanitiseInput(e)).join(", ") || "None specified"}
+Environmental factors: ${environmentalFactors.map(f => sanitiseInput(f)).join(", ") || "None specified"}
+Human factors: ${humanFactors.map(f => sanitiseInput(f)).join(", ") || "None specified"}
+Similar previous incidents: ${previousSimilarIncidents}
+State: ${sanitiseInput(state)}
+
+Return a JSON object with:
+- "severityIfActualised": "LOW"|"MEDIUM"|"HIGH"|"CRITICAL" — what severity if near-miss had been real
+- "hazardType": primary hazard classification
+- "immediateActions": array of actions to take right now
+- "rootCauses": array of likely root causes
+- "controlHierarchy": array of { "level": string, "controls": string[] } ordered by hierarchy (elimination, substitution, engineering, administrative, PPE)
+- "regulatoryRequirements": relevant legislation/regulations
+- "trainingGaps": identified training or competency gaps
+- "systemChangesRequired": systemic changes to prevent recurrence
+- "reportingObligations": whether this must be reported and to whom
+- "lessonsLearned": key takeaways for site toolbox talk
+- "riskRating": { "before": string, "after": string } with proposed controls`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, trade, state, analysedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      severityIfActualised: "HIGH",
+      hazardType: sanitiseInput(trade || "General") + " hazard",
+      immediateActions: ["Secure the area", "Report to supervisor immediately", "Review related work procedures"],
+      rootCauses: ["Automated analysis unavailable — conduct formal investigation"],
+      controlHierarchy: [
+        { level: "1 — Elimination", controls: ["Remove the hazard if possible"] },
+        { level: "2 — Substitution", controls: ["Replace with safer alternative"] },
+        { level: "3 — Engineering", controls: ["Install physical barrier or guard"] },
+        { level: "4 — Administrative", controls: ["Update procedures and training"] },
+        { level: "5 — PPE", controls: ["Ensure appropriate PPE is worn"] },
+      ],
+      regulatoryRequirements: [`Work Health and Safety Act (${state})`],
+      trainingGaps: [],
+      systemChangesRequired: ["Conduct formal investigation to identify systemic issues"],
+      reportingObligations: "Consult your WHS officer regarding reporting requirements.",
+      lessonsLearned: ["Near-misses must be reported — every near-miss is a warning"],
+      riskRating: { before: "HIGH", after: "MEDIUM (with controls)" },
+      trade, state, analysedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
