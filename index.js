@@ -18550,6 +18550,235 @@ app.get("/benchmark-comparison/:jobType", apiKeyAuth, (req, res) => {
   });
 });
 
+// ── Round 45 ──────────────────────────────────────────────────────────────────
+
+// POST /job-workflow  — Define and track a multi-step workflow for a job type
+app.post("/job-workflow", apiKeyAuth, async (req, res) => {
+  const { jobType, jobId, currentStep, completedSteps, notes } = req.body;
+
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+
+  const safeJobType = sanitiseInput(String(jobType)).toLowerCase();
+  const safeJobId   = jobId ? sanitiseInput(String(jobId)) : null;
+  const safeNotes   = sanitiseInput(String(notes || ""));
+
+  const WORKFLOWS = {
+    plumbing: [
+      { step: 1,  name: "Quote and scope agreed",          critical: false },
+      { step: 2,  name: "Permit obtained (if required)",  critical: true  },
+      { step: 3,  name: "Pre-job inspection photos taken", critical: true  },
+      { step: 4,  name: "Water supply isolated",           critical: true  },
+      { step: 5,  name: "Work in progress — photos taken", critical: true  },
+      { step: 6,  name: "Pressure test performed",         critical: true  },
+      { step: 7,  name: "Tempering valve installed/tested",critical: true  },
+      { step: 8,  name: "Completion photos taken",         critical: true  },
+      { step: 9,  name: "Client walkthrough completed",    critical: false },
+      { step: 10, name: "Certificate of Compliance issued",critical: true  },
+    ],
+    gas: [
+      { step: 1,  name: "Quote and scope agreed",          critical: false },
+      { step: 2,  name: "Gas isolated at meter",           critical: true  },
+      { step: 3,  name: "Pre-job photos taken",            critical: true  },
+      { step: 4,  name: "Work in progress — photos taken", critical: true  },
+      { step: 5,  name: "Pressure test performed and recorded", critical: true },
+      { step: 6,  name: "Combustion analysis completed",   critical: true  },
+      { step: 7,  name: "Completion photos taken",         critical: true  },
+      { step: 8,  name: "Gas Certificate of Compliance issued", critical: true },
+      { step: 9,  name: "Client signature obtained",       critical: false },
+    ],
+    electrical: [
+      { step: 1,  name: "Quote and scope agreed",          critical: false },
+      { step: 2,  name: "Supply isolated at switchboard",  critical: true  },
+      { step: 3,  name: "Pre-job photos taken",            critical: true  },
+      { step: 4,  name: "Work in progress — photos taken", critical: true  },
+      { step: 5,  name: "Earth continuity tested",         critical: true  },
+      { step: 6,  name: "Insulation resistance tested",    critical: true  },
+      { step: 7,  name: "RCD tested and functioning",      critical: true  },
+      { step: 8,  name: "Circuit schedule updated",        critical: true  },
+      { step: 9,  name: "Completion photos — switchboard", critical: true  },
+      { step: 10, name: "ESCC issued",                     critical: true  },
+    ],
+    drainage: [
+      { step: 1,  name: "Quote and scope agreed",          critical: false },
+      { step: 2,  name: "Dial Before You Dig — confirmed", critical: true  },
+      { step: 3,  name: "Pre-job photos taken",            critical: true  },
+      { step: 4,  name: "Excavation completed",            critical: false },
+      { step: 5,  name: "Pipe installed with correct fall",critical: true  },
+      { step: 6,  name: "Inspection openings installed",   critical: true  },
+      { step: 7,  name: "Water test passed",               critical: true  },
+      { step: 8,  name: "Photos of pipe before backfill",  critical: true  },
+      { step: 9,  name: "Certificate of Compliance issued",critical: true  },
+    ],
+    carpentry: [
+      { step: 1,  name: "Quote and scope agreed",          critical: false },
+      { step: 2,  name: "Building permit obtained",        critical: true  },
+      { step: 3,  name: "Pre-job photos taken",            critical: true  },
+      { step: 4,  name: "Material delivery confirmed",     critical: false },
+      { step: 5,  name: "Framing/structural work complete",critical: true  },
+      { step: 6,  name: "Frame inspection photos taken",   critical: true  },
+      { step: 7,  name: "Engineer's certificate obtained (if required)", critical: false },
+      { step: 8,  name: "Final inspection passed",         critical: true  },
+      { step: 9,  name: "Compliance certificate issued",   critical: true  },
+    ],
+    hvac: [
+      { step: 1,  name: "Quote and scope agreed",          critical: false },
+      { step: 2,  name: "Pre-job photos taken",            critical: true  },
+      { step: 3,  name: "Indoor and outdoor units positioned", critical: false },
+      { step: 4,  name: "Refrigerant lineset installed and insulated", critical: true },
+      { step: 5,  name: "Electrical connected and isolated",critical: true  },
+      { step: 6,  name: "Condensate drain installed",      critical: true  },
+      { step: 7,  name: "System vacuumed and charged",     critical: true  },
+      { step: 8,  name: "Commissioning test and airflow balanced", critical: true },
+      { step: 9,  name: "Completion photos taken",         critical: true  },
+      { step: 10, name: "ARCtick refrigerant log completed",critical: true  },
+    ],
+  };
+
+  const workflow = WORKFLOWS[safeJobType];
+  if (!workflow) return res.status(404).json({ error: `No workflow for trade: ${safeJobType}`, availableTrades: Object.keys(WORKFLOWS) });
+
+  const completedSet = new Set((Array.isArray(completedSteps) ? completedSteps : []).map(Number));
+  const currentStepNum = parseInt(currentStep) || (completedSet.size + 1);
+
+  const steps = workflow.map(s => ({
+    ...s,
+    completed:  completedSet.has(s.step),
+    isCurrent:  s.step === currentStepNum,
+    locked:     s.step > currentStepNum,
+  }));
+
+  const completedCount  = steps.filter(s => s.completed).length;
+  const criticalMissed  = steps.filter(s => s.critical && !s.completed && s.step < currentStepNum);
+  const progressPct     = Math.round((completedCount / steps.length) * 100);
+  const nextStep        = steps.find(s => !s.completed);
+
+  return res.json({
+    jobId:          safeJobId,
+    jobType:        safeJobType,
+    totalSteps:     steps.length,
+    completedSteps: completedCount,
+    currentStep:    currentStepNum,
+    progressPercent: progressPct,
+    workflowStatus: completedCount === steps.length ? "COMPLETE"
+                  : criticalMissed.length > 0 ? "CRITICAL_STEPS_MISSED"
+                  : "IN_PROGRESS",
+    criticalStepsMissed: criticalMissed.map(s => s.name),
+    nextAction:     nextStep ? nextStep.name : "All steps complete",
+    steps,
+    notes:          safeNotes || null,
+    generatedAt:    new Date().toISOString(),
+  });
+});
+
+// POST /ai-photo-score  — Score a single compliance photo using AI vision
+app.post("/ai-photo-score", apiKeyAuth, async (req, res) => {
+  const { photo, jobType, stage } = req.body;
+
+  if (!photo || (!photo.dataUrl && !photo.url)) {
+    return res.status(400).json({ error: "photo with dataUrl or url is required." });
+  }
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+
+  const safeJobType = sanitiseInput(String(jobType)).toLowerCase();
+  const safeStage   = sanitiseInput(String(stage || "general"));
+
+  const systemPrompt = `You are a Victorian trade compliance photo evaluator. Score a single compliance photo on a scale of 0–10. Evaluate: image clarity, relevant compliance items visible, proper lighting, labelling present, and suitability as compliance evidence.
+
+Return JSON with: "score" (0-10), "quality" ("excellent"|"good"|"acceptable"|"poor"), "strengths" (array, max 3), "improvements" (array, max 3), "complianceValue" ("HIGH"|"MEDIUM"|"LOW"), "isUsable" (boolean), "notes" (string).`;
+
+  let result;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: [
+          { type: "text",      text: `Trade: ${safeJobType}\nStage: ${safeStage}` },
+          { type: "image_url", image_url: { url: photo.dataUrl || photo.url, detail: "low" } },
+        ]},
+      ],
+      max_tokens: 300,
+      response_format: { type: "json_object" },
+    });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    result = {
+      score:          Math.min(10, Math.max(0, parseFloat(parsed.score) || 5)),
+      quality:        ["excellent", "good", "acceptable", "poor"].includes(parsed.quality) ? parsed.quality : "acceptable",
+      strengths:      Array.isArray(parsed.strengths)    ? parsed.strengths.slice(0, 3).map(s => sanitiseInput(String(s)))    : [],
+      improvements:   Array.isArray(parsed.improvements) ? parsed.improvements.slice(0, 3).map(i => sanitiseInput(String(i))) : [],
+      complianceValue:["HIGH", "MEDIUM", "LOW"].includes((parsed.complianceValue || "").toUpperCase()) ? parsed.complianceValue.toUpperCase() : "MEDIUM",
+      isUsable:       parsed.isUsable !== false,
+      notes:          parsed.notes ? sanitiseInput(String(parsed.notes)).slice(0, 300) : null,
+    };
+  } catch {
+    result = { score: 5, quality: "acceptable", strengths: [], improvements: ["Could not evaluate photo automatically"], complianceValue: "MEDIUM", isUsable: true, notes: "Manual review required" };
+  }
+
+  return res.json({
+    jobType:    safeJobType,
+    stage:      safeStage,
+    ...result,
+    scoredAt:   new Date().toISOString(),
+  });
+});
+
+// POST /contractor-goals  — Set and track compliance improvement goals for a contractor
+app.post("/contractor-goals", apiKeyAuth, async (req, res) => {
+  const { contractorId, goals } = req.body;
+
+  if (!contractorId || !goals || !Array.isArray(goals) || goals.length === 0) {
+    return res.status(400).json({ error: "contractorId and goals array are required." });
+  }
+
+  const safeId    = sanitiseInput(String(contractorId));
+  const now       = new Date();
+
+  const VALID_METRICS = ["complianceScore", "certificateRate", "signatureRate", "gpsRate", "photoCount"];
+
+  const processedGoals = goals.slice(0, 10).map((g, i) => {
+    const metric   = VALID_METRICS.includes(g.metric) ? g.metric : "complianceScore";
+    const target   = parseFloat(g.targetValue) || 80;
+    const current  = parseFloat(g.currentValue) || 0;
+    const dueDate  = g.dueDate ? new Date(g.dueDate) : (() => { const d = new Date(); d.setMonth(d.getMonth() + 3); return d; })();
+    const achieved = current >= target;
+
+    return {
+      goalId:       `GOAL-${now.getTime()}-${i}`,
+      metric,
+      targetValue:  target,
+      currentValue: current,
+      achieved,
+      gap:          achieved ? 0 : Math.round((target - current) * 10) / 10,
+      dueDate:      dueDate.toISOString().slice(0, 10),
+      status:       achieved ? "ACHIEVED" : new Date() > dueDate ? "OVERDUE" : "IN_PROGRESS",
+      description:  g.description ? sanitiseInput(String(g.description)).slice(0, 200) : `Improve ${metric} to ${target}`,
+    };
+  });
+
+  const achievedCount = processedGoals.filter(g => g.achieved).length;
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("contractor_goals").upsert({
+      contractor_id: safeId,
+      goals:         processedGoals,
+      updated_at:    now.toISOString(),
+    }, { onConflict: "contractor_id" });
+    saved = !error;
+  }
+
+  return res.json({
+    contractorId:    safeId,
+    totalGoals:      processedGoals.length,
+    achievedGoals:   achievedCount,
+    progressRate:    `${Math.round((achievedCount / processedGoals.length) * 100)}%`,
+    goals:           processedGoals,
+    nextReview:      (() => { const d = new Date(); d.setMonth(d.getMonth() + 1); return d.toISOString().slice(0, 10); })(),
+    saved,
+    updatedAt:       now.toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
