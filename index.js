@@ -25166,6 +25166,154 @@ app.get("/trade-tests/:jobId", apiKeyAuth, async (req, res) => {
   return res.json({ jobId, totalTests: allTests.length, failed, allPassed: failed === 0 && allTests.length > 0, ...tests, generatedAt: new Date().toISOString() });
 });
 
+// POST /client-feedback  — Collect client satisfaction feedback after job completion
+app.post("/client-feedback", apiKeyAuth, async (req, res) => {
+  const { jobId, contractorId, clientName, clientEmail, overallSatisfaction, quality, cleanliness, communication, punctuality, value, wouldRecommend, comments } = req.body || {};
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  const clamp = v => Math.min(5, Math.max(1, Math.round(parseFloat(v) || 3)));
+  const safeJobId   = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeCId     = contractorId ? sanitiseInput(String(contractorId)).slice(0, 80) : null;
+  const safeName    = clientName ? sanitiseInput(String(clientName)).slice(0, 100) : null;
+  const safeEmail   = clientEmail && isValidEmail(clientEmail) ? clientEmail.toLowerCase() : null;
+  const safeComments = comments ? sanitiseInput(String(comments)).slice(0, 1000) : null;
+
+  const ratings = {
+    overall: clamp(overallSatisfaction), quality: clamp(quality),
+    cleanliness: clamp(cleanliness), communication: clamp(communication),
+    punctuality: clamp(punctuality), value: clamp(value),
+  };
+  const avg = parseFloat((Object.values(ratings).reduce((s, v) => s + v, 0) / Object.keys(ratings).length).toFixed(2));
+  const nps  = avg >= 4.5 ? "PROMOTER" : avg >= 3.5 ? "PASSIVE" : "DETRACTOR";
+
+  const feedback = {
+    feedbackId: `FB-${safeJobId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    jobId: safeJobId, contractorId: safeCId, clientName: safeName, clientEmail: safeEmail,
+    ratings, averageRating: avg, npsCategory: nps,
+    wouldRecommend: wouldRecommend !== false,
+    comments: safeComments, submittedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("client_feedback").insert({
+        feedback_id: feedback.feedbackId, job_id: safeJobId, contractor_id: safeCId,
+        client_name: safeName, client_email: safeEmail, ratings, average_rating: avg,
+        nps_category: nps, would_recommend: feedback.wouldRecommend,
+        comments: safeComments, submitted_at: feedback.submittedAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...feedback, saved: !!supabaseAdmin });
+});
+
+// GET /client-feedback/:contractorId  — Get client feedback summary for a contractor
+app.get("/client-feedback/:contractorId", apiKeyAuth, async (req, res) => {
+  const contractorId = sanitiseInput(String(req.params.contractorId || "")).slice(0, 80);
+  if (!contractorId) return res.status(400).json({ error: "contractorId required." });
+
+  let feedback = [];
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin.from("client_feedback").select("*").eq("contractor_id", contractorId).order("submitted_at", { ascending: false }).limit(100);
+      feedback = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  if (feedback.length === 0) return res.json({ contractorId, count: 0, message: "No feedback found." });
+
+  const avgOf = field => feedback.some(f => f.ratings?.[field]) ? parseFloat((feedback.reduce((s, f) => s + (f.ratings?.[field] || 0), 0) / feedback.length).toFixed(2)) : null;
+  const nps   = { PROMOTER: 0, PASSIVE: 0, DETRACTOR: 0 };
+  feedback.forEach(f => { if (nps[f.nps_category] !== undefined) nps[f.nps_category]++; });
+  const npsScore = Math.round(((nps.PROMOTER - nps.DETRACTOR) / feedback.length) * 100);
+
+  return res.json({
+    contractorId, count: feedback.length,
+    averageRating: parseFloat((feedback.reduce((s, f) => s + (f.average_rating || 0), 0) / feedback.length).toFixed(2)),
+    npsScore, npsBreakdown: nps,
+    categoryAverages: {
+      overall: avgOf("overall"), quality: avgOf("quality"), cleanliness: avgOf("cleanliness"),
+      communication: avgOf("communication"), punctuality: avgOf("punctuality"), value: avgOf("value"),
+    },
+    recommendRate: parseFloat(((feedback.filter(f => f.would_recommend).length / feedback.length) * 100).toFixed(1)),
+    recentFeedback: feedback.slice(0, 5).map(f => ({ averageRating: f.average_rating, nps: f.nps_category, comments: f.comments, date: f.submitted_at })),
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /contractor-invoice  — Create a contractor invoice record
+app.post("/contractor-invoice", apiKeyAuth, async (req, res) => {
+  const { contractorId, clientId, jobId, projectId, invoiceDate, dueDate, lineItems = [], gstRate = 0.1, notes, terms } = req.body || {};
+  if (!contractorId || !Array.isArray(lineItems) || lineItems.length === 0) return res.status(400).json({ error: "contractorId and lineItems required." });
+
+  const safeCId      = sanitiseInput(String(contractorId)).slice(0, 80);
+  const safeClientId = clientId ? sanitiseInput(String(clientId)).slice(0, 80) : null;
+  const safeJobId    = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeProjId   = projectId ? sanitiseInput(String(projectId)).slice(0, 80) : null;
+  const safeDate     = invoiceDate ? sanitiseInput(String(invoiceDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeDue      = dueDate ? sanitiseInput(String(dueDate)).slice(0, 20) : null;
+  const safeNotes    = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+  const safeTerms    = terms ? sanitiseInput(String(terms)).slice(0, 100) : "14 days from invoice date";
+  const gst          = Math.min(0.3, Math.max(0, parseFloat(gstRate) || 0.1));
+
+  const items = lineItems.slice(0, 100).map(item => {
+    const qty   = Math.max(0, parseFloat(item.quantity) || 1);
+    const price = Math.max(0, parseFloat(item.unitPrice) || 0);
+    const line  = parseFloat((qty * price).toFixed(2));
+    return { description: sanitiseInput(String(item.description || "")).slice(0, 200), quantity: qty, unit: item.unit ? sanitiseInput(String(item.unit)).slice(0, 20) : "ea", unitPrice: price, lineTotal: line };
+  });
+
+  const subtotal   = parseFloat(items.reduce((s, i) => s + i.lineTotal, 0).toFixed(2));
+  const gstAmount  = parseFloat((subtotal * gst).toFixed(2));
+  const total      = parseFloat((subtotal + gstAmount).toFixed(2));
+  const invoiceNum = `INV-${safeCId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`;
+
+  const invoice = {
+    invoiceNumber: invoiceNum, contractorId: safeCId, clientId: safeClientId, jobId: safeJobId, projectId: safeProjId,
+    invoiceDate: safeDate, dueDate: safeDue, terms: safeTerms,
+    lineItems: items, subtotal, gstRate: gst, gstAmount, total,
+    status: "PENDING", notes: safeNotes, createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("contractor_invoices").insert({
+        invoice_number: invoiceNum, contractor_id: safeCId, client_id: safeClientId,
+        job_id: safeJobId, project_id: safeProjId, invoice_date: safeDate, due_date: safeDue,
+        line_items: items, subtotal, gst_rate: gst, gst_amount: gstAmount, total,
+        status: "PENDING", notes: safeNotes, terms: safeTerms, created_at: invoice.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...invoice, saved: !!supabaseAdmin });
+});
+
+// GET /contractor-invoice/:contractorId  — Get invoices for a contractor
+app.get("/contractor-invoice/:contractorId", apiKeyAuth, async (req, res) => {
+  const contractorId = sanitiseInput(String(req.params.contractorId || "")).slice(0, 80);
+  const status       = req.query.status ? sanitiseInput(String(req.query.status)).toUpperCase() : null;
+  if (!contractorId) return res.status(400).json({ error: "contractorId required." });
+
+  let invoices = [];
+  if (supabaseAdmin) {
+    try {
+      let q = supabaseAdmin.from("contractor_invoices").select("*").eq("contractor_id", contractorId).order("invoice_date", { ascending: false }).limit(100);
+      if (status) q = q.eq("status", status);
+      const { data } = await q;
+      invoices = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const totalValue   = parseFloat(invoices.reduce((s, i) => s + (i.total || 0), 0).toFixed(2));
+  const outstanding  = parseFloat(invoices.filter(i => i.status === "PENDING" || i.status === "OVERDUE").reduce((s, i) => s + (i.total || 0), 0).toFixed(2));
+  const statusCounts = {};
+  invoices.forEach(i => { statusCounts[i.status] = (statusCounts[i.status] || 0) + 1; });
+
+  return res.json({ contractorId, invoiceCount: invoices.length, totalValue, outstanding, statusCounts, invoices, generatedAt: new Date().toISOString() });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
