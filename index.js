@@ -53254,6 +53254,332 @@ Return a JSON object with:
   }
 });
 
+// POST /plant-prestart-checklist — Record a plant pre-start inspection for construction plant/equipment
+app.post("/plant-prestart-checklist", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      checklistRef,
+      date,
+      shift,
+      operator,
+      operatorLicenceNumber,
+      plantType,
+      plantId,
+      registrationNumber,
+      hoursReading,
+      fuelLevel,
+      engineOilOk,
+      hydraulicOilOk,
+      coolantLevelOk,
+      beltsHosesOk,
+      tyresOrTracksOk,
+      brakesOk,
+      steeringOk,
+      lightsHornOk,
+      ropsOk,
+      fireExtinguisherPresent,
+      seatbeltOk,
+      mirrorsCameraOk,
+      attachmentsSecure,
+      leaksObserved,
+      leakDescription,
+      alarmsFaultCodes,
+      alarmDescription,
+      safeToOperate,
+      faultsDescription,
+      supervisorNotified,
+      maintenanceRaised,
+      maintenanceRef,
+      notes,
+    } = req.body;
+
+    if (!plantId || !plantType || !date || !operator || safeToOperate === undefined) {
+      return res.status(400).json({ error: "plantId, plantType, date, operator, and safeToOperate are required" });
+    }
+
+    const failures = [];
+    if (!brakesOk) failures.push("Brakes defective — plant must not be operated");
+    if (!ropsOk) failures.push("ROPS/FOPS damaged or missing — operator protection compromised, do not operate");
+    if (!steeringOk) failures.push("Steering defective — plant must not be operated");
+    if (!seatbeltOk) failures.push("Seatbelt non-functional — must be repaired before use");
+    if (leaksObserved) failures.push(`Active leak observed: ${sanitiseInput(leakDescription || "details not provided")} — assess severity before operation`);
+    if (alarmsFaultCodes) failures.push(`Active fault codes/alarms: ${sanitiseInput(alarmDescription || "details not provided")} — consult manufacturer before operating`);
+    if (!safeToOperate) failures.push("Operator assessed plant as NOT safe to operate");
+
+    if (failures.length > 0 || !safeToOperate) {
+      console.warn(`[PLANT PRESTART] Plant ${plantId} at ${projectId} — ${failures.join("; ") || "deemed unsafe"}`);
+    }
+
+    const record = {
+      project_id: sanitiseInput(projectId || ""),
+      checklist_ref: sanitiseInput(checklistRef || `PP-${Date.now()}`),
+      date,
+      shift: sanitiseInput(shift || "day"),
+      operator: sanitiseInput(operator),
+      operator_licence_number: sanitiseInput(operatorLicenceNumber || ""),
+      plant_type: sanitiseInput(plantType),
+      plant_id: sanitiseInput(plantId),
+      registration_number: sanitiseInput(registrationNumber || ""),
+      hours_reading: hoursReading || null,
+      fuel_level: sanitiseInput(fuelLevel || ""),
+      engine_oil_ok: !!engineOilOk,
+      hydraulic_oil_ok: !!hydraulicOilOk,
+      coolant_level_ok: !!coolantLevelOk,
+      belts_hoses_ok: !!beltsHosesOk,
+      tyres_or_tracks_ok: !!tyresOrTracksOk,
+      brakes_ok: !!brakesOk,
+      steering_ok: !!steeringOk,
+      lights_horn_ok: !!lightsHornOk,
+      rops_ok: !!ropsOk,
+      fire_extinguisher_present: !!fireExtinguisherPresent,
+      seatbelt_ok: !!seatbeltOk,
+      mirrors_camera_ok: !!mirrorsCameraOk,
+      attachments_secure: !!attachmentsSecure,
+      leaks_observed: !!leaksObserved,
+      leak_description: sanitiseInput(leakDescription || ""),
+      alarms_fault_codes: !!alarmsFaultCodes,
+      alarm_description: sanitiseInput(alarmDescription || ""),
+      safe_to_operate: !!safeToOperate,
+      failures,
+      faults_description: sanitiseInput(faultsDescription || ""),
+      supervisor_notified: !!supervisorNotified,
+      maintenance_raised: !!maintenanceRaised,
+      maintenance_ref: sanitiseInput(maintenanceRef || ""),
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("plant_prestart_checklists").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (failures.length > 0 || !safeToOperate) {
+      return res.status(422).json({
+        safeToOperate: false,
+        failures,
+        message: "Plant must be taken out of service. Notify supervisor and raise a maintenance work order before returning to operation.",
+        record,
+        saved,
+      });
+    }
+
+    res.json({
+      safeToOperate: true,
+      plantId,
+      plantType,
+      failures: [],
+      applicableStandards: ["OHS Equipment (Plant) Regulations 2007 (Vic)", "AS 4024 Safety of machinery", "Manufacturer's pre-start inspection requirements"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/plant-prestart-checklist error:", err.message);
+    res.status(500).json({ error: "Failed to record plant pre-start checklist" });
+  }
+});
+
+// GET /plant-prestart-checklist/:plantId — Retrieve recent pre-start checklists for a specific plant
+app.get("/plant-prestart-checklist/:plantId", apiKeyAuth, async (req, res) => {
+  try {
+    const plantId = sanitiseInput(req.params.plantId);
+    if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured" });
+    const { data, error } = await supabaseAdmin
+      .from("plant_prestart_checklists")
+      .select("*")
+      .eq("plant_id", plantId)
+      .order("date", { ascending: false })
+      .limit(30);
+    if (error) return res.status(500).json({ error: "Failed to retrieve plant pre-start checklists" });
+    res.json({ plantId, checklists: data || [] });
+  } catch (err) {
+    console.error("/plant-prestart-checklist GET error:", err.message);
+    res.status(500).json({ error: "Failed to retrieve plant pre-start checklists" });
+  }
+});
+
+// POST /ground-vibration-monitoring — Record ground vibration monitoring for piling/blasting (AS 2187)
+app.post("/ground-vibration-monitoring", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      monitoringRef,
+      date,
+      time,
+      location,
+      monitoredBy,
+      monitoringReason,
+      distanceFromSourceM,
+      vibrationSource,
+      peakParticleVelocityMms,
+      dominantFrequencyHz,
+      airBlastOverpressureDb,
+      structureType,
+      structureCondition,
+      blastRef,
+      chargeWeightKg,
+      sensorLocation,
+      exceedanceLimit,
+      structureDamageObserved,
+      damageDescription,
+      complaints,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !location || !vibrationSource || peakParticleVelocityMms === undefined) {
+      return res.status(400).json({ error: "projectId, date, location, vibrationSource, and peakParticleVelocityMms are required" });
+    }
+
+    const alerts = [];
+    // AS 2187.2 Table 8.2 PPV limits: residential 5 mm/s (< 10 Hz), 10 mm/s heritage, 25 mm/s industrial
+    const ppv = Number(peakParticleVelocityMms);
+    const isHeritage = structureCondition && String(structureCondition).toLowerCase().includes("heritage");
+    const isIndustrial = structureType && String(structureType).toLowerCase().includes("industrial");
+    const ppvLimit = isHeritage ? 5 : isIndustrial ? 25 : 10;
+
+    if (ppv >= ppvLimit) alerts.push(`PPV ${peakParticleVelocityMms} mm/s exceeds AS 2187.2 limit of ${ppvLimit} mm/s for ${isHeritage ? "heritage" : isIndustrial ? "industrial" : "residential"} structure`);
+    if (airBlastOverpressureDb && Number(airBlastOverpressureDb) > 115) alerts.push(`Air blast overpressure ${airBlastOverpressureDb} dB(Lin) exceeds 115 dB(Lin) limit`);
+    if (structureDamageObserved) alerts.push(`Structure damage observed: ${sanitiseInput(damageDescription || "details not provided")} — suspend works, engage structural engineer`);
+    if (complaints) alerts.push("Neighbour/community complaints received — review blast design and community notification");
+
+    if (alerts.length > 0) console.warn(`[GROUND VIBRATION] ${location} at ${projectId} — ${alerts.join("; ")}`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      monitoring_ref: sanitiseInput(monitoringRef || `GV-${Date.now()}`),
+      date,
+      time: sanitiseInput(time || ""),
+      location: sanitiseInput(location),
+      monitored_by: sanitiseInput(monitoredBy || ""),
+      monitoring_reason: sanitiseInput(monitoringReason || ""),
+      distance_from_source_m: distanceFromSourceM || null,
+      vibration_source: sanitiseInput(vibrationSource),
+      peak_particle_velocity_mms: ppv,
+      dominant_frequency_hz: dominantFrequencyHz || null,
+      air_blast_overpressure_db: airBlastOverpressureDb || null,
+      structure_type: sanitiseInput(structureType || ""),
+      structure_condition: sanitiseInput(structureCondition || ""),
+      blast_ref: sanitiseInput(blastRef || ""),
+      charge_weight_kg: chargeWeightKg || null,
+      sensor_location: sanitiseInput(sensorLocation || ""),
+      exceedance_limit: ppvLimit,
+      exceedance_occurred: ppv >= ppvLimit,
+      structure_damage_observed: !!structureDamageObserved,
+      damage_description: sanitiseInput(damageDescription || ""),
+      complaints: !!complaints,
+      alerts,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("ground_vibration_monitoring").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      exceedanceOccurred: ppv >= ppvLimit,
+      ppvLimit,
+      alerts,
+      applicableStandards: ["AS 2187.2 Blasting in construction — use of explosives", "DIN 4150-3 (structural vibration limits)", "WorkSafe Victoria blasting obligations"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/ground-vibration-monitoring error:", err.message);
+    res.status(500).json({ error: "Failed to record ground vibration monitoring" });
+  }
+});
+
+// POST /ai-plant-risk-assessment — AI assesses construction plant risk and maintenance requirements
+app.post("/ai-plant-risk-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      plantType,
+      plantAge,
+      hoursOperated,
+      lastServiceDate,
+      knownFaults,
+      operatingEnvironment,
+      workNearPowerLines,
+      workOnSlope,
+      loadHandling,
+      operatorExperience,
+    } = req.body;
+
+    if (!plantType) {
+      return res.status(400).json({ error: "plantType is required" });
+    }
+
+    const prompt = `You are a plant safety and maintenance expert with expertise in Victorian OHS Equipment (Plant) Regulations and AS 4024 safety of machinery.
+
+Assess plant risk and maintenance requirements for:
+- Plant type: ${sanitiseInput(plantType)}
+- Plant age: ${sanitiseInput(String(plantAge || "unknown"))} years
+- Hours operated: ${sanitiseInput(String(hoursOperated || "unknown"))}
+- Last service date: ${sanitiseInput(lastServiceDate || "unknown")}
+- Known faults: ${sanitiseInput(knownFaults || "none")}
+- Operating environment: ${sanitiseInput(operatingEnvironment || "general construction")}
+- Work near power lines: ${sanitiseInput(String(workNearPowerLines || false))}
+- Work on slope: ${sanitiseInput(String(workOnSlope || false))}
+- Load handling: ${sanitiseInput(String(loadHandling || false))}
+- Operator experience: ${sanitiseInput(operatorExperience || "not specified")}
+
+Return a JSON object with:
+{
+  "riskRating": "LOW|MEDIUM|HIGH|CRITICAL",
+  "registrationRequired": boolean,
+  "inspectionFrequency": string,
+  "maintenancePriorities": [string],
+  "criticalSafetyChecks": [string],
+  "operatorRequirements": [string],
+  "exclusionZoneRequired": boolean,
+  "exclusionZoneDistance": string,
+  "powerLineProximityControls": [string],
+  "slopeRatingLimitations": string,
+  "loadChartRequired": boolean,
+  "applicableStandards": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ plantType, assessment });
+  } catch (err) {
+    console.error("/ai-plant-risk-assessment error:", err.message);
+    res.json({
+      plantType: req.body.plantType || "",
+      assessment: {
+        riskRating: "HIGH",
+        registrationRequired: true,
+        inspectionFrequency: "Pre-start inspection daily; major inspection per manufacturer schedule or annually (whichever is sooner)",
+        maintenancePriorities: ["Hydraulic system integrity", "Braking system condition", "ROPS/FOPS structural integrity", "Ground engagement tool wear"],
+        criticalSafetyChecks: ["Functional brake test", "ROPS certification label present", "Safe operating load clearly marked", "All warning devices operational"],
+        operatorRequirements: ["High Risk Work Licence (HRWL) required for plant exceeding 3 tonne or mobile crane", "Site induction and site-specific plant induction", "Operator logbook maintained"],
+        exclusionZoneRequired: true,
+        exclusionZoneDistance: "3 m minimum from any unprotected person; 3 m from overhead power lines unless electrical safety permit issued",
+        powerLineProximityControls: ["Contact local network operator before working within 3 m of power lines", "Obtain Electrical Safety Permit from Distribution Network Service Provider", "Fit boom/mast height limiters where practicable"],
+        slopeRatingLimitations: "Check manufacturer stability chart — most earthmoving plant limited to 15–30° slope. On grades > manufacturer limit, cease operations.",
+        loadChartRequired: true,
+        applicableStandards: ["OHS Equipment (Plant) Regulations 2007 (Vic)", "AS 4024 Safety of machinery", "AS 2550 Cranes — safe use", "AS 1418 Cranes, hoists and winches"],
+        recommendation: "Ensure daily pre-start inspections are completed and documented. Verify plant registration is current with WorkSafe. Brief operator on site-specific hazards before each task.",
+        summary: "Construction plant requires daily pre-start inspections, current registration, and licensed operators. High-risk activities (power line proximity, load handling) require specific permits and controls.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
