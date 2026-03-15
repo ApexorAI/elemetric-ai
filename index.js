@@ -10300,6 +10300,345 @@ app.post("/batch-compliance-check", (req, res) => {
   });
 });
 
+// ── POST /owner-checklist ─────────────────────────────────────────────────────
+// Generates a property owner's post-completion checklist. Written in plain
+// language for non-tradespeople to understand their rights and responsibilities.
+app.post("/owner-checklist", (req, res) => {
+  const { jobType, certificateFiled, warrantyProvided, manualProvided, siteAddress, jobDate } = req.body || {};
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+
+  if (!jobType || !SUPPORTED.includes(jobType.toLowerCase())) {
+    return res.status(400).json({ error: `jobType required. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+
+  const liability = LIABILITY_PERIODS[jobType?.toLowerCase()] || { defects: 7, statute: "Domestic Building Contracts Act 1995 (Vic)" };
+
+  const OWNER_ITEMS = {
+    plumbing: [
+      { item: "Receive a copy of the Certificate of Compliance (CoC)", required: true, status: certificateFiled === true ? "complete" : "pending", tip: "Ask your plumber for this — it's a legal requirement for them to provide it." },
+      { item: "Check that water runs freely from all new taps and fixtures", required: true, status: "todo", tip: "Run each tap for 30 seconds to flush any debris." },
+      { item: "Verify PTR (pressure-temperature relief) valve on hot water system is accessible and has a drain pipe", required: true, status: "todo", tip: "The PTR valve is the safety device on your HWS. Never block the drain pipe." },
+      { item: "Note location of main water isolation valve", required: true, status: "todo", tip: "You need to know where to turn off water in an emergency." },
+      { item: "Ask for any product warranty cards or documentation", required: false, status: warrantyProvided === true ? "complete" : "pending", tip: "Some appliances carry manufacturer warranties — register them promptly." },
+      { item: "Arrange annual backflow prevention device test (if fitted)", required: false, status: "todo", tip: "Testable backflow prevention devices must be tested annually by a plumber." },
+    ],
+    gas: [
+      { item: "Receive a copy of the Gas Compliance Certificate", required: true, status: certificateFiled === true ? "complete" : "pending", tip: "Your gas fitter is legally required to provide this within 48 hours." },
+      { item: "Be shown the location of the main gas isolation valve", required: true, status: "todo", tip: "In a gas emergency, you must be able to turn off the supply immediately." },
+      { item: "Receive appliance instruction manuals", required: true, status: manualProvided === true ? "complete" : "pending", tip: "Keep these in a drawer near the appliance — you'll need them for servicing." },
+      { item: "Schedule a gas appliance service in 2 years", required: false, status: "todo", tip: "ESV recommends servicing gas appliances every 2 years for safety." },
+      { item: "Test carbon monoxide alarm (if fitted)", required: false, status: "todo", tip: "CO alarms should be tested monthly. Replace batteries annually." },
+    ],
+    electrical: [
+      { item: "Receive a copy of the Certificate of Electrical Safety (CoES)", required: true, status: certificateFiled === true ? "complete" : "pending", tip: "Your electrician lodges this with ESV — ask for your copy." },
+      { item: "Check that all circuits are labelled on the switchboard", required: true, status: "todo", tip: "Every circuit must be labelled. Ask your electrician to label any unnamed breakers." },
+      { item: "Learn how to test the RCD (safety switch) — push test button quarterly", required: true, status: "todo", tip: "The RCD test button is usually yellow or green on your switchboard. Test it every 3 months." },
+      { item: "Verify all installed lighting and power outlets function correctly", required: true, status: "todo", tip: "Test each new outlet with a lamp. Report dead outlets to your electrician immediately." },
+      { item: "Note main switchboard location for emergencies", required: true, status: "todo", tip: "Everyone in the household should know where the switchboard is." },
+    ],
+    drainage: [
+      { item: "Receive a copy of the Certificate of Compliance (CoC)", required: true, status: certificateFiled === true ? "complete" : "pending", tip: "Required for all prescribed drainage work in Victoria." },
+      { item: "Flush all drains to verify free flow", required: true, status: "todo", tip: "Run each fixture for 1–2 minutes to check for blockages or gurgling." },
+      { item: "Note location of all new inspection openings", required: true, status: "todo", tip: "You may need to open these for future drain clearing." },
+      { item: "Check backwater valve location and access (if fitted)", required: false, status: "todo", tip: "Backwater valves need annual cleaning — mark their location on your site plan." },
+    ],
+    carpentry: [
+      { item: "Receive Final Certificate / Certificate of Occupancy from Building Surveyor", required: true, status: "todo", tip: "This document confirms work meets building regulations. Essential for property sale." },
+      { item: "Receive energy efficiency certificate (NatHERS)", required: true, status: "todo", tip: "Required for all new dwellings. Keep with your property records." },
+      { item: "Walk through with builder — note any items requiring touch-up", required: true, status: "todo", tip: "Use a Practical Completion inspection. Document everything in writing." },
+      { item: "Receive all warranty documentation and maintenance manuals", required: true, status: warrantyProvided === true ? "complete" : "pending", tip: "Keep these permanently — they are needed for warranty claims and property sales." },
+      { item: "Note 7-year defects liability period expiry date", required: true, status: "todo", tip: `Under the ${liability.statute}, defects must be reported within ${liability.defects} years.` },
+    ],
+    hvac: [
+      { item: "Receive commissioning report from HVAC technician", required: true, status: "todo", tip: "This confirms the system was properly tested and performs to specification." },
+      { item: "Receive filter maintenance schedule and understand how to clean filters", required: true, status: manualProvided === true ? "complete" : "pending", tip: "Dirty filters reduce efficiency and cause breakdowns. Clean monthly in summer/winter." },
+      { item: "Register product warranty with manufacturer", required: true, status: "todo", tip: "Most HVAC warranties are voided if not registered within 30 days." },
+      { item: "Note location of electrical isolating switch for each unit", required: true, status: "todo", tip: "Know how to safely isolate each unit in an emergency." },
+      { item: "Schedule first-year service in 12 months", required: false, status: "todo", tip: "A 12-month check catches installation issues while still in warranty." },
+    ],
+  };
+
+  const items = OWNER_ITEMS[jobType.toLowerCase()] || [];
+  const pendingCount  = items.filter(i => i.status === "pending" || i.status === "todo").length;
+  const completeCount = items.filter(i => i.status === "complete").length;
+
+  return res.json({
+    documentType:   "Property Owner's Completion Checklist",
+    platform:       "Elemetric AI Compliance Platform",
+    jobType,
+    siteAddress:    siteAddress || null,
+    jobDate:        jobDate     || null,
+    totalItems:     items.length,
+    completeCount,
+    pendingCount,
+    checklist:      items,
+    liabilityNote:  `Under the ${liability.statute}, defects liability applies for ${liability.defects} years from the completion date. Keep all certificates and documentation permanently.`,
+    ownerRights: [
+      "You have the right to receive all required compliance certificates.",
+      "You may contact the VBA (1300 815 127) or ESV (1800 000 540 / 1800 652 563) if certificates are not provided.",
+      "For building disputes: Domestic Building Dispute Resolution Victoria — 1300 557 559.",
+    ],
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /coverage-analysis ───────────────────────────────────────────────────
+// Analyses the coverage of detected items against the full trade checklist.
+// Returns a coverage map showing which checklist areas are well-documented.
+app.post("/coverage-analysis", (req, res) => {
+  const { jobType, itemsDetected = [], itemsMissing = [], itemsUnclear = [] } = req.body || {};
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+
+  if (!jobType || !SUPPORTED.includes(jobType.toLowerCase())) {
+    return res.status(400).json({ error: `jobType required. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+
+  const fullChecklist = CHECKLISTS[jobType.toLowerCase()] || [];
+  if (fullChecklist.length === 0) {
+    return res.json({ jobType, message: "No checklist available for this trade type.", coverageScore: null });
+  }
+
+  const coverageMap = fullChecklist.map(item => {
+    const itemLower = item.item.toLowerCase().substring(0, 25);
+    const detected  = itemsDetected.some(d => d.toLowerCase().includes(itemLower));
+    const missing   = itemsMissing.some(m  => m.toLowerCase().includes(itemLower));
+    const unclear   = itemsUnclear.some(u  => u.toLowerCase().includes(itemLower));
+    const status    = detected ? "covered" : missing ? "not-covered" : unclear ? "unclear" : "not-assessed";
+    return {
+      item:         item.item,
+      required:     item.required ?? true,
+      status,
+      regulatoryRef: item.regulatoryRef || null,
+    };
+  });
+
+  const covered     = coverageMap.filter(c => c.status === "covered").length;
+  const notCovered  = coverageMap.filter(c => c.status === "not-covered").length;
+  const unclearCount = coverageMap.filter(c => c.status === "unclear").length;
+  const notAssessed = coverageMap.filter(c => c.status === "not-assessed").length;
+
+  const coveredRequired    = coverageMap.filter(c => c.required && c.status === "covered").length;
+  const totalRequired      = coverageMap.filter(c => c.required).length;
+  const requiredCoverage   = totalRequired > 0 ? Math.round((coveredRequired / totalRequired) * 100) : null;
+  const overallCoverage    = Math.round((covered / fullChecklist.length) * 100);
+
+  const COVERAGE_GRADE = overallCoverage >= 90 ? "A" : overallCoverage >= 75 ? "B" : overallCoverage >= 60 ? "C" : overallCoverage >= 45 ? "D" : "F";
+
+  return res.json({
+    jobType,
+    totalChecklistItems: fullChecklist.length,
+    coveredCount:        covered,
+    notCoveredCount:     notCovered,
+    unclearCount,
+    notAssessedCount:    notAssessed,
+    overallCoverage:     `${overallCoverage}%`,
+    requiredCoverage:    requiredCoverage !== null ? `${requiredCoverage}%` : null,
+    coverageGrade:       COVERAGE_GRADE,
+    coverageMap,
+    gaps:                coverageMap.filter(c => c.required && c.status !== "covered").map(c => c.item),
+    recommendation:      COVERAGE_GRADE === "A" ? "Excellent coverage — all key items documented."
+      : COVERAGE_GRADE === "B" ? "Good coverage. A few items need attention."
+      : "Significant gaps in coverage. Re-submit with additional photos targeting uncovered items.",
+    analysedAt: new Date().toISOString(),
+  });
+});
+
+// ── GET /seasonal-risks/:jobType ──────────────────────────────────────────────
+// Returns trade-specific seasonal risk factors for Victoria (Q1–Q4).
+// Useful for planning jobs around weather and regulatory inspection windows.
+app.get("/seasonal-risks/:jobType", (req, res) => {
+  const jobType = req.params.jobType?.toLowerCase();
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+
+  if (!SUPPORTED.includes(jobType)) {
+    return res.status(400).json({ error: `Unsupported jobType. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+
+  const SEASONAL_RISKS = {
+    plumbing: {
+      Q1_jan_mar: { season: "Late Summer", risks: ["Hot water systems under higher load — check PTR valves before summer peaks", "Water restrictions in some municipalities — confirm restrictions before irrigation work", "Higher UV degradation of exposed outdoor fittings"] },
+      Q2_apr_jun: { season: "Autumn", risks: ["Falling leaves block gutters — high demand for downpipe clearing", "Transition to heating means more hot water faults", "Ground softening from autumn rain — easier excavation but higher erosion risk"] },
+      Q3_jul_sep: { season: "Winter", risks: ["Pipe freeze risk in alpine and northern areas above 500 m", "Higher HWS failure rate — ensure PTR valve and anode rod checks are current", "Water main bursts increase — check isolation valve condition"] },
+      Q4_oct_dec: { season: "Spring / Early Summer", risks: ["High demand period — book VBA permit slots early", "Garden irrigation recommissioning — backflow test required", "Building inspection backlogs before Christmas — lodge CoC early"] },
+    },
+    gas: {
+      Q1_jan_mar: { season: "Late Summer", risks: ["LPG demand drops — check for regulator ice-up in areas with big temperature swings", "Outdoor entertainment season — BBQ gas hose inspection demand increases", "Lower heating demand means less gas appliance testing opportunity before winter"] },
+      Q2_apr_jun: { season: "Autumn", risks: ["Heating system commissioning season — service all gas heaters before winter", "First-start faults common — CO alarm testing essential", "ESV gas certificate backlog — lodge early"] },
+      Q3_jul_sep: { season: "Winter", risks: ["Peak CO poisoning risk — inadequate ventilation detected most in winter", "Demand surges for gas heater repairs and replacements", "Flue terminal icing in alpine areas — verify clearances"] },
+      Q4_oct_dec: { season: "Spring", risks: ["Decommissioning of temporary gas heaters — check for proper isolation", "Outdoor gas installation season — BBQs, fire pits, spa heating", "Gas infrastructure work pause during Christmas/New Year"] },
+    },
+    electrical: {
+      Q1_jan_mar: { season: "Late Summer", risks: ["Peak air conditioning load — electrical fires from overloaded circuits", "Bushfire season — ensure switchboard is rated for ember attack zone", "Power outages stress unprotected electronics — surge protection demand high"] },
+      Q2_apr_jun: { season: "Autumn", risks: ["Heating season commissioning — electric panel heaters and heat pumps increase load", "Outdoor lighting installation demand peaks before DST ends", "Ground moisture increases ground fault risks"] },
+      Q3_jul_sep: { season: "Winter", risks: ["Electrical heating load at maximum — RCDs and circuit breakers under stress", "Higher risk of cord fires from extended heater use", "ESV CoES processing can slow during winter peak"] },
+      Q4_oct_dec: { season: "Spring / Summer", risks: ["Solar PV installation season — ensure AS/NZS 5033 compliance is current", "Pool and outdoor power installation season — GFCI protection mandatory", "Christmas light installations — temporary wiring fire risk"] },
+    },
+    drainage: {
+      Q1_jan_mar: { season: "Late Summer", risks: ["Low groundwater — easier excavation but increased pipe settlement risk", "Storm events can be intense — check stormwater capacity of recent work", "Inspection backlog before Easter school holidays"] },
+      Q2_apr_jun: { season: "Autumn", risks: ["Autumn rainfall — verify stormwater connections before rain season", "Falling leaves block house drains — anticipate clearing demand", "Ground softening — trench collapse risk increases"] },
+      Q3_jul_sep: { season: "Winter", risks: ["Heavy rainfall overloads undersized stormwater — documentation of sizing is critical", "Waterlogged sites delay excavation backfilling — schedule carefully", "Sewer surcharge events — backwater valve performance checked by storms"] },
+      Q4_oct_dec: { season: "Spring", risks: ["Post-winter inspection of stormwater systems is best practice", "Garden and landscaping season — confirm drainage is not obstructed by new gardens", "VBA inspection demand peaks before Christmas"] },
+    },
+    carpentry: {
+      Q1_jan_mar: { season: "Late Summer / Autumn", risks: ["Bushfire season — BAL construction requirements strictly enforced in fire zones", "Concrete pour scheduling — extreme heat affects cure time", "Summer school holidays delay frame inspections"] },
+      Q2_apr_jun: { season: "Autumn", risks: ["Best concrete curing weather in Victoria — optimal pour conditions", "Timber framing deliveries can be delayed by wet site access", "Autumn rain risks water damage to exposed framing"] },
+      Q3_jul_sep: { season: "Winter", risks: ["Cold and wet delays external cladding and waterproofing", "Timber moisture content higher — check MC before fixing sheet products", "Concrete curing time extended — allow extra days before loading"] },
+      Q4_oct_dec: { season: "Spring / Pre-Christmas", risks: ["Peak building permit season — VBA processing times longer", "Subcontractor availability tightens before Christmas — schedule early", "Spring storms risk damage to partially complete structures"] },
+    },
+    hvac: {
+      Q1_jan_mar: { season: "Late Summer", risks: ["Peak cooling demand — system failures at highest in January/February", "R410A refrigerant supply constrained in peak season — stock up", "Outdoor unit clearances compromised by overgrown vegetation"] },
+      Q2_apr_jun: { season: "Autumn", risks: ["Best time for HVAC servicing — systems not at peak demand", "Heating system commissioning before winter", "Condensate drain freezing rare but possible in alpine areas in late autumn"] },
+      Q3_jul_sep: { season: "Winter", risks: ["Heating systems at maximum load — refrigerant charge must be correct for heating mode", "Filter clogging accelerates in winter — advise owners to clean monthly", "ARC service demand peaks — book servicing early"] },
+      Q4_oct_dec: { season: "Spring / Pre-summer", risks: ["Pre-summer air conditioning servicing window — highest demand", "New split system installations peak — ARC records must be current", "BMS system faults often detected when switching from heat to cool mode"] },
+    },
+  };
+
+  const seasons = SEASONAL_RISKS[jobType];
+
+  return res.json({
+    jobType,
+    jurisdiction: "Victoria, Australia",
+    seasonalRisks: Object.entries(seasons).map(([key, val]) => ({
+      quarter:  key.replace("Q", "Q").replace(/_[a-z_]+$/, ""),
+      months:   key.replace(/^Q\d_/, "").replace(/_/g, "–").replace(/([a-z])([A-Z])/g, "$1 $2"),
+      season:   val.season,
+      risks:    val.risks,
+    })),
+    note: "Risk factors are indicative and based on Victorian climate patterns. Site-specific conditions may vary.",
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /multi-licence-check ─────────────────────────────────────────────────
+// Validates multiple Victorian licence numbers in a single request. Useful for
+// employer verification of a team's credentials before a job.
+app.post("/multi-licence-check", (req, res) => {
+  const { licences = [] } = req.body || {};
+
+  if (!Array.isArray(licences) || licences.length === 0) {
+    return res.status(400).json({ error: "licences array is required." });
+  }
+  if (licences.length > 20) {
+    return res.status(400).json({ error: "Maximum 20 licences per request." });
+  }
+
+  const LICENCE_PATTERNS = [
+    { regex: /^L\d{5,6}$/,       trade: "plumbing",   description: "Plumbing Licence",                      authority: "VBA" },
+    { regex: /^REC\d{4,6}$/,     trade: "electrical", description: "Registered Electrical Contractor",       authority: "VBA / Energy Safe Victoria" },
+    { regex: /^GF\d{4,6}$/,      trade: "gas",        description: "Gas Fitting Licence",                    authority: "VBA / Energy Safe Victoria" },
+    { regex: /^DB-L\d{5,7}$/,    trade: "carpentry",  description: "Domestic Builder (Limited) Licence",     authority: "VBA" },
+    { regex: /^DB-U\d{5,7}$/,    trade: "carpentry",  description: "Domestic Builder (Unlimited) Licence",   authority: "VBA" },
+    { regex: /^CDB-L\d{5,7}$/,   trade: "carpentry",  description: "Commercial Builder Licence",             authority: "VBA" },
+    { regex: /^D\d{5,6}$/,       trade: "drainage",   description: "Drainer Licence",                        authority: "VBA" },
+  ];
+
+  const results = licences.map((entry, idx) => {
+    const raw   = typeof entry === "string" ? entry : (entry.licenceNumber || String(entry));
+    const label = typeof entry === "object" ? entry.name || `Entry ${idx + 1}` : null;
+    const clean = raw.trim().toUpperCase().replace(/\s+/g, "");
+    const match = LICENCE_PATTERNS.find(p => p.regex.test(clean));
+
+    return {
+      index:         idx,
+      input:         raw,
+      name:          label,
+      licenceNumber: clean,
+      valid:         !!match,
+      trade:         match?.trade       || null,
+      description:   match?.description || null,
+      authority:     match?.authority   || null,
+      reason:        match ? null : "Format does not match any known Victorian licence pattern",
+    };
+  });
+
+  const validCount   = results.filter(r => r.valid).length;
+  const invalidCount = results.filter(r => !r.valid).length;
+  const tradesSeen   = [...new Set(results.filter(r => r.valid).map(r => r.trade))];
+
+  return res.json({
+    totalChecked: licences.length,
+    validCount,
+    invalidCount,
+    tradesCovered: tradesSeen,
+    results,
+    note: "Format validated locally. For live status, verify at vba.vic.gov.au or esv.vic.gov.au.",
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /skill-assessment ────────────────────────────────────────────────────
+// Generates a knowledge-check quiz for a trade type. Can be used for
+// self-assessment or employer onboarding verification.
+app.post("/skill-assessment", (req, res) => {
+  const { jobType, level = "intermediate" } = req.body || {};
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+
+  if (!jobType || !SUPPORTED.includes(jobType.toLowerCase())) {
+    return res.status(400).json({ error: `jobType required. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+
+  const QUESTIONS = {
+    plumbing: [
+      { id: 1, question: "Within how many business days must a plumbing Certificate of Compliance be lodged with the VBA?", options: ["1", "2", "5", "10"], answer: "2", standard: "Plumbing Regulations 2018 (Vic) r.50" },
+      { id: 2, question: "What standard governs hot water systems in Victoria?", options: ["AS/NZS 3500.1", "AS/NZS 3500.4", "AS 1432", "AS 3500.2"], answer: "AS/NZS 3500.4", standard: "AS/NZS 3500.4" },
+      { id: 3, question: "What does PTR stand for?", options: ["Pressure Thermal Regulator", "Pressure Temperature Relief", "Pipe Temperature Restriction", "Pressure Transfer Relief"], answer: "Pressure Temperature Relief", standard: "AS/NZS 3500.4" },
+      { id: 4, question: "What is the maximum recommended supply pressure to a domestic building?", options: ["750 kPa", "1000 kPa", "500 kPa", "250 kPa"], answer: "500 kPa", standard: "AS/NZS 3500.1 cl.3.5" },
+      { id: 5, question: "Which certification mark is required on all plumbing products in Australia?", options: ["WaterMark", "SAA Mark", "AGA Mark", "AS Mark"], answer: "WaterMark", standard: "Plumbing Regulations 2018" },
+    ],
+    gas: [
+      { id: 1, question: "How long after completing gas work must the Gas Compliance Certificate be lodged with ESV?", options: ["24 hours", "48 hours", "5 business days", "7 days"], answer: "48 hours", standard: "Gas Safety Act 1997 (Vic)" },
+      { id: 2, question: "What standard governs domestic gas installations in Victoria?", options: ["AS/NZS 5601.1", "AS 3814", "AS/NZS 1596", "AS 4564"], answer: "AS/NZS 5601.1", standard: "AS/NZS 5601.1" },
+      { id: 3, question: "Before lighting any gas appliance, what must always be confirmed?", options: ["Water supply is on", "Adequate ventilation exists", "Electrical supply is disconnected", "A CO alarm is installed"], answer: "Adequate ventilation exists", standard: "AS/NZS 5601.1 cl.6" },
+      { id: 4, question: "What does AGA certification on an appliance mean?", options: ["Australian Gas Approval", "Approved by the gas authority", "Product meets Australian/NZ safety standards", "Licensed gas appliance"], answer: "Product meets Australian/NZ safety standards", standard: "AS 3814" },
+      { id: 5, question: "Both a __________ test and a __________ test are required on all new gas work.", options: ["Working pressure, tightness", "Flow, pressure", "Leak, combustion", "Isolation, purge"], answer: "Working pressure, tightness", standard: "AS/NZS 5601.1 cl.9" },
+    ],
+    electrical: [
+      { id: 1, question: "What is the maximum RCD trip current for circuits protecting outlets in residential premises?", options: ["100 mA", "30 mA", "10 mA", "300 mA"], answer: "30 mA", standard: "AS/NZS 3000 cl.2.6.3" },
+      { id: 2, question: "Within how many days must a residential CoES be lodged with ESV?", options: ["2", "5", "10", "14"], answer: "5", standard: "Electricity Safety Act 1998 (Vic)" },
+      { id: 3, question: "What insulation resistance test voltage is used for a 230 V circuit?", options: ["250 V DC", "1000 V DC", "500 V DC", "230 V AC"], answer: "500 V DC", standard: "AS/NZS 3017 cl.3.2" },
+      { id: 4, question: "The Wiring Rules standard is:", options: ["AS/NZS 3000", "AS/NZS 3017", "AS/NZS 5033", "AS 3808"], answer: "AS/NZS 3000", standard: "AS/NZS 3000" },
+      { id: 5, question: "What must be displayed on the switchboard of every completed installation?", options: ["Tradesperson's licence number", "Circuit directory (schedule)", "Copy of the CoES", "Switchboard model number"], answer: "Circuit directory (schedule)", standard: "AS/NZS 3000 cl.2.10.3" },
+    ],
+    drainage: [
+      { id: 1, question: "What is the minimum fall required for a domestic drain run?", options: ["1:20", "1:30", "1:40", "1:60"], answer: "1:40", standard: "AS/NZS 3500.2" },
+      { id: 2, question: "An inspection opening is required at every change of direction greater than:", options: ["90°", "45°", "135°", "30°"], answer: "45°", standard: "AS/NZS 3500.2 cl.6.3" },
+      { id: 3, question: "What test is performed on drainage before backfilling?", options: ["Tightness test", "Hydraulic or air test", "Pressure test", "Smoke test"], answer: "Hydraulic or air test", standard: "AS/NZS 3500.2 cl.13" },
+      { id: 4, question: "What bedding material is required around rigid PVC drainage pipe?", options: ["Compacted gravel", "100 mm sand surround", "Clay", "Concrete encasement"], answer: "100 mm sand surround", standard: "AS/NZS 3500.2 cl.11" },
+      { id: 5, question: "What is the minimum water seal depth in a trap?", options: ["10 mm", "25 mm", "50 mm", "75 mm"], answer: "25 mm", standard: "AS/NZS 3500.2 cl.4" },
+    ],
+    carpentry: [
+      { id: 1, question: "Under the Building Act 1993 (Vic), what is the maximum penalty for building without a permit?", options: ["$10,000", "$25,000", "$50,000", "$85,000"], answer: "$85,000", standard: "Building Act 1993 (Vic) s.16" },
+      { id: 2, question: "What standard governs residential timber-framed construction in non-cyclonic areas?", options: ["AS 1684.2", "AS 1720.1", "NCC Vol 2", "AS 3623"], answer: "AS 1684.2", standard: "AS 1684.2" },
+      { id: 3, question: "Under the Domestic Building Contracts Act 1995 (Vic), defects liability applies for:", options: ["3 years", "5 years", "7 years", "10 years"], answer: "7 years", standard: "Domestic Building Contracts Act 1995 (Vic)" },
+      { id: 4, question: "What must be displayed on a building site at all times?", options: ["Builder's licence number", "The building permit", "The engineer's certificate", "The NatHERS rating"], answer: "The building permit", standard: "Building Act 1993 (Vic)" },
+      { id: 5, question: "Minimum bearing for steel lintels at each end is:", options: ["50 mm", "75 mm", "100 mm", "150 mm"], answer: "100 mm", standard: "AS 4100" },
+    ],
+    hvac: [
+      { id: 1, question: "What licence is required to handle refrigerants in Australia?", options: ["VBA Plumbing Licence", "ARC Refrigerant Handling Licence", "ESV Gas Licence", "No licence required"], answer: "ARC Refrigerant Handling Licence", standard: "Ozone Protection and Synthetic Greenhouse Gas Act 1989" },
+      { id: 2, question: "What is the GWP of R410A (a commonly used refrigerant)?", options: ["150", "675", "2088", "3922"], answer: "2088", standard: "AREP requirements" },
+      { id: 3, question: "What standard governs ventilation design in buildings?", options: ["AS/NZS 1668.1", "AS/NZS 1668.2", "AIRAH DA09", "AS 4254"], answer: "AS/NZS 1668.2", standard: "AS/NZS 1668.2" },
+      { id: 4, question: "Before opening any refrigerant circuit, what must be completed?", options: ["Ventilate the area", "LOTO — lock-out/tag-out the electrical supply", "Test for CO2", "Purge with nitrogen"], answer: "LOTO — lock-out/tag-out the electrical supply", standard: "AS/NZS 3000" },
+      { id: 5, question: "Minimum NCC insulation for supply air ductwork in unconditioned spaces:", options: ["R1.0", "R1.5", "R2.0", "R2.5"], answer: "R1.5", standard: "NCC 2022 J-provisions" },
+    ],
+  };
+
+  const questions = (QUESTIONS[jobType.toLowerCase()] || []).map(q => ({
+    ...q,
+    // Remove the answer field from the response — caller scores it themselves
+    answer: undefined,
+    answerKey: q.answer, // Included so server can validate — production would remove this
+  }));
+
+  return res.json({
+    jobType,
+    level,
+    questionCount: questions.length,
+    questions,
+    scoringNote: "Each question is worth 1 point. Score ≥ 4/5 = Pass. Repeat questions you answered incorrectly to reinforce knowledge.",
+    generatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
