@@ -47105,6 +47105,296 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /fire-door-inspection — Inspect a fire door set (AS 1905.1, NCC 2022 Spec C3.4)
+app.post("/fire-door-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, buildingName, buildingAddress,
+    inspectionDate, inspectorName, inspectorAccreditation,
+    doorRef, doorLocation, doorLevel,
+    frlRating, doorLeafType, frameType,
+    // Physical condition checks
+    doorLeafConditionOk, noVisibleDamage, noWarping, noGaps,
+    glazingPanelIntact, glazingBeadsSecure,
+    // Hardware checks
+    selfCloserInstalled, selfCloserFunctional, selfCloserAdjusted,
+    latching, latchBoltEngaged, holdOpenDeviceCompliant,
+    panicHardwareInstalled, panicHardwareFunctional,
+    // Seals and gaps
+    intumescentSealsInstalled, intumescentSealCondition,
+    smokeSealsInstalled, smokeSealCondition,
+    gapUnderDoorMm, gapHingeEdgeMm, gapLatchEdgeMm, gapTopMm,
+    maxGapMm,
+    // Labelling
+    labelPresent, labelLegible, frlLabelMatchesSpec,
+    // Signage
+    keepClosedSignage, fireExitSignage,
+    nonCompliances, rectificationRequired, notes,
+  } = req.body;
+
+  if (!projectId || !doorRef || !inspectionDate || !inspectorName) {
+    return res.status(400).json({ error: "projectId, doorRef, inspectionDate, and inspectorName are required." });
+  }
+
+  const sanitisedDoorRef = sanitiseInput(doorRef, 60);
+  const sanitisedInspector = sanitiseInput(inspectorName, 120);
+
+  // AS 1905.1 maximum allowable gaps: 3mm at sides/top, 10mm at bottom
+  const MAX_SIDE_GAP_MM = 3;
+  const MAX_BOTTOM_GAP_MM = 10;
+  const resolvedMaxGap = maxGapMm || MAX_SIDE_GAP_MM;
+
+  const failures = [];
+
+  // Physical condition
+  if (noVisibleDamage === false) failures.push("Visible damage to door leaf or frame — repair or replace.");
+  if (noWarping === false) failures.push("Door leaf warped — replace (warping compromises fire rating).");
+  if (noGaps === false) failures.push("Gaps visible in door set — investigate and seal.");
+  if (glazingPanelIntact === false) failures.push("Glazing panel cracked or damaged — replace with fire-rated glazing.");
+  if (glazingBeadsSecure === false) failures.push("Glazing beads not secure — refix immediately.");
+
+  // Hardware
+  if (!selfCloserInstalled) failures.push("Self-closer not installed (AS 1905.1 clause 2.9.1).");
+  if (selfCloserInstalled && !selfCloserFunctional) failures.push("Self-closer not functional — door must self-close and latch (AS 1905.1).");
+  if (latchBoltEngaged === false) failures.push("Latch bolt not engaging — adjust door hardware.");
+
+  // Seals
+  if (!intumescentSealsInstalled) failures.push("Intumescent seals not installed — required for smoke control (AS 1905.1).");
+  if (intumescentSealCondition === "DAMAGED" || intumescentSealCondition === "MISSING") {
+    failures.push("Intumescent seal damaged or missing — replace before next inspection.");
+  }
+  if (smokeSealsInstalled && smokeSealCondition === "DAMAGED") {
+    failures.push("Smoke seal damaged — replace.");
+  }
+
+  // Gap checks
+  if (gapUnderDoorMm !== undefined && Number(gapUnderDoorMm) > MAX_BOTTOM_GAP_MM) {
+    failures.push(`Gap under door ${gapUnderDoorMm}mm exceeds ${MAX_BOTTOM_GAP_MM}mm maximum — adjust door or install drop seal.`);
+  }
+  if (gapHingeEdgeMm !== undefined && Number(gapHingeEdgeMm) > MAX_SIDE_GAP_MM) {
+    failures.push(`Hinge edge gap ${gapHingeEdgeMm}mm exceeds ${MAX_SIDE_GAP_MM}mm — rehang door.`);
+  }
+  if (gapLatchEdgeMm !== undefined && Number(gapLatchEdgeMm) > MAX_SIDE_GAP_MM) {
+    failures.push(`Latch edge gap ${gapLatchEdgeMm}mm exceeds ${MAX_SIDE_GAP_MM}mm — adjust door.`);
+  }
+  if (gapTopMm !== undefined && Number(gapTopMm) > MAX_SIDE_GAP_MM) {
+    failures.push(`Top gap ${gapTopMm}mm exceeds ${MAX_SIDE_GAP_MM}mm — adjust frame or door.`);
+  }
+
+  // Labelling
+  if (!labelPresent) failures.push("Fire door label not present — label required per AS 1905.1 clause 4.3.");
+  if (labelPresent && !labelLegible) failures.push("Fire door label not legible — replace label.");
+  if (labelPresent && frlLabelMatchesSpec === false) failures.push("FRL on label does not match specification — investigate and rectify.");
+
+  // Additional non-compliances
+  const addlNC = (nonCompliances || []).map(n => sanitiseInput(String(n), 200)).slice(0, 10);
+  const allFailures = [...failures, ...addlNC];
+
+  const overallResult = allFailures.length === 0 ? "PASS" : "FAIL";
+
+  const ref = `FDI-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    buildingName: sanitiseInput(buildingName || "", 200),
+    buildingAddress: sanitiseInput(buildingAddress || "", 300),
+    inspectionDate,
+    inspectorName: sanitisedInspector,
+    inspectorAccreditation: sanitiseInput(inspectorAccreditation || "", 80),
+    door: {
+      ref: sanitisedDoorRef,
+      location: sanitiseInput(doorLocation || "", 150),
+      level: sanitiseInput(doorLevel || "", 30),
+      frlRating: sanitiseInput(frlRating || "", 30),
+      leafType: sanitiseInput(doorLeafType || "", 60),
+      frameType: sanitiseInput(frameType || "", 60),
+    },
+    gaps: {
+      underDoorMm: gapUnderDoorMm || null,
+      hingeEdgeMm: gapHingeEdgeMm || null,
+      latchEdgeMm: gapLatchEdgeMm || null,
+      topMm: gapTopMm || null,
+    },
+    checks: {
+      doorLeafConditionOk, noVisibleDamage, noWarping, noGaps,
+      glazingPanelIntact, glazingBeadsSecure,
+      selfCloserInstalled, selfCloserFunctional, selfCloserAdjusted,
+      latchBoltEngaged, holdOpenDeviceCompliant,
+      panicHardwareInstalled, panicHardwareFunctional,
+      intumescentSealsInstalled, intumescentSealCondition,
+      smokeSealsInstalled, smokeSealCondition,
+      labelPresent, labelLegible, frlLabelMatchesSpec,
+      keepClosedSignage, fireExitSignage,
+    },
+    overallResult,
+    failures: allFailures,
+    rectificationRequired: allFailures.length > 0 && (rectificationRequired !== false),
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("fire_door_inspections").insert(record);
+      if (error) console.error("Fire door inspection insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Fire door inspection DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    doorRef: sanitisedDoorRef,
+    overallResult,
+    failureCount: allFailures.length,
+    failures: allFailures,
+    message: overallResult === "PASS"
+      ? `Fire door ${sanitisedDoorRef} PASSED inspection — compliant with AS 1905.1.`
+      : `Fire door ${sanitisedDoorRef} FAILED — ${allFailures.length} non-compliance(s). Rectify before next annual inspection.`,
+    saved,
+    record,
+  });
+});
+
+// GET /fire-door-inspection/:projectId — List fire door inspections for a project/building
+app.get("/fire-door-inspection/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { result, level } = req.query;
+
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  try {
+    let query = supabaseAdmin
+      .from("fire_door_inspections")
+      .select("*")
+      .eq("projectId", sanitiseInput(String(projectId), 80))
+      .order("inspectionDate", { ascending: false });
+
+    if (result) query = query.eq("overallResult", sanitiseInput(String(result), 10).toUpperCase());
+    if (level) query = query.eq("door->level", sanitiseInput(String(level), 30));
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const records = data || [];
+    const passCount = records.filter(r => r.overallResult === "PASS").length;
+    const failCount = records.filter(r => r.overallResult === "FAIL").length;
+    const rectificationRequired = records.filter(r => r.rectificationRequired).length;
+
+    return res.json({
+      projectId,
+      total: records.length,
+      passCount,
+      failCount,
+      rectificationRequired,
+      complianceRate: records.length > 0 ? Math.round((passCount / records.length) * 100) : null,
+      inspections: records,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to retrieve fire door inspections.", detail: e.message });
+  }
+});
+
+// POST /ai-fire-door-report — AI generates a fire door audit report
+app.post("/ai-fire-door-report", apiKeyAuth, async (req, res) => {
+  const {
+    buildingName, buildingAddress, buildingClass, numberOfStoreys,
+    totalDoorsInspected, passCount, failCount,
+    commonFailures, criticalDoors, inspectionDate, notes,
+  } = req.body;
+
+  if (!buildingName || !totalDoorsInspected) {
+    return res.status(400).json({ error: "buildingName and totalDoorsInspected are required." });
+  }
+
+  const sanitisedBuilding = sanitiseInput(buildingName, 200);
+  const sanitisedFailures = Array.isArray(commonFailures)
+    ? commonFailures.map(f => sanitiseInput(String(f), 150)).slice(0, 15)
+    : [];
+  const sanitisedCritical = Array.isArray(criticalDoors)
+    ? criticalDoors.map(d => sanitiseInput(String(d), 100)).slice(0, 20)
+    : [];
+
+  const prompt = `You are a fire safety consultant in Victoria, Australia, preparing a formal fire door audit report.
+
+Prepare a fire door audit report for:
+- Building: ${sanitisedBuilding}, ${sanitiseInput(buildingAddress || "", 200)}
+- Building class: ${sanitiseInput(String(buildingClass || ""), 10)}
+- Storeys: ${numberOfStoreys || "Unknown"}
+- Inspection date: ${sanitiseInput(inspectionDate || "", 20)}
+- Total doors inspected: ${totalDoorsInspected}
+- Passed: ${passCount || 0}
+- Failed: ${failCount || 0}
+- Common failures: ${sanitisedFailures.join("; ") || "Not specified"}
+- Critical doors requiring urgent attention: ${sanitisedCritical.join(", ") || "None identified"}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Reference AS 1905.1, NCC 2022 Specification C3.4, and Victorian Building Regulations.
+
+Respond ONLY with a JSON object:
+{
+  "overallCompliance": "COMPLIANT|PARTIALLY_COMPLIANT|NON_COMPLIANT",
+  "complianceRate": number (percentage),
+  "riskLevel": "LOW|MEDIUM|HIGH|CRITICAL",
+  "keyFindings": [string],
+  "criticalActions": [{"action": string, "doorRef": string, "urgency": "IMMEDIATE|WITHIN_7_DAYS|WITHIN_30_DAYS"}],
+  "recurringIssues": [string],
+  "regulatoryObligations": [string],
+  "maintenanceProgramRecommendations": [string],
+  "reportNarrative": string (formal 3-4 sentence paragraph),
+  "nextInspectionRecommendedMonths": number
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+    const failRate = totalDoorsInspected > 0 ? Math.round(((failCount || 0) / totalDoorsInspected) * 100) : 0;
+
+    return res.json({
+      success: true,
+      buildingName: sanitisedBuilding,
+      overallCompliance: parsed.overallCompliance || (failRate === 0 ? "COMPLIANT" : failRate < 20 ? "PARTIALLY_COMPLIANT" : "NON_COMPLIANT"),
+      complianceRate: parsed.complianceRate ?? (100 - failRate),
+      riskLevel: parsed.riskLevel || "MEDIUM",
+      keyFindings: parsed.keyFindings || [],
+      criticalActions: parsed.criticalActions || [],
+      recurringIssues: parsed.recurringIssues || [],
+      regulatoryObligations: parsed.regulatoryObligations || [],
+      maintenanceProgramRecommendations: parsed.maintenanceProgramRecommendations || [],
+      reportNarrative: parsed.reportNarrative || "",
+      nextInspectionRecommendedMonths: parsed.nextInspectionRecommendedMonths || 12,
+    });
+  } catch (e) {
+    console.error("AI fire door report error:", e.message);
+    const failRate = totalDoorsInspected > 0 ? Math.round(((failCount || 0) / totalDoorsInspected) * 100) : 0;
+    return res.json({
+      success: true,
+      buildingName: sanitisedBuilding,
+      overallCompliance: failRate === 0 ? "COMPLIANT" : failRate < 20 ? "PARTIALLY_COMPLIANT" : "NON_COMPLIANT",
+      complianceRate: 100 - failRate,
+      riskLevel: failRate > 30 ? "HIGH" : failRate > 10 ? "MEDIUM" : "LOW",
+      keyFindings: [`${passCount || 0} of ${totalDoorsInspected} doors passed inspection (${100 - failRate}% compliance rate)`],
+      criticalActions: sanitisedCritical.map(d => ({ action: "Rectify non-compliant door", doorRef: d, urgency: "WITHIN_7_DAYS" })),
+      recurringIssues: sanitisedFailures,
+      regulatoryObligations: ["Annual fire door inspection required under AS 1851", "Non-compliant fire doors must be rectified before next annual inspection"],
+      maintenanceProgramRecommendations: ["Implement 6-monthly visual inspections between annual formal audits", "Maintain a fire door register for the building"],
+      reportNarrative: `A fire door audit was conducted at ${sanitisedBuilding} on ${inspectionDate || "the inspection date"}. ${totalDoorsInspected} fire doors were inspected, achieving a compliance rate of ${100 - failRate}%. Identified non-compliances must be rectified and documented prior to the next scheduled inspection.`,
+      nextInspectionRecommendedMonths: 12,
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
