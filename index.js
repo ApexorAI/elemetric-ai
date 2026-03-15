@@ -38748,6 +38748,212 @@ Return JSON with:
   }
 });
 
+// POST /material-delivery-record — Log a material delivery to site
+app.post("/material-delivery-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, deliveryDate, supplierName, deliveryDocketNumber,
+    materials = [], conditionOnArrival = "ACCEPTABLE",
+    receivedBy, vehicleRegistration, storageLocation,
+    shortageReported = false, damageReported = false,
+    damageDescription, nonConformanceRaised = false, notes,
+  } = req.body;
+  if (!projectId || !supplierName || !materials.length) {
+    return res.status(400).json({ error: "projectId, supplierName, and at least one material are required." });
+  }
+  const validConditions = ["ACCEPTABLE", "DAMAGED", "INCORRECT", "PARTIAL", "REFUSED"];
+  if (!validConditions.includes(conditionOnArrival)) {
+    return res.status(400).json({ error: `conditionOnArrival must be one of: ${validConditions.join(", ")}` });
+  }
+  const deliveryRef = `DEL-${Date.now().toString(36).toUpperCase()}`;
+  const totalItems = Array.isArray(materials) ? materials.reduce((s, m) => s + (Number(m.quantity) || 0), 0) : 0;
+  const record = {
+    delivery_ref: deliveryRef,
+    project_id: projectId,
+    delivery_date: deliveryDate || new Date().toISOString().split("T")[0],
+    supplier_name: sanitiseInput(supplierName),
+    delivery_docket_number: sanitiseInput(deliveryDocketNumber || ""),
+    materials: Array.isArray(materials) ? materials.map(m => ({
+      description: sanitiseInput(m.description || ""),
+      quantity: Number(m.quantity) || 0,
+      unit: sanitiseInput(m.unit || ""),
+      grade: sanitiseInput(m.grade || ""),
+    })) : [],
+    total_items: totalItems,
+    condition_on_arrival: conditionOnArrival,
+    received_by: sanitiseInput(receivedBy || ""),
+    vehicle_registration: sanitiseInput(vehicleRegistration || ""),
+    storage_location: sanitiseInput(storageLocation || ""),
+    shortage_reported: Boolean(shortageReported),
+    damage_reported: Boolean(damageReported),
+    damage_description: sanitiseInput(damageDescription || ""),
+    non_conformance_raised: Boolean(nonConformanceRaised),
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("material_deliveries").insert(record);
+    if (error) console.error("material-delivery-record DB error:", error.message);
+  }
+  res.json({
+    deliveryRef, supplierName, conditionOnArrival, materialCount: materials.length,
+    totalItems, shortageReported, damageReported, saved: !!supabaseAdmin,
+  });
+});
+
+// GET /material-delivery-record/:projectId — List deliveries for a project
+app.get("/material-delivery-record/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { from, to, supplier } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("material_deliveries").select("*").eq("project_id", projectId).order("delivery_date", { ascending: false });
+  if (from) query = query.gte("delivery_date", from);
+  if (to) query = query.lte("delivery_date", to);
+  if (supplier) query = query.ilike("supplier_name", `%${supplier}%`);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({
+    projectId, deliveryCount: data.length,
+    issues: { shortages: data.filter(d => d.shortage_reported).length, damages: data.filter(d => d.damage_reported).length, ncrs: data.filter(d => d.non_conformance_raised).length },
+    deliveries: data,
+  });
+});
+
+// POST /asbestos-register — Register asbestos containing materials (ACMs)
+app.post("/asbestos-register", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, buildingName, surveyDate, surveyorName, surveyorLicenceNumber,
+    acmItems = [], riskRating = "LOW", nextInspectionDate,
+    managementPlan = false, managementPlanRef, propertyOwner, notes,
+  } = req.body;
+  if (!propertyAddress || !surveyDate || !surveyorName) {
+    return res.status(400).json({ error: "propertyAddress, surveyDate, and surveyorName are required." });
+  }
+  const registerRef = `ASB-${Date.now().toString(36).toUpperCase()}`;
+  const friableCount = Array.isArray(acmItems) ? acmItems.filter(i => i.type === "FRIABLE").length : 0;
+  const nonFriableCount = Array.isArray(acmItems) ? acmItems.filter(i => i.type === "NON_FRIABLE").length : 0;
+  const overallRisk = friableCount > 0 ? "HIGH" : riskRating;
+  const record = {
+    register_ref: registerRef,
+    property_address: sanitiseInput(propertyAddress),
+    building_name: sanitiseInput(buildingName || ""),
+    survey_date: surveyDate,
+    surveyor_name: sanitiseInput(surveyorName),
+    surveyor_licence: sanitiseInput(surveyorLicenceNumber || ""),
+    acm_items: Array.isArray(acmItems) ? acmItems.map(item => ({
+      location: sanitiseInput(item.location || ""),
+      material: sanitiseInput(item.material || ""),
+      type: item.type || "NON_FRIABLE",
+      condition: item.condition || "GOOD",
+      area_m2: Number(item.area_m2) || null,
+      riskRating: item.riskRating || "LOW",
+      action: item.action || "MANAGE_IN_PLACE",
+      labelled: Boolean(item.labelled),
+    })) : [],
+    total_acm_count: Array.isArray(acmItems) ? acmItems.length : 0,
+    friable_count: friableCount,
+    non_friable_count: nonFriableCount,
+    overall_risk: overallRisk,
+    next_inspection_date: nextInspectionDate || null,
+    management_plan: Boolean(managementPlan),
+    management_plan_ref: sanitiseInput(managementPlanRef || ""),
+    property_owner: sanitiseInput(propertyOwner || ""),
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("asbestos_registers").insert(record);
+    if (error) console.error("asbestos-register DB error:", error.message);
+  }
+  res.json({
+    registerRef, propertyAddress, surveyDate, surveyorName, overallRisk,
+    totalAcmCount: record.total_acm_count, friableCount, nonFriableCount,
+    managementPlanRequired: overallRisk !== "NONE", saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-remediation-plan — AI generates a remediation plan for ACM or site contamination
+app.post("/ai-remediation-plan", apiKeyAuth, async (req, res) => {
+  const {
+    remediationType = "ASBESTOS", siteDescription, contaminantDescription,
+    areaAffectedM2, buildingType, state = "VIC",
+    occupiedDuringWorks = false, requiresAirMonitoring = true,
+    clearanceRequired = true, wasteClassification,
+  } = req.body;
+  if (!siteDescription || !contaminantDescription) {
+    return res.status(400).json({ error: "siteDescription and contaminantDescription are required." });
+  }
+  const validTypes = ["ASBESTOS", "CONTAMINATED_SOIL", "LEAD_PAINT", "MOULD", "CHEMICAL_SPILL", "UNDERGROUND_TANK"];
+  if (!validTypes.includes(remediationType)) {
+    return res.status(400).json({ error: `remediationType must be one of: ${validTypes.join(", ")}` });
+  }
+  const sanitisedType = sanitiseInput(remediationType);
+  const sanitisedSite = sanitiseInput(siteDescription);
+  const sanitisedContaminant = sanitiseInput(contaminantDescription);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian environmental and occupational hygiene specialist with expertise in remediation of hazardous materials.`;
+  const userPrompt = `Generate a ${sanitisedType} remediation plan:
+Site: ${sanitisedSite}
+Contaminant: ${sanitisedContaminant}
+Area affected: ${areaAffectedM2 ? `${areaAffectedM2} m²` : "Unknown"}
+Building type: ${sanitiseInput(buildingType || "Not specified")}
+State: ${sanitisedState}
+Occupied during works: ${occupiedDuringWorks}
+Air monitoring required: ${requiresAirMonitoring}
+Clearance required: ${clearanceRequired}
+Waste classification: ${sanitiseInput(wasteClassification || "To be determined")}
+
+Return JSON with:
+{
+  "planTitle": "...",
+  "regualtoryFramework": ["...", "..."],
+  "licencingRequirements": "...",
+  "workMethod": ["...", "..."],
+  "controlMeasures": ["...", "..."],
+  "airMonitoringPlan": "...",
+  "decontaminationProcedure": "...",
+  "wasteManagement": {"classification": "...", "disposal": "...", "transporter": "...", "manifest": true},
+  "clearanceProcedure": "...",
+  "documentationRequired": ["...", "..."],
+  "costDrivers": ["...", "..."],
+  "estimatedDurationDays": 5,
+  "notificationRequirements": ["...", "..."]
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const plan = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ remediationType: sanitisedType, siteDescription: sanitisedSite, state: sanitisedState, plan });
+  } catch (err) {
+    console.error("ai-remediation-plan error:", err.message);
+    res.json({
+      remediationType: sanitisedType, siteDescription: sanitisedSite, state: sanitisedState,
+      plan: {
+        planTitle: `${sanitisedType.replace(/_/g, " ")} Remediation Plan`,
+        regualtoryFramework: [`${sanitisedState} Environment Protection Act`, "Safe Work Australia Code of Practice", "AS 2601 (Demolition of Structures)"],
+        licencingRequirements: "Engage licensed contractor for hazardous material removal.",
+        workMethod: ["Engage specialist remediation contractor", "Establish exclusion zone", "Carry out removal as per approved methodology", "Conduct clearance inspection"],
+        controlMeasures: ["Full encapsulation PPE", "Negative pressure enclosures where applicable", "Site decontamination facilities", "Signage and access control"],
+        airMonitoringPlan: requiresAirMonitoring ? "Continuous air monitoring during works by accredited hygienist." : "Air monitoring not required for this scope.",
+        decontaminationProcedure: "Three-stage decontamination unit required. PPE double-bagged and disposed as hazardous waste.",
+        wasteManagement: { classification: wasteClassification || "Hazardous", disposal: "Licensed hazardous waste facility", transporter: "Licensed transporter required", manifest: true },
+        clearanceProcedure: clearanceRequired ? "Independent clearance inspection by licensed occupational hygienist required prior to re-occupation." : "Clearance inspection not required.",
+        documentationRequired: ["Waste transport manifests", "Air monitoring reports", "Clearance certificate", "Contractor licence copies"],
+        costDrivers: ["Area to be treated", "Access difficulty", "Waste disposal fees", "Air monitoring costs"],
+        estimatedDurationDays: Math.ceil((Number(areaAffectedM2) || 10) / 20),
+        notificationRequirements: ["Notify relevant authority prior to commencing works", "Notify occupants minimum 24 hours in advance"],
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
