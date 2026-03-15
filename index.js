@@ -60204,6 +60204,348 @@ Return a JSON object with:
   }
 });
 
+// POST /floor-slab-level-survey — Record concrete floor slab flatness/levelness survey per AS 3610 / TR 342
+app.post("/floor-slab-level-survey", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    location,
+    slabType,           // ground-slab | suspended-slab | post-tensioned | precast
+    surveyDate,
+    surveyMethod,       // rotating-laser | total-station | digital-level | screed-rail
+    gridSpacing,        // metres
+    totalReadings,
+    minLevel,           // mm (lowest reading)
+    maxLevel,           // mm (highest reading)
+    variation,          // mm (max - min)
+    flatnessF_number,   // F_F number if US method used
+    levelnessF_number,  // F_L number if US method used
+    tolerance,          // mm per 3m straight edge (as spec'd)
+    straightEdgeResults,// array of { location, deviation, pass }
+    highSpotsCount,
+    lowSpotsCount,
+    grinding_required,
+    topping_required,
+    designLevel,        // mm AHD or datum
+    asBuiltMeanLevel,   // mm AHD or datum
+    surveyor,
+    surveyorLicence,
+    concreteGrade,
+    pourDate,
+    cureAge,            // days since pour
+    photos,             // array of URLs
+    notes,
+  } = req.body;
+
+  const failures = [];
+
+  // Validate tolerance against variation
+  const numTolerance = parseFloat(tolerance);
+  const numVariation = parseFloat(variation);
+  if (!isNaN(numTolerance) && !isNaN(numVariation) && numVariation > numTolerance) {
+    failures.push(`Slab variation ${numVariation} mm exceeds specified tolerance ${numTolerance} mm`);
+  }
+
+  // Check straight-edge results
+  const failedEdges = Array.isArray(straightEdgeResults)
+    ? straightEdgeResults.filter((r) => r.pass === false || r.pass === "false")
+    : [];
+  if (failedEdges.length > 0) {
+    failures.push(`${failedEdges.length} straight-edge reading(s) exceed tolerance`);
+  }
+
+  // Excessive high or low spots
+  const numHigh = parseInt(highSpotsCount, 10) || 0;
+  const numLow = parseInt(lowSpotsCount, 10) || 0;
+  if (numHigh + numLow > 10) {
+    failures.push(`${numHigh + numLow} high/low spots identified — grinding or topping required before final finishes`);
+  }
+
+  const passed = failures.length === 0;
+  const overallResult = passed ? "COMPLIANT" : "NON-COMPLIANT";
+
+  if (!passed) {
+    return res.status(422).json({
+      error: "Slab level survey identifies flatness/levelness non-compliance",
+      overallResult,
+      failures,
+      remediationRequired: true,
+      applicableStandards: ["AS 3610", "TR 342", "AS 3600"],
+      grindingRequired: true,
+      recommendation:
+        "Remediate high/low spots by grinding or topping, resurvey after remediation, and obtain sign-off before installing floor finishes.",
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    location: sanitiseInput(location),
+    slab_type: sanitiseInput(slabType),
+    survey_date: surveyDate,
+    survey_method: sanitiseInput(surveyMethod),
+    grid_spacing: gridSpacing,
+    total_readings: totalReadings,
+    min_level: minLevel,
+    max_level: maxLevel,
+    variation,
+    flatness_f_number: flatnessF_number,
+    levelness_f_number: levelnessF_number,
+    tolerance,
+    straight_edge_results: straightEdgeResults || [],
+    high_spots_count: highSpotsCount,
+    low_spots_count: lowSpotsCount,
+    grinding_required: grinding_required || false,
+    topping_required: topping_required || false,
+    design_level: designLevel,
+    as_built_mean_level: asBuiltMeanLevel,
+    surveyor: sanitiseInput(surveyor),
+    surveyor_licence: sanitiseInput(surveyorLicence),
+    concrete_grade: sanitiseInput(concreteGrade),
+    pour_date: pourDate,
+    cure_age: cureAge,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    overall_result: overallResult,
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("floor_slab_level_surveys")
+      .insert(record);
+    if (dbErr) console.error("DB error /floor-slab-level-survey:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Floor slab level survey recorded",
+    overallResult,
+    variation: numVariation,
+    tolerance: numTolerance,
+    straightEdgeFailures: failedEdges.length,
+    highSpotsCount: numHigh,
+    lowSpotsCount: numLow,
+    grindingRequired: grinding_required || false,
+    toppingRequired: topping_required || false,
+    applicableStandards: ["AS 3610", "TR 342", "AS 3600"],
+    saved,
+  });
+});
+
+// POST /defect-liability-register — Track building defects during the Defects Liability Period (DLP)
+app.post("/defect-liability-register", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    contractorName,
+    defectId,
+    description,
+    location,
+    tradeResponsible,   // carpentry | concrete | waterproofing | electrical | plumbing | glazing | painting | tiling | roofing | other
+    severity,           // critical | major | minor | cosmetic
+    discoveredDate,
+    discoveredBy,
+    photosUrls,
+    dlpExpiryDate,
+    targetRectificationDate,
+    status,             // open | in-progress | pending-inspection | rectified | disputed | closed
+    rectificationNotes,
+    rectifiedDate,
+    inspectedBy,
+    inspectionOutcome,  // passed | failed | further-work-required
+    rootCause,
+    preventiveMeasure,
+    linkedVariation,
+    costEstimate,
+    notes,
+  } = req.body;
+
+  // Validate severity
+  const validSeverities = ["critical", "major", "minor", "cosmetic"];
+  const normSeverity = (severity || "").toLowerCase();
+  if (!validSeverities.includes(normSeverity)) {
+    return res
+      .status(400)
+      .json({ error: "severity must be critical | major | minor | cosmetic" });
+  }
+
+  // Validate status
+  const validStatuses = ["open", "in-progress", "pending-inspection", "rectified", "disputed", "closed"];
+  const normStatus = (status || "open").toLowerCase();
+  if (!validStatuses.includes(normStatus)) {
+    return res
+      .status(400)
+      .json({ error: "status must be one of: open | in-progress | pending-inspection | rectified | disputed | closed" });
+  }
+
+  // DLP expiry warning
+  const dlpWarning = dlpExpiryDate
+    ? new Date(dlpExpiryDate) < new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+    : false;
+
+  // Critical defect with no target date
+  const urgentAlert = normSeverity === "critical" && !targetRectificationDate;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    contractor_name: sanitiseInput(contractorName),
+    defect_id: sanitiseInput(defectId),
+    description: sanitiseInput(description),
+    location: sanitiseInput(location),
+    trade_responsible: sanitiseInput(tradeResponsible),
+    severity: normSeverity,
+    discovered_date: discoveredDate,
+    discovered_by: sanitiseInput(discoveredBy),
+    photos_urls: photosUrls || [],
+    dlp_expiry_date: dlpExpiryDate,
+    target_rectification_date: targetRectificationDate,
+    status: normStatus,
+    rectification_notes: sanitiseInput(rectificationNotes),
+    rectified_date: rectifiedDate,
+    inspected_by: sanitiseInput(inspectedBy),
+    inspection_outcome: sanitiseInput(inspectionOutcome),
+    root_cause: sanitiseInput(rootCause),
+    preventive_measure: sanitiseInput(preventiveMeasure),
+    linked_variation: sanitiseInput(linkedVariation),
+    cost_estimate: costEstimate,
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("defect_liability_register")
+      .insert(record);
+    if (dbErr) console.error("DB error /defect-liability-register:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Defect liability record saved",
+    defectId: sanitiseInput(defectId),
+    severity: normSeverity,
+    status: normStatus,
+    dlpExpiryWarning: dlpWarning
+      ? "DLP expires within 30 days — escalate outstanding defects"
+      : null,
+    urgentAlert: urgentAlert
+      ? "Critical defect has no target rectification date — assign immediately"
+      : null,
+    applicableStandards: ["AS 4000-1997", "AS 2124-1992", "HIA Contract", "MBA Contract"],
+    saved,
+  });
+});
+
+// POST /ai-floor-slab-assessment — AI assesses slab quality, tolerance risks, and remediation strategy
+app.post("/ai-floor-slab-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    slabType,
+    variation,
+    tolerance,
+    highSpotsCount,
+    lowSpotsCount,
+    concreteGrade,
+    cureAge,
+    intendedFinish,   // hardened | carpet | tiles | epoxy | polished | raised-floor
+    loadedUse,        // warehouse | office | retail | carpark | industrial
+    surveyMethod,
+    notes,
+    photos,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are an expert concrete technologist and floor surveying specialist with 20 years experience on Australian construction projects. Assess floor slab flatness and levelness compliance with AS 3610, TR 342, and AS 3600.
+
+Assess:
+1. Whether variation and high/low spot counts are consistent with the intended floor finish and use
+2. Risk of delamination, cracking, or serviceability issues based on slab type and cure age
+3. Tolerance requirements for specific finishes (polished/epoxy most demanding, carpet most forgiving)
+4. Remediation options: grinding (high spots), self-levelling compound (low spots), diamond grinding, shot-blasting
+5. Impact on structural performance if applicable (post-tensioned slabs need special care)
+6. Long-term monitoring requirements
+
+Respond with JSON: { "qualityRating": "excellent|good|acceptable|poor|unacceptable", "toleranceCompliance": "compliant|marginal|non-compliant", "remediationRequired": boolean, "remediationOptions": [], "structuralConcerns": [], "finishCompatibility": "compatible|conditional|incompatible", "grindingRecommended": boolean, "toppingRecommended": boolean, "polishedFloorViable": boolean, "epoxyCoatingViable": boolean, "raisedFloorViable": boolean, "longTermRisks": [], "testingRecommended": [], "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Slab type: ${slabType || "not specified"}
+Variation: ${variation || "not specified"} mm
+Tolerance: ${tolerance || "not specified"} mm per 3 m
+High spots: ${highSpotsCount || 0}
+Low spots: ${lowSpotsCount || 0}
+Concrete grade: ${concreteGrade || "not specified"}
+Cure age: ${cureAge || "not specified"} days
+Intended finish: ${intendedFinish || "not specified"}
+Loaded use: ${loadedUse || "not specified"}
+Survey method: ${surveyMethod || "not specified"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-floor-slab-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        qualityRating: "acceptable",
+        toleranceCompliance: "marginal",
+        remediationRequired: true,
+        remediationOptions: [
+          "Grind high spots >3 mm above tolerance",
+          "Apply self-levelling compound to low areas",
+          "Shot-blast surface before epoxy/polished finish",
+        ],
+        structuralConcerns: ["Check for plastic shrinkage cracking", "Verify post-tension profile if PT slab"],
+        finishCompatibility: "conditional",
+        grindingRecommended: true,
+        toppingRecommended: false,
+        polishedFloorViable: false,
+        epoxyCoatingViable: true,
+        raisedFloorViable: true,
+        longTermRisks: [
+          "Tiling over uneven substrate may cause grout cracking",
+          "Epoxy debonding over low spots if surface preparation inadequate",
+        ],
+        testingRecommended: ["Resurvey after remediation", "Moisture vapour emission test before impermeable coatings"],
+        applicableStandards: ["AS 3610", "TR 342", "AS 3600", "AS 1884"],
+        recommendation:
+          "Grind high spots and resurvey. Confirm moisture vapour emission rate (MVER) before applying impermeable finishes. Document all remediation and resurvey results.",
+        summary:
+          "Floor slab requires remediation of high/low spots before final finishes. Grind high spots first, assess residual low spots for topping, resurvey, and confirm compliance with AS 3610 before proceeding with floor finishes.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
