@@ -63948,6 +63948,407 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /fire-evacuation-drill — Fire evacuation drill record per AS 3745 / Emergency Management Act 2013 (Vic)
+app.post("/fire-evacuation-drill", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    drillDate,
+    drillTime,
+    drillType,            // announced | unannounced | partial | full | desktop
+    warden,               // chief warden name
+    wardenTrainingCurrent,
+    floorWardens,         // array of { name, floor, trained }
+    totalOccupants,
+    occupantsEvacuated,
+    evacuationTime_seconds,
+    targetTime_seconds,   // AS 3745 — typically site specific, often 3–5 min
+    assemblyPoint,
+    allAccountedFor,
+    unaccountedPersons,   // number
+    disabledPersonsEvacuated,
+    disabledEvacuationPlan,
+    fireDoorsCorrect,     // held open illegally, propped, etc.
+    exitPathsClear,
+    emergencyLightingWorking,
+    alarmAudible,
+    alarmVisible,         // strobe for hearing impaired
+    communicationWorking, // warden intercommunication system
+    issues,               // array of strings (problems identified)
+    corrective_actions,   // array of { issue, action, responsible, dueDate }
+    emergencyResponsePlanCurrent,
+    nextDrillDate,
+    photos,
+    notes,
+  } = req.body;
+
+  const drillIssues = Array.isArray(issues) ? [...issues] : [];
+
+  // Time compliance check
+  const actualTime = parseFloat(evacuationTime_seconds) || 0;
+  const targetTime = parseFloat(targetTime_seconds) || 300; // 5 min default
+  if (actualTime > targetTime) {
+    drillIssues.push(
+      `Evacuation time ${Math.round(actualTime / 60)}m ${actualTime % 60}s exceeds target ${Math.round(targetTime / 60)}m ${targetTime % 60}s`
+    );
+  }
+
+  // Unaccounted persons
+  const unaccounted = parseInt(unaccountedPersons, 10) || 0;
+  if (unaccounted > 0 || !allAccountedFor) {
+    drillIssues.push(`${unaccounted || "Unknown number of"} person(s) unaccounted for at assembly point`);
+  }
+
+  // Critical infrastructure
+  if (emergencyLightingWorking === false || emergencyLightingWorking === "false") {
+    drillIssues.push("Emergency lighting not working — safety non-compliance");
+  }
+  if (alarmAudible === false || alarmAudible === "false") {
+    drillIssues.push("Fire alarm not audible in all areas — safety non-compliance");
+  }
+  if (!exitPathsClear) {
+    drillIssues.push("Exit paths not clear — obstruction identified");
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    drill_date: drillDate,
+    drill_time: drillTime,
+    drill_type: sanitiseInput(drillType),
+    warden: sanitiseInput(warden),
+    warden_training_current: wardenTrainingCurrent,
+    floor_wardens: floorWardens || [],
+    total_occupants: totalOccupants,
+    occupants_evacuated: occupantsEvacuated,
+    evacuation_time_seconds: evacuationTime_seconds,
+    target_time_seconds: targetTime_seconds || 300,
+    assembly_point: sanitiseInput(assemblyPoint),
+    all_accounted_for: allAccountedFor,
+    unaccounted_persons: unaccountedPersons || 0,
+    disabled_persons_evacuated: disabledPersonsEvacuated,
+    disabled_evacuation_plan: disabledEvacuationPlan,
+    fire_doors_correct: fireDoorsCorrect,
+    exit_paths_clear: exitPathsClear,
+    emergency_lighting_working: emergencyLightingWorking,
+    alarm_audible: alarmAudible,
+    alarm_visible: alarmVisible,
+    communication_working: communicationWorking,
+    issues: drillIssues,
+    corrective_actions: corrective_actions || [],
+    emergency_response_plan_current: emergencyResponsePlanCurrent,
+    next_drill_date: nextDrillDate,
+    evacuation_time_met: actualTime > 0 && actualTime <= targetTime,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("fire_evacuation_drills")
+      .insert(record);
+    if (dbErr) console.error("DB error /fire-evacuation-drill:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Fire evacuation drill record saved",
+    drillType: sanitiseInput(drillType),
+    evacuationTime_seconds: actualTime,
+    targetTime_seconds: targetTime,
+    evacuationTimeMet: actualTime > 0 && actualTime <= targetTime,
+    allAccountedFor: allAccountedFor && unaccounted === 0,
+    issuesCount: drillIssues.length,
+    issues: drillIssues,
+    nextDrillDate: nextDrillDate || null,
+    applicableStandards: [
+      "AS 3745",
+      "Emergency Management Act 2013 (Vic)",
+      "NCC 2022 Specification E1.8",
+    ],
+    saved,
+  });
+});
+
+// POST /slope-stability-monitoring — Slope/embankment stability monitoring per AS 1726 / ANCOLD guidelines
+app.post("/slope-stability-monitoring", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    slopeId,
+    location,
+    monitoringDate,
+    inspector,
+    slopeType,            // natural | cut | fill | embankment | dam | tailings
+    height_m,
+    angle_deg,
+    soilType,
+    groundwaterDepth_m,
+    rainfall_mm_last7days,
+    instruments,          // array of { type: inclinometer|piezometer|settlement-monument|extensometer|crackmeter, id, reading, unit }
+    inclinometerReadings, // array of { id, depth_m, displacement_mm, cumulative_mm }
+    maxDisplacement_mm,
+    alertLevel_mm,
+    alarmLevel_mm,
+    actionLevel_mm,
+    piezometerLevel_m,
+    designGroundwaterLevel_m,
+    surfaceCracks,        // array of { location, width_mm, length_m, orientation }
+    newCracksObserved,
+    seepageObserved,
+    vegetationChange,
+    headScarpObserved,
+    overallAssessment,    // stable | monitor-closely | action-required | evacuate
+    photos,
+    notes,
+  } = req.body;
+
+  // Threshold checks
+  const maxDisp = parseFloat(maxDisplacement_mm) || 0;
+  const alertLvl = parseFloat(alertLevel_mm) || 5;
+  const alarmLvl = parseFloat(alarmLevel_mm) || 10;
+  const actionLvl = parseFloat(actionLevel_mm) || 20;
+
+  let threatLevel = "stable";
+  const warnings = [];
+
+  if (maxDisp >= actionLvl) {
+    threatLevel = "action-required";
+    warnings.push(`Displacement ${maxDisp} mm has reached ACTION level ${actionLvl} mm — evacuate area`);
+  } else if (maxDisp >= alarmLvl) {
+    threatLevel = "alarm";
+    warnings.push(`Displacement ${maxDisp} mm has reached ALARM level ${alarmLvl} mm — immediate engineer notification`);
+  } else if (maxDisp >= alertLvl) {
+    threatLevel = "alert";
+    warnings.push(`Displacement ${maxDisp} mm has reached ALERT level ${alertLvl} mm — increase monitoring frequency`);
+  }
+
+  // Head scarp — very high risk indicator
+  if (headScarpObserved === true || headScarpObserved === "true") {
+    threatLevel = "action-required";
+    warnings.push("Head scarp tension crack observed — imminent slope failure risk");
+  }
+
+  // Groundwater rise
+  const gwDepth = parseFloat(groundwaterDepth_m) || 0;
+  const designGW = parseFloat(designGroundwaterLevel_m) || 0;
+  if (designGW > 0 && gwDepth < designGW) {
+    warnings.push(`Groundwater at ${gwDepth} m depth is higher than design level ${designGW} m — reduced stability`);
+  }
+
+  if (threatLevel === "action-required" || overallAssessment === "evacuate") {
+    return res.status(422).json({
+      error: "Slope stability ACTION LEVEL reached — immediate evacuation required",
+      threatLevel,
+      maxDisplacement_mm: maxDisp,
+      actionLevel_mm: actionLvl,
+      warnings,
+      immediateActions: [
+        "Evacuate all personnel from slope influence zone immediately",
+        "Establish exclusion zone — minimum 1.5× slope height from crest",
+        "Notify geotechnical engineer and site management immediately",
+        "Cease all excavation, surcharge, and dewatering changes",
+        "Continuous monitoring until engineer assessment complete",
+      ],
+      applicableStandards: ["AS 1726", "ANCOLD Guidelines", "OHS Regulations 2017 (Vic)"],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    slope_id: sanitiseInput(slopeId),
+    location: sanitiseInput(location),
+    monitoring_date: monitoringDate,
+    inspector: sanitiseInput(inspector),
+    slope_type: sanitiseInput(slopeType),
+    height_m,
+    angle_deg,
+    soil_type: sanitiseInput(soilType),
+    groundwater_depth_m: groundwaterDepth_m,
+    rainfall_mm_last7days: rainfall_mm_last7days,
+    instruments: instruments || [],
+    inclinometer_readings: inclinometerReadings || [],
+    max_displacement_mm: maxDisplacement_mm,
+    alert_level_mm: alertLevel_mm,
+    alarm_level_mm: alarmLevel_mm,
+    action_level_mm: actionLevel_mm,
+    piezometer_level_m: piezometerLevel_m,
+    design_groundwater_level_m: designGroundwaterLevel_m,
+    surface_cracks: surfaceCracks || [],
+    new_cracks_observed: newCracksObserved,
+    seepage_observed: seepageObserved,
+    vegetation_change: vegetationChange,
+    head_scarp_observed: headScarpObserved,
+    overall_assessment: threatLevel,
+    warnings,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("slope_stability_monitoring")
+      .insert(record);
+    if (dbErr) console.error("DB error /slope-stability-monitoring:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Slope stability monitoring record saved",
+    slopeId: sanitiseInput(slopeId),
+    threatLevel,
+    maxDisplacement_mm: maxDisp,
+    alertLevel_mm: alertLvl,
+    alarmLevel_mm: alarmLvl,
+    actionLevel_mm: actionLvl,
+    warnings,
+    overallAssessment: threatLevel,
+    applicableStandards: ["AS 1726", "AS 1289", "ANCOLD Guidelines"],
+    saved,
+  });
+});
+
+// POST /ai-slope-stability-assessment — AI assesses slope failure risk, instrumentation, and mitigation strategies
+app.post("/ai-slope-stability-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    slopeType,
+    height_m,
+    angle_deg,
+    soilType,
+    groundwaterDepth_m,
+    rainfall_mm_last7days,
+    maxDisplacement_mm,
+    headScarpObserved,
+    seepageObserved,
+    newCracks,
+    vegetationLoss,
+    nearbyExcavation,
+    surchargePresent,
+    existingInstrumentation,
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are a geotechnical engineer specialising in slope stability with 25 years experience on Australian construction, mining, and infrastructure projects. Assess slope stability risk and required mitigation per AS 1726, ANCOLD Guidelines, and Geotechnical Engineering Practice.
+
+Assess:
+1. Primary failure mechanism — rotational, translational, wedge, debris flow, toppling
+2. Triggering factors — rainfall infiltration, groundwater rise, seismic, surcharge, excavation
+3. Factor of Safety estimation and acceptable FS thresholds (typically 1.3 static, 1.1 seismic)
+4. Monitoring instrumentation adequacy — inclinometers, piezometers, surface monuments
+5. Trigger, alert, alarm, and action levels appropriate to site
+6. Mitigation options — drainage, regrading, anchoring, vegetation, retaining structures
+7. Consequence category and risk acceptance per AS 1726 Table C1
+
+Respond with JSON: { "failureRisk": "low|medium|high|critical", "primaryFailureMechanism": "string", "estimatedFactorOfSafety": number, "triggeringFactors": [], "monitoringAdequate": boolean, "recommendedInstrumentation": [], "triggerLevels": { "alert_mm": number, "alarm_mm": number, "action_mm": number }, "mitigationOptions": [], "drainageRecommendations": [], "vegetationManagement": "string", "consequenceCategory": "string", "engineerInspectionFrequency": "string", "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Slope type: ${slopeType || "not specified"}
+Height: ${height_m || "not specified"} m
+Angle: ${angle_deg || "not specified"}°
+Soil type: ${soilType || "not specified"}
+Groundwater depth: ${groundwaterDepth_m || "not specified"} m
+Rainfall last 7 days: ${rainfall_mm_last7days || "not specified"} mm
+Maximum displacement: ${maxDisplacement_mm || "not measured"} mm
+Head scarp observed: ${headScarpObserved || "no"}
+Seepage observed: ${seepageObserved || "no"}
+New cracks: ${newCracks || "no"}
+Vegetation loss: ${vegetationLoss || "no"}
+Nearby excavation: ${nearbyExcavation || "no"}
+Surcharge present: ${surchargePresent || "no"}
+Existing instrumentation: ${existingInstrumentation || "none"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-slope-stability-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        failureRisk: "medium",
+        primaryFailureMechanism: "Translational sliding along clay layer or weak horizon",
+        estimatedFactorOfSafety: 1.4,
+        triggeringFactors: [
+          "Prolonged heavy rainfall increasing pore water pressure",
+          "Toe erosion reducing passive resistance",
+          "Surcharge loading at crest",
+        ],
+        monitoringAdequate: false,
+        recommendedInstrumentation: [
+          "Install inclinometers at crest and mid-slope",
+          "Install piezometers in primary failure mechanism zone",
+          "Surface survey monuments at 20 m spacing",
+        ],
+        triggerLevels: {
+          alert_mm: 5,
+          alarm_mm: 10,
+          action_mm: 20,
+        },
+        mitigationOptions: [
+          "Install horizontal drains to reduce pore water pressure",
+          "Grade slope to 1V:2H or flatter if kinematics allow",
+          "Toe berms to increase passive resistance",
+          "Rock anchors or soil nails in high-risk zones",
+        ],
+        drainageRecommendations: [
+          "Intercept surface runoff above crest with diversion drain",
+          "Install horizontal drains at potential failure plane",
+          "Maintain all drainage clear of debris",
+        ],
+        vegetationManagement:
+          "Maintain deep-rooted vegetation on slope face to reduce erosion and improve drainage; remove large trees near crest",
+        consequenceCategory:
+          "CC2 — moderate consequence per AS 1726 (property damage, no casualties expected)",
+        engineerInspectionFrequency:
+          "Post-rainfall >50 mm/24h, after seismic events, and semi-annual routine inspection",
+        applicableStandards: [
+          "AS 1726",
+          "AS 1289",
+          "ANCOLD Guidelines",
+          "AustStab Technical Guidelines",
+        ],
+        recommendation:
+          "Install inclinometers and piezometers. Establish formal trigger/alarm/action level programme. Improve surface drainage above crest. Semi-annual geotechnical engineer inspection.",
+        summary:
+          "Slope presents medium failure risk manageable through drainage improvement, instrumentation monitoring, and periodic geotechnical review. Install monitoring programme before wet season.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
