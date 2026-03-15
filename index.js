@@ -55127,6 +55127,296 @@ Return a JSON object with:
   }
 });
 
+// POST /steel-erection-record — Record a structural steel erection and bolting inspection
+app.post("/steel-erection-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      erectionRef,
+      date,
+      supervisor,
+      erectionContractor,
+      gridReference,
+      elementType,
+      steelGrade,
+      drawingRef,
+      boltGrade,
+      boltSize,
+      boltPattern,
+      snugTightCompleted,
+      fullTensionCompleted,
+      torqueSpannerCalibrated,
+      torqueValue,
+      proofLoadTested,
+      columnBaseGrouted,
+      columnBaseLevelOk,
+      columnBasePlateLevelTolerance,
+      plumbTolerance,
+      levelTolerance,
+      splicePlatesFitted,
+      connectionType,
+      weldingCompleted,
+      weldInspector,
+      weldInspectionResult,
+      ndtRequired,
+      ndtMethod,
+      ndtResult,
+      temporaryBracingInPlace,
+      erectedWithCrane,
+      craneSwlChecked,
+      overallResult,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !supervisor || !elementType || !overallResult) {
+      return res.status(400).json({ error: "projectId, date, supervisor, elementType, and overallResult are required" });
+    }
+
+    const failures = [];
+    if (!snugTightCompleted && connectionType !== "welded") failures.push("Bolts not snug-tight — complete snug-tightening pass before final tensioning");
+    if (!temporaryBracingInPlace) failures.push("Temporary bracing not in place — steel structure must be braced before releasing crane");
+    if (!columnBaseLevelOk && elementType.toLowerCase().includes("column")) failures.push("Column base level out of tolerance — adjust before grouting");
+    if (ndtRequired && ndtResult && ndtResult.toUpperCase() === "FAIL") failures.push(`NDT (${ndtMethod || "method not specified"}) failed — defective welds must be repaired and re-tested`);
+    if (overallResult === "FAIL") failures.push("Steel erection inspection FAILED — notify structural engineer");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      erection_ref: sanitiseInput(erectionRef || `SE-${Date.now()}`),
+      date,
+      supervisor: sanitiseInput(supervisor),
+      erection_contractor: sanitiseInput(erectionContractor || ""),
+      grid_reference: sanitiseInput(gridReference || ""),
+      element_type: sanitiseInput(elementType),
+      steel_grade: sanitiseInput(steelGrade || ""),
+      drawing_ref: sanitiseInput(drawingRef || ""),
+      bolt_grade: sanitiseInput(boltGrade || ""),
+      bolt_size: sanitiseInput(boltSize || ""),
+      bolt_pattern: sanitiseInput(boltPattern || ""),
+      snug_tight_completed: !!snugTightCompleted,
+      full_tension_completed: !!fullTensionCompleted,
+      torque_spanner_calibrated: !!torqueSpannerCalibrated,
+      torque_value: torqueValue || null,
+      proof_load_tested: !!proofLoadTested,
+      column_base_grouted: !!columnBaseGrouted,
+      column_base_level_ok: !!columnBaseLevelOk,
+      column_base_plate_level_tolerance: sanitiseInput(columnBasePlateLevelTolerance || ""),
+      plumb_tolerance: sanitiseInput(plumbTolerance || ""),
+      level_tolerance: sanitiseInput(levelTolerance || ""),
+      splice_plates_fitted: !!splicePlatesFitted,
+      connection_type: sanitiseInput(connectionType || "bolted"),
+      welding_completed: !!weldingCompleted,
+      weld_inspector: sanitiseInput(weldInspector || ""),
+      weld_inspection_result: sanitiseInput(weldInspectionResult || ""),
+      ndt_required: !!ndtRequired,
+      ndt_method: sanitiseInput(ndtMethod || ""),
+      ndt_result: sanitiseInput(ndtResult || ""),
+      temporary_bracing_in_place: !!temporaryBracingInPlace,
+      erected_with_crane: !!erectedWithCrane,
+      crane_swl_checked: !!craneSwlChecked,
+      overall_result: sanitiseInput(overallResult),
+      failures,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("steel_erection_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (failures.length > 0) {
+      return res.status(422).json({ passed: false, failures, message: "Steel erection inspection failed. Rectify failures and re-inspect before proceeding.", record, saved });
+    }
+
+    res.json({
+      passed: true,
+      erectionRef: record.erection_ref,
+      failures: [],
+      applicableStandards: ["AS 4100 Steel structures", "AS/NZS 3678 Structural steel", "AS 4291 Mechanical fasteners", "AS/NZS 1554.1 Structural steel welding"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/steel-erection-record error:", err.message);
+    res.status(500).json({ error: "Failed to record steel erection inspection" });
+  }
+});
+
+// POST /swms-register — Register a Safe Work Method Statement for high-risk construction work
+app.post("/swms-register", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      swmsRef,
+      title,
+      revisionNumber,
+      preparedBy,
+      preparedDate,
+      reviewedBy,
+      approvedBy,
+      approvalDate,
+      subcontractor,
+      highRiskActivities,
+      workLocation,
+      workStartDate,
+      estimatedDuration,
+      workerCount,
+      staffBriefed,
+      staffBriefingDate,
+      briefedWorkerNames,
+      hazardsIdentified,
+      controlMeasures,
+      ppeRequired,
+      emergencyProcedure,
+      supervisorName,
+      supervisorPhone,
+      currentStatus,
+      lastReviewDate,
+      nextReviewTrigger,
+      notes,
+    } = req.body;
+
+    if (!projectId || !swmsRef || !title || !preparedBy || !highRiskActivities) {
+      return res.status(400).json({ error: "projectId, swmsRef, title, preparedBy, and highRiskActivities are required" });
+    }
+
+    const flags = [];
+    if (!staffBriefed) flags.push("Workers have not been briefed on this SWMS — briefing is mandatory before commencing high-risk construction work");
+    if (!approvedBy || !approvalDate) flags.push("SWMS not yet approved — must be approved by responsible person before work commences");
+    if (!emergencyProcedure) flags.push("Emergency procedure not documented in SWMS — mandatory for high-risk construction work");
+    if (Array.isArray(highRiskActivities) && highRiskActivities.length === 0) flags.push("No high-risk activities listed — SWMS must document all HRCW activities");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      swms_ref: sanitiseInput(swmsRef),
+      title: sanitiseInput(title),
+      revision_number: sanitiseInput(String(revisionNumber || "0")),
+      prepared_by: sanitiseInput(preparedBy),
+      prepared_date: preparedDate || null,
+      reviewed_by: sanitiseInput(reviewedBy || ""),
+      approved_by: sanitiseInput(approvedBy || ""),
+      approval_date: approvalDate || null,
+      subcontractor: sanitiseInput(subcontractor || ""),
+      high_risk_activities: Array.isArray(highRiskActivities) ? highRiskActivities.map(a => sanitiseInput(a)) : [sanitiseInput(String(highRiskActivities))],
+      work_location: sanitiseInput(workLocation || ""),
+      work_start_date: workStartDate || null,
+      estimated_duration: sanitiseInput(estimatedDuration || ""),
+      worker_count: workerCount || null,
+      staff_briefed: !!staffBriefed,
+      staff_briefing_date: staffBriefingDate || null,
+      briefed_worker_names: Array.isArray(briefedWorkerNames) ? briefedWorkerNames.map(n => sanitiseInput(n)) : [],
+      hazards_identified: Array.isArray(hazardsIdentified) ? hazardsIdentified.map(h => sanitiseInput(h)) : [],
+      control_measures: Array.isArray(controlMeasures) ? controlMeasures.map(c => sanitiseInput(c)) : [],
+      ppe_required: Array.isArray(ppeRequired) ? ppeRequired.map(p => sanitiseInput(p)) : [],
+      emergency_procedure: sanitiseInput(emergencyProcedure || ""),
+      supervisor_name: sanitiseInput(supervisorName || ""),
+      supervisor_phone: sanitiseInput(supervisorPhone || ""),
+      current_status: sanitiseInput(currentStatus || "ACTIVE"),
+      last_review_date: lastReviewDate || null,
+      next_review_trigger: sanitiseInput(nextReviewTrigger || "change in scope, incident, or new hazard identified"),
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("swms_register").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({ swmsRef, currentStatus: record.current_status, flags, record, saved });
+  } catch (err) {
+    console.error("/swms-register error:", err.message);
+    res.status(500).json({ error: "Failed to register SWMS" });
+  }
+});
+
+// POST /ai-structural-steel-risk — AI assesses structural steel erection risk
+app.post("/ai-structural-steel-risk", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      erectionScope,
+      maximumLiftWeightT,
+      maximumHeightM,
+      siteConstraints,
+      connectionMethod,
+      weldingRequired,
+      craneLiftRequired,
+      adjacentStructures,
+      schedulePressures,
+    } = req.body;
+
+    if (!erectionScope) {
+      return res.status(400).json({ error: "erectionScope is required" });
+    }
+
+    const prompt = `You are a structural engineer and construction safety specialist with expertise in steel erection under AS 4100, AS 4291, and Victorian OHS Regulations.
+
+Assess the steel erection risk for:
+- Scope: ${sanitiseInput(erectionScope)}
+- Maximum lift weight: ${sanitiseInput(String(maximumLiftWeightT || "not specified"))} t
+- Maximum height: ${sanitiseInput(String(maximumHeightM || "not specified"))} m
+- Site constraints: ${sanitiseInput(siteConstraints || "none")}
+- Connection method: ${sanitiseInput(connectionMethod || "bolted")}
+- Welding required: ${sanitiseInput(String(weldingRequired || false))}
+- Crane lift required: ${sanitiseInput(String(craneLiftRequired || true))}
+- Adjacent structures: ${sanitiseInput(adjacentStructures || "none")}
+- Schedule pressures: ${sanitiseInput(schedulePressures || "normal")}
+
+Return a JSON object with:
+{
+  "riskLevel": "LOW|MEDIUM|HIGH|CRITICAL",
+  "keyRisks": [string],
+  "erectionSequenceConsiderations": [string],
+  "temporaryStabilityRequirements": string,
+  "craneRequirements": string,
+  "boltingSequence": string,
+  "weldingRequirements": string,
+  "inspectionHoldPoints": [string],
+  "ndtRequirements": string,
+  "siteConstraintRisks": [string],
+  "collapsePreventionMeasures": [string],
+  "applicableStandards": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ erectionScope, assessment });
+  } catch (err) {
+    console.error("/ai-structural-steel-risk error:", err.message);
+    res.json({
+      erectionScope: req.body.erectionScope || "",
+      assessment: {
+        riskLevel: "HIGH",
+        keyRisks: ["Progressive collapse during partial erection", "Crane load path instability", "Workers struck by moving steel", "Incomplete bolting before crane release"],
+        erectionSequenceConsiderations: ["Erect and fully brace each bay before proceeding to next", "Do not release crane until minimum bolts installed per erection drawing", "Establish erection sequence with structural engineer before commencing"],
+        temporaryStabilityRequirements: "Temporary guy wires, knee braces, or erection props required until permanent bracing elements are installed and connected.",
+        craneRequirements: "Crane lift plan required per AS 2550. Confirm SWL chart for all radius/height combinations. Exclusion zone around all lifts.",
+        boltingSequence: "Install minimum snug-tight bolts before releasing crane. Complete full tensioning (DTI or turn-of-nut method) per AS 4291.1 before loading.",
+        weldingRequirements: "All structural welds to be performed by qualified welders per AS/NZS 2980. Inspect welds per AS/NZS 1554.1 acceptance criteria.",
+        inspectionHoldPoints: ["Column base grouting and level check", "Bolt tensioning witness inspection", "Weld visual inspection", "Final plumb and level survey before cladding"],
+        ndtRequirements: "Category SP welds on primary structural connections require NDT (UT or MPI) per AS/NZS 1554.1 — coordinate with project ITP.",
+        siteConstraintRisks: ["Restricted crane access may force lifts at extended radius — reduced crane capacity", "Adjacent structures may limit swing arc — requires lift plan review"],
+        collapsePreventionMeasures: ["Erect to engineered sequence only", "Install all permanent bracing before removing temporary bracing", "No personnel under suspended loads"],
+        applicableStandards: ["AS 4100 Steel structures", "AS 4291.1 Mechanical fasteners — bolts", "AS/NZS 1554.1 Structural steel welding", "AS 2550 Cranes safe use"],
+        recommendation: "Prepare a formal erection procedure including sequence, bracing scheme, hold points, and crane lift plan before mobilising. Engage structural engineer to review erection methodology.",
+        summary: "Steel erection is a high-risk activity requiring careful sequencing, temporary bracing, and inspection hold points. A site-specific erection procedure and SWMS are mandatory.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
