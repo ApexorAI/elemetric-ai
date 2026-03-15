@@ -64349,6 +64349,420 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /tree-protection-zone-inspection — TPZ compliance inspection per AS 4970 / planning permit conditions
+app.post("/tree-protection-zone-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    inspectionDate,
+    inspector,
+    arboristName,
+    arboristArboricultureAustraliaMember,
+    treeId,
+    treeSpecies,
+    treeHeight_m,
+    trunkDiameter_cm,    // DBH — measured at 1.4 m above ground
+    treeHealthRating,    // 1-excellent to 5-dead
+    tpzRadius_m,         // AS 4970: typically 12× DBH in metres
+    srzRadius_m,         // Structural Root Zone — typically 5× DBH (urban)
+    fenceInstalled,
+    fenceType,           // tree-guard | orange-mesh | timber | steel-bollards
+    fenceIntact,
+    fenceFollowsTPZ,
+    encroachments,       // array of { type: excavation|fill|compaction|vehicle|storage, depth_m, area_m2, description }
+    rootDamage,          // none | minor | moderate | severe
+    crownDamage,         // none | minor | moderate | severe
+    soilCompaction,
+    fillOverRoots,
+    excavationWithinTPZ,
+    chemicalExposure,
+    retentionValue,       // high | medium | low (from planning permit)
+    planningPermitTree,   // tree protected by planning overlay
+    significantTree,      // listed as significant tree
+    removalProhibited,
+    overallRisk,          // low | medium | high | critical
+    photos,
+    notes,
+  } = req.body;
+
+  const violations = [];
+
+  // TPZ encroachments
+  if (excavationWithinTPZ) violations.push("Excavation within Tree Protection Zone — root damage likely");
+  if (fillOverRoots) violations.push("Fill placed over structural root zone — oxygen and moisture deprivation");
+  if (soilCompaction) violations.push("Soil compaction within TPZ — damaging root system");
+  if (chemicalExposure) violations.push("Chemical exposure within TPZ — toxic to roots");
+
+  // Fence integrity
+  if (!fenceInstalled && treeHealthRating <= 3) {
+    violations.push("TPZ fencing not installed — required for retained trees during construction");
+  }
+  if (fenceInstalled && !fenceIntact) {
+    violations.push("TPZ fencing damaged or breached — restore immediately");
+  }
+  if (fenceInstalled && !fenceFollowsTPZ) {
+    violations.push("TPZ fencing does not follow correct radius — adjust fence position");
+  }
+
+  // Root/crown damage
+  if (rootDamage === "severe" || crownDamage === "severe") {
+    violations.push(`${rootDamage === "severe" ? "Severe root damage" : ""}${crownDamage === "severe" ? " Severe crown damage" : ""} — tree viability at risk`);
+  }
+
+  // Planning permit tree with violations
+  if (planningPermitTree && violations.length > 0) {
+    violations.push("Planning permit tree has been damaged — possible planning permit non-compliance");
+  }
+
+  const hasViolations = violations.length > 0;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    arborist_name: sanitiseInput(arboristName),
+    tree_id: sanitiseInput(treeId),
+    tree_species: sanitiseInput(treeSpecies),
+    tree_height_m: treeHeight_m,
+    trunk_diameter_cm: trunkDiameter_cm,
+    tree_health_rating: treeHealthRating,
+    tpz_radius_m: tpzRadius_m,
+    srz_radius_m: srzRadius_m,
+    fence_installed: fenceInstalled,
+    fence_type: sanitiseInput(fenceType),
+    fence_intact: fenceIntact,
+    fence_follows_tpz: fenceFollowsTPZ,
+    encroachments: encroachments || [],
+    root_damage: sanitiseInput(rootDamage),
+    crown_damage: sanitiseInput(crownDamage),
+    soil_compaction: soilCompaction,
+    fill_over_roots: fillOverRoots,
+    excavation_within_tpz: excavationWithinTPZ,
+    chemical_exposure: chemicalExposure,
+    retention_value: sanitiseInput(retentionValue),
+    planning_permit_tree: planningPermitTree,
+    significant_tree: significantTree,
+    removal_prohibited: removalProhibited,
+    violations,
+    overall_risk: sanitiseInput(overallRisk) || (hasViolations ? "high" : "low"),
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("tree_protection_zone_inspections")
+      .insert(record);
+    if (dbErr) console.error("DB error /tree-protection-zone-inspection:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  if (hasViolations) {
+    return res.status(422).json({
+      error: "TPZ violations identified — tree protection non-compliant",
+      violations,
+      immediateActions: [
+        "Stop all works within TPZ immediately",
+        "Restore TPZ fencing to correct radius",
+        "Notify arborist and planning authority if planning permit tree",
+        "Remove any fill or stored materials from within TPZ",
+        "Commission arborist to assess tree health impact",
+      ],
+      applicableStandards: [
+        "AS 4970",
+        "Planning and Environment Act 1987 (Vic)",
+        "Local Planning Scheme overlays",
+      ],
+      saved,
+    });
+  }
+
+  res.json({
+    message: "TPZ inspection completed — compliant",
+    treeId: sanitiseInput(treeId),
+    tpzRadius_m,
+    fenceInstalled,
+    overallRisk: sanitiseInput(overallRisk) || "low",
+    applicableStandards: ["AS 4970", "Planning and Environment Act 1987 (Vic)"],
+    saved,
+  });
+});
+
+// POST /environmental-compliance-audit — Site environmental compliance audit per EPA Victoria / SEPP Waters
+app.post("/environmental-compliance-audit", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    siteAddress,
+    auditDate,
+    auditor,
+    auditType,            // routine | triggered | pre-construction | post-event | regulatory
+    projectType,          // construction | demolition | industrial | mining | land-development
+    epaLicenceNumber,
+    environmentManagementPlanCurrent,
+    sedimentControlInstalled,
+    sedimentControlCondition, // good | damaged | blocked | absent
+    drainageConnectedToEnvironment, // true | false
+    waterQualityMonitoringCurrent,
+    turbidityLastResult_NTU,
+    turbidityLimit_NTU,   // EPA SEPP Waters: typically 50 NTU discharge limit
+    noiseMonitoringCurrent,
+    dustControls,
+    dustControlsAdequate,
+    stockpileManagement,  // covered | bunded | uncovered | not-applicable
+    wasteSegregation,     // compliant | partial | non-compliant
+    wasteManifestsCurrentYear,
+    hazardousMaterialsManaged,
+    spill_kit_present,
+    spillsReported,       // number of spills since last audit
+    spillsNotified,       // to EPA if required
+    environmentalIncidents, // array of { date, description, notified }
+    epaConditionsCompliant,
+    deficiencies,         // array of { category, description, severity, dueDate }
+    photos,
+    notes,
+  } = req.body;
+
+  const nonCompliances = [];
+
+  // Turbidity check
+  const turbidity = parseFloat(turbidityLastResult_NTU) || 0;
+  const turbidityLim = parseFloat(turbidityLimit_NTU) || 50;
+  if (turbidity > turbidityLim) {
+    nonCompliances.push(
+      `Turbidity ${turbidity} NTU exceeds SEPP Waters limit ${turbidityLim} NTU — stop discharge`
+    );
+  }
+
+  // Drainage to environment without controls
+  if (drainageConnectedToEnvironment === true || drainageConnectedToEnvironment === "true") {
+    nonCompliances.push("Site drainage connected to environment without adequate treatment");
+  }
+
+  // Sediment control
+  if (sedimentControlCondition === "absent") {
+    nonCompliances.push("Sediment controls absent — required on all disturbed land per EPA guidelines");
+  } else if (sedimentControlCondition === "damaged" || sedimentControlCondition === "blocked") {
+    nonCompliances.push(`Sediment controls ${sedimentControlCondition} — restore immediately`);
+  }
+
+  // Spills not reported
+  const spillCount = parseInt(spillsReported, 10) || 0;
+  if (spillCount > 0 && !spillsNotified) {
+    nonCompliances.push(`${spillCount} spill(s) recorded but not notified to EPA as required`);
+  }
+
+  // Waste management
+  if (wasteSegregation === "non-compliant") {
+    nonCompliances.push("Waste not segregated — Environment Protection Act 2017 (Vic) requirements not met");
+  }
+
+  // Add from deficiencies array (critical/major only)
+  if (Array.isArray(deficiencies)) {
+    deficiencies
+      .filter((d) => d.severity === "critical" || d.severity === "major")
+      .forEach((d) => nonCompliances.push(`${d.category}: ${d.description}`));
+  }
+
+  const complianceStatus = nonCompliances.length === 0 ? "COMPLIANT" : "NON-COMPLIANT";
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    site_address: sanitiseInput(siteAddress),
+    audit_date: auditDate,
+    auditor: sanitiseInput(auditor),
+    audit_type: sanitiseInput(auditType),
+    project_type: sanitiseInput(projectType),
+    epa_licence_number: sanitiseInput(epaLicenceNumber),
+    environment_management_plan_current: environmentManagementPlanCurrent,
+    sediment_control_installed: sedimentControlInstalled,
+    sediment_control_condition: sanitiseInput(sedimentControlCondition),
+    drainage_connected_to_environment: drainageConnectedToEnvironment,
+    water_quality_monitoring_current: waterQualityMonitoringCurrent,
+    turbidity_last_result_ntu: turbidityLastResult_NTU,
+    turbidity_limit_ntu: turbidityLimit_NTU || 50,
+    noise_monitoring_current: noiseMonitoringCurrent,
+    dust_controls: sanitiseInput(dustControls),
+    dust_controls_adequate: dustControlsAdequate,
+    stockpile_management: sanitiseInput(stockpileManagement),
+    waste_segregation: sanitiseInput(wasteSegregation),
+    waste_manifests_current_year: wasteManifestsCurrentYear,
+    hazardous_materials_managed: hazardousMaterialsManaged,
+    spill_kit_present,
+    spills_reported: spillsReported || 0,
+    spills_notified: spillsNotified,
+    environmental_incidents: environmentalIncidents || [],
+    epa_conditions_compliant: epaConditionsCompliant,
+    deficiencies: deficiencies || [],
+    non_compliances: nonCompliances,
+    compliance_status: complianceStatus,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("environmental_compliance_audits")
+      .insert(record);
+    if (dbErr) console.error("DB error /environmental-compliance-audit:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Environmental compliance audit recorded",
+    complianceStatus,
+    nonCompliancesCount: nonCompliances.length,
+    nonCompliances,
+    turbidityCompliant: turbidity === 0 || turbidity <= turbidityLim,
+    applicableLegislation: [
+      "Environment Protection Act 2017 (Vic)",
+      "SEPP Waters 2018 (Vic)",
+      "EPA Victoria Construction Guidelines",
+      "OHS Regulations 2017 (Vic)",
+    ],
+    saved,
+  });
+});
+
+// POST /ai-environmental-audit-assessment — AI assesses environmental compliance gaps and remediation priorities
+app.post("/ai-environmental-audit-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    projectType,
+    nonCompliances,
+    turbidity_NTU,
+    sedimentControlCondition,
+    drainageToEnvironment,
+    nearbyWaterways,
+    soilConditions,
+    spillCount,
+    dustIssues,
+    wasteManagement,
+    epaLicenceType,
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are an environmental consultant and EPA compliance specialist with 20 years experience on Victorian construction and industrial sites. Assess environmental compliance gaps and remediation priorities per Environment Protection Act 2017 (Vic), SEPP Waters 2018, and EPA Victoria guidelines.
+
+Assess:
+1. Water quality risk — turbidity, sediment loss, chemical contamination to waterways
+2. Sediment and erosion control adequacy — sequence, design, maintenance
+3. Dust and air quality management
+4. Waste management — classification, segregation, licensed disposal
+5. Chemical and hazardous materials controls
+6. EPA licence conditions compliance
+7. Notifiable incident and spill reporting obligations
+8. Best environmental management practice (BEMP) gaps
+
+Respond with JSON: { "overallRisk": "low|medium|high|critical", "waterwayRisk": "low|medium|high|critical", "keyNonCompliances": [], "priorityActions": [], "sedimentControlRecommendations": [], "waterQualityManagement": [], "wasteManagementGaps": [], "epaNotificationRequired": boolean, "epaNotificationReason": "string", "bestPracticeRecommendations": [], "applicableLegislation": [], "recommendation": "string", "summary": "string" }`;
+
+  const nonComplianceSummary = Array.isArray(nonCompliances)
+    ? nonCompliances.join("; ")
+    : "Not specified";
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Project type: ${projectType || "construction"}
+Non-compliances identified: ${nonComplianceSummary}
+Turbidity: ${turbidity_NTU || "not measured"} NTU
+Sediment control condition: ${sedimentControlCondition || "not inspected"}
+Drainage connected to environment: ${drainageToEnvironment || "no"}
+Nearby waterways: ${nearbyWaterways || "none"}
+Soil conditions: ${soilConditions || "not specified"}
+Spill count: ${spillCount || 0}
+Dust issues: ${dustIssues || "none"}
+Waste management status: ${wasteManagement || "not assessed"}
+EPA licence type: ${epaLicenceType || "not required"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-environmental-audit-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        overallRisk: "medium",
+        waterwayRisk: "medium",
+        keyNonCompliances: [
+          "Inadequate sediment controls allowing turbid water discharge",
+          "Stockpiles not bunded — erosion risk in rainfall events",
+        ],
+        priorityActions: [
+          "Install or repair sediment basin downstream of disturbed areas",
+          "Bund all stockpiles and install sediment fence around perimeter",
+          "Monitor discharge point turbidity before and after rainfall",
+          "Stop works in rain if sediment controls cannot contain runoff",
+        ],
+        sedimentControlRecommendations: [
+          "Install sediment basins sized per EPA Construction Technique Sheet 1",
+          "Install silt fences at 1:5 gradient or flatter",
+          "Stabilise all trafficked areas with crushed rock or geotextile",
+        ],
+        waterQualityManagement: [
+          "Monitor turbidity at discharge point after every rainfall event",
+          "Target turbidity <50 NTU per SEPP Waters 2018",
+          "Divert clean water around disturbed areas",
+        ],
+        wasteManagementGaps: [
+          "Ensure all waste categories segregated on-site",
+          "Maintain waste tracking documents for prescribed industrial waste",
+          "Engage licensed waste contractor for hazardous materials",
+        ],
+        epaNotificationRequired: false,
+        epaNotificationReason: "No immediate EPA notification trigger identified",
+        bestPracticeRecommendations: [
+          "Develop a Site Environmental Management Plan (SEMP)",
+          "Conduct weekly environmental inspections and record results",
+          "Train all site personnel in environmental obligations",
+        ],
+        applicableLegislation: [
+          "Environment Protection Act 2017 (Vic)",
+          "SEPP Waters 2018 (Vic)",
+          "EPA Victoria Construction Technique Sheets",
+          "Best Practice Environmental Management Guidelines",
+        ],
+        recommendation:
+          "Prioritise sediment control installation and repair before next rainfall. Monitor discharge turbidity weekly. Develop SEMP and brief all site personnel.",
+        summary:
+          "Site presents medium environmental risk primarily from sediment and water quality. Immediate improvement to sediment controls and discharge monitoring will address key risks. Maintain environmental compliance records.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
