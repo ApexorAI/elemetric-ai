@@ -77911,6 +77911,359 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 277 ─────────────────────────────────────────────────────────────────
+
+// POST /maintenance-plan-record — Record building / asset maintenance plan and schedule
+app.post("/maintenance-plan-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, assetId, assetDescription, planDate, preparedBy,
+      assetClass, criticalityRating, maintenanceItems,
+      annualBudgetAud, lastReviewDate, nextReviewDate,
+      essentialSafetyMeasuresIncluded, esmItemCount,
+      preventiveMaintenanceIncluded, predictiveMaintenanceIncluded,
+      statutoryInspectionsScheduled, contractorAppointed,
+      contractorName, contractorLicenceRef, notes
+    } = req.body;
+
+    if (!assetId || !assetDescription || !planDate || !preparedBy) {
+      return res.status(400).json({ error: "assetId, assetDescription, planDate, preparedBy are required." });
+    }
+
+    const safeAsset = sanitiseInput(String(assetId));
+    const safeDesc = sanitiseInput(String(assetDescription));
+    const safePreparedBy = sanitiseInput(String(preparedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+
+    const items = Array.isArray(maintenanceItems) ? maintenanceItems : [];
+    const criticalityLevel = String(criticalityRating || "MEDIUM").toUpperCase();
+    const warnings = [];
+    const criticalIssues = [];
+
+    // Building Act 1993 (Vic) — Essential Safety Measures (ESM)
+    // Building Regulations 2018 (Vic) reg 229 — annual ESM reporting
+    if (!essentialSafetyMeasuresIncluded && assetClass && parseInt(assetClass) >= 2) {
+      criticalIssues.push("Essential Safety Measures not included in maintenance plan — mandatory annual ESM obligation for Class 2-9 buildings (Building Regulations 2018 Vic reg 229).");
+    }
+
+    if (essentialSafetyMeasuresIncluded === true || essentialSafetyMeasuresIncluded === "true") {
+      if (!esmItemCount || parseInt(esmItemCount) === 0) {
+        warnings.push("ESM items not enumerated — list all required ESM measures per Occupancy Permit/ESM Report.");
+      }
+    }
+
+    if (!statutoryInspectionsScheduled) {
+      warnings.push("Statutory inspection schedule not confirmed — annual AS 1851 fire system maintenance, lift, pressure vessel, ESM inspections required.");
+    }
+
+    if (criticalityLevel === "CRITICAL" && !contractorAppointed) {
+      warnings.push("Critical asset rated but maintenance contractor not appointed — engage contractor before asset is put into service.");
+    }
+
+    if (!preventiveMaintenanceIncluded) {
+      warnings.push("Preventive maintenance not included — reactive-only maintenance increases failure and lifecycle cost.");
+    }
+
+    if (nextReviewDate) {
+      const review = new Date(nextReviewDate);
+      const reviewAnnual = new Date(planDate);
+      reviewAnnual.setFullYear(reviewAnnual.getFullYear() + 1);
+      if (review > reviewAnnual) {
+        warnings.push("Next review date is more than 12 months away — annual maintenance plan review recommended for all Class 2-9 buildings.");
+      }
+    }
+
+    const planStatus = criticalIssues.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "REVIEW_REQUIRED" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("maintenance_plan_records")
+        .insert({
+          project_id: safeProject,
+          asset_id: safeAsset,
+          asset_description: safeDesc,
+          plan_date: planDate,
+          prepared_by: safePreparedBy,
+          asset_class: assetClass || null,
+          criticality_rating: criticalityLevel,
+          maintenance_items: items,
+          annual_budget_aud: annualBudgetAud || null,
+          last_review_date: lastReviewDate || null,
+          next_review_date: nextReviewDate || null,
+          essential_safety_measures_included: essentialSafetyMeasuresIncluded || false,
+          esm_item_count: esmItemCount || null,
+          preventive_maintenance_included: preventiveMaintenanceIncluded || false,
+          predictive_maintenance_included: predictiveMaintenanceIncluded || false,
+          statutory_inspections_scheduled: statutoryInspectionsScheduled || false,
+          contractor_appointed: contractorAppointed || false,
+          contractor_name: contractorName ? sanitiseInput(String(contractorName)) : null,
+          contractor_licence_ref: contractorLicenceRef ? sanitiseInput(String(contractorLicenceRef)) : null,
+          plan_status: planStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        planStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Maintenance plan non-compliant — ESM obligations not addressed.",
+        standards: ["Building Regulations 2018 (Vic) reg 229", "AS 1851", "Building Act 1993 (Vic)"],
+      });
+    }
+
+    res.json({
+      planStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      assetId: safeAsset,
+      criticalityRating: criticalityLevel,
+      standards: ["Building Regulations 2018 (Vic) reg 229", "AS 1851"],
+    });
+  } catch (err) {
+    console.error("POST /maintenance-plan-record error:", err.message);
+    res.status(500).json({ error: "Failed to record maintenance plan." });
+  }
+});
+
+// POST /esm-annual-statement — Record Essential Safety Measures annual report
+app.post("/esm-annual-statement", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, buildingAddress, reportDate, preparedBy,
+      buildingClass, reportingYear,
+      esmItems, overallCompliance,
+      deficienciesFound, deficiencyDetails,
+      rectificationRequired, rectificationCompleted,
+      buildingOwnerName, buildingOwnerSignature, notes
+    } = req.body;
+
+    if (!buildingAddress || !reportDate || !preparedBy || !reportingYear) {
+      return res.status(400).json({ error: "buildingAddress, reportDate, preparedBy, reportingYear are required." });
+    }
+
+    const safeAddress = sanitiseInput(String(buildingAddress));
+    const safePreparedBy = sanitiseInput(String(preparedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+
+    const items = Array.isArray(esmItems) ? esmItems : [];
+    const deficiencies = Array.isArray(deficiencyDetails) ? deficiencyDetails : [];
+    const warnings = [];
+    const criticalIssues = [];
+
+    // Building Regulations 2018 (Vic) reg 229 — annual ESM reporting
+    const buildClass = parseInt(buildingClass) || null;
+    if (buildClass && buildClass < 2) {
+      warnings.push("ESM annual statements are required for Class 2-9 buildings — verify if applicable.");
+    }
+
+    if (items.length === 0) {
+      criticalIssues.push("No ESM items listed — all ESM measures specified in the Occupancy Permit must be listed and confirmed maintained.");
+    }
+
+    // Check for non-compliant items
+    const nonCompliantItems = items.filter(item =>
+      item.status === "NON_COMPLIANT" || item.maintained === false || item.maintained === "false"
+    );
+    if (nonCompliantItems.length > 0) {
+      criticalIssues.push(`${nonCompliantItems.length} ESM item(s) not maintained to standard — must be rectified to comply with Building Regulations 2018 (Vic) reg 229.`);
+    }
+
+    if (overallCompliance === false || overallCompliance === "false") {
+      criticalIssues.push("Overall ESM compliance not achieved — building owner is in breach of Building Regulations 2018 (Vic). Council enforcement risk.");
+    }
+
+    if (deficienciesFound === true || deficienciesFound === "true") {
+      if (deficiencies.length > 0) {
+        const critDef = deficiencies.filter(d => /fire|sprinkler|smoke|exit|egress|emergency|alarm/i.test(String(d)));
+        if (critDef.length > 0) {
+          criticalIssues.push(`Critical fire safety ESM deficiencies: ${critDef.map(d => sanitiseInput(String(d))).join("; ")} — rectify immediately.`);
+        } else {
+          warnings.push(`ESM deficiencies: ${deficiencies.map(d => sanitiseInput(String(d))).join("; ")} — schedule rectification.`);
+        }
+      }
+    }
+
+    if (rectificationRequired === true || rectificationRequired === "true") {
+      if (!(rectificationCompleted === true || rectificationCompleted === "true")) {
+        warnings.push("Rectification required but not completed — document rectification plan and target completion date.");
+      }
+    }
+
+    if (!buildingOwnerSignature) {
+      warnings.push("Building owner signature not recorded — ESM annual statement must be signed by building owner (Building Regulations 2018 Vic reg 229).");
+    }
+
+    const reportStatus = criticalIssues.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "PARTIALLY_COMPLIANT" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("esm_annual_statements")
+        .insert({
+          project_id: safeProject,
+          building_address: safeAddress,
+          report_date: reportDate,
+          prepared_by: safePreparedBy,
+          building_class: buildClass,
+          reporting_year: reportingYear,
+          esm_items: items,
+          overall_compliance: overallCompliance !== false && overallCompliance !== "false",
+          deficiencies_found: deficienciesFound || false,
+          deficiency_details: deficiencies,
+          rectification_required: rectificationRequired || false,
+          rectification_completed: rectificationCompleted || false,
+          building_owner_name: buildingOwnerName ? sanitiseInput(String(buildingOwnerName)) : null,
+          building_owner_signature: buildingOwnerSignature || false,
+          report_status: reportStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        reportStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "ESM non-compliant — building owner must rectify immediately to avoid enforcement action.",
+        standards: ["Building Regulations 2018 (Vic) reg 229", "AS 1851", "Building Act 1993 (Vic)"],
+      });
+    }
+
+    res.json({
+      reportStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      esmItemCount: items.length,
+      reportingYear,
+      standards: ["Building Regulations 2018 (Vic) reg 229", "AS 1851"],
+    });
+  } catch (err) {
+    console.error("POST /esm-annual-statement error:", err.message);
+    res.status(500).json({ error: "Failed to record ESM annual statement." });
+  }
+});
+
+// POST /ai-asset-lifecycle-assessment — AI assesses building asset lifecycle and capital expenditure planning
+app.post("/ai-asset-lifecycle-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      assetType, buildingClass, constructionYear, grossFloorAreaM2,
+      currentCondition, maintenanceHistory, criticalSystems,
+      esmDeficiencies, knownDefects, plannedWorks, siteContext
+    } = req.body;
+
+    if (!assetType) {
+      return res.status(400).json({ error: "assetType is required." });
+    }
+
+    const safeAssetType = sanitiseInput(String(assetType));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const systems = Array.isArray(criticalSystems) ? criticalSystems.map(s => sanitiseInput(String(s))) : [];
+    const defects = Array.isArray(knownDefects) ? knownDefects.map(d => sanitiseInput(String(d))) : [];
+    const planned = Array.isArray(plannedWorks) ? plannedWorks.map(w => sanitiseInput(String(w))) : [];
+
+    const buildAge = constructionYear ? new Date().getFullYear() - parseInt(constructionYear) : null;
+
+    const prompt = `You are a building asset lifecycle consultant assessing capital expenditure planning for a Victorian building asset.
+
+Asset type: ${safeAssetType}
+Building class: ${buildingClass || "Unknown"}
+Construction year: ${constructionYear || "Unknown"}${buildAge ? " (age: " + buildAge + " years)" : ""}
+Gross floor area: ${grossFloorAreaM2 ? grossFloorAreaM2 + " m²" : "Unknown"}
+Current condition: ${currentCondition || "Not assessed"}
+Maintenance history: ${maintenanceHistory || "Unknown"}
+Critical systems: ${systems.join(", ") || "Not specified"}
+ESM deficiencies: ${esmDeficiencies || "None known"}
+Known defects: ${defects.join("; ") || "None"}
+Planned works: ${planned.join("; ") || "None"}
+Location: ${safeSite}
+
+Develop a lifecycle assessment covering:
+1. Overall asset condition rating
+2. Remaining service life for major elements
+3. 5-year and 10-year capital expenditure forecast
+4. Priority works (immediate, 1-3 years, 3-5 years)
+5. Compliance obligations (ESM, Building Act, NCC)
+6. Value at risk if maintenance deferred
+
+Respond ONLY in JSON:
+{
+  "assetConditionRating": "GOOD|FAIR|POOR|CRITICAL",
+  "remainingServiceLifeYears": number or null,
+  "fiveYearCapexForecast": "string",
+  "tenYearCapexForecast": "string",
+  "priorityWorks": {
+    "immediate": ["string"],
+    "oneToThreeYears": ["string"],
+    "threeToFiveYears": ["string"]
+  },
+  "complianceObligations": ["string"],
+  "deferralRisk": "string",
+  "recommendedMaintenanceStrategy": "string",
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        assetConditionRating: "FAIR",
+        remainingServiceLifeYears: null,
+        fiveYearCapexForecast: "AI assessment unavailable — engage building asset consultant",
+        tenYearCapexForecast: "AI assessment unavailable — engage building asset consultant",
+        priorityWorks: {
+          immediate: ["Address all ESM deficiencies", "Rectify life-safety defects"],
+          oneToThreeYears: ["Roof and envelope maintenance", "HVAC servicing"],
+          threeToFiveYears: ["Lift modernisation planning", "Facade inspection program"],
+        },
+        complianceObligations: ["Annual ESM statement per Building Regulations 2018 (Vic) reg 229", "AS 1851 fire system maintenance"],
+        deferralRisk: "Deferred maintenance increases lifecycle cost and regulatory risk.",
+        recommendedMaintenanceStrategy: "Preventive maintenance program with annual professional building inspection.",
+        applicableStandards: ["Building Regulations 2018 (Vic)", "AS 1851", "Building Act 1993 (Vic)"],
+        summary: "AI lifecycle assessment unavailable. Engage registered building consultant for formal assessment.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      assetType: safeAssetType,
+      buildAge,
+      standards: ["Building Regulations 2018 (Vic)", "AS 1851", "Building Act 1993 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /ai-asset-lifecycle-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess asset lifecycle." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
