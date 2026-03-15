@@ -73171,6 +73171,406 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 264 ─────────────────────────────────────────────────────────────────
+
+// POST /waterproofing-inspection — Record waterproofing installation inspection
+app.post("/waterproofing-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, location, inspectionDate, inspectedBy,
+      waterproofingType, applicationArea, substrateCondition,
+      primerApplied, primerCoverageOk, primerCureTimeHours,
+      membraneApplied, membraneBrand, membraneThicknessMm, specifiedThicknessMm,
+      jointsLappedMm, specifiedLapMm, flashingsInstalled,
+      penetrationsSealedOk, drainageCellInstalled, protectionBoardInstalled,
+      pondTestConducted, pondTestPassed, pondTestDurationHours,
+      defectsFound, defectDetails, notes
+    } = req.body;
+
+    if (!projectId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "projectId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+
+    const defects = Array.isArray(defectDetails) ? defectDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const membThick = parseFloat(membraneThicknessMm) || null;
+    const specThick = parseFloat(specifiedThicknessMm) || null;
+    const lapMm = parseFloat(jointsLappedMm) || null;
+    const specLapMm = parseFloat(specifiedLapMm) || null;
+
+    // AS 3740 — Waterproofing of domestic wet areas, AS 4654.1/2 — Waterproofing membranes
+    if (substrateCondition === "WET" || substrateCondition === "CONTAMINATED") {
+      criticalIssues.push(`Substrate condition ${substrateCondition} — waterproofing must not proceed until substrate is dry and clean (AS 4654.2).`);
+    }
+
+    if (membThick !== null && specThick !== null && membThick < specThick * 0.9) {
+      criticalIssues.push(`Membrane thickness ${membThick}mm below 90% of specified ${specThick}mm — apply additional coat to meet specification.`);
+    } else if (membThick !== null && specThick !== null && membThick < specThick) {
+      warnings.push(`Membrane thickness ${membThick}mm slightly below specified ${specThick}mm — verify within tolerance.`);
+    }
+
+    if (lapMm !== null && specLapMm !== null && lapMm < specLapMm) {
+      criticalIssues.push(`Joint lap ${lapMm}mm below specified ${specLapMm}mm — insufficient overlap creates water ingress risk.`);
+    }
+
+    if (!flashingsInstalled) {
+      criticalIssues.push("Flashings not confirmed installed at upturns — primary failure point for water ingress.");
+    }
+    if (!penetrationsSealedOk) {
+      criticalIssues.push("Penetrations not fully sealed — mandatory waterproofing continuity requirement (AS 3740).");
+    }
+
+    if (!primerApplied) {
+      warnings.push("Primer application not confirmed — required for membrane adhesion on most substrates (AS 4654.2).");
+    }
+
+    if (pondTestConducted === true || pondTestConducted === "true") {
+      if (pondTestPassed === false || pondTestPassed === "false") {
+        criticalIssues.push("Pond test FAILED — waterproofing membrane has leak(s). Locate and repair before covering.");
+      } else if (pondTestDurationHours != null && parseFloat(pondTestDurationHours) < 24) {
+        warnings.push(`Pond test duration ${pondTestDurationHours}h — minimum 24 hours recommended for reliable result.`);
+      }
+    } else {
+      warnings.push("No pond test conducted — consider 24-hour water test before covering membrane (best practice).");
+    }
+
+    if (defectsFound === true || defectsFound === "true") {
+      if (defects.length > 0) {
+        const critDefects = defects.filter(d => /blister|tear|hole|puncture|void/i.test(String(d)));
+        if (critDefects.length > 0) {
+          criticalIssues.push(`Critical membrane defects: ${critDefects.join(", ")} — repair immediately.`);
+        } else {
+          warnings.push(`Membrane defects: ${defects.join(", ")} — repair before covering.`);
+        }
+      } else {
+        warnings.push("Defects flagged but details not recorded — document all defects.");
+      }
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "FAIL" : warnings.length > 0 ? "CONDITIONAL_PASS" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("waterproofing_inspections")
+        .insert({
+          project_id: safeProject,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          waterproofing_type: waterproofingType ? sanitiseInput(String(waterproofingType)) : null,
+          application_area: applicationArea || null,
+          substrate_condition: substrateCondition || null,
+          primer_applied: primerApplied || false,
+          membrane_brand: membraneBrand ? sanitiseInput(String(membraneBrand)) : null,
+          membrane_thickness_mm: membThick,
+          specified_thickness_mm: specThick,
+          joints_lapped_mm: lapMm,
+          specified_lap_mm: specLapMm,
+          flashings_installed: flashingsInstalled || false,
+          penetrations_sealed_ok: penetrationsSealedOk || false,
+          drainage_cell_installed: drainageCellInstalled || false,
+          protection_board_installed: protectionBoardInstalled || false,
+          pond_test_conducted: pondTestConducted || false,
+          pond_test_passed: pondTestPassed || false,
+          pond_test_duration_hours: pondTestDurationHours || null,
+          defects_found: defectsFound || false,
+          defect_details: defects,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Waterproofing inspection failed — do not cover until defects rectified.",
+        standards: ["AS 3740", "AS 4654.1", "AS 4654.2", "NCC 2022"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      membraneThicknessMm: membThick,
+      specifiedThicknessMm: specThick,
+      standards: ["AS 3740", "AS 4654.1", "AS 4654.2"],
+    });
+  } catch (err) {
+    console.error("POST /waterproofing-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record waterproofing inspection." });
+  }
+});
+
+// POST /glazing-inspection — Record glazing installation inspection per AS 1288
+app.post("/glazing-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, location, inspectionDate, inspectedBy,
+      glazingType, thickness, specifiedThickness,
+      edgeClearanceMm, specifiedEdgeClearanceMm,
+      faceWidthMm, specifiedFaceWidthMm,
+      settingBlocksInstalled, settingBlockSpacingMm,
+      safetyGlazingRequired, safetyGlazingInstalled, safetyMarkingPresent,
+      fallFromHeightRisk, impactRiskArea,
+      weathersealApplied, siliconeType, drainageHolesPresent,
+      cracksOrChips, defectsFound, defectDetails, notes
+    } = req.body;
+
+    if (!projectId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "projectId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+
+    const defects = Array.isArray(defectDetails) ? defectDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const edgeClear = parseFloat(edgeClearanceMm) || null;
+    const specEdgeClear = parseFloat(specifiedEdgeClearanceMm) || null;
+    const thick = parseFloat(thickness) || null;
+    const specThick = parseFloat(specifiedThickness) || null;
+    const faceWidth = parseFloat(faceWidthMm) || null;
+    const specFaceWidth = parseFloat(specifiedFaceWidthMm) || null;
+
+    // AS 1288 — Glass in buildings
+    if (safetyGlazingRequired === true || safetyGlazingRequired === "true") {
+      if (!safetyGlazingInstalled) {
+        criticalIssues.push("Safety glazing required but not confirmed installed — life safety risk (AS 1288 cl.3.4).");
+      } else if (!safetyMarkingPresent) {
+        warnings.push("Safety glazing marking/etching not confirmed — required for verification (AS 1288).");
+      }
+    }
+
+    if (fallFromHeightRisk === true || fallFromHeightRisk === "true") {
+      if (!safetyGlazingInstalled) {
+        criticalIssues.push("Fall-from-height risk location — safety glazing (laminated or toughened) mandatory (NCC 2022 / AS 1288).");
+      }
+    }
+
+    if (impactRiskArea === true || impactRiskArea === "true") {
+      if (!safetyGlazingInstalled) {
+        criticalIssues.push("Human impact risk area — safety glazing required per AS 1288 Section 3.");
+      }
+    }
+
+    // Edge clearance
+    if (edgeClear !== null && specEdgeClear !== null && edgeClear < specEdgeClear) {
+      criticalIssues.push(`Edge clearance ${edgeClear}mm below specified ${specEdgeClear}mm — thermal movement may cause glass breakage.`);
+    }
+
+    // Thickness
+    if (thick !== null && specThick !== null && thick < specThick) {
+      criticalIssues.push(`Glass thickness ${thick}mm below specified ${specThick}mm — insufficient for design wind load.`);
+    }
+
+    // Face width
+    if (faceWidth !== null && specFaceWidth !== null && faceWidth < specFaceWidth) {
+      warnings.push(`Face width ${faceWidth}mm below specified ${specFaceWidth}mm — check retention adequacy.`);
+    }
+
+    if (!settingBlocksInstalled) {
+      criticalIssues.push("Setting blocks not installed — glass weight not properly transferred to frame. Risk of glass slipping/breaking (AS 1288).");
+    }
+
+    if (cracksOrChips === true || cracksOrChips === "true") {
+      criticalIssues.push("Cracks or chips detected in glazing — glass must be replaced before handover.");
+    }
+
+    if (defectsFound === true || defectsFound === "true") {
+      if (defects.length > 0) {
+        warnings.push(`Glazing defects: ${defects.map(d => sanitiseInput(String(d))).join(", ")}`);
+      } else {
+        warnings.push("Defects flagged but not documented — record all defects.");
+      }
+    }
+
+    if (!weathersealApplied) {
+      warnings.push("Weatherseal not confirmed applied — required for weather performance.");
+    }
+    if (!drainageHolesPresent) {
+      warnings.push("Drainage holes not confirmed present in rebate — water accumulation may cause seal failure.");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "FAIL" : warnings.length > 0 ? "CONDITIONAL_PASS" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("glazing_inspections")
+        .insert({
+          project_id: safeProject,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          glazing_type: glazingType ? sanitiseInput(String(glazingType)) : null,
+          thickness_mm: thick,
+          specified_thickness_mm: specThick,
+          edge_clearance_mm: edgeClear,
+          specified_edge_clearance_mm: specEdgeClear,
+          face_width_mm: faceWidth,
+          setting_blocks_installed: settingBlocksInstalled || false,
+          safety_glazing_required: safetyGlazingRequired || false,
+          safety_glazing_installed: safetyGlazingInstalled || false,
+          safety_marking_present: safetyMarkingPresent || false,
+          fall_from_height_risk: fallFromHeightRisk || false,
+          impact_risk_area: impactRiskArea || false,
+          cracks_or_chips: cracksOrChips || false,
+          defects_found: defectsFound || false,
+          defect_details: defects,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Glazing inspection failed — rectify before handover.",
+        standards: ["AS 1288", "NCC 2022 Section J / F"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      glazingType: glazingType || null,
+      thicknessMm: thick,
+      standards: ["AS 1288", "NCC 2022"],
+    });
+  } catch (err) {
+    console.error("POST /glazing-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record glazing inspection." });
+  }
+});
+
+// POST /ai-building-envelope-assessment — AI assesses building envelope defects and weathertightness risk
+app.post("/ai-building-envelope-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      buildingType, ageYears, envelopeElements, defectsObserved,
+      waterIngressReported, waterIngressLocations,
+      roofCondition, facadeCondition, windowCondition,
+      climateZone, lastMaintenanceYear, siteContext
+    } = req.body;
+
+    if (!buildingType) {
+      return res.status(400).json({ error: "buildingType is required." });
+    }
+
+    const safeBuildingType = sanitiseInput(String(buildingType));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const defects = Array.isArray(defectsObserved) ? defectsObserved.map(d => sanitiseInput(String(d))) : [];
+    const ingressLocations = Array.isArray(waterIngressLocations) ? waterIngressLocations.map(l => sanitiseInput(String(l))) : [];
+    const elements = Array.isArray(envelopeElements) ? envelopeElements.map(e => sanitiseInput(String(e))) : [];
+
+    const prompt = `You are a building envelope consultant assessing weathertightness and defect risk for a Victorian building.
+
+Building type: ${safeBuildingType}
+Age: ${ageYears ? ageYears + " years" : "Unknown"}
+Envelope elements assessed: ${elements.join(", ") || "Not specified"}
+Defects observed: ${defects.join("; ") || "None recorded"}
+Water ingress reported: ${waterIngressReported ? "Yes — " + (ingressLocations.join(", ") || "locations not specified") : "No"}
+Roof condition: ${roofCondition || "Not assessed"}
+Facade condition: ${facadeCondition || "Not assessed"}
+Window condition: ${windowCondition || "Not assessed"}
+Climate zone: ${climateZone || "Victoria (temperate/cool)"}
+Last maintenance: ${lastMaintenanceYear || "Unknown"}
+Location: ${safeSite}
+
+Assess under:
+- NCC 2022 (weathertightness, waterproofing)
+- AS 4654.2 (above-ground waterproofing membranes)
+- AS 1288 (glazing)
+- AS 3600 (concrete envelope elements)
+- Building Act 1993 (Vic) — defect liability periods (domestic: 10 years structural, 2 years non-structural)
+
+Provide:
+1. Weathertightness risk rating
+2. Priority defects requiring immediate attention
+3. Defect liability period implications
+4. Remediation recommendations by element
+5. Maintenance schedule
+
+Respond ONLY in JSON:
+{
+  "weathertightnessRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "priorityDefects": ["string"],
+  "defectLiabilityImplications": "string",
+  "remediationByElement": {"element": "recommendation"},
+  "maintenanceSchedule": ["string"],
+  "estimatedRemediationCostTier": "LOW|MEDIUM|HIGH|VERY_HIGH",
+  "applicableStandards": ["string"],
+  "immediateActionsRequired": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        weathertightnessRisk: "MODERATE",
+        priorityDefects: ["AI assessment unavailable — engage building envelope consultant"],
+        defectLiabilityImplications: "Defect liability periods apply — Building Act 1993 (Vic): 10 years structural, 2 years non-structural.",
+        remediationByElement: {},
+        maintenanceSchedule: ["Schedule annual building envelope inspection"],
+        estimatedRemediationCostTier: "MEDIUM",
+        applicableStandards: ["NCC 2022", "AS 4654.2", "AS 1288", "Building Act 1993 (Vic)"],
+        immediateActionsRequired: ["Investigate all active water ingress points"],
+        summary: "AI assessment unavailable. Building envelope consultant inspection recommended.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      buildingType: safeBuildingType,
+      standards: ["NCC 2022", "AS 4654.2", "AS 1288", "Building Act 1993 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /ai-building-envelope-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess building envelope." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
