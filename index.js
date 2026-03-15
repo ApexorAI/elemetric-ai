@@ -80706,6 +80706,479 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 284 ─────────────────────────────────────────────────────────────────
+
+// POST /confined-space-entry — Record confined space entry permit per AS 2865
+app.post("/confined-space-entry", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, spaceId, spaceDescription, entryDate, permitNumber,
+      issuedBy, entrantNames, standbyPersonName,
+      atmosphericTestingConducted, o2PercentPre, o2PercentDuring,
+      cosPpmPre, h2sPpmPre, lel1PercentPre,
+      forcedVentilationUsed, ventilationMethod,
+      isolationLockoutCompleted, hotWorkPermitRequired, hotWorkPermitNumber,
+      rescueEquipmentChecked, rescuePlan,
+      harnessBelayed, fallProtectionType,
+      lightingAdequate, communicationDevicePresent,
+      maxTimeInSpaceMin, actualEntryTime, actualExitTime,
+      workCompleted, incidentsOccurred, incidentDetails,
+      permitClosed, closedBy, notes
+    } = req.body;
+
+    if (!spaceId || !entryDate || !issuedBy || !permitNumber) {
+      return res.status(400).json({ error: "spaceId, entryDate, issuedBy, permitNumber are required." });
+    }
+
+    const safeSpaceId = sanitiseInput(String(spaceId));
+    const safeIssuer = sanitiseInput(String(issuedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const criticalIssues = [];
+    const warnings = [];
+
+    const o2Pre = parseFloat(o2PercentPre) || null;
+    const cosPpm = parseFloat(cosPpmPre) || null;
+    const h2sPpm = parseFloat(h2sPpmPre) || null;
+    const lelPct = parseFloat(lel1PercentPre) || null;
+
+    // AS 2865 — Safe working in a confined space
+    // OHS Regulations 2017 (Vic) Part 3.4
+    if (!atmosphericTestingConducted) {
+      criticalIssues.push("Atmospheric testing not conducted before entry — entry into a confined space is prohibited without atmospheric test (AS 2865 cl.4.7).");
+    } else {
+      if (o2Pre !== null && (o2Pre < 19.5 || o2Pre > 23.5)) {
+        criticalIssues.push(`Pre-entry O₂ level ${o2Pre}% outside safe range 19.5–23.5% — entry prohibited until atmosphere is safe (AS 2865 cl.4.7).`);
+      }
+      if (cosPpm !== null && cosPpm > 25) {
+        criticalIssues.push(`CO pre-entry concentration ${cosPpm} ppm exceeds TWA of 25 ppm — SCBA required or entry prohibited (AS 2865 / OHS Regulations 2017 (Vic)).`);
+      }
+      if (h2sPpm !== null && h2sPpm > 1) {
+        criticalIssues.push(`H₂S pre-entry concentration ${h2sPpm} ppm exceeds 1 ppm TWA — SCBA required or entry prohibited (AS 2865).`);
+      }
+      if (lelPct !== null && lelPct > 5) {
+        criticalIssues.push(`Flammable gas/vapour pre-entry level ${lelPct}% LEL exceeds 5% LEL limit — entry prohibited until atmosphere is safe (AS 2865 cl.4.7).`);
+      }
+    }
+
+    if (!isolationLockoutCompleted) {
+      criticalIssues.push("Isolation and lockout/tagout not confirmed complete — entry into an un-isolated space creates energy source hazards (AS 2865 cl.4.5).");
+    }
+
+    if (!standbyPersonName) {
+      criticalIssues.push("No standby person assigned — a standby person outside the confined space is mandatory for all entries (AS 2865 cl.4.9).");
+    }
+
+    if (!rescueEquipmentChecked) {
+      criticalIssues.push("Rescue equipment not checked — confined space rescue equipment must be verified present and operable before entry (AS 2865 cl.4.8).");
+    }
+
+    if (hotWorkPermitRequired === true || hotWorkPermitRequired === "true") {
+      if (!hotWorkPermitNumber) {
+        criticalIssues.push("Hot work required but no hot work permit number recorded — hot work in a confined space requires a separate permit (AS 2865 cl.5).");
+      }
+    }
+
+    if (!forcedVentilationUsed) {
+      warnings.push("Forced ventilation not used — verify natural ventilation is sufficient for the space (AS 2865 cl.4.6).");
+    }
+
+    if (!rescuePlan) {
+      warnings.push("No rescue plan reference — a written emergency rescue procedure is required for all confined space entries (AS 2865 cl.4.8).");
+    }
+
+    if (!communicationDevicePresent) {
+      warnings.push("Communication device not recorded — entrant and standby person must have means of communication (AS 2865 cl.4.9).");
+    }
+
+    const entrants = Array.isArray(entrantNames) ? entrantNames : [];
+    if (entrants.length === 0) {
+      warnings.push("No entrant names recorded — all entrants must be identified on the confined space entry permit.");
+    }
+
+    const permitStatus = criticalIssues.length > 0 ? "ENTRY_PROHIBITED" : warnings.length > 0 ? "CAUTION" : "PERMIT_VALID";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("confined_space_entries")
+        .insert({
+          project_id: safeProject,
+          space_id: safeSpaceId,
+          space_description: spaceDescription ? sanitiseInput(String(spaceDescription)) : null,
+          entry_date: entryDate,
+          permit_number: sanitiseInput(String(permitNumber)),
+          issued_by: safeIssuer,
+          entrant_names: entrants,
+          standby_person: standbyPersonName ? sanitiseInput(String(standbyPersonName)) : null,
+          atmospheric_testing: atmosphericTestingConducted !== false && atmosphericTestingConducted !== "false",
+          o2_percent_pre: o2Pre,
+          co_ppm_pre: cosPpm,
+          h2s_ppm_pre: h2sPpm,
+          lel_percent_pre: lelPct,
+          o2_percent_during: parseFloat(o2PercentDuring) || null,
+          forced_ventilation: forcedVentilationUsed !== false && forcedVentilationUsed !== "false",
+          ventilation_method: ventilationMethod ? sanitiseInput(String(ventilationMethod)) : null,
+          isolation_lockout_complete: isolationLockoutCompleted !== false && isolationLockoutCompleted !== "false",
+          hot_work_permit: hotWorkPermitRequired || false,
+          hot_work_permit_number: hotWorkPermitNumber ? sanitiseInput(String(hotWorkPermitNumber)) : null,
+          rescue_equipment_checked: rescueEquipmentChecked !== false && rescueEquipmentChecked !== "false",
+          rescue_plan: rescuePlan ? sanitiseInput(String(rescuePlan)) : null,
+          fall_protection_type: fallProtectionType ? sanitiseInput(String(fallProtectionType)) : null,
+          communication_device: communicationDevicePresent !== false && communicationDevicePresent !== "false",
+          max_time_in_space_min: parseFloat(maxTimeInSpaceMin) || null,
+          actual_entry_time: actualEntryTime || null,
+          actual_exit_time: actualExitTime || null,
+          work_completed: workCompleted !== false && workCompleted !== "false",
+          incidents_occurred: incidentsOccurred || false,
+          incident_details: incidentDetails ? sanitiseInput(String(incidentDetails)) : null,
+          permit_closed: permitClosed !== false && permitClosed !== "false",
+          closed_by: closedBy ? sanitiseInput(String(closedBy)) : null,
+          permit_status: permitStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        permitStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Confined space entry PROHIBITED — critical safety conditions not met. Do not enter until all issues are resolved.",
+        standards: ["AS 2865", "OHS Regulations 2017 (Vic) Part 3.4"],
+      });
+    }
+
+    res.json({
+      permitStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      permitNumber: sanitiseInput(String(permitNumber)),
+      spaceId: safeSpaceId,
+      standards: ["AS 2865", "OHS Regulations 2017 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /confined-space-entry error:", err.message);
+    res.status(500).json({ error: "Failed to record confined space entry." });
+  }
+});
+
+// POST /crane-lift-record — Record crane/lifting equipment pre-lift check and lift record per AS 2550
+app.post("/crane-lift-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, craneId, liftDate, operatorName, operatorLicenceNumber,
+      craneMake, craneModel, craneType, swlTonnes,
+      liftLoadTonnes, liftRadiusM, liftHeightM,
+      groundBearingCapacityVerified, outriggersFullyExtended, outriggerPadsUsed,
+      levelToleranceDeg,
+      windSpeedKmh, maximumAllowableWindKmh,
+      liftPlanAvailable, engineerSignedLiftPlan,
+      riggerName, riggerLicenceNumber,
+      slingType, slingRatedCapacityTonnes, slingInspectedOk,
+      exclusionZoneEstablished, bankspersonAssigned,
+      preLiftInspectionPassed, hydraulicOilOk, wireRopeOk, hookBlockOk,
+      anemometerFunctional, loadIndicatorFunctional, slrFunctional,
+      defectsFound, defectDetails, notes
+    } = req.body;
+
+    if (!craneId || !liftDate || !operatorName || !operatorLicenceNumber) {
+      return res.status(400).json({ error: "craneId, liftDate, operatorName, operatorLicenceNumber are required." });
+    }
+
+    const safeCraneId = sanitiseInput(String(craneId));
+    const safeOperator = sanitiseInput(String(operatorName));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const defects = Array.isArray(defectDetails) ? defectDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const load = parseFloat(liftLoadTonnes) || null;
+    const swl = parseFloat(swlTonnes) || null;
+    const radius = parseFloat(liftRadiusM) || null;
+    const windSpeed = parseFloat(windSpeedKmh) || null;
+    const maxWind = parseFloat(maximumAllowableWindKmh) || null;
+    const levelDeg = parseFloat(levelToleranceDeg) || null;
+    const slingCapacity = parseFloat(slingRatedCapacityTonnes) || null;
+
+    // AS 2550.1 — Cranes, hoists and winches — Safe use
+    // OHS Regulations 2017 (Vic) Part 5.1
+    if (load !== null && swl !== null && load > swl) {
+      criticalIssues.push(`Lift load ${load} t exceeds crane SWL ${swl} t at specified radius — OVERLOAD. Do not lift (AS 2550.1 cl.3.3).`);
+    }
+
+    if (load !== null && swl !== null && load > swl * 0.9) {
+      warnings.push(`Lift load ${load} t is within 10% of SWL ${swl} t — critical lift conditions. Require engineer-designed lift plan.`);
+    }
+
+    if (!groundBearingCapacityVerified) {
+      criticalIssues.push("Ground bearing capacity not verified — crane outrigger loads must be assessed against ground conditions before lift (AS 2550.1 cl.4.2).");
+    }
+
+    if (!outriggersFullyExtended) {
+      criticalIssues.push("Outriggers not fully extended — crane must not lift unless outriggers are fully extended and load charts reflect actual configuration (AS 2550.1 cl.3.6).");
+    }
+
+    if (windSpeed !== null && maxWind !== null && windSpeed > maxWind) {
+      criticalIssues.push(`Wind speed ${windSpeed} km/h exceeds maximum allowable ${maxWind} km/h — crane must not operate in these conditions (AS 2550.1 cl.3.8).`);
+    } else if (windSpeed !== null && windSpeed > 50) {
+      criticalIssues.push(`Wind speed ${windSpeed} km/h exceeds general safe limit of 50 km/h for crane operation — do not lift until conditions improve.`);
+    }
+
+    if (!preLiftInspectionPassed) {
+      criticalIssues.push("Pre-lift inspection not passed — crane must not be operated until all pre-lift checks are satisfactory (AS 2550.1 cl.7).");
+    }
+
+    if (!wireRopeOk) {
+      criticalIssues.push("Wire rope defect detected — wire rope must not be used if it has visible broken wires, kinking, or excessive wear (AS 3569).");
+    }
+
+    if (!hookBlockOk) {
+      criticalIssues.push("Hook block defective — do not lift. Repair or replace hook block before operation.");
+    }
+
+    if (!slrFunctional) {
+      criticalIssues.push("Safe load indicator (SLI) / rated capacity limiter not functional — AS 2550 requires this device to be operational during lifts.");
+    }
+
+    if (load !== null && slingCapacity !== null && load > slingCapacity) {
+      criticalIssues.push(`Lift load ${load} t exceeds sling rated capacity ${slingCapacity} t — replace with appropriate rated slings.`);
+    }
+
+    if (!slingInspectedOk) {
+      criticalIssues.push("Sling inspection failed — damaged slings must be removed from service immediately (AS 3775 / AS 4991).");
+    }
+
+    if (!riggerLicenceNumber) {
+      criticalIssues.push("No rigger licence number recorded — all rigging of loads must be performed by a licensed rigger (OHS Regulations 2017 (Vic) reg 5.1.9).");
+    }
+
+    if (!exclusionZoneEstablished) {
+      criticalIssues.push("Exclusion zone not established — all crane operations require an exclusion zone under the load path (AS 2550.1 cl.6.2).");
+    }
+
+    if (!bankspersonAssigned) {
+      warnings.push("No banksperson/dogger assigned — all crane lifts require a dogger/banksperson to direct lifts when load is not in operator's full view (OHS Regulations 2017 (Vic)).");
+    }
+
+    if (!liftPlanAvailable) {
+      warnings.push("No lift plan recorded — complex or critical lifts require a documented lift plan (AS 2550.1 cl.6).");
+    }
+
+    if (levelDeg !== null && levelDeg > 1) {
+      warnings.push(`Crane level tolerance ${levelDeg}° — manufacturers typically require crane to be level to within 1° for accurate SWL charts.`);
+    }
+
+    if (!anemometerFunctional) {
+      warnings.push("Anemometer not functional — wind speed monitoring is required for safe crane operations (AS 2550.1).");
+    }
+
+    const liftStatus = criticalIssues.length > 0 ? "LIFT_PROHIBITED" : warnings.length > 0 ? "CAUTION" : "APPROVED";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("crane_lift_records")
+        .insert({
+          project_id: safeProject,
+          crane_id: safeCraneId,
+          lift_date: liftDate,
+          operator_name: safeOperator,
+          operator_licence: sanitiseInput(String(operatorLicenceNumber)),
+          crane_make: craneMake ? sanitiseInput(String(craneMake)) : null,
+          crane_model: craneModel ? sanitiseInput(String(craneModel)) : null,
+          crane_type: craneType ? sanitiseInput(String(craneType)) : null,
+          swl_tonnes: swl,
+          lift_load_tonnes: load,
+          lift_radius_m: radius,
+          lift_height_m: parseFloat(liftHeightM) || null,
+          ground_bearing_verified: groundBearingCapacityVerified !== false && groundBearingCapacityVerified !== "false",
+          outriggers_extended: outriggersFullyExtended !== false && outriggersFullyExtended !== "false",
+          outrigger_pads_used: outriggerPadsUsed !== false && outriggerPadsUsed !== "false",
+          wind_speed_kmh: windSpeed,
+          max_wind_kmh: maxWind,
+          lift_plan_available: liftPlanAvailable !== false && liftPlanAvailable !== "false",
+          engineer_signed_lift_plan: engineerSignedLiftPlan || false,
+          rigger_name: riggerName ? sanitiseInput(String(riggerName)) : null,
+          rigger_licence: riggerLicenceNumber ? sanitiseInput(String(riggerLicenceNumber)) : null,
+          sling_type: slingType ? sanitiseInput(String(slingType)) : null,
+          sling_rated_capacity_t: slingCapacity,
+          sling_inspected_ok: slingInspectedOk !== false && slingInspectedOk !== "false",
+          exclusion_zone: exclusionZoneEstablished !== false && exclusionZoneEstablished !== "false",
+          banksperson_assigned: bankspersonAssigned !== false && bankspersonAssigned !== "false",
+          pre_lift_inspection_passed: preLiftInspectionPassed !== false && preLiftInspectionPassed !== "false",
+          hydraulic_oil_ok: hydraulicOilOk !== false && hydraulicOilOk !== "false",
+          wire_rope_ok: wireRopeOk !== false && wireRopeOk !== "false",
+          hook_block_ok: hookBlockOk !== false && hookBlockOk !== "false",
+          slr_functional: slrFunctional !== false && slrFunctional !== "false",
+          defects_found: defectsFound || false,
+          defect_details: defects,
+          lift_status: liftStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        liftStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Crane lift PROHIBITED — critical safety conditions not met. Do not lift until all issues are resolved.",
+        standards: ["AS 2550.1", "AS 3569", "AS 3775", "OHS Regulations 2017 (Vic) Part 5.1"],
+      });
+    }
+
+    res.json({
+      liftStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      craneId: safeCraneId,
+      standards: ["AS 2550.1", "AS 3569", "OHS Regulations 2017 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /crane-lift-record error:", err.message);
+    res.status(500).json({ error: "Failed to record crane lift." });
+  }
+});
+
+// POST /ai-lifting-operations-assessment — AI assesses crane and lifting operation compliance
+app.post("/ai-lifting-operations-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      siteId, projectPhase, craneCount, craneTypes,
+      totalLiftsCompleted, criticalLiftsCount, nearMisses,
+      hasLiftingSupervisor, liftingSupervisorLicence,
+      liftPlanProcessInPlace, engineerDesignedLiftPlans, percentageCriticalLiftsWithPlan,
+      riggerCount, qualifiedRiggers,
+      inspectionProgramInPlace, lastCraneInspectionDate,
+      siteConstraints, adjacentStructures, overheadPowerlines,
+      incidentHistory, deficienciesNoted, notes
+    } = req.body;
+
+    if (!siteId) {
+      return res.status(400).json({ error: "siteId is required." });
+    }
+
+    const safeSite = sanitiseInput(String(siteId));
+    const deficiencies = Array.isArray(deficienciesNoted) ? deficienciesNoted : [];
+    const types = Array.isArray(craneTypes) ? craneTypes : [];
+    const constraints = Array.isArray(siteConstraints) ? siteConstraints : [];
+
+    const prompt = `You are a senior crane and lifting operations engineer. Assess the lifting operations compliance and risk profile for this construction site under Victorian and Australian standards.
+
+Site ID: ${safeSite}
+Project phase: ${projectPhase || "Unknown"}
+
+CRANE OPERATIONS:
+- Cranes on site: ${craneCount || 0}
+- Crane types: ${types.join(", ") || "Not specified"}
+- Total lifts completed: ${totalLiftsCompleted || 0}
+- Critical lifts completed: ${criticalLiftsCount || 0}
+- Near miss incidents: ${nearMisses || 0}
+
+PERSONNEL:
+- Lifting supervisor assigned: ${hasLiftingSupervisor ? "Yes (Licence: " + (hasLiftingSupervisor ? hasLiftingSupervisorLicence || "recorded" : "N/A") + ")" : "No"}
+- Total riggers: ${riggerCount || 0}
+- Qualified riggers: ${qualifiedRiggers || 0}
+
+MANAGEMENT SYSTEMS:
+- Lift plan process in place: ${liftPlanProcessInPlace ? "Yes" : "No"}
+- Engineer-designed lift plans used: ${engineerDesignedLiftPlans ? "Yes" : "No"}
+- % critical lifts with lift plan: ${percentageCriticalLiftsWithPlan || 0}%
+- Inspection program in place: ${inspectionProgramInPlace ? "Yes" : "No"}
+- Last crane inspection: ${lastCraneInspectionDate || "Unknown"}
+
+SITE CONDITIONS:
+- Site constraints: ${constraints.join(", ") || "None"}
+- Adjacent structures: ${adjacentStructures || "None noted"}
+- Overhead power lines: ${overheadPowerlines ? "YES — exclusion zone required" : "None"}
+
+Incident history: ${incidentHistory || "None recorded"}
+Deficiencies noted: ${deficiencies.join("; ") || "None"}
+
+Assess under:
+- AS 2550.1 (cranes, hoists and winches — safe use)
+- AS 2550.10 (mobile cranes — safe use)
+- AS 3569 (steel wire ropes)
+- AS 3775 (chain slings)
+- AS 4991 (lifting beams)
+- OHS Regulations 2017 (Vic) Part 5.1
+- EPBC Act (proximity to infrastructure)
+- Safe Work Australia: Cranes Code of Practice
+
+Provide:
+1. Overall lifting operations risk rating
+2. Regulatory compliance assessment
+3. Personnel competency gaps
+4. Lift plan adequacy
+5. Inspection and maintenance program assessment
+6. Immediate and short-term actions
+
+Respond ONLY in JSON:
+{
+  "overallRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "complianceStatus": "COMPLIANT|PARTIALLY_COMPLIANT|NON_COMPLIANT",
+  "personnelGaps": ["string"],
+  "liftPlanGaps": ["string"],
+  "inspectionGaps": ["string"],
+  "immediateActions": ["string"],
+  "shortTermActions": ["string"],
+  "overheadPowerlineControls": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallRisk: "HIGH",
+        complianceStatus: "PARTIALLY_COMPLIANT",
+        personnelGaps: ["Verify all riggers and crane operators hold current licences under OHS Regulations 2017 (Vic)"],
+        liftPlanGaps: ["Ensure 100% of critical lifts have engineer-designed lift plans per AS 2550.1"],
+        inspectionGaps: ["Confirm crane pre-start and periodic inspection records are current"],
+        immediateActions: ["Audit all crane operator and rigger licences", "Establish exclusion zones for all lifts"],
+        shortTermActions: ["Implement formal lift plan process for all critical lifts", "Schedule engineering review of lifting appliances"],
+        overheadPowerlineControls: ["Maintain minimum 3m exclusion zone from overhead powerlines per Energy Safe Victoria guidelines"],
+        applicableStandards: ["AS 2550.1", "AS 3569", "OHS Regulations 2017 (Vic) Part 5.1"],
+        summary: "AI lifting operations assessment unavailable. Engage a qualified crane engineer for formal lifting operations audit.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      siteId: safeSite,
+      standards: ["AS 2550.1", "AS 2550.10", "AS 3569", "AS 3775", "OHS Regulations 2017 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /ai-lifting-operations-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess lifting operations." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
