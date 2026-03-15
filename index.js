@@ -47708,6 +47708,339 @@ Generate emergency response procedures for each hazard type. Respond ONLY with a
   }
 });
 
+// POST /legionella-control-record — Log a Legionella management inspection/test
+app.post("/legionella-control-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, assetName, assetType, assetLocation,
+    inspectionDate, inspectedBy, technicianLicence,
+    // Water temperature readings
+    coldWaterTempC, hotWaterTempC, hotWaterReturnTempC, deadLegTempC,
+    // Chemical dosing (cooling towers)
+    biocidePpm, corrosionInhibitorPpm, scalingInhibitorPpm, phLevel,
+    conductivityMs, turbidityNtu,
+    // Bacterial testing
+    heterotrophicPlateCounts, legionellaTestConducted,
+    legionellaColonyFormingUnits, labName, labRef,
+    // Risk factors
+    deadLegsIdentified, aerosolsPotential, stagnationPresent,
+    biofilmEvidence, sedimentPresent,
+    // Actions
+    correctiveActions, biocideShockDose, systemDrained, notes,
+  } = req.body;
+
+  if (!projectId || !assetType || !inspectionDate || !inspectedBy) {
+    return res.status(400).json({ error: "projectId, assetType, inspectionDate, and inspectedBy are required." });
+  }
+
+  // Victorian Health (Legionella) Regulations 2019 / AS 3666 compliance thresholds
+  const COLD_WATER_MAX_C = 25;   // Must be below 25°C (AS 3666.2 clause 6.2)
+  const HOT_WATER_MIN_C = 60;    // Storage must be ≥ 60°C
+  const HOT_WATER_RETURN_MIN_C = 50; // Return must be ≥ 50°C
+  const LEGIONELLA_ACTION_CFU = 100;   // Action level: 100 CFU/mL
+  const LEGIONELLA_CRITICAL_CFU = 10000; // Shut down: > 10,000 CFU/mL (Health Regs)
+
+  const failures = [];
+  const warnings = [];
+
+  if (coldWaterTempC !== undefined && Number(coldWaterTempC) > COLD_WATER_MAX_C) {
+    failures.push(`Cold water temperature ${coldWaterTempC}°C exceeds ${COLD_WATER_MAX_C}°C maximum — increase circulation or system review.`);
+  }
+  if (hotWaterTempC !== undefined && Number(hotWaterTempC) < HOT_WATER_MIN_C) {
+    failures.push(`Hot water storage ${hotWaterTempC}°C below ${HOT_WATER_MIN_C}°C minimum — increase set point (Legionella risk).`);
+  }
+  if (hotWaterReturnTempC !== undefined && Number(hotWaterReturnTempC) < HOT_WATER_RETURN_MIN_C) {
+    failures.push(`Hot water return ${hotWaterReturnTempC}°C below ${HOT_WATER_RETURN_MIN_C}°C minimum.`);
+  }
+
+  const legCFU = legionellaColonyFormingUnits !== undefined ? Number(legionellaColonyFormingUnits) : null;
+  let legionellaStatus = "NOT_TESTED";
+  if (legCFU !== null) {
+    if (legCFU >= LEGIONELLA_CRITICAL_CFU) {
+      legionellaStatus = "CRITICAL";
+      failures.push(`Legionella ${legCFU} CFU/mL — CRITICAL: Shut down system, notify Chief Health Officer (Health (Legionella) Regulations 2019 reg.11).`);
+    } else if (legCFU >= LEGIONELLA_ACTION_CFU) {
+      legionellaStatus = "ACTION_REQUIRED";
+      failures.push(`Legionella ${legCFU} CFU/mL — Action level exceeded: Investigate, shock dose, and retest within 48 hours.`);
+    } else {
+      legionellaStatus = "ACCEPTABLE";
+    }
+  }
+
+  if (deadLegsIdentified) warnings.push("Dead legs identified in system — programme for removal or regular flushing.");
+  if (stagnationPresent) warnings.push("Stagnation present — flush affected sections and review WMP.");
+  if (biofilmEvidence) warnings.push("Biofilm evidence — increase biocide dosing and clean affected sections.");
+  if (sedimentPresent) warnings.push("Sediment present — clean tank/sump.");
+
+  const overallStatus = failures.length > 0 ? (legionellaStatus === "CRITICAL" ? "CRITICAL" : "NON_COMPLIANT") : "COMPLIANT";
+
+  const ref = `LEGR-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    assetName: sanitiseInput(assetName || "", 150),
+    assetType: sanitiseInput(assetType, 80),
+    assetLocation: sanitiseInput(assetLocation || "", 200),
+    inspectionDate,
+    inspectedBy: sanitiseInput(inspectedBy, 120),
+    technicianLicence: sanitiseInput(technicianLicence || "", 60),
+    temperatures: {
+      coldWaterC: coldWaterTempC || null,
+      hotWaterC: hotWaterTempC || null,
+      hotWaterReturnC: hotWaterReturnTempC || null,
+      deadLegC: deadLegTempC || null,
+    },
+    chemistry: {
+      biocidePpm: biocidePpm || null,
+      corrosionInhibitorPpm: corrosionInhibitorPpm || null,
+      scalingInhibitorPpm: scalingInhibitorPpm || null,
+      ph: phLevel || null,
+      conductivityMs: conductivityMs || null,
+      turbidityNtu: turbidityNtu || null,
+    },
+    microbiology: {
+      heterotrophicPlateCounts: heterotrophicPlateCounts || null,
+      legionellaTestConducted: !!legionellaTestConducted,
+      legionellaCFU: legCFU,
+      legionellaStatus,
+      labName: sanitiseInput(labName || "", 150),
+      labRef: sanitiseInput(labRef || "", 60),
+    },
+    riskFactors: {
+      deadLegsIdentified: !!deadLegsIdentified,
+      aerosolsPotential: !!aerosolsPotential,
+      stagnationPresent: !!stagnationPresent,
+      biofilmEvidence: !!biofilmEvidence,
+      sedimentPresent: !!sedimentPresent,
+    },
+    overallStatus,
+    failures,
+    warnings,
+    correctiveActions: (correctiveActions || []).map(a => sanitiseInput(String(a), 200)).slice(0, 10),
+    biocideShockDose: !!biocideShockDose,
+    systemDrained: !!systemDrained,
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("legionella_control_records").insert(record);
+      if (error) console.error("Legionella record insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Legionella record DB error:", e.message);
+    }
+  }
+
+  const statusCode = legionellaStatus === "CRITICAL" ? 422 : 201;
+
+  return res.status(statusCode).json({
+    success: legionellaStatus !== "CRITICAL",
+    ref,
+    overallStatus,
+    legionellaStatus,
+    legionellaCFU: legCFU,
+    failures,
+    warnings,
+    message: legionellaStatus === "CRITICAL"
+      ? `CRITICAL: Legionella ${legCFU} CFU/mL. Shut down system immediately and notify Chief Health Officer.`
+      : failures.length > 0
+        ? `Non-compliant — ${failures.length} failure(s) require immediate corrective action.`
+        : `Legionella management check COMPLIANT for ${sanitiseInput(assetName || assetType, 80)}.`,
+    saved,
+    record,
+  });
+});
+
+// POST /water-system-flush-record — Log a hydraulic system flush and disinfection record
+app.post("/water-system-flush-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, systemRef, systemDescription,
+    flushDate, flushedBy, supervisedBy,
+    flushMethod, disinfectantUsed, disinfectantConcentrationPpm,
+    contactTimeMins, finalResidualPpm,
+    coldWaterSampleTempC, hotWaterSampleTempC,
+    bacteriaTestConducted, bacteriaTestResult, labRef,
+    systemReadyForOccupation, notes,
+  } = req.body;
+
+  if (!projectId || !systemRef || !flushDate || !flushedBy) {
+    return res.status(400).json({ error: "projectId, systemRef, flushDate, and flushedBy are required." });
+  }
+
+  // AS 3500.4 clause 3.3 — minimum flush requirements
+  // Chlorine disinfection: 50 mg/L for 1 hour or 5 mg/L for 24 hours contact time
+  const residual = finalResidualPpm !== undefined ? Number(finalResidualPpm) : null;
+  const MIN_RESIDUAL_PPM = 0.2; // Minimum residual chlorine after flushing
+
+  const failures = [];
+  if (residual !== null && residual < MIN_RESIDUAL_PPM) {
+    failures.push(`Final residual disinfectant ${residual} mg/L is below ${MIN_RESIDUAL_PPM} mg/L minimum — re-disinfect and re-test.`);
+  }
+  if (bacteriaTestConducted && bacteriaTestResult === "FAIL") {
+    failures.push("Microbiological test failed — system not suitable for occupation. Re-flush and retest.");
+  }
+
+  const readyForOccupation = failures.length === 0 && (systemReadyForOccupation !== false);
+
+  const ref = `WSFL-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectName: sanitiseInput(projectName || "", 200),
+    systemRef: sanitiseInput(systemRef, 100),
+    systemDescription: sanitiseInput(systemDescription || "", 200),
+    flushDate,
+    flushedBy: sanitiseInput(flushedBy, 120),
+    supervisedBy: sanitiseInput(supervisedBy || "", 120),
+    flushMethod: sanitiseInput(flushMethod || "", 100),
+    disinfection: {
+      disinfectantUsed: sanitiseInput(disinfectantUsed || "", 80),
+      concentrationPpm: disinfectantConcentrationPpm || null,
+      contactTimeMins: contactTimeMins || null,
+      finalResidualPpm: residual,
+    },
+    waterTemperatures: {
+      coldWaterC: coldWaterSampleTempC || null,
+      hotWaterC: hotWaterSampleTempC || null,
+    },
+    microbiology: {
+      tested: !!bacteriaTestConducted,
+      result: bacteriaTestResult || null,
+      labRef: sanitiseInput(labRef || "", 60),
+    },
+    failures,
+    readyForOccupation,
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("water_system_flush_records").insert(record);
+      if (error) console.error("Water flush record insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Water flush record DB error:", e.message);
+    }
+  }
+
+  return res.status(readyForOccupation ? 201 : 422).json({
+    success: readyForOccupation,
+    ref,
+    readyForOccupation,
+    failures,
+    message: readyForOccupation
+      ? `Water system ${sanitiseInput(systemRef, 60)} flushed and disinfected — READY FOR OCCUPATION.`
+      : `Water system ${sanitiseInput(systemRef, 60)} NOT ready for occupation — ${failures.length} issue(s) require resolution.`,
+    saved,
+    record,
+  });
+});
+
+// POST /ai-water-quality-risk-assessment — AI assesses Legionella/microbiological risk for a water system
+app.post("/ai-water-quality-risk-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    systemType, buildingType, buildingAge, systemAge,
+    waterTemperatureRange, stagnationRisk, aerosolsGeneration,
+    suspectedContamination, occupantVulnerability, maintenanceHistory, notes,
+  } = req.body;
+
+  if (!systemType) {
+    return res.status(400).json({ error: "systemType is required." });
+  }
+
+  const sanitisedSystem = sanitiseInput(systemType, 100);
+
+  const prompt = `You are a water quality engineer specialising in Legionella management under AS 3666 and the Victorian Health (Legionella) Regulations 2019.
+
+Assess the Legionella and microbiological risk for:
+- System type: ${sanitisedSystem}
+- Building type: ${sanitiseInput(String(buildingType || ""), 80)}
+- Building age: ${buildingAge || "Unknown"} years
+- System age: ${systemAge || "Unknown"} years
+- Water temperature range: ${sanitiseInput(String(waterTemperatureRange || "Unknown"), 60)}
+- Stagnation risk: ${sanitiseInput(String(stagnationRisk || "Unknown"), 40)}
+- Aerosol generation potential: ${sanitiseInput(String(aerosolsGeneration || "Unknown"), 60)}
+- Suspected contamination: ${suspectedContamination ? "Yes" : "No"}
+- Occupant vulnerability: ${sanitiseInput(String(occupantVulnerability || "General population"), 80)}
+- Maintenance history: ${sanitiseInput(String(maintenanceHistory || "Unknown"), 200)}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Reference: AS 3666.1 (Air handling and water systems of buildings), Health (Legionella) Regulations 2019 (Vic).
+
+Respond ONLY with a JSON object:
+{
+  "riskLevel": "LOW|MEDIUM|HIGH|CRITICAL",
+  "riskScore": number (1-10),
+  "keyRiskFactors": [string],
+  "controlMeasures": [{"measure": string, "frequency": string, "priority": "IMMEDIATE|MONTHLY|QUARTERLY|ANNUALLY"}],
+  "waterManagementPlanRequired": boolean,
+  "testingFrequency": string,
+  "temperatureTargets": {"coldWaterMaxC": number, "hotWaterMinC": number, "hotReturnMinC": number},
+  "regulatoryObligations": [string],
+  "immediateActions": [string],
+  "summary": string (2-3 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      systemType: sanitisedSystem,
+      riskLevel: parsed.riskLevel || "MEDIUM",
+      riskScore: parsed.riskScore ?? null,
+      keyRiskFactors: parsed.keyRiskFactors || [],
+      controlMeasures: parsed.controlMeasures || [],
+      waterManagementPlanRequired: parsed.waterManagementPlanRequired ?? false,
+      testingFrequency: parsed.testingFrequency || "Quarterly",
+      temperatureTargets: parsed.temperatureTargets || { coldWaterMaxC: 25, hotWaterMinC: 60, hotReturnMinC: 50 },
+      regulatoryObligations: parsed.regulatoryObligations || [],
+      immediateActions: parsed.immediateActions || [],
+      summary: parsed.summary || "Water quality risk assessment complete.",
+    });
+  } catch (e) {
+    console.error("AI water quality risk error:", e.message);
+    return res.json({
+      success: true,
+      systemType: sanitisedSystem,
+      riskLevel: "MEDIUM",
+      riskScore: 5,
+      keyRiskFactors: ["Warm water temperatures in dead legs (25–50°C favour Legionella growth)", "Stagnant water sections", "Age of system"],
+      controlMeasures: [
+        { measure: "Maintain cold water below 25°C and hot water above 60°C", frequency: "Continuous monitoring", priority: "IMMEDIATE" },
+        { measure: "Monthly temperature checks at representative outlets", frequency: "Monthly", priority: "MONTHLY" },
+        { measure: "Quarterly biocide treatment for cooling towers (if applicable)", frequency: "Quarterly", priority: "QUARTERLY" },
+        { measure: "Annual Legionella testing of water samples", frequency: "Annually", priority: "ANNUALLY" },
+      ],
+      waterManagementPlanRequired: true,
+      testingFrequency: "Quarterly for high-risk systems; annually for low-risk",
+      temperatureTargets: { coldWaterMaxC: 25, hotWaterMinC: 60, hotReturnMinC: 50 },
+      regulatoryObligations: [
+        "Health (Legionella) Regulations 2019 (Vic) — cooling tower registration and risk management plan",
+        "AS 3666.1 — water system design and maintenance for buildings",
+        "Notify Chief Health Officer if Legionella > 10,000 CFU/mL",
+      ],
+      immediateActions: ["Review water system temperatures", "Check for dead legs and stagnant sections"],
+      summary: "Standard Legionella risk controls apply. Implement a Water Management Plan and conduct regular temperature monitoring and microbiological testing.",
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
