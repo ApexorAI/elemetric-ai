@@ -34228,6 +34228,174 @@ Write a friendly, professional progress update suitable for emailing to a homeow
   }
 });
 
+// ── Round 128: Notification system, webhook dispatch, event log ───────────────
+
+// POST /notification — Send a notification to a contractor or client
+app.post("/notification", apiKeyAuth, async (req, res) => {
+  const {
+    recipientId, recipientEmail, recipientType,
+    notificationType, title, message, priority = "NORMAL",
+    channel = "EMAIL", relatedEntityType, relatedEntityId,
+    actionUrl, expiresAt,
+  } = req.body;
+
+  if (!title || !message || (!recipientId && !recipientEmail))
+    return res.status(400).json({ error: "title, message, and recipientId or recipientEmail required." });
+
+  if (recipientEmail && !isValidEmail(recipientEmail)) return res.status(400).json({ error: "Invalid email." });
+
+  const validTypes = ["COMPLIANCE_ALERT", "EXPIRY_WARNING", "PAYMENT_DUE", "JOB_UPDATE", "SAFETY_ALERT", "DOCUMENT_REQUIRED", "APPROVAL_REQUIRED", "SYSTEM", "CUSTOM"];
+  const validChannels = ["EMAIL", "PUSH", "SMS", "IN_APP", "WEBHOOK"];
+  const validPriorities = ["LOW", "NORMAL", "HIGH", "URGENT"];
+
+  const notif = (notificationType || "CUSTOM").toUpperCase();
+  const chan = (channel || "EMAIL").toUpperCase();
+  const pri = (priority || "NORMAL").toUpperCase();
+
+  const notificationId = `NOTIF-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+
+  const record = {
+    notification_id: notificationId,
+    recipient_id: sanitiseInput(recipientId || ""),
+    recipient_email: sanitiseInput(recipientEmail || ""),
+    recipient_type: sanitiseInput(recipientType || ""),
+    notification_type: validTypes.includes(notif) ? notif : "CUSTOM",
+    title: sanitiseInput(title),
+    message: sanitiseInput(message),
+    priority: validPriorities.includes(pri) ? pri : "NORMAL",
+    channel: validChannels.includes(chan) ? chan : "IN_APP",
+    related_entity_type: sanitiseInput(relatedEntityType || ""),
+    related_entity_id: sanitiseInput(relatedEntityId || ""),
+    action_url: actionUrl && isSafeUrl(actionUrl) ? actionUrl : null,
+    expires_at: expiresAt || null,
+    status: "SENT",
+    sent_at: new Date().toISOString(),
+  };
+
+  // If email channel, attempt to send via Resend
+  let emailSent = false;
+  if (chan === "EMAIL" && recipientEmail && resend) {
+    try {
+      await resend.emails.send({
+        from: process.env.EMAIL_FROM || "Elemetric <noreply@elemetric.app>",
+        to: [recipientEmail],
+        subject: `[${pri}] ${title}`,
+        text: `${message}${actionUrl ? `\n\nAction required: ${actionUrl}` : ""}`,
+      });
+      emailSent = true;
+      usageStats.emailCalls++;
+    } catch (err) { /* log but don't fail */ }
+  }
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("notifications")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, notificationId, emailSent, ...record });
+  }
+
+  res.json({ success: true, notificationId, emailSent, ...record, saved: false });
+});
+
+// GET /notifications/:recipientId — Get unread notifications for a recipient
+app.get("/notifications/:recipientId", apiKeyAuth, async (req, res) => {
+  const { recipientId } = req.params;
+  const { unreadOnly, priority } = req.query;
+
+  if (supabaseAdmin) {
+    let query = supabaseAdmin
+      .from("notifications")
+      .select("*")
+      .eq("recipient_id", recipientId)
+      .order("sent_at", { ascending: false })
+      .limit(50);
+
+    if (unreadOnly === "true") query = query.neq("status", "READ");
+    if (priority) query = query.eq("priority", priority.toUpperCase());
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "DB error." });
+
+    const unreadCount = (data || []).filter(n => n.status !== "READ").length;
+    const urgentCount = (data || []).filter(n => n.priority === "URGENT" && n.status !== "READ").length;
+
+    return res.json({ recipientId, notifications: data || [], totalCount: (data || []).length, unreadCount, urgentCount });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /event-log — Write an event to the platform audit log
+app.post("/event-log", apiKeyAuth, async (req, res) => {
+  const {
+    eventType, actorId, actorType, targetId, targetType,
+    description, metadata, ipAddress, userAgent,
+  } = req.body;
+
+  if (!eventType || !actorId) return res.status(400).json({ error: "eventType and actorId required." });
+
+  const validEventTypes = [
+    "LOGIN", "LOGOUT", "DATA_CREATE", "DATA_UPDATE", "DATA_DELETE",
+    "DOCUMENT_UPLOAD", "DOCUMENT_DOWNLOAD", "PAYMENT", "APPROVAL",
+    "CERTIFICATE_ISSUED", "COMPLIANCE_FAILED", "INCIDENT_REPORTED",
+    "SETTINGS_CHANGE", "API_CALL", "WEBHOOK_RECEIVED", "OTHER",
+  ];
+  const et = (eventType || "OTHER").toUpperCase();
+
+  const record = {
+    event_type: validEventTypes.includes(et) ? et : "OTHER",
+    actor_id: sanitiseInput(actorId),
+    actor_type: sanitiseInput(actorType || ""),
+    target_id: sanitiseInput(targetId || ""),
+    target_type: sanitiseInput(targetType || ""),
+    description: sanitiseInput(description || ""),
+    metadata: typeof metadata === "object" ? metadata : {},
+    ip_address: sanitiseInput(ipAddress || ""),
+    user_agent: sanitiseInput(userAgent || ""),
+    logged_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("event_log")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, logId: data.id, ...record });
+  }
+
+  res.json({ success: true, logId: null, ...record, saved: false });
+});
+
+// GET /event-log/:actorId — Get recent events for an actor
+app.get("/event-log/:actorId", apiKeyAuth, async (req, res) => {
+  const { actorId } = req.params;
+  const { eventType, limit = 50 } = req.query;
+  const lim = Math.min(200, Number(limit) || 50);
+
+  if (supabaseAdmin) {
+    let query = supabaseAdmin
+      .from("event_log")
+      .select("*")
+      .eq("actor_id", actorId)
+      .order("logged_at", { ascending: false })
+      .limit(lim);
+
+    if (eventType) query = query.eq("event_type", eventType.toUpperCase());
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "DB error." });
+
+    return res.json({ actorId, events: data || [], count: (data || []).length });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
