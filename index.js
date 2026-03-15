@@ -33395,6 +33395,226 @@ app.post("/battery-storage-compliance", apiKeyAuth, async (req, res) => {
   res.json({ success: true, recordId: null, compliancePercent, status: record.status, clearanceAdequate, ...record, saved: false });
 });
 
+// ── Round 124: Pool/spa compliance, waterproofing certificate, tiling cert ────
+
+// POST /pool-spa-compliance — Record pool or spa barrier compliance inspection
+app.post("/pool-spa-compliance", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, propertyAddress, inspectorName, inspectorLicence,
+    inspectionDate, poolType, barrierType,
+    barrierHeightMm, gateSelfClosing = false, gateLatching = false,
+    gateOpeningAway = false, noClimbingAids = false,
+    depthMarkings = false, cprSignageDisplayed = false,
+    fencingContinuous = false, poolRegisterNumber,
+    complianceCertNumber, state = "VIC", notes,
+  } = req.body;
+
+  if (!siteId || !propertyAddress) return res.status(400).json({ error: "siteId and propertyAddress required." });
+
+  const validPoolTypes = ["INGROUND", "ABOVE_GROUND", "INFLATABLE", "SPA", "WADING_POOL"];
+  const pool = (poolType || "INGROUND").toUpperCase();
+
+  // VIC barrier height requirement — 1200mm for Type A (standalone), 900mm for Type B (building-as-barrier)
+  const requiredHeightMm = barrierType === "TYPE_B" ? 900 : 1200;
+  const heightCompliant = barrierHeightMm ? Number(barrierHeightMm) >= requiredHeightMm : null;
+
+  const checks = [
+    { check: "Barrier height meets requirements", passed: heightCompliant === true },
+    { check: "Gate is self-closing", passed: Boolean(gateSelfClosing) },
+    { check: "Gate has self-latching mechanism", passed: Boolean(gateLatching) },
+    { check: "Gate opens away from pool", passed: Boolean(gateOpeningAway) },
+    { check: "No climbing aids within 900mm of barrier", passed: Boolean(noClimbingAids) },
+    { check: "Depth markings present (pools > 1.5m deep)", passed: Boolean(depthMarkings) },
+    { check: "CPR signage displayed poolside", passed: Boolean(cprSignageDisplayed) },
+    { check: "Barrier/fencing is continuous", passed: Boolean(fencingContinuous) },
+  ];
+
+  const passedCount = checks.filter(c => c.passed).length;
+  const compliancePercent = Math.round((passedCount / checks.length) * 100);
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    property_address: sanitiseInput(propertyAddress),
+    inspector_name: sanitiseInput(inspectorName || ""),
+    inspector_licence: sanitiseInput(inspectorLicence || ""),
+    inspection_date: inspectionDate || new Date().toISOString().split("T")[0],
+    pool_type: validPoolTypes.includes(pool) ? pool : "INGROUND",
+    barrier_type: sanitiseInput(barrierType || "TYPE_A"),
+    barrier_height_mm: Number(barrierHeightMm) || null,
+    required_height_mm: requiredHeightMm,
+    height_compliant: heightCompliant,
+    compliance_checks: checks,
+    compliance_percent: compliancePercent,
+    pool_register_number: sanitiseInput(poolRegisterNumber || ""),
+    compliance_cert_number: sanitiseInput(complianceCertNumber || ""),
+    state: sanitiseInput(state),
+    applicable_legislation: state === "VIC" ? "Building Regulations 2018 (Vic) — Part 9" : "Building Code of Australia — Pool Barriers",
+    overall_status: compliancePercent === 100 ? "COMPLIANT" : compliancePercent >= 75 ? "MINOR_DEFECTS" : "NON_COMPLIANT",
+    notes: sanitiseInput(notes || ""),
+    inspected_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("pool_spa_compliance")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, recordId: data.id, compliancePercent, overallStatus: record.overall_status, ...record });
+  }
+
+  res.json({ success: true, recordId: null, compliancePercent, overallStatus: record.overall_status, ...record, saved: false });
+});
+
+// POST /waterproofing-certificate — Issue a waterproofing compliance certificate
+app.post("/waterproofing-certificate", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, propertyAddress, contractorId, installerName,
+    licenceNumber, areaType, systemUsed, manufacturer,
+    applicationMethod, thicknessAchievedMm, standardMet,
+    substratePrepped = false, primingApplied = false,
+    flashingsInstalled = false, angleFilletInstalled = false,
+    drainageAdequate = false, inspectionDate, clientName, state = "VIC",
+  } = req.body;
+
+  if (!siteId || !areaType) return res.status(400).json({ error: "siteId and areaType required." });
+
+  const validAreas = ["BATHROOM", "LAUNDRY", "BALCONY", "ROOF_DECK", "KITCHEN", "POND", "RETAINING_WALL", "BASEMENT", "WET_AREA", "OTHER"];
+  const area = (areaType || "WET_AREA").toUpperCase();
+
+  // AS 4654.2 minimum thickness (indicative)
+  const minThickness = { BATHROOM: 0.8, BALCONY: 1.0, ROOF_DECK: 1.5, KITCHEN: 0.8, BASEMENT: 1.5 };
+  const requiredThickness = minThickness[area] || 1.0;
+  const thicknessCompliant = thicknessAchievedMm ? Number(thicknessAchievedMm) >= requiredThickness : null;
+
+  const complianceChecks = [
+    { check: "Substrate prepared correctly", passed: Boolean(substratePrepped) },
+    { check: "Priming applied (if required)", passed: Boolean(primingApplied) },
+    { check: "Minimum thickness achieved", passed: thicknessCompliant === true },
+    { check: "Angle fillets / coves installed", passed: Boolean(angleFilletInstalled) },
+    { check: "Flashings installed at junctions", passed: Boolean(flashingsInstalled) },
+    { check: "Drainage provision adequate", passed: Boolean(drainageAdequate) },
+  ];
+
+  const passedCount = complianceChecks.filter(c => c.passed).length;
+  const certNumber = `WPC-${state}-${Date.now().toString(36).toUpperCase().slice(-8)}`;
+
+  const record = {
+    certificate_number: certNumber,
+    site_id: sanitiseInput(siteId),
+    property_address: sanitiseInput(propertyAddress || ""),
+    contractor_id: sanitiseInput(contractorId || ""),
+    installer_name: sanitiseInput(installerName || ""),
+    licence_number: sanitiseInput(licenceNumber || ""),
+    area_type: validAreas.includes(area) ? area : "WET_AREA",
+    system_used: sanitiseInput(systemUsed || ""),
+    manufacturer: sanitiseInput(manufacturer || ""),
+    application_method: sanitiseInput(applicationMethod || ""),
+    thickness_achieved_mm: Number(thicknessAchievedMm) || null,
+    required_thickness_mm: requiredThickness,
+    thickness_compliant: thicknessCompliant,
+    standard_met: sanitiseInput(standardMet || "AS 4654.2"),
+    compliance_checks: complianceChecks,
+    checks_passed: passedCount,
+    total_checks: complianceChecks.length,
+    client_name: sanitiseInput(clientName || ""),
+    inspection_date: inspectionDate || new Date().toISOString().split("T")[0],
+    state: sanitiseInput(state),
+    status: passedCount === complianceChecks.length ? "ISSUED" : "CONDITIONAL",
+    issued_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("waterproofing_certificates")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, certId: data.id, certificateNumber: certNumber, status: record.status, ...record });
+  }
+
+  res.json({ success: true, certId: null, certificateNumber: certNumber, status: record.status, ...record, saved: false });
+});
+
+// POST /tiling-compliance — Record tiling compliance inspection
+app.post("/tiling-compliance", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, propertyAddress, tilerName, tilerLicence,
+    inspectionDate, location, tileType, tileSize,
+    substrateType, adhesiveUsed, groutUsed,
+    lippage_mm, movementJointsInstalled = false, movementJointSpacingMm,
+    substrateDeflectionCheck = false, wetAreaWaterproofed = false,
+    fallToDrainAchieved = false, fallGradient,
+    clientName, state = "VIC", notes,
+  } = req.body;
+
+  if (!siteId || !location) return res.status(400).json({ error: "siteId and location required." });
+
+  // AS 3958.1 lippage tolerance: max 1mm for tiles <200mm, max 2mm for tiles ≥200mm
+  const tileSize_ = Number(tileSize) || 300;
+  const maxLippage = tileSize_ < 200 ? 1.0 : 2.0;
+  const lippageCompliant = lippage_mm !== undefined ? Number(lippage_mm) <= maxLippage : null;
+
+  // AS 3740 fall requirement: min 1:100 for showers
+  const requiredFall = 0.01; // 1:100
+  const fallCompliant = fallGradient ? Number(fallGradient) >= requiredFall : null;
+
+  const complianceChecks = [
+    { check: `Lippage within tolerance (≤${maxLippage}mm)`, passed: lippageCompliant === true },
+    { check: "Movement joints installed", passed: Boolean(movementJointsInstalled) },
+    { check: "Substrate deflection checked", passed: Boolean(substrateDeflectionCheck) },
+    { check: "Wet areas waterproofed before tiling", passed: Boolean(wetAreaWaterproofed) },
+    { check: "Correct fall to drain achieved", passed: fallCompliant === true || fallCompliant === null },
+  ];
+
+  const passedCount = complianceChecks.filter(c => c.passed).length;
+  const compliancePercent = Math.round((passedCount / complianceChecks.length) * 100);
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    property_address: sanitiseInput(propertyAddress || ""),
+    tiler_name: sanitiseInput(tilerName || ""),
+    tiler_licence: sanitiseInput(tilerLicence || ""),
+    inspection_date: inspectionDate || new Date().toISOString().split("T")[0],
+    location: sanitiseInput(location),
+    tile_type: sanitiseInput(tileType || ""),
+    tile_size_mm: tileSize_,
+    substrate_type: sanitiseInput(substrateType || ""),
+    adhesive_used: sanitiseInput(adhesiveUsed || ""),
+    grout_used: sanitiseInput(groutUsed || ""),
+    lippage_measured_mm: lippage_mm !== undefined ? Number(lippage_mm) : null,
+    max_allowable_lippage_mm: maxLippage,
+    lippage_compliant: lippageCompliant,
+    movement_joints_installed: Boolean(movementJointsInstalled),
+    movement_joint_spacing_mm: movementJointSpacingMm ? Number(movementJointSpacingMm) : null,
+    fall_gradient: fallGradient ? Number(fallGradient) : null,
+    required_fall_gradient: requiredFall,
+    fall_compliant: fallCompliant,
+    compliance_checks: complianceChecks,
+    compliance_percent: compliancePercent,
+    client_name: sanitiseInput(clientName || ""),
+    state: sanitiseInput(state),
+    applicable_standards: ["AS 3958.1", "AS 3740"],
+    status: compliancePercent >= 80 ? "COMPLIANT" : "NON_COMPLIANT",
+    notes: sanitiseInput(notes || ""),
+    inspected_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("tiling_compliance")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, recordId: data.id, compliancePercent, status: record.status, ...record });
+  }
+
+  res.json({ success: true, recordId: null, compliancePercent, status: record.status, ...record, saved: false });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
