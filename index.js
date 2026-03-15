@@ -38105,6 +38105,201 @@ Return JSON with:
   }
 });
 
+// POST /work-order — Create a work order
+app.post("/work-order", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, clientId, trade, workDescription, priority = "NORMAL",
+    scheduledDate, estimatedDurationHours, assignedTeam = [],
+    materials = [], siteAddress, contactName, contactPhone,
+    purchaseOrderRef, status = "PENDING", notes,
+  } = req.body;
+  if (!trade || !workDescription || !scheduledDate) {
+    return res.status(400).json({ error: "trade, workDescription, and scheduledDate are required." });
+  }
+  const validPriorities = ["EMERGENCY", "URGENT", "HIGH", "NORMAL", "LOW"];
+  const validStatuses = ["PENDING", "SCHEDULED", "IN_PROGRESS", "COMPLETED", "CANCELLED", "ON_HOLD"];
+  if (!validPriorities.includes(priority)) return res.status(400).json({ error: `priority must be one of: ${validPriorities.join(", ")}` });
+  if (!validStatuses.includes(status)) return res.status(400).json({ error: `status must be one of: ${validStatuses.join(", ")}` });
+  const workOrderRef = `WO-${Date.now().toString(36).toUpperCase()}`;
+  const estimatedLaborCost = (Number(estimatedDurationHours) || 0) * assignedTeam.length;
+  const record = {
+    work_order_ref: workOrderRef,
+    project_id: projectId || null,
+    client_id: clientId || null,
+    trade: sanitiseInput(trade),
+    work_description: sanitiseInput(workDescription),
+    priority,
+    scheduled_date: scheduledDate,
+    estimated_duration_hours: Number(estimatedDurationHours) || null,
+    assigned_team: Array.isArray(assignedTeam) ? assignedTeam.map(m => sanitiseInput(m)) : [],
+    materials: Array.isArray(materials) ? materials.map(m => sanitiseInput(m)) : [],
+    site_address: sanitiseInput(siteAddress || ""),
+    contact_name: sanitiseInput(contactName || ""),
+    contact_phone: sanitiseInput(contactPhone || ""),
+    purchase_order_ref: sanitiseInput(purchaseOrderRef || ""),
+    status,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("work_orders").insert(record);
+    if (error) console.error("work-order DB error:", error.message);
+  }
+  res.json({
+    workOrderRef, trade, priority, status, scheduledDate,
+    teamSize: record.assigned_team.length, estimatedDurationHours,
+    saved: !!supabaseAdmin,
+  });
+});
+
+// PATCH /work-order/:workOrderRef — Update work order status
+app.patch("/work-order/:workOrderRef", apiKeyAuth, async (req, res) => {
+  const { workOrderRef } = req.params;
+  const { status, completedDate, actualDurationHours, completionNotes, signedOffBy } = req.body;
+  const validStatuses = ["PENDING", "SCHEDULED", "IN_PROGRESS", "COMPLETED", "CANCELLED", "ON_HOLD"];
+  if (!status || !validStatuses.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${validStatuses.join(", ")}` });
+  }
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  const update = {
+    status,
+    completed_date: status === "COMPLETED" ? (completedDate || new Date().toISOString()) : null,
+    actual_duration_hours: Number(actualDurationHours) || null,
+    completion_notes: sanitiseInput(completionNotes || ""),
+    signed_off_by: sanitiseInput(signedOffBy || ""),
+    updated_at: new Date().toISOString(),
+  };
+  const { error } = await supabaseAdmin.from("work_orders").update(update).eq("work_order_ref", workOrderRef);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ workOrderRef, status, updated: true });
+});
+
+// POST /crew-roster — Assign crew to a shift
+app.post("/crew-roster", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, shiftDate, shiftType = "DAY", startTime, endTime,
+    supervisorName, crewMembers = [], tradeBreakdown = {},
+    siteAddress, briefingNotes, weatherConditions,
+  } = req.body;
+  if (!projectId || !shiftDate || !supervisorName) {
+    return res.status(400).json({ error: "projectId, shiftDate, and supervisorName are required." });
+  }
+  const validShifts = ["DAY", "AFTERNOON", "NIGHT", "SPLIT"];
+  if (!validShifts.includes(shiftType)) {
+    return res.status(400).json({ error: `shiftType must be one of: ${validShifts.join(", ")}` });
+  }
+  const rosterRef = `RST-${Date.now().toString(36).toUpperCase()}`;
+  const headcount = Array.isArray(crewMembers) ? crewMembers.length : 0;
+  const record = {
+    roster_ref: rosterRef,
+    project_id: projectId,
+    shift_date: shiftDate,
+    shift_type: shiftType,
+    start_time: startTime || null,
+    end_time: endTime || null,
+    supervisor_name: sanitiseInput(supervisorName),
+    crew_members: Array.isArray(crewMembers) ? crewMembers.map(m => sanitiseInput(m)) : [],
+    headcount,
+    trade_breakdown: tradeBreakdown,
+    site_address: sanitiseInput(siteAddress || ""),
+    briefing_notes: sanitiseInput(briefingNotes || ""),
+    weather_conditions: sanitiseInput(weatherConditions || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("crew_rosters").insert(record);
+    if (error) console.error("crew-roster DB error:", error.message);
+  }
+  res.json({ rosterRef, projectId, shiftDate, shiftType, supervisorName, headcount, saved: !!supabaseAdmin });
+});
+
+// GET /crew-roster/:projectId — Get rosters for a project
+app.get("/crew-roster/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { from, to } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("crew_rosters").select("*").eq("project_id", projectId).order("shift_date", { ascending: false });
+  if (from) query = query.gte("shift_date", from);
+  if (to) query = query.lte("shift_date", to);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  const totalPersonDays = data.reduce((s, r) => s + (r.headcount || 0), 0);
+  res.json({ projectId, shiftCount: data.length, totalPersonDays, rosters: data });
+});
+
+// POST /ai-site-briefing — AI generates a daily site briefing
+app.post("/ai-site-briefing", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, briefingDate, trade, activitiesPlanned = [],
+    crewCount, supervisorName, weatherForecast, riskAlerts = [],
+    keyMilestones = [], safetyFocus, previousDayIssues, notes,
+  } = req.body;
+  if (!briefingDate || !activitiesPlanned.length) {
+    return res.status(400).json({ error: "briefingDate and activitiesPlanned are required." });
+  }
+  const sanitisedProject = sanitiseInput(projectName || "");
+  const sanitisedSupervisor = sanitiseInput(supervisorName || "");
+  const systemPrompt = `You are a construction site supervisor assistant. Generate clear, actionable daily site briefings for trade crews.`;
+  const userPrompt = `Generate a daily site briefing for ${briefingDate}:
+Project: ${sanitisedProject}
+Trade: ${sanitiseInput(trade || "general")}
+Crew: ${crewCount} workers
+Supervisor: ${sanitisedSupervisor}
+Planned activities: ${activitiesPlanned.map(a => sanitiseInput(a)).join("; ")}
+Weather: ${sanitiseInput(weatherForecast || "Check BOM")}
+Safety focus: ${sanitiseInput(safetyFocus || "General site safety")}
+Risk alerts: ${riskAlerts.map(r => sanitiseInput(r)).join("; ") || "None"}
+Key milestones: ${keyMilestones.map(m => sanitiseInput(m)).join("; ") || "None"}
+Previous day issues: ${sanitiseInput(previousDayIssues || "None")}
+
+Return JSON with:
+{
+  "briefingTitle": "...",
+  "safetyMoment": "...",
+  "todaysActivities": ["...", "..."],
+  "criticalSafetyPoints": ["...", "..."],
+  "weatherConsiderations": "...",
+  "sequencingNotes": "...",
+  "interfaceRisks": ["...", "..."],
+  "resourceChecklist": ["...", "..."],
+  "qualityHoldPoints": ["...", "..."],
+  "endOfDayRequirements": ["...", "..."],
+  "motivationalClose": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const briefing = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ projectId, briefingDate, supervisorName: sanitisedSupervisor, crewCount, briefing });
+  } catch (err) {
+    console.error("ai-site-briefing error:", err.message);
+    res.json({
+      projectId, briefingDate, supervisorName: sanitisedSupervisor, crewCount,
+      briefing: {
+        briefingTitle: `Daily Site Briefing — ${briefingDate}`,
+        safetyMoment: "Remember: if in doubt, don't. Stop and speak to your supervisor.",
+        todaysActivities: activitiesPlanned,
+        criticalSafetyPoints: ["Wear all required PPE at all times", "No unauthorised access to exclusion zones", "Report all near-misses immediately"],
+        weatherConsiderations: sanitiseInput(weatherForecast || "Check BOM forecast before commencing work"),
+        sequencingNotes: "Complete planned activities in the order specified. Notify supervisor of any delays.",
+        interfaceRisks: riskAlerts.length ? riskAlerts : ["Maintain awareness of other trades working in adjacent areas"],
+        resourceChecklist: ["PPE checked", "Tools on-site", "Materials delivered", "First aid kit accessible"],
+        qualityHoldPoints: ["Inspection required before concrete pours", "Sign-off required at each stage"],
+        endOfDayRequirements: ["Complete daily diary", "Secure plant and materials", "Report incidents", "Update programme"],
+        motivationalClose: "Let's have a safe and productive day.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
