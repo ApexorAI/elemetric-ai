@@ -63129,6 +63129,395 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /pavement-condition-survey — Road/pavement condition survey per AUSTROADS / VicRoads
+app.post("/pavement-condition-survey", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    roadName,
+    surveyDate,
+    surveyor,
+    startChainage,        // metres
+    endChainage,
+    surveyLength_m,
+    pavementType,         // asphalt | concrete | sprayed-seal | granular | brick-paver
+    constructionYear,
+    lastResurfaceYear,
+    distressTypes,        // array of { type, extent_pct, severity: low|medium|high }
+    // distress types: cracking | rutting | shoving | bleeding | potholing | ravelling | edge-break | deformation
+    ruttingDepth_mm,
+    roughnessIRI,         // IRI (m/km) — good <2.5, fair 2.5-4.5, poor >4.5
+    skidResistance_SFC,   // >0.40 acceptable per AUSTROADS
+    structuralAdequacy,   // adequate | marginal | failed
+    crackSealRequired,
+    resurfaceRequired,
+    rehabilitationRequired,
+    pci,                  // Pavement Condition Index 0-100
+    remainingLifeYears,
+    maintenanceCategory,  // routine | periodic | rehabilitation | reconstruction
+    trafficVolume_AADT,   // Annual Average Daily Traffic
+    heavyVehiclePct,
+    photos,
+    notes,
+  } = req.body;
+
+  // PCI thresholds (0–100 scale)
+  const pciValue = parseFloat(pci) || 0;
+  const pciGrade =
+    pciValue >= 85 ? "EXCELLENT" :
+    pciValue >= 70 ? "GOOD" :
+    pciValue >= 55 ? "FAIR" :
+    pciValue >= 40 ? "POOR" :
+    pciValue >= 25 ? "VERY POOR" : "FAILED";
+
+  // IRI check
+  const iri = parseFloat(roughnessIRI) || 0;
+  const iriGrade = iri < 2.5 ? "good" : iri < 4.5 ? "fair" : "poor";
+
+  // Skid resistance check
+  const sfc = parseFloat(skidResistance_SFC) || 0;
+  const skidWarning = sfc > 0 && sfc < 0.40 ? "Skid resistance below AUSTROADS minimum 0.40 SFC" : null;
+
+  // Rutting check — >20 mm is structural failure
+  const rut = parseFloat(ruttingDepth_mm) || 0;
+  const ruttingCritical = rut > 20;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    road_name: sanitiseInput(roadName),
+    survey_date: surveyDate,
+    surveyor: sanitiseInput(surveyor),
+    start_chainage: startChainage,
+    end_chainage: endChainage,
+    survey_length_m: surveyLength_m,
+    pavement_type: sanitiseInput(pavementType),
+    construction_year: constructionYear,
+    last_resurface_year: lastResurfaceYear,
+    distress_types: distressTypes || [],
+    rutting_depth_mm: ruttingDepth_mm,
+    roughness_iri: roughnessIRI,
+    skid_resistance_sfc: skidResistance_SFC,
+    structural_adequacy: sanitiseInput(structuralAdequacy),
+    crack_seal_required: crackSealRequired,
+    resurface_required: resurfaceRequired,
+    rehabilitation_required: rehabilitationRequired,
+    pci: pciValue,
+    pci_grade: pciGrade,
+    remaining_life_years: remainingLifeYears,
+    maintenance_category: sanitiseInput(maintenanceCategory),
+    traffic_volume_aadt: trafficVolume_AADT,
+    heavy_vehicle_pct: heavyVehiclePct,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("pavement_condition_surveys")
+      .insert(record);
+    if (dbErr) console.error("DB error /pavement-condition-survey:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Pavement condition survey recorded",
+    pci: pciValue,
+    pciGrade,
+    iriGrade,
+    ruttingCritical,
+    skidWarning,
+    maintenanceCategory: sanitiseInput(maintenanceCategory),
+    remainingLifeYears: remainingLifeYears || null,
+    immediateActionRequired: ruttingCritical || pciValue < 25 || sfc < 0.30,
+    applicableStandards: [
+      "AUSTROADS Guide to Pavement Technology",
+      "VicRoads Pavement Design Manual",
+      "AS 1289.6.7.2 (skid resistance)",
+      "ASTM D6433 (PCI method)",
+    ],
+    saved,
+  });
+});
+
+// POST /crane-inspection-record — Tower/mobile crane inspection per AS 2550 / AS 1418
+app.post("/crane-inspection-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    craneId,
+    craneType,            // tower | mobile | crawler | franna | overhead | gantry
+    manufacturer,
+    model,
+    swl_tonnes,           // Safe Working Load
+    boomLength_m,
+    maxRadius_m,
+    ratedCapacityAtMaxRadius_t,
+    inspectionDate,
+    inspectionType,       // pre-erection | daily-prestart | periodic | annual | post-incident
+    inspector,
+    craneOperator,
+    operatorLicenceNumber,
+    riggerName,
+    riggerLicenceNumber,
+    erectionSupervisor,
+    lastAnnualInspectionDate,
+    nextAnnualDueDate,
+    structuralCondition,  // good | fair | poor | damaged
+    hooksAndBlocksCondition,
+    ropeCondition,        // good | fair | kinks | broken-wires | replace
+    brakesCondition,
+    limitsAndSwitchesWorking,
+    slipRingAssembly,
+    anchorageSystem,      // adequately-anchored | not-anchored | not-applicable
+    windSpeedAtInspection_kmh,
+    windSpeedLimit_kmh,   // manufacturer's limit
+    groundBearingPressure_kPa,
+    designBearingCapacity_kPa,
+    levellingWithin_deg,  // typically 0.5° for tower cranes
+    criticalDefects,      // array of strings
+    overallResult,        // FIT-FOR-SERVICE | TAKE-OUT-OF-SERVICE | RESTRICTED-USE
+    photos,
+    notes,
+  } = req.body;
+
+  const failures = [];
+
+  // Ground bearing capacity
+  const gbp = parseFloat(groundBearingPressure_kPa) || 0;
+  const dbc = parseFloat(designBearingCapacity_kPa) || 0;
+  if (dbc > 0 && gbp > dbc) {
+    failures.push(`Ground bearing pressure ${gbp} kPa exceeds design capacity ${dbc} kPa`);
+  }
+
+  // Wind speed check
+  const wind = parseFloat(windSpeedAtInspection_kmh) || 0;
+  const windLimit = parseFloat(windSpeedLimit_kmh) || 72; // AS 2550 default 72 km/h out-of-service limit
+  if (wind > windLimit) {
+    failures.push(`Wind speed ${wind} km/h exceeds manufacturer limit ${windLimit} km/h — cease operations`);
+  }
+
+  // Rope condition
+  if (ropeCondition === "replace") {
+    failures.push("Wire rope requires immediate replacement — broken wires or kinks identified");
+  }
+
+  // Limits and switches
+  if (limitsAndSwitchesWorking === false || limitsAndSwitchesWorking === "false") {
+    failures.push("Limit switches not functioning — crane must not operate");
+  }
+
+  // Structural damage
+  if (structuralCondition === "damaged") {
+    failures.push("Structural damage identified — crane must not operate until engineering assessment");
+  }
+
+  // Critical defects from inspector
+  if (Array.isArray(criticalDefects) && criticalDefects.length > 0) {
+    criticalDefects.forEach((d) => failures.push(d));
+  }
+
+  const result = failures.length > 0 ? "TAKE-OUT-OF-SERVICE" : (overallResult || "FIT-FOR-SERVICE");
+
+  if (result === "TAKE-OUT-OF-SERVICE") {
+    return res.status(422).json({
+      error: "Crane inspection — crane must be taken out of service",
+      failures,
+      immediateActions: [
+        "Lower all loads and cease all crane operations immediately",
+        "Isolate and lock out crane controls",
+        "Notify crane engineer and principal contractor",
+        "Rectify all defects before returning to service",
+        "Obtain engineer certification before recommencing",
+      ],
+      applicableStandards: ["AS 2550", "AS 1418.1", "AS 1418.5", "OHS Regulations 2017 (Vic)"],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    crane_id: sanitiseInput(craneId),
+    crane_type: sanitiseInput(craneType),
+    manufacturer: sanitiseInput(manufacturer),
+    model: sanitiseInput(model),
+    swl_tonnes,
+    boom_length_m: boomLength_m,
+    max_radius_m: maxRadius_m,
+    rated_capacity_at_max_radius_t: ratedCapacityAtMaxRadius_t,
+    inspection_date: inspectionDate,
+    inspection_type: sanitiseInput(inspectionType),
+    inspector: sanitiseInput(inspector),
+    crane_operator: sanitiseInput(craneOperator),
+    operator_licence_number: sanitiseInput(operatorLicenceNumber),
+    rigger_name: sanitiseInput(riggerName),
+    rigger_licence_number: sanitiseInput(riggerLicenceNumber),
+    erection_supervisor: sanitiseInput(erectionSupervisor),
+    last_annual_inspection_date: lastAnnualInspectionDate,
+    next_annual_due_date: nextAnnualDueDate,
+    structural_condition: sanitiseInput(structuralCondition),
+    hooks_and_blocks_condition: sanitiseInput(hooksAndBlocksCondition),
+    rope_condition: sanitiseInput(ropeCondition),
+    brakes_condition: sanitiseInput(brakesCondition),
+    limits_and_switches_working: limitsAndSwitchesWorking,
+    anchorage_system: sanitiseInput(anchorageSystem),
+    wind_speed_at_inspection_kmh: windSpeedAtInspection_kmh,
+    wind_speed_limit_kmh: windSpeedLimit_kmh || 72,
+    ground_bearing_pressure_kpa: groundBearingPressure_kPa,
+    design_bearing_capacity_kpa: designBearingCapacity_kPa,
+    levelling_within_deg: levellingWithin_deg,
+    critical_defects: criticalDefects || [],
+    overall_result: result,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("crane_inspection_records")
+      .insert(record);
+    if (dbErr) console.error("DB error /crane-inspection-record:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Crane inspection record saved",
+    craneId: sanitiseInput(craneId),
+    overallResult: result,
+    windSpeedKmh: wind,
+    windLimitKmh: windLimit,
+    groundBearingOk: dbc === 0 || gbp <= dbc,
+    nextAnnualDueDate: nextAnnualDueDate || null,
+    applicableStandards: ["AS 2550", "AS 1418.1", "AS 1418.5", "OHS Regulations 2017 (Vic)"],
+    saved,
+  });
+});
+
+// POST /ai-pavement-assessment — AI assesses pavement deterioration, treatment options, and remaining life
+app.post("/ai-pavement-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    pavementType,
+    pci,
+    ruttingDepth_mm,
+    roughnessIRI,
+    distressTypes,
+    trafficVolume_AADT,
+    heavyVehiclePct,
+    constructionYear,
+    lastResurfaceYear,
+    climate,              // tropical | temperate | arid | alpine
+    subgradeCondition,    // good | fair | poor
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are a pavement engineer with 20 years experience in Australian road and pavement rehabilitation. Assess pavement condition, failure modes, and treatment options per AUSTROADS Guides to Pavement Technology, VicRoads Pavement Design Manual, and AAPA technical guidelines.
+
+Assess:
+1. Primary deterioration mechanism (fatigue cracking, deformation, surface wear, drainage failure, subgrade failure)
+2. Appropriate treatment: crack sealing → microsurfacing → asphalt overlay → mill-and-fill → full-depth reclamation → reconstruction
+3. Remaining life before major intervention
+4. Drainage improvement requirements
+5. Heavy vehicle damage factor and load damage implications
+6. Cost-effective maintenance programme (routine vs periodic vs rehabilitation)
+
+Respond with JSON: { "primaryFailureMode": "string", "failureModes": [], "remainingLifeYears": number, "treatmentRecommendation": "string", "treatmentOptions": [], "maintenanceProgramme": [], "drainageImprovements": [], "subgradeRisk": "low|medium|high", "costCategory": "low|medium|high|very-high", "urgency": "routine|scheduled|urgent|immediate", "trafficManagementRequired": boolean, "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const distressSummary = Array.isArray(distressTypes)
+    ? distressTypes.map((d) => `${d.type} (${d.extent_pct}% extent, ${d.severity} severity)`).join("; ")
+    : "Not specified";
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Pavement type: ${pavementType || "asphalt"}
+PCI: ${pci || "not assessed"}
+Rutting depth: ${ruttingDepth_mm || "not measured"} mm
+Roughness IRI: ${roughnessIRI || "not measured"} m/km
+Distress types: ${distressSummary}
+Traffic volume: ${trafficVolume_AADT || "not specified"} AADT
+Heavy vehicle percentage: ${heavyVehiclePct || "not specified"}%
+Construction year: ${constructionYear || "unknown"}
+Last resurface year: ${lastResurfaceYear || "unknown"}
+Climate zone: ${climate || "temperate"}
+Subgrade condition: ${subgradeCondition || "unknown"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-pavement-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        primaryFailureMode: "Top-down fatigue cracking with surface oxidation",
+        failureModes: [
+          "Fatigue cracking from heavy vehicle loading",
+          "Surface oxidation and ravelling",
+          "Potholing from water ingress through cracks",
+        ],
+        remainingLifeYears: 5,
+        treatmentRecommendation: "Mill and inlay asphalt overlay with crack sealing in year 1",
+        treatmentOptions: [
+          "Crack seal and slurry seal for PCI 55-70",
+          "40 mm asphalt mill and inlay for PCI 40-55",
+          "Full-depth reclamation and overlay for PCI <40",
+        ],
+        maintenanceProgramme: [
+          "Annual crack sealing to prevent water ingress",
+          "2-yearly condition survey to track deterioration rate",
+          "Pothole patching within 5 days of identification",
+        ],
+        drainageImprovements: [
+          "Clear kerb and table drains",
+          "Improve crossfall to minimum 3% on sealed shoulders",
+        ],
+        subgradeRisk: "medium",
+        costCategory: "medium",
+        urgency: "scheduled",
+        trafficManagementRequired: true,
+        applicableStandards: [
+          "AUSTROADS Guide to Pavement Technology Part 5",
+          "VicRoads Pavement Design Manual",
+          "AAPA Technical Guidance",
+          "AS 1289.6.7.2",
+        ],
+        recommendation:
+          "Seal existing cracks immediately to prevent water ingress. Plan mill-and-inlay overlay within 2 years to restore structural capacity and riding quality.",
+        summary:
+          "Pavement shows fatigue cracking and surface oxidation consistent with end-of-first-life condition. Crack sealing now and asphalt overlay within 2 years will restore 15+ years of service life cost-effectively.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
