@@ -70137,6 +70137,345 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// ── Round 256 ─────────────────────────────────────────────────────────────────
+
+// POST /job-safety-analysis — Create/record a Job Safety Analysis (JSA / SWMS)
+app.post("/job-safety-analysis", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, location, taskDescription, conductedBy, conductedDate,
+      workSteps, hazardsIdentified, controlMeasures, residualRiskRating,
+      reviewedByCompetentPerson, reviewerName, workerSignatures,
+      emergencyProcedures, ppeRequired, permitRequired, highRiskWork
+    } = req.body;
+
+    if (!projectId || !taskDescription || !conductedBy || !conductedDate) {
+      return res.status(400).json({ error: "projectId, taskDescription, conductedBy, conductedDate are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeTask = sanitiseInput(String(taskDescription));
+    const safeConductedBy = sanitiseInput(String(conductedBy));
+    const safeLocation = location ? sanitiseInput(String(location)) : null;
+    const safeReviewerName = reviewerName ? sanitiseInput(String(reviewerName)) : null;
+
+    const steps = Array.isArray(workSteps) ? workSteps : [];
+    const hazards = Array.isArray(hazardsIdentified) ? hazardsIdentified : [];
+    const controls = Array.isArray(controlMeasures) ? controlMeasures : [];
+    const signatories = Array.isArray(workerSignatures) ? workerSignatures : [];
+    const ppe = Array.isArray(ppeRequired) ? ppeRequired : [];
+
+    const warnings = [];
+    const criticalGaps = [];
+
+    // High-risk construction work (HRCW) under OHS Regulations 2017 (Vic) reg 5.1.5
+    const isHighRisk = highRiskWork === true || highRiskWork === "true";
+    if (isHighRisk && !reviewedByCompetentPerson) {
+      criticalGaps.push("HRCW requires SWMS reviewed by competent person — OHS Regulations 2017 (Vic) reg 5.1.5");
+    }
+    if (isHighRisk && signatories.length === 0) {
+      criticalGaps.push("All workers must sign SWMS before commencing HRCW — OHS Regulations 2017 (Vic) reg 5.1.5");
+    }
+
+    if (steps.length === 0) warnings.push("No work steps recorded — JSA is incomplete.");
+    if (hazards.length === 0) warnings.push("No hazards identified — review thoroughness.");
+    if (controls.length === 0) warnings.push("No control measures recorded.");
+
+    if (hazards.length > 0 && controls.length < hazards.length) {
+      warnings.push(`Only ${controls.length} control measures for ${hazards.length} hazards — ensure all hazards are addressed.`);
+    }
+
+    const residualRisk = residualRiskRating ? String(residualRiskRating).toLowerCase() : "unknown";
+    if (residualRisk === "extreme" || residualRisk === "high") {
+      criticalGaps.push(`Residual risk rated ${residualRiskRating} — work must not proceed until risk reduced to medium or lower.`);
+    }
+
+    if (!emergencyProcedures) warnings.push("Emergency procedures not documented.");
+    if (ppe.length === 0) warnings.push("PPE requirements not specified.");
+
+    const status = criticalGaps.length > 0 ? "INADEQUATE" : warnings.length > 0 ? "REQUIRES_REVIEW" : "ADEQUATE";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("job_safety_analyses")
+        .insert({
+          project_id: safeProject,
+          location: safeLocation,
+          task_description: safeTask,
+          conducted_by: safeConductedBy,
+          conducted_date: conductedDate,
+          work_steps: steps,
+          hazards_identified: hazards,
+          control_measures: controls,
+          residual_risk_rating: residualRiskRating || null,
+          reviewed_by_competent_person: reviewedByCompetentPerson || false,
+          reviewer_name: safeReviewerName,
+          worker_signatures: signatories,
+          emergency_procedures: emergencyProcedures || null,
+          ppe_required: ppe,
+          permit_required: permitRequired || false,
+          high_risk_work: isHighRisk,
+          status,
+          critical_gaps: criticalGaps,
+          warnings,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalGaps.length > 0) {
+      return res.status(422).json({
+        status,
+        criticalGaps,
+        warnings,
+        savedId,
+        message: "JSA/SWMS inadequate — work must not proceed.",
+        standards: ["OHS Regulations 2017 (Vic) Part 5.1", "AS/NZS ISO 45001:2018"],
+      });
+    }
+
+    res.json({
+      status,
+      warnings,
+      criticalGaps,
+      savedId,
+      highRiskWork: isHighRisk,
+      stepCount: steps.length,
+      hazardCount: hazards.length,
+      controlCount: controls.length,
+      signatoryCount: signatories.length,
+      residualRiskRating: residualRiskRating || null,
+      standards: ["OHS Regulations 2017 (Vic) Part 5.1", "AS/NZS ISO 45001:2018"],
+    });
+  } catch (err) {
+    console.error("POST /job-safety-analysis error:", err.message);
+    res.status(500).json({ error: "Failed to record JSA." });
+  }
+});
+
+// POST /fatigue-hours-register — Record worker hours/fatigue management per Vic transport fatigue rules
+app.post("/fatigue-hours-register", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      workerId, workerName, projectId, shiftDate, shiftStartTime, shiftEndTime,
+      hoursWorkedToday, hoursWorkedLast7Days, hoursWorkedLast14Days,
+      hoursWorkedLast28Days, breaksTaken, minimumBreakMinutes,
+      fatigueRiskFactors, supervisorName, supervisorAssessment
+    } = req.body;
+
+    if (!workerId || !workerName || !shiftDate || hoursWorkedToday == null) {
+      return res.status(400).json({ error: "workerId, workerName, shiftDate, hoursWorkedToday are required." });
+    }
+
+    const safeWorker = sanitiseInput(String(workerName));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const safeSupervisor = supervisorName ? sanitiseInput(String(supervisorName)) : null;
+
+    const hoursToday = parseFloat(hoursWorkedToday) || 0;
+    const hours7 = parseFloat(hoursWorkedLast7Days) || 0;
+    const hours14 = parseFloat(hoursWorkedLast14Days) || 0;
+    const hours28 = parseFloat(hoursWorkedLast28Days) || 0;
+    const breaksMin = parseInt(minimumBreakMinutes) || 30;
+    const breaks = Array.isArray(breaksTaken) ? breaksTaken : [];
+
+    const violations = [];
+    const warnings = [];
+
+    // OHS Regulations 2017 (Vic) and AS/NZS ISO 45001 — general fatigue thresholds
+    // Construction industry standard thresholds
+    if (hoursToday > 12) {
+      violations.push(`Shift length ${hoursToday}h exceeds 12-hour maximum — immediate fatigue risk.`);
+    } else if (hoursToday > 10) {
+      warnings.push(`Shift length ${hoursToday}h — extended shift, heightened fatigue monitoring required.`);
+    }
+
+    if (hours7 > 60) {
+      violations.push(`${hours7}h worked in last 7 days exceeds 60-hour limit — WorkSafe Vic fatigue guidance.`);
+    } else if (hours7 > 55) {
+      warnings.push(`${hours7}h worked in last 7 days — approaching 60-hour weekly limit.`);
+    }
+
+    if (hours14 > 112) {
+      violations.push(`${hours14}h worked in last 14 days exceeds 112-hour fortnightly limit.`);
+    }
+
+    if (hours28 > 200) {
+      violations.push(`${hours28}h worked in last 28 days exceeds 200-hour monthly limit.`);
+    }
+
+    // Break compliance
+    if (hoursToday > 5 && breaks.length === 0) {
+      warnings.push("No breaks recorded for shift exceeding 5 hours — minimum 30-minute break required.");
+    }
+    const totalBreakMin = breaks.reduce((sum, b) => sum + (parseInt(b.durationMinutes) || 0), 0);
+    if (hoursToday > 5 && totalBreakMin < breaksMin) {
+      warnings.push(`Total breaks ${totalBreakMin} min — below minimum ${breaksMin} min for shift length.`);
+    }
+
+    const risks = Array.isArray(fatigueRiskFactors) ? fatigueRiskFactors : [];
+    const nightShift = shiftStartTime && (shiftStartTime < "06:00" || shiftStartTime >= "22:00");
+    if (nightShift) warnings.push("Night shift — circadian disruption increases fatigue risk (WorkSafe Vic).");
+
+    const fitnessForDuty = violations.length > 0 ? "UNFIT" : warnings.length > 2 ? "MONITOR" : "FIT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("fatigue_hours_register")
+        .insert({
+          worker_id: workerId,
+          worker_name: safeWorker,
+          project_id: safeProject,
+          shift_date: shiftDate,
+          shift_start_time: shiftStartTime || null,
+          shift_end_time: shiftEndTime || null,
+          hours_worked_today: hoursToday,
+          hours_worked_last_7_days: hours7,
+          hours_worked_last_14_days: hours14,
+          hours_worked_last_28_days: hours28,
+          breaks_taken: breaks,
+          fatigue_risk_factors: risks,
+          supervisor_name: safeSupervisor,
+          supervisor_assessment: supervisorAssessment || null,
+          fitness_for_duty: fitnessForDuty,
+          violations,
+          warnings,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (violations.length > 0) {
+      return res.status(422).json({
+        fitnessForDuty,
+        violations,
+        warnings,
+        savedId,
+        message: "Worker must not continue work — fatigue limit exceeded.",
+        standards: ["OHS Regulations 2017 (Vic)", "WorkSafe Vic Fatigue Guidance", "AS/NZS ISO 45001:2018"],
+      });
+    }
+
+    res.json({
+      fitnessForDuty,
+      violations,
+      warnings,
+      savedId,
+      hoursToday,
+      hours7,
+      hours14,
+      hours28,
+      nightShift: !!nightShift,
+      totalBreakMinutes: totalBreakMin,
+      standards: ["OHS Regulations 2017 (Vic)", "WorkSafe Vic Fatigue Guidance"],
+    });
+  } catch (err) {
+    console.error("POST /fatigue-hours-register error:", err.message);
+    res.status(500).json({ error: "Failed to record fatigue hours." });
+  }
+});
+
+// POST /ai-swms-review — AI reviews a SWMS/JSA for adequacy and regulatory compliance
+app.post("/ai-swms-review", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      taskDescription, workSteps, hazardsIdentified, controlMeasures,
+      residualRiskRating, highRiskWork, jobType, siteContext
+    } = req.body;
+
+    if (!taskDescription) {
+      return res.status(400).json({ error: "taskDescription is required." });
+    }
+
+    const safeTask = sanitiseInput(String(taskDescription));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Construction site, Victoria";
+    const steps = Array.isArray(workSteps) ? workSteps.map(s => sanitiseInput(String(s))) : [];
+    const hazards = Array.isArray(hazardsIdentified) ? hazardsIdentified.map(h => sanitiseInput(String(h))) : [];
+    const controls = Array.isArray(controlMeasures) ? controlMeasures.map(c => sanitiseInput(String(c))) : [];
+
+    const prompt = `You are an expert WHS/OHS consultant reviewing a Safe Work Method Statement (SWMS) or Job Safety Analysis (JSA) for compliance with Victorian workplace safety law and Australian standards.
+
+Task: ${safeTask}
+Site context: ${safeSite}
+High risk construction work (HRCW): ${highRiskWork ? "Yes" : "No"}
+Job type: ${jobType || "General construction"}
+
+Work steps recorded (${steps.length}):
+${steps.map((s, i) => `${i + 1}. ${s}`).join("\n") || "None provided"}
+
+Hazards identified (${hazards.length}):
+${hazards.map((h, i) => `${i + 1}. ${h}`).join("\n") || "None provided"}
+
+Control measures (${controls.length}):
+${controls.map((c, i) => `${i + 1}. ${c}`).join("\n") || "None provided"}
+
+Residual risk rating: ${residualRiskRating || "Not stated"}
+
+Assess this SWMS/JSA for:
+1. Completeness — are all expected hazards for this task identified?
+2. Hierarchy of controls — are controls applied in correct order (elimination → substitution → engineering → admin → PPE)?
+3. Adequacy — do controls actually address the hazards?
+4. Regulatory compliance — OHS Regulations 2017 (Vic), AS/NZS ISO 45001:2018
+5. Missed hazards — what key hazards are absent given the task type?
+6. Residual risk — is the stated residual risk realistic?
+
+Respond ONLY in JSON:
+{
+  "overallAdequacy": "ADEQUATE|REQUIRES_REVISION|INADEQUATE",
+  "completenessScore": 0-100,
+  "hierarchyOfControlsScore": 0-100,
+  "missedHazards": ["string"],
+  "inadequateControls": ["string"],
+  "regulatoryGaps": ["string"],
+  "residualRiskAssessment": "string",
+  "strengthsIdentified": ["string"],
+  "priorityImprovements": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 900,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallAdequacy: "REQUIRES_REVISION",
+        completenessScore: null,
+        hierarchyOfControlsScore: null,
+        missedHazards: ["AI analysis unavailable — manual review required"],
+        inadequateControls: [],
+        regulatoryGaps: ["Verify compliance with OHS Regulations 2017 (Vic) Part 5.1"],
+        residualRiskAssessment: "Unable to assess — manual review required",
+        strengthsIdentified: [],
+        priorityImprovements: ["Engage WHS consultant to review SWMS"],
+        summary: "AI review unavailable. A competent WHS consultant must review this SWMS before work commences.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      taskDescription: safeTask,
+      highRiskWork: !!highRiskWork,
+      inputCounts: { steps: steps.length, hazards: hazards.length, controls: controls.length },
+      standards: ["OHS Regulations 2017 (Vic) Part 5.1", "AS/NZS ISO 45001:2018", "Safe Work Australia SWMS Guide"],
+    });
+  } catch (err) {
+    console.error("POST /ai-swms-review error:", err.message);
+    res.status(500).json({ error: "Failed to review SWMS." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
