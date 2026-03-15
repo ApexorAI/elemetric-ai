@@ -377,6 +377,153 @@ app.post(
   }
 );
 
+// ── Task 13: Supabase user-created webhook ────────────────────────────────────
+// Called by Supabase Auth webhook when a new user signs up.
+// Verified by SUPABASE_WEBHOOK_SECRET header to prevent spoofing.
+// Actions: send branded welcome email, create default profile row, log signup,
+//          notify cayde@elemetric.com.au of the new user.
+
+app.post("/webhook/user-created", async (req, res) => {
+  const secret = process.env.SUPABASE_WEBHOOK_SECRET;
+  const provided = req.headers["x-supabase-webhook-secret"] || req.headers["authorization"];
+
+  // Verify shared secret (constant-time comparison)
+  if (secret) {
+    const providedClean = (provided || "").replace(/^Bearer\s+/i, "");
+    let match = false;
+    try {
+      match = crypto.timingSafeEqual(Buffer.from(providedClean), Buffer.from(secret));
+    } catch {
+      match = false;
+    }
+    if (!match) {
+      console.warn("webhook/user-created: invalid secret, rejecting");
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+  } else {
+    console.warn("webhook/user-created: SUPABASE_WEBHOOK_SECRET not set — accepting without verification");
+  }
+
+  const { record } = req.body || {};
+  if (!record || !record.id) {
+    return res.status(400).json({ error: "Missing user record" });
+  }
+
+  const userId    = record.id;
+  const email     = record.email || null;
+  const createdAt = record.created_at || new Date().toISOString();
+  const rawMeta   = record.raw_user_meta_data || {};
+  const fullName  = rawMeta.full_name || rawMeta.name || "";
+  const firstName = fullName.split(" ")[0] || "there";
+
+  console.log(`webhook/user-created: new user id=${userId} email=${email ? email.replace(/(.{2}).+(@.+)/, "$1***$2") : "unknown"}`);
+
+  const errors = [];
+
+  // 1. Create default profile row in Supabase
+  if (supabaseAdmin) {
+    try {
+      const { error: profileErr } = await supabaseAdmin
+        .from("profiles")
+        .insert({
+          id:         userId,
+          email:      email,
+          full_name:  fullName || null,
+          created_at: createdAt,
+          plan:       "free",
+          jobs_analysed: 0,
+        })
+        .select()
+        .single();
+
+      if (profileErr && profileErr.code !== "23505") {
+        // 23505 = unique violation (profile already exists — safe to ignore)
+        console.error("webhook/user-created: profile insert error:", profileErr.message);
+        errors.push("profile_insert_failed");
+      } else {
+        console.log("webhook/user-created: default profile created for", userId);
+      }
+    } catch (err) {
+      console.error("webhook/user-created: profile insert threw:", err.message);
+      errors.push("profile_insert_threw");
+    }
+  }
+
+  // 2. Send branded welcome email to the new user
+  if (resend && email && isValidEmail(email)) {
+    try {
+      const welcomeContent = `
+        <h1 style="margin:0 0 8px;font-size:24px;font-weight:700;color:#0f172a;">Welcome to Elemetric, ${escHtml(firstName)}.</h1>
+        <p style="margin:0 0 24px;font-size:14px;color:#64748b;">AI-powered compliance for Australian tradespeople.</p>
+        <p style="margin:0 0 16px;font-size:15px;color:#1e293b;line-height:1.7;">
+          Your account is ready. Start by snapping a photo of your work and letting Elemetric check it against
+          Australian standards — in seconds.
+        </p>
+        <table cellpadding="0" cellspacing="0" style="margin:0 0 24px;">
+          <tr>
+            <td style="background:#f97316;border-radius:8px;padding:14px 32px;">
+              <a href="https://elemetric.app/review" style="font-size:15px;font-weight:700;color:#ffffff;text-decoration:none;display:block;">
+                Start Your First Analysis &rarr;
+              </a>
+            </td>
+          </tr>
+        </table>
+        <p style="margin:0 0 16px;font-size:15px;color:#1e293b;line-height:1.7;">
+          Need help? Check out our
+          <a href="https://elemetric.app/docs" style="color:#f97316;text-decoration:none;">getting started guide</a>
+          or reply to this email — we respond within one business day.
+        </p>
+        <p style="margin:0;font-size:14px;color:#64748b;">
+          — The Elemetric team
+        </p>`;
+
+      await resend.emails.send({
+        from:    EMAIL_FROM,
+        to:      email,
+        subject: `Welcome to Elemetric, ${firstName}!`,
+        html:    buildEmailHtml("Welcome to Elemetric", welcomeContent),
+      });
+      usageStats.emailsSent++;
+      console.log("webhook/user-created: welcome email sent to", userId);
+    } catch (emailErr) {
+      console.error("webhook/user-created: welcome email failed:", emailErr.message);
+      errors.push("welcome_email_failed");
+    }
+  }
+
+  // 3. Notify cayde@elemetric.com.au of the new signup
+  if (resend) {
+    try {
+      const adminContent = `
+        <h1 style="margin:0 0 8px;font-size:20px;font-weight:700;color:#0f172a;">New User Signup</h1>
+        <p style="margin:0 0 16px;font-size:14px;color:#64748b;">A new user just joined Elemetric.</p>
+        <table style="width:100%;border-collapse:collapse;font-size:14px;">
+          <tr><td style="padding:8px 0;color:#64748b;width:120px;">User ID</td><td style="padding:8px 0;color:#1e293b;font-family:monospace;">${escHtml(userId)}</td></tr>
+          <tr><td style="padding:8px 0;color:#64748b;">Email</td><td style="padding:8px 0;color:#1e293b;">${escHtml(email || "unknown")}</td></tr>
+          <tr><td style="padding:8px 0;color:#64748b;">Name</td><td style="padding:8px 0;color:#1e293b;">${escHtml(fullName || "not provided")}</td></tr>
+          <tr><td style="padding:8px 0;color:#64748b;">Signed up</td><td style="padding:8px 0;color:#1e293b;">${escHtml(createdAt)}</td></tr>
+        </table>`;
+
+      await resend.emails.send({
+        from:    EMAIL_FROM,
+        to:      "cayde@elemetric.com.au",
+        subject: `New Elemetric signup: ${email || userId}`,
+        html:    buildEmailHtml("New Elemetric Signup", adminContent),
+      });
+      usageStats.emailsSent++;
+    } catch (notifyErr) {
+      console.error("webhook/user-created: admin notification failed:", notifyErr.message);
+      errors.push("admin_notify_failed");
+    }
+  }
+
+  return res.json({
+    success: true,
+    userId,
+    errors: errors.length > 0 ? errors : undefined,
+  });
+});
+
 // ── Security headers (helmet) ─────────────────────────────────────────────────
 app.use(helmet());
 
@@ -453,8 +600,8 @@ app.use(globalLimiter);
 // ── API key auth ───────────────────────────────────────────────────────────────
 
 app.use((req, res, next) => {
-  // Allow unauthenticated health check and Stripe webhook
-  if (req.path === "/" || req.path === "/webhook" || req.path === "/health") return next();
+  // Allow unauthenticated health check, Stripe webhook, and Supabase user webhook
+  if (req.path === "/" || req.path === "/webhook" || req.path === "/webhook/user-created" || req.path === "/health") return next();
 
   const key = req.headers["x-elemetric-key"];
   const expected = process.env.ELEMETRIC_API_KEY;
