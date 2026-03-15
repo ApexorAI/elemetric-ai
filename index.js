@@ -506,6 +506,60 @@ const replicate = new Replicate({
   auth: process.env.REPLICATE_API_TOKEN,
 });
 
+/**
+ * Generate a grayscale PNG mask using only Node.js built-ins (zlib).
+ * White rectangle = area to inpaint (product placement).
+ * Black = preserve exactly as-is.
+ * Image is assumed 1024px wide (mobile resizes before sending).
+ */
+function generateMaskPNG(width = 1024, height = 768) {
+  const rectX1 = Math.floor(width * 0.20);
+  const rectX2 = Math.floor(width * 0.80);
+  const rectY1 = Math.floor(height * 0.10);
+  const rectY2 = Math.floor(height * 0.55);
+
+  // Build raw scanlines: 1 filter byte (0=None) + width grayscale pixels per row
+  const rows = [];
+  for (let y = 0; y < height; y++) {
+    const row = Buffer.alloc(1 + width, 0); // black by default
+    if (y >= rectY1 && y < rectY2) {
+      row.fill(255, 1 + rectX1, 1 + rectX2); // white in target zone
+    }
+    rows.push(row);
+  }
+  const compressed = require("zlib").deflateSync(Buffer.concat(rows));
+
+  // CRC32 lookup table
+  const crcTable = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    crcTable[n] = c;
+  }
+  function crc32(buf) {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < buf.length; i++) c = crcTable[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+  function pngChunk(type, data) {
+    const t = Buffer.from(type, "ascii");
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length, 0);
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(Buffer.concat([t, data])), 0);
+    return Buffer.concat([len, t, data, crc]);
+  }
+
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0); ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; ihdr[9] = 0; // 8-bit grayscale
+
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), // PNG signature
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", compressed),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]).toString("base64");
+}
+
 app.post("/visualise", visualiserLimiter, async (req, res) => {
   try {
     const { wallImage, mime, modelNumber } = req.body || {};
@@ -548,20 +602,24 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
       console.warn("Vision step skipped:", visionErr.message);
     }
 
-    // Step 2: Run Stable Diffusion img2img via Replicate
-    // replicate.run() polls internally and returns when the prediction is complete
+    // Step 2: Generate mask PNG — white rectangle in upper-center wall area
+    const maskBase64 = generateMaskPNG(1024, 768);
+
+    // Step 3: Run Stable Diffusion inpainting via Replicate
+    // Only the masked (white) region is edited; everything else is preserved exactly.
     const prompt =
-      `Add a ${modelNumber} mounted on the wall, photorealistic, same room, same lighting, ` +
-      `${roomDescription}, product clearly visible and naturally installed, high quality photograph`;
+      `a ${modelNumber} mounted on the wall, photorealistic, natural lighting, seamlessly integrated, ` +
+      `${roomDescription}, high quality photograph`;
 
     const output = await replicate.run(
-      "stability-ai/stable-diffusion-img2img:15a3689ee13b0d2616e98820eca31d4af4b51b09e1ef83b7bd29abe2c99e8ff6",
+      "stability-ai/stable-diffusion-inpainting:95b7223104132402a9ae91cc677285bc5eb997834bd2349fa486f53910fd68b3",
       {
         input: {
           image:            `data:${mime};base64,${wallImage}`,
+          mask:             `data:image/png;base64,${maskBase64}`,
           prompt,
-          negative_prompt:  "blurry, low quality, distorted, unrealistic, cartoon, sketch, watermark",
-          strength:         0.4,
+          negative_prompt:  "blurry, low quality, distorted, unrealistic, cartoon, sketch, watermark, text",
+          strength:         0.95,
           guidance_scale:   7.5,
           num_inference_steps: 30,
           num_outputs:      1,
@@ -569,10 +627,8 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
       }
     );
 
-    // output is an array of ReadableStream or URL strings depending on SDK version
+    // Replicate SDK ≥ 1.0 returns FileOutput objects; extract URL string
     let imageUrl = Array.isArray(output) ? output[0] : output;
-
-    // Replicate SDK ≥ 1.0 returns FileOutput objects with a .url() method
     if (imageUrl && typeof imageUrl === "object" && typeof imageUrl.url === "function") {
       imageUrl = imageUrl.url();
     }
