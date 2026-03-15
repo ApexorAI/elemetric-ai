@@ -43335,6 +43335,195 @@ Return JSON with:
   }
 });
 
+// POST /accessibility-audit — Record a DDA/accessibility audit
+app.post("/accessibility-audit", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, buildingClass, state = "VIC",
+    auditDate, auditorName, auditorCertification,
+    accessibleRoute = false, accessibleParking = false,
+    accessibleEntrance = false, accessibleLift = false,
+    accessibleToilet = false, accessibleSignage = false,
+    tactileGroundSurfaces = false, hearingAugmentation = false,
+    doorClearanceMm, rampGradientPct, handrailsInstalled = false,
+    complianceStandard = "AS 1428.1",
+    deficiencies = [], priorityRemediation = [], notes,
+  } = req.body;
+  if (!propertyAddress || !buildingClass || !auditDate || !auditorName) {
+    return res.status(400).json({ error: "propertyAddress, buildingClass, auditDate, and auditorName are required." });
+  }
+  const features = [
+    { name: "Accessible route", provided: accessibleRoute },
+    { name: "Accessible parking", provided: accessibleParking },
+    { name: "Accessible entrance", provided: accessibleEntrance },
+    { name: "Accessible lift (multi-storey)", provided: accessibleLift },
+    { name: "Accessible toilet", provided: accessibleToilet },
+    { name: "Accessible signage", provided: accessibleSignage },
+    { name: "Tactile ground surfaces", provided: tactileGroundSurfaces },
+    { name: "Hearing augmentation", provided: hearingAugmentation },
+    { name: "Handrails (stairs/ramps)", provided: handrailsInstalled },
+  ];
+  const featuresProvided = features.filter(f => f.provided).length;
+  const compliancePercent = +(featuresProvided / features.length * 100).toFixed(0);
+  // Door clearance: min 850mm per AS 1428.1
+  const doorClearanceOk = doorClearanceMm !== undefined ? Number(doorClearanceMm) >= 850 : null;
+  // Ramp gradient: max 1:14 (7.1%) per AS 1428.1
+  const rampGradientOk = rampGradientPct !== undefined ? Number(rampGradientPct) <= 7.1 : null;
+  const overallResult = compliancePercent >= 80 && doorClearanceOk !== false && rampGradientOk !== false
+    ? "SUBSTANTIALLY_COMPLIANT"
+    : compliancePercent >= 50
+    ? "PARTIALLY_COMPLIANT"
+    : "NON_COMPLIANT";
+  const auditRef = `ACC-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    audit_ref: auditRef,
+    property_address: sanitiseInput(propertyAddress),
+    building_class: sanitiseInput(buildingClass),
+    state: sanitiseInput(state),
+    audit_date: auditDate,
+    auditor_name: sanitiseInput(auditorName),
+    auditor_certification: sanitiseInput(auditorCertification || ""),
+    features,
+    features_provided: featuresProvided,
+    compliance_percent: compliancePercent,
+    door_clearance_mm: Number(doorClearanceMm) || null,
+    door_clearance_ok: doorClearanceOk,
+    ramp_gradient_pct: Number(rampGradientPct) || null,
+    ramp_gradient_ok: rampGradientOk,
+    overall_result: overallResult,
+    compliance_standard: sanitiseInput(complianceStandard),
+    deficiencies: Array.isArray(deficiencies) ? deficiencies.map(d => sanitiseInput(d)) : [],
+    priority_remediation: Array.isArray(priorityRemediation) ? priorityRemediation.map(r => sanitiseInput(r)) : [],
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("accessibility_audits").insert(record);
+    if (error) console.error("accessibility-audit DB error:", error.message);
+  }
+  res.json({
+    auditRef, buildingClass, overallResult, compliancePercent,
+    featuresProvided: `${featuresProvided}/${features.length}`,
+    deficiencyCount: record.deficiencies.length, saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-accessibility-report — AI generates an accessibility compliance report
+app.post("/ai-accessibility-report", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, buildingClass, state = "VIC", buildYear,
+    existingBuilding = true, proposedWorks = [],
+    accessibleFeatures = [], knownBarriers = [],
+    occupancyTypes = [], compliancePath = "NCC_DTS",
+  } = req.body;
+  if (!propertyAddress || !buildingClass) {
+    return res.status(400).json({ error: "propertyAddress and buildingClass are required." });
+  }
+  const sanitisedAddress = sanitiseInput(propertyAddress);
+  const sanitisedClass = sanitiseInput(buildingClass);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian accessibility consultant with expertise in DDA, NCC Part D3, and AS 1428 series compliance.`;
+  const userPrompt = `Generate an accessibility compliance report for:
+Address: ${sanitisedAddress}
+Building class: ${sanitisedClass}
+State: ${sanitisedState}
+Build year: ${buildYear || "Unknown"}
+Existing building: ${existingBuilding}
+Proposed works: ${proposedWorks.map(w => sanitiseInput(w)).join("; ") || "None"}
+Accessible features provided: ${accessibleFeatures.map(f => sanitiseInput(f)).join(", ") || "Not assessed"}
+Known barriers: ${knownBarriers.map(b => sanitiseInput(b)).join("; ") || "None identified"}
+Occupancy types: ${occupancyTypes.map(o => sanitiseInput(o)).join(", ") || "Not specified"}
+Compliance path: ${compliancePath}
+
+Return JSON with:
+{
+  "overallCompliance": "COMPLIANT|NON_COMPLIANT|REQUIRES_ASSESSMENT",
+  "complianceScore": 65,
+  "requiredFeatures": [{"feature": "...", "nccRef": "...", "asRef": "...", "provided": false}],
+  "barriers": [{"barrier": "...", "ddaImpact": "...", "remediation": "...", "cost": "..."}],
+  "improvements": ["...", "..."],
+  "ddaRisk": "HIGH|MEDIUM|LOW",
+  "exemptions": ["...", "..."],
+  "reasonableAdjustments": ["...", "..."],
+  "priorityActions": [{"action": "...", "deadline": "..."}],
+  "applicableStandards": ["AS 1428.1", "NCC Part D3", "..."],
+  "accessibilityConsultantRequired": true,
+  "summary": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const report = JSON.parse(aiRes.choices[0].message.content);
+    const reportRef = `ACS-${Date.now().toString(36).toUpperCase()}`;
+    res.json({ reportRef, propertyAddress: sanitisedAddress, buildingClass: sanitisedClass, state: sanitisedState, report });
+  } catch (err) {
+    console.error("ai-accessibility-report error:", err.message);
+    res.json({
+      reportRef: "ACS-FALLBACK", propertyAddress: sanitisedAddress, buildingClass: sanitisedClass, state: sanitisedState,
+      report: {
+        overallCompliance: "REQUIRES_ASSESSMENT",
+        complianceScore: 0,
+        requiredFeatures: [],
+        barriers: knownBarriers.map(b => ({ barrier: sanitiseInput(b), ddaImpact: "Unknown", remediation: "Assess with accessibility consultant", cost: "TBD" })),
+        improvements: ["Commission formal accessibility audit by AS 1428 specialist"],
+        ddaRisk: "MEDIUM",
+        exemptions: ["Some existing buildings may have heritage or cost unreasonableness exemptions"],
+        reasonableAdjustments: ["Assess what changes are reasonable given building age and cost"],
+        priorityActions: [{ action: "Commission accessibility audit", deadline: "Within 3 months" }],
+        applicableStandards: ["AS 1428.1 (Design for Access and Mobility)", "NCC 2022 Part D3", "Disability Discrimination Act 1992"],
+        accessibilityConsultantRequired: true,
+        summary: "Accessibility assessment requires on-site audit by a qualified consultant.",
+      },
+    });
+  }
+});
+
+// POST /tactile-indicator-register — Register tactile ground surface indicators
+app.post("/tactile-indicator-register", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, projectId, location, indicatorType,
+    installationDate, condition = "GOOD", compliesAS1428 = true,
+    hasFadeReflectanceContrast = true, areaM2,
+    lastInspectionDate, nextInspectionDate, notes,
+  } = req.body;
+  if (!propertyAddress || !location || !indicatorType) {
+    return res.status(400).json({ error: "propertyAddress, location, and indicatorType are required." });
+  }
+  const validTypes = ["WARNING_STRIP", "DIRECTIONAL_STRIP", "HAZARD_PROTECTION", "STAIR_EDGE", "RAMP_LANDING"];
+  const validConditions = ["EXCELLENT", "GOOD", "FAIR", "POOR", "REQUIRES_REPLACEMENT"];
+  if (!validTypes.includes(indicatorType)) return res.status(400).json({ error: `indicatorType must be one of: ${validTypes.join(", ")}` });
+  if (!validConditions.includes(condition)) return res.status(400).json({ error: `condition must be one of: ${validConditions.join(", ")}` });
+  const tgiRef = `TGI-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    tgi_ref: tgiRef,
+    property_address: sanitiseInput(propertyAddress),
+    project_id: projectId || null,
+    location: sanitiseInput(location),
+    indicator_type: indicatorType,
+    installation_date: installationDate || null,
+    condition,
+    complies_as1428: Boolean(compliesAS1428),
+    has_fade_reflectance_contrast: Boolean(hasFadeReflectanceContrast),
+    area_m2: Number(areaM2) || null,
+    last_inspection_date: lastInspectionDate || null,
+    next_inspection_date: nextInspectionDate || null,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("tactile_indicator_register").insert(record);
+    if (error) console.error("tactile-indicator-register DB error:", error.message);
+  }
+  res.json({ tgiRef, location, indicatorType, condition, compliesAS1428, saved: !!supabaseAdmin });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
