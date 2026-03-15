@@ -17641,6 +17641,197 @@ app.post("/contract-summary", apiKeyAuth, async (req, res) => {
   });
 });
 
+// ── Round 41 ──────────────────────────────────────────────────────────────────
+
+// POST /bulk-email  — Send a batch of job notification emails (rate-limited to 50 per call)
+app.post("/bulk-email", apiKeyAuth, async (req, res) => {
+  const { emails, defaultFrom } = req.body;
+
+  if (!emails || !Array.isArray(emails) || emails.length === 0) {
+    return res.status(400).json({ error: "emails array is required." });
+  }
+
+  const safeFrom = defaultFrom || process.env.EMAIL_FROM || "Elemetric <noreply@elemetric.app>";
+  const batch    = emails.slice(0, 50);
+  const results  = [];
+  let sentCount  = 0;
+  let failCount  = 0;
+
+  for (const e of batch) {
+    if (!e.to || !isValidEmail(e.to) || !e.subject || !e.body) {
+      results.push({ to: e.to || "unknown", status: "SKIPPED", reason: "Missing required fields (to, subject, body)" });
+      failCount++;
+      continue;
+    }
+
+    const safeSubject = sanitiseInput(String(e.subject)).slice(0, 200);
+    const safeBody    = sanitiseInput(String(e.body)).slice(0, 3000);
+    const html        = `<div style="font-family:Arial,sans-serif;max-width:600px;white-space:pre-wrap;">${escHtml(safeBody)}</div><hr style="margin-top:24px;"><p style="font-size:12px;color:#888;">Elemetric — Trade Compliance Platform | www.elemetric.com.au</p>`;
+
+    try {
+      if (resend) {
+        await resend.emails.send({ from: safeFrom, to: [e.to], subject: safeSubject, html });
+        usageStats.emailCalls++;
+        results.push({ to: e.to, status: "SENT" });
+        sentCount++;
+      } else {
+        results.push({ to: e.to, status: "SKIPPED", reason: "Resend not configured" });
+        failCount++;
+      }
+    } catch (err) {
+      results.push({ to: e.to, status: "FAILED", reason: "Send error" });
+      failCount++;
+    }
+  }
+
+  return res.json({
+    totalRequested: batch.length,
+    sent:           sentCount,
+    failed:         failCount,
+    results,
+    sentAt:         new Date().toISOString(),
+  });
+});
+
+// POST /daily-summary  — Generate a daily summary of jobs completed and compliance metrics
+app.post("/daily-summary", apiKeyAuth, (req, res) => {
+  const { date, jobs, contractorName, includeBreakdown } = req.body;
+
+  if (!jobs || !Array.isArray(jobs) || jobs.length === 0) {
+    return res.status(400).json({ error: "jobs array is required." });
+  }
+
+  const safeDate       = sanitiseInput(String(date || new Date().toISOString().slice(0, 10)));
+  const safeContractor = sanitiseInput(String(contractorName || "Contractor"));
+
+  const total          = jobs.length;
+  const scores         = jobs.map(j => parseFloat(j.complianceScore) || 0).filter(s => s > 0);
+  const avgScore       = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+  const certified      = jobs.filter(j => j.certificateFiled).length;
+  const withSig        = jobs.filter(j => j.signatureObtained).length;
+  const withGps        = jobs.filter(j => j.gpsRecorded).length;
+  const highRisk       = jobs.filter(j => (parseFloat(j.complianceScore) || 0) < 60).length;
+
+  const tradeBreakdown = {};
+  for (const j of jobs) {
+    const t = sanitiseInput(String(j.jobType || "unknown")).toLowerCase();
+    tradeBreakdown[t] = (tradeBreakdown[t] || 0) + 1;
+  }
+
+  const highlights = [
+    avgScore !== null    ? `Average compliance score: ${avgScore}/100` : null,
+    certified > 0        ? `${certified} of ${total} certificates filed` : null,
+    highRisk > 0         ? `${highRisk} job${highRisk !== 1 ? "s" : ""} below 60% compliance — review required` : null,
+    withSig < total      ? `${total - withSig} job${total - withSig !== 1 ? "s" : ""} missing client signature` : null,
+  ].filter(Boolean);
+
+  const breakdown = includeBreakdown ? jobs.slice(0, 50).map(j => ({
+    jobId:           j.jobId ? sanitiseInput(String(j.jobId)) : null,
+    jobType:         sanitiseInput(String(j.jobType || "general")).toLowerCase(),
+    address:         j.address ? sanitiseInput(String(j.address)) : null,
+    complianceScore: parseFloat(j.complianceScore) || null,
+    certificateFiled: !!j.certificateFiled,
+  })) : null;
+
+  return res.json({
+    date:           safeDate,
+    contractorName: safeContractor,
+    jobsCompleted:  total,
+    avgComplianceScore: avgScore,
+    certificateRate: `${Math.round((certified / total) * 100)}%`,
+    signatureRate:   `${Math.round((withSig / total) * 100)}%`,
+    gpsRate:         `${Math.round((withGps  / total) * 100)}%`,
+    highRiskJobs:    highRisk,
+    tradeBreakdown,
+    highlights,
+    breakdown,
+    generatedAt:    new Date().toISOString(),
+  });
+});
+
+// POST /tools-register  — Register or update a calibrated tool/equipment record
+app.post("/tools-register", apiKeyAuth, async (req, res) => {
+  const { contractorId, toolName, toolId, calibrationDate, calibrationDue,
+          calibratedBy, standard, notes } = req.body;
+
+  if (!toolName) return res.status(400).json({ error: "toolName is required." });
+
+  const safeName     = sanitiseInput(String(toolName));
+  const safeToolId   = sanitiseInput(String(toolId    || `TOOL-${Date.now().toString(36).toUpperCase()}`));
+  const safeCaliBy   = sanitiseInput(String(calibratedBy || "Contractor"));
+  const safeStandard = sanitiseInput(String(standard   || ""));
+  const safeNotes    = sanitiseInput(String(notes      || ""));
+
+  const calDate = calibrationDate ? new Date(calibrationDate) : null;
+  const calDue  = calibrationDue  ? new Date(calibrationDue)  : null;
+
+  const now             = new Date();
+  const daysUntilDue    = calDue && !isNaN(calDue.getTime()) ? Math.round((calDue - now) / (1000 * 60 * 60 * 24)) : null;
+  const calibrationStatus = daysUntilDue === null ? "UNKNOWN" : daysUntilDue < 0 ? "OVERDUE" : daysUntilDue <= 30 ? "DUE_SOON" : "CURRENT";
+
+  const record = {
+    toolId:            safeToolId,
+    toolName:          safeName,
+    contractorId:      contractorId ? sanitiseInput(String(contractorId)) : null,
+    calibrationDate:   calDate ? calDate.toISOString().slice(0, 10) : null,
+    calibrationDue:    calDue  ? calDue.toISOString().slice(0, 10)  : null,
+    daysUntilDue,
+    calibrationStatus,
+    calibratedBy:      safeCaliBy,
+    standard:          safeStandard || null,
+    notes:             safeNotes    || null,
+    alert:             calibrationStatus === "OVERDUE"  ? `OVERDUE: ${safeName} calibration has expired — do not use until recalibrated`
+                     : calibrationStatus === "DUE_SOON" ? `Due in ${daysUntilDue} days — schedule recalibration`
+                     : null,
+    registeredAt:      now.toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("tools_register").upsert({
+      tool_id:          safeToolId,
+      contractor_id:    record.contractorId,
+      tool_name:        safeName,
+      calibration_date: calDate ? calDate.toISOString() : null,
+      calibration_due:  calDue  ? calDue.toISOString()  : null,
+      status:           calibrationStatus,
+      updated_at:       now.toISOString(),
+    }, { onConflict: "tool_id" });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...record, saved });
+});
+
+// GET /tools-register/:contractorId  — Retrieve calibration register for a contractor
+app.get("/tools-register/:contractorId", apiKeyAuth, async (req, res) => {
+  const contractorId = sanitiseInput(String(req.params.contractorId || ""));
+  if (!contractorId) return res.status(400).json({ error: "contractorId is required." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  const { data, error } = await supabaseAdmin
+    .from("tools_register")
+    .select("*")
+    .eq("contractor_id", contractorId)
+    .order("calibration_due", { ascending: true });
+
+  if (error) return res.status(500).json({ error: "Failed to retrieve tools register." });
+
+  const tools   = data || [];
+  const overdue = tools.filter(t => t.status === "OVERDUE").length;
+  const dueSoon = tools.filter(t => t.status === "DUE_SOON").length;
+
+  return res.json({
+    contractorId,
+    totalTools:   tools.length,
+    overdueCount: overdue,
+    dueSoonCount: dueSoon,
+    alertSummary: overdue > 0 ? `${overdue} tool(s) have expired calibration — take offline immediately` : dueSoon > 0 ? `${dueSoon} tool(s) due for calibration within 30 days` : "All tools current",
+    tools,
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
