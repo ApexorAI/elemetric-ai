@@ -12297,6 +12297,297 @@ app.post("/bulk-validate-request", (req, res) => {
   });
 });
 
+// ── POST /ai-photo-review ─────────────────────────────────────────────────────
+// Uses GPT-4.1-mini vision to review a single photo and return compliance
+// observations. Lighter-weight than /review — for pre-submission photo checks.
+app.post("/ai-photo-review", async (req, res) => {
+  const { photo, jobType, label, context } = req.body || {};
+
+  if (!photo || !photo.data) {
+    return res.status(400).json({ error: "photo.data (base64) is required." });
+  }
+  if (!jobType) {
+    return res.status(400).json({ error: "jobType is required." });
+  }
+  if (!client) return res.status(503).json({ error: "AI service not configured." });
+
+  const base64  = String(photo.data).split(",").pop();
+  const mimeType = photo.mimeType || "image/jpeg";
+
+  const prompt = `You are reviewing a compliance photo for a Victorian ${jobType} job.
+Photo label: "${label || "unlabelled"}"
+${context ? `Context: ${context}` : ""}
+
+Assess this photo and respond ONLY with JSON:
+{
+  "quality": "good|acceptable|poor",
+  "qualityIssues": ["<issue>", ...],
+  "complianceItems": ["<item visible>", ...],
+  "missingEvidence": ["<what should be shown but isn't>"],
+  "recommendation": "<one sentence>",
+  "usable": true/false
+}`;
+
+  try {
+    const response = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: prompt },
+            { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64}`, detail: "high" } },
+          ],
+        },
+      ],
+      max_tokens: 300,
+      temperature: 0.1,
+    });
+
+    const raw = response.choices[0]?.message?.content?.trim() || "{}";
+    let parsed;
+    try {
+      const match = raw.match(/\{[\s\S]*\}/);
+      parsed = JSON.parse(match ? match[0] : raw);
+    } catch {
+      return res.status(502).json({ error: "AI returned unparseable response.", raw });
+    }
+
+    usageStats.openaiCalls++;
+
+    return res.json({
+      jobType,
+      label:            label || null,
+      quality:          parsed.quality          || "unknown",
+      qualityIssues:    Array.isArray(parsed.qualityIssues)   ? parsed.qualityIssues   : [],
+      complianceItems:  Array.isArray(parsed.complianceItems) ? parsed.complianceItems : [],
+      missingEvidence:  Array.isArray(parsed.missingEvidence) ? parsed.missingEvidence : [],
+      usable:           parsed.usable           !== false,
+      recommendation:   parsed.recommendation   || null,
+      reviewedAt:       new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("ai-photo-review error:", err);
+    return res.status(500).json({ error: "Photo review failed." });
+  }
+});
+
+// ── POST /compare-contractors ─────────────────────────────────────────────────
+// Compares performance metrics of two contractors from Supabase based on their
+// user IDs. Returns side-by-side compliance, pass rate, and trend comparison.
+app.post("/compare-contractors", async (req, res) => {
+  const { contractorAId, contractorBId, jobType, limit: limitParam = 20 } = req.body || {};
+
+  if (!contractorAId || !contractorBId) {
+    return res.status(400).json({ error: "contractorAId and contractorBId are required." });
+  }
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  const limit = Math.min(Number(limitParam) || 20, 50);
+
+  const fetchContractor = async (userId) => {
+    let q = supabaseAdmin
+      .from("analyses")
+      .select("compliance_score, confidence, job_type, created_at")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+    if (jobType) q = q.eq("job_type", jobType.toLowerCase());
+    const { data } = await q;
+    return data || [];
+  };
+
+  try {
+    const [jobsA, jobsB] = await Promise.all([fetchContractor(contractorAId), fetchContractor(contractorBId)]);
+
+    const summarise = (jobs, id) => {
+      const scores = jobs.map(j => j.compliance_score ?? j.confidence).filter(s => typeof s === "number");
+      const avg    = scores.length > 0 ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length * 10) / 10 : null;
+      const pass   = scores.filter(s => s >= 70).length;
+      const half   = Math.floor(scores.length / 2);
+      const recentAvg = half > 0 ? Math.round(scores.slice(0, half).reduce((a, b) => a + b, 0) / half * 10) / 10 : null;
+      const olderAvg  = half > 0 ? Math.round(scores.slice(half).reduce((a, b) => a + b, 0) / half * 10) / 10 : null;
+      const trend     = recentAvg !== null && olderAvg !== null ? recentAvg > olderAvg + 2 ? "improving" : recentAvg < olderAvg - 2 ? "declining" : "stable" : "unknown";
+      return { id, jobCount: jobs.length, avgScore: avg, passCount: pass, passRate: scores.length > 0 ? Math.round((pass / scores.length) * 100) : null, trend };
+    };
+
+    const a = summarise(jobsA, contractorAId);
+    const b = summarise(jobsB, contractorBId);
+
+    const winner = a.avgScore !== null && b.avgScore !== null
+      ? a.avgScore > b.avgScore + 2 ? "A" : b.avgScore > a.avgScore + 2 ? "B" : "tie"
+      : null;
+
+    return res.json({
+      jobType:         jobType || "all",
+      contractorA:     a,
+      contractorB:     b,
+      scoreDelta:      (a.avgScore !== null && b.avgScore !== null) ? Math.round((a.avgScore - b.avgScore) * 10) / 10 : null,
+      winner,
+      summary: winner === "A" ? `Contractor A performs better by ${Math.round((a.avgScore - b.avgScore) * 10) / 10} pts.`
+        : winner === "B" ? `Contractor B performs better by ${Math.round((b.avgScore - a.avgScore) * 10) / 10} pts.`
+        : winner === "tie" ? "Both contractors have comparable performance."
+        : "Insufficient data for comparison.",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("compare-contractors error:", err);
+    return res.status(500).json({ error: "Comparison failed." });
+  }
+});
+
+// ── POST /job-complexity-assessment ──────────────────────────────────────────
+// Detailed complexity assessment using 8 weighted factors. More granular than
+// the simple complexity scoring in /review.
+app.post("/job-complexity-assessment", (req, res) => {
+  const {
+    jobType,
+    scope             = [],
+    existingBuilding,
+    heritageOverlay,
+    aboveGround,
+    hasAsbestos,
+    multiFloor,
+    commercialGrade,
+    remoteLocation,
+    estimatedValue,
+  } = req.body || {};
+
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+
+  const factors = [];
+  let totalPoints = 0;
+
+  const factor = (name, value, points, rationale) => {
+    if (value) {
+      totalPoints += points;
+      factors.push({ factor: name, points, rationale });
+    } else {
+      factors.push({ factor: name, points: 0, rationale: "Not applicable or not confirmed" });
+    }
+  };
+
+  factor("Scope Breadth",       scope.length >= 5,                  2, "Large scope with 5+ line items adds coordination complexity");
+  factor("Existing Building",   existingBuilding === true,           1, "Retrofitting existing buildings is more complex than new work");
+  factor("Heritage Overlay",    heritageOverlay  === true,           3, "Heritage overlays add permit complexity and approval time");
+  factor("Above-Ground / Rooftop", aboveGround   === true,           2, "Elevated work adds safety complexity and equipment needs");
+  factor("Asbestos Present",    hasAsbestos       === true,           3, "Asbestos management plan, testing, and removal adds significant complexity");
+  factor("Multi-Floor / Multi-Zone", multiFloor   === true,           2, "Multiple levels or zones add coordination and access complexity");
+  factor("Commercial Grade",    commercialGrade   === true,           2, "Commercial-grade standards are more demanding than residential");
+  factor("Remote Location",     remoteLocation    === true,           1, "Remote sites add logistics and potentially longer inspection lead times");
+  factor("High Job Value",      (Number(estimatedValue) || 0) > 50000, 1, "High-value jobs typically involve more complex scope");
+
+  const MAX_POINTS  = 17;
+  const score       = Math.min(10, Math.round((totalPoints / MAX_POINTS) * 10));
+  const complexity  = score >= 8 ? "complex" : score >= 5 ? "medium" : "simple";
+
+  const IMPACT = {
+    simple:  { timeMultiplier: "1.0×", costMultiplier: "1.0×", riskLevel: "low",    requiredPhotos: "Standard" },
+    medium:  { timeMultiplier: "1.3×", costMultiplier: "1.25×", riskLevel: "medium", requiredPhotos: "+20% additional photos recommended" },
+    complex: { timeMultiplier: "1.8×", costMultiplier: "1.5×",  riskLevel: "high",   requiredPhotos: "+50% additional photos strongly recommended" },
+  };
+
+  return res.json({
+    jobType,
+    complexityScore:  score,
+    complexityLabel:  complexity,
+    totalPoints,
+    maxPoints:        MAX_POINTS,
+    factors,
+    activeFactors:    factors.filter(f => f.points > 0).map(f => f.factor),
+    impact:           IMPACT[complexity],
+    recommendation:   complexity === "complex"
+      ? "Complex job — allocate additional time, budget, and documentation effort. Consider specialist subcontractors."
+      : complexity === "medium"
+      ? "Moderate complexity — allow buffer time for approvals and inspections."
+      : "Standard complexity — routine documentation requirements apply.",
+    assessedAt: new Date().toISOString(),
+  });
+});
+
+// ── GET /compliance-deadlines ─────────────────────────────────────────────────
+// Returns all pending certificate deadlines from the notification queue,
+// sorted by urgency. Shows what needs to be lodged soon.
+app.get("/compliance-deadlines", (req, res) => {
+  const { userId } = req.query;
+  const now = Date.now();
+
+  // Pull certificate reminders from the notification queue
+  let reminders = notificationQueue.filter(n => n.type === "certificate_reminder" && !n.sent);
+  if (userId) reminders = reminders.filter(n => n.userId === userId);
+
+  const enriched = reminders.map(n => {
+    const msUntilSend   = n.sendAfter - now;
+    const hoursUntilDue = Math.round((msUntilSend + 4 * 3_600_000) / 3_600_000 * 10) / 10; // add back the 4hr buffer
+    return {
+      notificationId: n.id,
+      userId:         n.userId,
+      jobType:        n.jobType,
+      jobId:          n.jobId,
+      certificateType: n.title,
+      authority:       n.authority,
+      hoursUntilDue:   Math.max(0, hoursUntilDue),
+      dueSoon:         hoursUntilDue < 24,
+      overdue:         hoursUntilDue < 0,
+      scheduledAt:     n.scheduledAt,
+      sendAfter:       new Date(n.sendAfter).toISOString(),
+    };
+  }).sort((a, b) => a.hoursUntilDue - b.hoursUntilDue);
+
+  const overdue  = enriched.filter(e => e.overdue).length;
+  const dueSoon  = enriched.filter(e => e.dueSoon && !e.overdue).length;
+
+  return res.json({
+    userId:        userId || "all",
+    totalPending:  enriched.length,
+    overdueCount:  overdue,
+    dueSoonCount:  dueSoon,
+    deadlines:     enriched,
+    retrievedAt:   new Date().toISOString(),
+  });
+});
+
+// ── POST /validate-certificate-number ────────────────────────────────────────
+// Validates the format of a compliance certificate number. Different registries
+// use different formats — this validates the structure only (not live lookup).
+app.post("/validate-certificate-number", (req, res) => {
+  const { certificateNumber, jobType } = req.body || {};
+
+  if (!certificateNumber || typeof certificateNumber !== "string") {
+    return res.status(400).json({ error: "certificateNumber is required." });
+  }
+
+  const clean = certificateNumber.trim().toUpperCase().replace(/\s+/g, "");
+
+  // Known certificate number patterns
+  const CERT_PATTERNS = [
+    { regex: /^VBA-P-\d{6,10}$/,    type: "plumbing",   system: "VBA Plumber Portal",    description: "VBA Plumbing CoC (VBA-P-XXXXXX)" },
+    { regex: /^VBA-D-\d{6,10}$/,    type: "drainage",   system: "VBA Plumber Portal",    description: "VBA Drainer CoC (VBA-D-XXXXXX)" },
+    { regex: /^ESV-GCC-\d{6,10}$/,  type: "gas",        system: "ESV Gas Portal",         description: "ESV Gas Compliance Certificate (ESV-GCC-XXXXXX)" },
+    { regex: /^ESV-ES-\d{6,10}$/,   type: "electrical", system: "ESV E-licensing Portal", description: "ESV Certificate of Electrical Safety (ESV-ES-XXXXXX)" },
+    { regex: /^BP-\d{4}-\d{4,8}$/,  type: "carpentry",  system: "Local Council / RBS",   description: "Building Permit (BP-YYYY-XXXXXX)" },
+    { regex: /^ARC-\d{6,12}$/,      type: "hvac",       system: "ARC Database",           description: "ARC Service Record Reference (ARC-XXXXXX)" },
+    // Also accept free-form numeric references (common in older systems)
+    { regex: /^\d{6,12}$/,          type: "unknown",    system: "Legacy / Unknown",       description: "Numeric reference only — system unknown" },
+  ];
+
+  const match = CERT_PATTERNS.find(p => p.regex.test(clean));
+
+  const tradeMismatch = match && jobType && match.type !== "unknown" && match.type !== jobType.toLowerCase();
+
+  return res.json({
+    certificateNumber: clean,
+    formatValid:       !!match,
+    matchedPattern:    match?.description || null,
+    registrySystem:    match?.system      || null,
+    inferredTradeType: match?.type        || null,
+    tradeMismatch:     tradeMismatch || false,
+    tradeMismatchNote: tradeMismatch ? `Format suggests ${match?.type} but job type is ${jobType}` : null,
+    validationNote:    match ? "Format recognised. Verify the number is active at the relevant registry." : "Format not recognised. Check the number matches the format shown on the original certificate.",
+    validatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
