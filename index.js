@@ -75450,6 +75450,385 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 270 ─────────────────────────────────────────────────────────────────
+
+// POST /contaminated-land-assessment — Record contaminated land phase 1/2 assessment data
+app.post("/contaminated-land-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, siteAddress, assessmentDate, assessedBy, assessmentPhase,
+      priorLandUse, suspectedContaminants, samplesTaken, sampleCount,
+      contaminantsDetected, contaminantDetails,
+      asbestosBuriedDetected, leadDetectedMgKg, leadGuidelineValue,
+      petroleumHydrocarbonsDetectedMgKg, phGuidelineValue,
+      heavyMetalsDetected, heavyMetalDetails,
+      epaAuditRequired, epaAuditNumber, cleanupRequired,
+      remediationStrategy, occupationalHealthRisk, publicHealthRisk,
+      siteClassification, constructionSiteNotification, notes
+    } = req.body;
+
+    if (!projectId || !siteAddress || !assessmentDate || !assessedBy) {
+      return res.status(400).json({ error: "projectId, siteAddress, assessmentDate, assessedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeSite = sanitiseInput(String(siteAddress));
+    const safeAssessedBy = sanitiseInput(String(assessedBy));
+
+    const contaminants = Array.isArray(contaminantsDetected) ? contaminantsDetected : [];
+    const heavyMetals = Array.isArray(heavyMetalDetails) ? heavyMetalDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const phase = String(assessmentPhase || "").toUpperCase();
+
+    // Environment Protection Act 2017 (Vic) — contaminated land obligations
+    // EPA Publication 833 — Victorian EPA cleanup guidelines
+    if (asbestosBuriedDetected === true || asbestosBuriedDetected === "true") {
+      criticalIssues.push("Buried asbestos detected — site must be assessed by licensed asbestos assessor. EPA notification may be required (Environment Protection Act 2017 Vic s.316). Do not disturb until CEMP prepared.");
+    }
+
+    const leadMgKg = parseFloat(leadDetectedMgKg) || null;
+    const leadGuideline = parseFloat(leadGuidelineValue) || 300; // EPA/NEPM residential guideline
+    if (leadMgKg !== null && leadMgKg > leadGuideline) {
+      criticalIssues.push(`Lead ${leadMgKg}mg/kg exceeds guideline ${leadGuideline}mg/kg — remediation required before residential use (EPA Publication 833).`);
+    } else if (leadMgKg !== null && leadMgKg > leadGuideline * 0.75) {
+      warnings.push(`Lead ${leadMgKg}mg/kg approaching guideline ${leadGuideline}mg/kg — monitor and assess land use compatibility.`);
+    }
+
+    const phMgKg = parseFloat(petroleumHydrocarbonsDetectedMgKg) || null;
+    const phGuideline = parseFloat(phGuidelineValue) || 100; // NEPM-C typical guideline
+    if (phMgKg !== null && phMgKg > phGuideline) {
+      criticalIssues.push(`Petroleum hydrocarbons ${phMgKg}mg/kg exceeds guideline ${phGuideline}mg/kg — remediation required (EPA Publication 833).`);
+    }
+
+    if (heavyMetals.length > 0) {
+      const critHeavy = heavyMetals.filter(m => m.exceeded === true || m.exceeded === "true");
+      if (critHeavy.length > 0) {
+        criticalIssues.push(`Heavy metal guideline exceedances: ${critHeavy.map(m => `${m.metal || "unknown"} ${m.detected || "?"} mg/kg`).join(", ")} — remediation required.`);
+      }
+    }
+
+    if (epaAuditRequired === true || epaAuditRequired === "true") {
+      if (!epaAuditNumber) {
+        criticalIssues.push("EPA Audit required but Audit number not recorded — obtain EPA Appointed Auditor before commencing works (Environment Protection Act 2017 Vic s.316).");
+      }
+    }
+
+    if (cleanupRequired === true || cleanupRequired === "true") {
+      if (!remediationStrategy) {
+        warnings.push("Cleanup required but remediation strategy not documented — develop Remedial Action Plan (RAP).");
+      }
+    }
+
+    if (publicHealthRisk === "HIGH" || publicHealthRisk === "EXTREME") {
+      criticalIssues.push(`Public health risk rated ${publicHealthRisk} — notify Department of Health and EPA Victoria.`);
+    }
+
+    if (!constructionSiteNotification) {
+      warnings.push("Construction site notification not confirmed — all workers must be informed of contamination status before commencing work.");
+    }
+
+    const siteClass = String(siteClassification || "").toUpperCase();
+    if (siteClass === "PRESCRIBED_CONTAMINATED_SITE" || siteClass === "PCS") {
+      criticalIssues.push("Site classified as Prescribed Contaminated Site — statutory obligations apply under Environment Protection Act 2017 (Vic).");
+    }
+
+    const assessmentStatus = criticalIssues.length > 0 ? "REMEDIATION_REQUIRED" : warnings.length > 0 ? "FURTHER_INVESTIGATION_REQUIRED" : "SUITABLE_FOR_INTENDED_USE";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("contaminated_land_assessments")
+        .insert({
+          project_id: safeProject,
+          site_address: safeSite,
+          assessment_date: assessmentDate,
+          assessed_by: safeAssessedBy,
+          assessment_phase: phase || null,
+          prior_land_use: priorLandUse ? sanitiseInput(String(priorLandUse)) : null,
+          suspected_contaminants: Array.isArray(suspectedContaminants) ? suspectedContaminants : [],
+          samples_taken: samplesTaken || false,
+          sample_count: sampleCount || null,
+          contaminants_detected: contaminants,
+          asbestos_buried_detected: asbestosBuriedDetected || false,
+          lead_detected_mg_kg: leadMgKg,
+          ph_hydrocarbons_detected_mg_kg: phMgKg,
+          heavy_metals_detected: heavyMetals.length > 0,
+          heavy_metal_details: heavyMetals,
+          epa_audit_required: epaAuditRequired || false,
+          epa_audit_number: epaAuditNumber ? sanitiseInput(String(epaAuditNumber)) : null,
+          cleanup_required: cleanupRequired || false,
+          remediation_strategy: remediationStrategy ? sanitiseInput(String(remediationStrategy)) : null,
+          occupational_health_risk: occupationalHealthRisk || null,
+          public_health_risk: publicHealthRisk || null,
+          site_classification: siteClass || null,
+          assessment_status: assessmentStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        assessmentStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Contaminated land remediation required before works can proceed.",
+        standards: ["Environment Protection Act 2017 (Vic)", "EPA Publication 833", "NEPM (Site Contamination) 1999"],
+      });
+    }
+
+    res.json({
+      assessmentStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      assessmentPhase: phase || null,
+      siteClassification: siteClass || null,
+      standards: ["Environment Protection Act 2017 (Vic)", "EPA Publication 833"],
+    });
+  } catch (err) {
+    console.error("POST /contaminated-land-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to record contaminated land assessment." });
+  }
+});
+
+// POST /geotechnical-bore-record — Record geotechnical borehole or test pit log
+app.post("/geotechnical-bore-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, boreId, siteAddress, logDate, loggedBy,
+      boreDepthM, boreMethod, groundwaterDepthM, groundwaterEncountered,
+      soilLayers, foundationDepthM, foundationMaterial,
+      sptBlowCounts, designBearingCapacityKpa, measuredUcs,
+      rockClassification, boulderEncountered,
+      landslipIndicators, expansiveSoilIndicators, collapsibleSoilIndicators,
+      contamination, notes
+    } = req.body;
+
+    if (!projectId || !boreId || !logDate || !loggedBy) {
+      return res.status(400).json({ error: "projectId, boreId, logDate, loggedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeBoreId = sanitiseInput(String(boreId));
+    const safeLoggedBy = sanitiseInput(String(loggedBy));
+    const safeAddress = siteAddress ? sanitiseInput(String(siteAddress)) : null;
+
+    const layers = Array.isArray(soilLayers) ? soilLayers : [];
+    const sptCounts = Array.isArray(sptBlowCounts) ? sptBlowCounts : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    // AS 1726 — Geotechnical site investigations
+    const bearingKpa = parseFloat(designBearingCapacityKpa) || null;
+    const gwDepth = parseFloat(groundwaterDepthM) || null;
+    const foundDepth = parseFloat(foundationDepthM) || null;
+
+    if (landslipIndicators === true || landslipIndicators === "true") {
+      criticalIssues.push("Landslip indicators present — geotechnical engineer must assess slope stability before any excavation or construction (AS 1726).");
+    }
+
+    if (expansiveSoilIndicators === true || expansiveSoilIndicators === "true") {
+      warnings.push("Expansive soil indicators (likely reactive clay) — site classification required per AS 2870. Foundation design must account for soil movement.");
+    }
+
+    if (collapsibleSoilIndicators === true || collapsibleSoilIndicators === "true") {
+      criticalIssues.push("Collapsible soil indicators present — engineered footing design required. Standard residential footings may not be adequate.");
+    }
+
+    if (groundwaterEncountered === true || groundwaterEncountered === "true") {
+      if (gwDepth !== null && foundDepth !== null && gwDepth < foundDepth) {
+        criticalIssues.push(`Groundwater at ${gwDepth}m — shallower than proposed foundation depth ${foundDepth}m. Dewatering or buoyancy design required.`);
+      } else if (gwDepth !== null && gwDepth < 3) {
+        warnings.push(`Groundwater at ${gwDepth}m — relatively shallow. Consider waterproofing of below-ground structures.`);
+      }
+    }
+
+    if (contamination === true || contamination === "true") {
+      criticalIssues.push("Contamination signs observed in borehole — report to project environmental consultant. Phase 2 assessment may be required.");
+    }
+
+    // SPT checks
+    const lowSPT = sptCounts.filter(s => (parseInt(s.N60) || parseInt(s.blows) || 0) < 4);
+    if (lowSPT.length > 0) {
+      warnings.push(`Low SPT N-values (<4) detected at ${lowSPT.length} depth(s) — very loose/soft material. Foundation design review required (AS 1726).`);
+    }
+
+    if (!designBearingCapacityKpa) {
+      warnings.push("Design bearing capacity not recorded — required for foundation design verification.");
+    }
+
+    if (boulderEncountered === true || boulderEncountered === "true") {
+      warnings.push("Boulders encountered — excavation may require rock breaking. Confirm machine capability and potential programme impact.");
+    }
+
+    const boreStatus = criticalIssues.length > 0 ? "ENGINEERING_REVIEW_REQUIRED" : warnings.length > 0 ? "FURTHER_ASSESSMENT_REQUIRED" : "RECORDED";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("geotechnical_bore_records")
+        .insert({
+          project_id: safeProject,
+          bore_id: safeBoreId,
+          site_address: safeAddress,
+          log_date: logDate,
+          logged_by: safeLoggedBy,
+          bore_depth_m: boreDepthM || null,
+          bore_method: boreMethod ? sanitiseInput(String(boreMethod)) : null,
+          groundwater_encountered: groundwaterEncountered || false,
+          groundwater_depth_m: gwDepth,
+          soil_layers: layers,
+          foundation_depth_m: foundDepth,
+          foundation_material: foundationMaterial ? sanitiseInput(String(foundationMaterial)) : null,
+          spt_blow_counts: sptCounts,
+          design_bearing_capacity_kpa: bearingKpa,
+          landslip_indicators: landslipIndicators || false,
+          expansive_soil_indicators: expansiveSoilIndicators || false,
+          collapsible_soil_indicators: collapsibleSoilIndicators || false,
+          contamination_observed: contamination || false,
+          boulder_encountered: boulderEncountered || false,
+          bore_status: boreStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        boreStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Geotechnical findings require engineering review before foundation design.",
+        standards: ["AS 1726", "AS 2870"],
+      });
+    }
+
+    res.json({
+      boreStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      boreId: safeBoreId,
+      groundwaterDepthM: gwDepth,
+      designBearingCapacityKpa: bearingKpa,
+      standards: ["AS 1726", "AS 2870"],
+    });
+  } catch (err) {
+    console.error("POST /geotechnical-bore-record error:", err.message);
+    res.status(500).json({ error: "Failed to record geotechnical bore." });
+  }
+});
+
+// POST /ai-geotechnical-risk-assessment — AI assesses geotechnical risk from site investigation data
+app.post("/ai-geotechnical-risk-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectType, foundationType, boreCount, soilDescription,
+      groundwaterDepthM, bedrockDepthM, sptNValues,
+      landslipHistory, floodZone, expansiveSoilsPresent,
+      existingStructuresNearby, vibrationSensitiveArea, siteContext
+    } = req.body;
+
+    if (!projectType || !foundationType) {
+      return res.status(400).json({ error: "projectType and foundationType are required." });
+    }
+
+    const safeProjectType = sanitiseInput(String(projectType));
+    const safeFoundationType = sanitiseInput(String(foundationType));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const nValues = Array.isArray(sptNValues) ? sptNValues : [];
+
+    const prompt = `You are a geotechnical engineer assessing foundation and construction risk for a Victorian project.
+
+Project type: ${safeProjectType}
+Proposed foundation type: ${safeFoundationType}
+Number of bores/test pits: ${boreCount || "Unknown"}
+Soil description: ${soilDescription || "Not provided"}
+Groundwater depth: ${groundwaterDepthM ? groundwaterDepthM + "m" : "Not recorded"}
+Bedrock depth: ${bedrockDepthM ? bedrockDepthM + "m" : "Not recorded"}
+SPT N-values (representative): ${nValues.join(", ") || "Not available"}
+Landslip history: ${landslipHistory ? "Yes" : "No"}
+Flood zone: ${floodZone ? "Yes" : "No"}
+Expansive soils: ${expansiveSoilsPresent ? "Yes" : "No"}
+Existing structures nearby: ${existingStructuresNearby ? "Yes" : "No"}
+Vibration-sensitive area: ${vibrationSensitiveArea ? "Yes" : "No"}
+Location: ${safeSite}
+
+Assess under AS 1726 and AS 2870:
+1. Foundation suitability for proposed type
+2. Key geotechnical risks
+3. Differential settlement risk
+4. Groundwater impact on construction
+5. Slope stability considerations
+6. Recommended investigations or design modifications
+7. Special construction precautions required
+
+Respond ONLY in JSON:
+{
+  "geotechnicalRisk": "LOW|MODERATE|HIGH|EXTREME",
+  "foundationSuitability": "SUITABLE|CONDITIONAL|UNSUITABLE|FURTHER_INVESTIGATION_REQUIRED",
+  "primaryRisks": ["string"],
+  "settlementRisk": "LOW|MODERATE|HIGH",
+  "additionalInvestigationRequired": ["string"],
+  "designModificationsRecommended": ["string"],
+  "constructionPrecautions": ["string"],
+  "applicableStandards": ["string"],
+  "siteClassification": "string",
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        geotechnicalRisk: "MODERATE",
+        foundationSuitability: "FURTHER_INVESTIGATION_REQUIRED",
+        primaryRisks: ["AI assessment unavailable — engage geotechnical engineer"],
+        settlementRisk: "MODERATE",
+        additionalInvestigationRequired: ["Complete geotechnical investigation per AS 1726"],
+        designModificationsRecommended: ["Foundation design to be confirmed by geotechnical engineer"],
+        constructionPrecautions: ["Monitor dewatering", "Protect adjacent structures"],
+        applicableStandards: ["AS 1726", "AS 2870", "AS 3600"],
+        siteClassification: "Unknown — AS 2870 classification required",
+        summary: "AI geotechnical assessment unavailable. Engage registered geotechnical engineer.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      projectType: safeProjectType,
+      foundationType: safeFoundationType,
+      standards: ["AS 1726", "AS 2870", "AS 3600"],
+    });
+  } catch (err) {
+    console.error("POST /ai-geotechnical-risk-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess geotechnical risk." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
