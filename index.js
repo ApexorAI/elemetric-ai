@@ -42560,6 +42560,205 @@ Return JSON with:
   }
 });
 
+// POST /steel-fabrication-record — Record steel fabrication and inspection details
+app.post("/steel-fabrication-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, memberRef, memberType, steelGrade,
+    dimensions, length_mm, quantity,
+    fabricator, shopDrawingRef, inspectionDate,
+    inspectorName, dimensionalCheckPassed = true,
+    weldVisualPassed = true, surfaceTreatment, surfaceTreatmentSpec,
+    ndt_required = false, ndt_type, ndt_result,
+    holdPointReleased = false, status = "INSPECTED", notes,
+  } = req.body;
+  if (!projectId || !memberRef || !memberType) {
+    return res.status(400).json({ error: "projectId, memberRef, and memberType are required." });
+  }
+  const validStatuses = ["FABRICATING", "AWAITING_INSPECTION", "INSPECTED", "APPROVED", "REJECTED", "REWORK", "DISPATCHED"];
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${validStatuses.join(", ")}` });
+  }
+  const fabRef = `SFR-${Date.now().toString(36).toUpperCase()}`;
+  const overallPassed = dimensionalCheckPassed && weldVisualPassed && (ndt_required ? ndt_result === "PASS" : true);
+  const record = {
+    fab_ref: fabRef,
+    project_id: projectId,
+    member_ref: sanitiseInput(memberRef),
+    member_type: sanitiseInput(memberType),
+    steel_grade: sanitiseInput(steelGrade || ""),
+    dimensions: sanitiseInput(dimensions || ""),
+    length_mm: Number(length_mm) || null,
+    quantity: Number(quantity) || 1,
+    fabricator: sanitiseInput(fabricator || ""),
+    shop_drawing_ref: sanitiseInput(shopDrawingRef || ""),
+    inspection_date: inspectionDate || null,
+    inspector_name: sanitiseInput(inspectorName || ""),
+    dimensional_check_passed: Boolean(dimensionalCheckPassed),
+    weld_visual_passed: Boolean(weldVisualPassed),
+    surface_treatment: sanitiseInput(surfaceTreatment || ""),
+    surface_treatment_spec: sanitiseInput(surfaceTreatmentSpec || ""),
+    ndt_required: Boolean(ndt_required),
+    ndt_type: sanitiseInput(ndt_type || ""),
+    ndt_result: ndt_required ? sanitiseInput(ndt_result || "") : null,
+    overall_passed: overallPassed,
+    hold_point_released: overallPassed ? Boolean(holdPointReleased) : false,
+    status: !overallPassed ? "REJECTED" : status,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("steel_fabrication_records").insert(record);
+    if (error) console.error("steel-fabrication-record DB error:", error.message);
+  }
+  res.json({
+    fabRef, memberRef, memberType, steelGrade, overallPassed,
+    status: record.status, holdPointReleased: record.hold_point_released,
+    saved: !!supabaseAdmin,
+  });
+});
+
+// POST /weld-inspection-record — Record a weld inspection
+app.post("/weld-inspection-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, weldId, welder, welderQualificationRef,
+    jointType, weldType, parentMaterial, fillMaterial,
+    weldingProcess, positionCode, inspectionDate, inspectorName,
+    inspectorCertification,
+    visualInspectionResult = "PASS", visualDefects = [],
+    ndtMethod, ndtPerformed = false, ndtResult, ndtReportRef,
+    preheatTempC, interpassTempC, pwhtRequired = false, pwhtCompleted,
+    weldSymbolRef, drawingRef, status = "ACCEPTED", notes,
+  } = req.body;
+  if (!projectId || !weldId || !welder || !weldType) {
+    return res.status(400).json({ error: "projectId, weldId, welder, and weldType are required." });
+  }
+  const validResults = ["PASS", "FAIL", "CONDITIONAL_PASS", "REPAIR_REQUIRED"];
+  if (!validResults.includes(visualInspectionResult)) {
+    return res.status(400).json({ error: `visualInspectionResult must be one of: ${validResults.join(", ")}` });
+  }
+  const weldRef = `WLD-${Date.now().toString(36).toUpperCase()}`;
+  const overallResult = visualInspectionResult !== "PASS"
+    ? visualInspectionResult
+    : (ndtPerformed && ndtResult === "FAIL" ? "FAIL" : visualInspectionResult);
+  const record = {
+    weld_ref: weldRef,
+    project_id: projectId,
+    weld_id: sanitiseInput(weldId),
+    welder: sanitiseInput(welder),
+    welder_qualification_ref: sanitiseInput(welderQualificationRef || ""),
+    joint_type: sanitiseInput(jointType || ""),
+    weld_type: sanitiseInput(weldType),
+    parent_material: sanitiseInput(parentMaterial || ""),
+    fill_material: sanitiseInput(fillMaterial || ""),
+    welding_process: sanitiseInput(weldingProcess || ""),
+    position_code: sanitiseInput(positionCode || ""),
+    inspection_date: inspectionDate || null,
+    inspector_name: sanitiseInput(inspectorName || ""),
+    inspector_certification: sanitiseInput(inspectorCertification || ""),
+    visual_inspection_result: visualInspectionResult,
+    visual_defects: Array.isArray(visualDefects) ? visualDefects.map(d => sanitiseInput(d)) : [],
+    ndt_method: sanitiseInput(ndtMethod || ""),
+    ndt_performed: Boolean(ndtPerformed),
+    ndt_result: ndtPerformed ? sanitiseInput(ndtResult || "") : null,
+    ndt_report_ref: sanitiseInput(ndtReportRef || ""),
+    preheat_temp_c: Number(preheatTempC) || null,
+    interpass_temp_c: Number(interpassTempC) || null,
+    pwht_required: Boolean(pwhtRequired),
+    pwht_completed: pwhtRequired ? Boolean(pwhtCompleted) : null,
+    overall_result: overallResult,
+    weld_symbol_ref: sanitiseInput(weldSymbolRef || ""),
+    drawing_ref: sanitiseInput(drawingRef || ""),
+    status,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("weld_inspection_records").insert(record);
+    if (error) console.error("weld-inspection-record DB error:", error.message);
+  }
+  res.json({
+    weldRef, weldId, weldType, overallResult, status,
+    ndtPerformed, visualDefectCount: record.visual_defects.length,
+    saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-steel-inspection — AI assesses steel inspection results
+app.post("/ai-steel-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    memberType, steelGrade, defectsFound = [], weldDefects = [],
+    dimensionalVariances = [], surfaceCondition = "ACCEPTABLE",
+    coatingThicknessUM, specifiedCoatingUM,
+    ndtResults = [], drawingConformance = true,
+    erectingNotes = [], applicableStandard = "AS 4100",
+  } = req.body;
+  if (!memberType) {
+    return res.status(400).json({ error: "memberType is required." });
+  }
+  const sanitisedMember = sanitiseInput(memberType);
+  const sanitisedGrade = sanitiseInput(steelGrade || "Unknown");
+  const sanitisedStandard = sanitiseInput(applicableStandard);
+  const systemPrompt = `You are an Australian structural steel inspection specialist with expertise in AS 4100 and fabrication quality.`;
+  const userPrompt = `Assess structural steel inspection results for:
+Member type: ${sanitisedMember}
+Steel grade: ${sanitisedGrade}
+Applicable standard: ${sanitisedStandard}
+Structural defects: ${defectsFound.map(d => sanitiseInput(d)).join("; ") || "None reported"}
+Weld defects: ${weldDefects.map(d => sanitiseInput(d)).join("; ") || "None reported"}
+Dimensional variances: ${dimensionalVariances.map(v => sanitiseInput(v)).join("; ") || "None reported"}
+Surface condition: ${sanitiseInput(surfaceCondition)}
+Coating thickness: ${coatingThicknessUM ? `${coatingThicknessUM} μm (specified: ${specifiedCoatingUM} μm)` : "Not measured"}
+NDT results: ${ndtResults.map(r => sanitiseInput(r)).join("; ") || "None performed"}
+Drawing conformance: ${drawingConformance}
+Erection notes: ${erectingNotes.map(n => sanitiseInput(n)).join("; ") || "None"}
+
+Return JSON with:
+{
+  "overallAssessment": "ACCEPTABLE|CONDITIONAL|REJECT",
+  "criticalDefects": ["...", "..."],
+  "minorDefects": ["...", "..."],
+  "rectificationRequired": ["...", "..."],
+  "holdPointStatus": "...",
+  "applicableTolerances": {"dimensional": "...", "weld": "...", "coating": "..."},
+  "complianceNotes": "...",
+  "recommendation": "...",
+  "engineerSignOffRequired": false,
+  "nextActions": ["...", "..."]
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ memberType: sanitisedMember, steelGrade: sanitisedGrade, applicableStandard: sanitisedStandard, assessment });
+  } catch (err) {
+    console.error("ai-steel-inspection error:", err.message);
+    const hasDefects = defectsFound.length > 0 || weldDefects.length > 0;
+    res.json({
+      memberType: sanitisedMember, steelGrade: sanitisedGrade, applicableStandard: sanitisedStandard,
+      assessment: {
+        overallAssessment: hasDefects ? "CONDITIONAL" : "ACCEPTABLE",
+        criticalDefects: [],
+        minorDefects: defectsFound.concat(weldDefects),
+        rectificationRequired: hasDefects ? ["Assess and rectify all identified defects before hold point release"] : [],
+        holdPointStatus: hasDefects ? "HOLD — defects require assessment before release" : "Release conditionally — subject to documentation",
+        applicableTolerances: { dimensional: "AS 4100 — refer Table 14.4", weld: "AS/NZS 1554 — refer acceptance criteria", coating: "AS 3715 or project specification" },
+        complianceNotes: `${sanitisedStandard} compliance assessment required.`,
+        recommendation: hasDefects ? "Engage structural engineer or CWI to assess defects." : "Proceed to erection, ensure documentation complete.",
+        engineerSignOffRequired: hasDefects,
+        nextActions: ["Complete inspection documentation", "Release hold point if all criteria met", "Update shop drawing register"],
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
