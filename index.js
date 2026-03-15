@@ -18779,6 +18779,228 @@ app.post("/contractor-goals", apiKeyAuth, async (req, res) => {
   });
 });
 
+// ── Round 46 ──────────────────────────────────────────────────────────────────
+
+// GET /leaderboard  — Return a compliance score leaderboard for a trade
+app.get("/leaderboard", apiKeyAuth, async (req, res) => {
+  const { jobType, limit: qLimit, period } = req.query;
+
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: "Database not configured." });
+  }
+
+  const rowLimit  = Math.min(parseInt(qLimit) || 10, 50);
+  const safeType  = jobType ? sanitiseInput(String(jobType)).toLowerCase() : null;
+
+  let query = supabaseAdmin
+    .from("jobs")
+    .select("contractor_id, contractor_name, job_type, compliance_score, created_at")
+    .not("compliance_score", "is", null)
+    .not("contractor_id", "is", null)
+    .order("compliance_score", { ascending: false });
+
+  if (safeType)  query = query.eq("job_type", safeType);
+
+  if (period) {
+    const PERIOD_DAYS = { week: 7, month: 30, quarter: 90, year: 365 };
+    const days = PERIOD_DAYS[sanitiseInput(String(period)).toLowerCase()];
+    if (days) {
+      const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+      query = query.gte("created_at", cutoff);
+    }
+  }
+
+  const { data, error } = await query.limit(rowLimit * 5); // fetch more to aggregate by contractor
+  if (error) return res.status(500).json({ error: "Failed to retrieve leaderboard data." });
+
+  const byContractor = {};
+  for (const r of (data || [])) {
+    const cid = r.contractor_id;
+    if (!byContractor[cid]) byContractor[cid] = { contractorId: cid, contractorName: r.contractor_name || "Unknown", scores: [], jobCount: 0 };
+    byContractor[cid].scores.push(parseFloat(r.compliance_score) || 0);
+    byContractor[cid].jobCount++;
+  }
+
+  const ranked = Object.values(byContractor)
+    .map(c => ({
+      ...c,
+      avgScore: Math.round(c.scores.reduce((a, b) => a + b, 0) / c.scores.length),
+      scores:   undefined,
+    }))
+    .sort((a, b) => b.avgScore - a.avgScore)
+    .slice(0, rowLimit)
+    .map((c, i) => ({ rank: i + 1, ...c }));
+
+  return res.json({
+    jobType:   safeType || "all",
+    period:    period   || "all_time",
+    count:     ranked.length,
+    leaderboard: ranked,
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
+// POST /action-plan  — Generate a prioritised action plan from compliance gaps
+app.post("/action-plan", apiKeyAuth, async (req, res) => {
+  const { jobType, complianceScore, itemsMissing, documentationGaps, useAI } = req.body;
+
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+
+  const safeJobType = sanitiseInput(String(jobType)).toLowerCase();
+  const score       = parseFloat(complianceScore) || 0;
+  const missing     = Array.isArray(itemsMissing)     ? itemsMissing.map(i    => sanitiseInput(String(i))) : [];
+  const docGaps     = Array.isArray(documentationGaps)? documentationGaps.map(d => sanitiseInput(String(d))) : [];
+
+  const PRIORITY_MAP = {
+    plumbing:   { "isolation valve": "HIGH", "certificate": "CRITICAL", "tempering valve": "HIGH", "tpr valve": "HIGH", "photos": "HIGH" },
+    gas:        { "gas certificate": "CRITICAL", "pressure test": "CRITICAL", "combustion": "HIGH", "isolation": "HIGH" },
+    electrical: { "rcd": "CRITICAL", "escc": "CRITICAL", "earth": "HIGH", "circuit schedule": "HIGH" },
+    drainage:   { "inspection opening": "HIGH", "water test": "HIGH", "certificate": "CRITICAL" },
+    carpentry:  { "permit": "CRITICAL", "engineer": "HIGH", "connection": "HIGH" },
+    hvac:       { "arctick": "CRITICAL", "refrigerant": "HIGH", "commissioning": "HIGH" },
+  };
+
+  const priorityKeywords = PRIORITY_MAP[safeJobType] || {};
+
+  const actions = [
+    ...missing.map(item => {
+      const kw    = Object.keys(priorityKeywords).find(k => item.toLowerCase().includes(k));
+      const prio  = kw ? priorityKeywords[kw] : "MEDIUM";
+      return { action: `Rectify missing item: ${item}`, priority: prio, category: "compliance_item", effort: prio === "CRITICAL" ? "Urgent" : "Standard" };
+    }),
+    ...docGaps.map(gap => ({
+      action:   `Address documentation gap: ${gap}`,
+      priority: gap.toLowerCase().includes("certificate") ? "CRITICAL" : "HIGH",
+      category: "documentation",
+      effort:   "Low",
+    })),
+    score < 60  ? { action: "Schedule full site re-inspection to address critical compliance issues", priority: "CRITICAL", category: "reinspection", effort: "High"  } : null,
+    score < 75  ? { action: "Review job checklist and re-photograph any uncovered work", priority: "HIGH", category: "photos", effort: "Medium" } : null,
+  ].filter(Boolean);
+
+  actions.sort((a, b) => {
+    const ORDER = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
+    return (ORDER[a.priority] || 3) - (ORDER[b.priority] || 3);
+  });
+
+  let aiSummary = null;
+  if (useAI && actions.length > 0) {
+    try {
+      const aiRes = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [
+          { role: "system", content: "You are a trade compliance advisor. Write a concise (2-3 sentence) plain-English action plan summary for a contractor to improve their compliance score. Be direct and specific." },
+          { role: "user",   content: `Trade: ${safeJobType}\nScore: ${score}/100\nTop actions:\n${actions.slice(0, 5).map(a => `[${a.priority}] ${a.action}`).join("\n")}` },
+        ],
+        max_tokens: 150,
+      });
+      aiSummary = sanitiseInput(aiRes.choices[0].message.content.trim()).slice(0, 500);
+    } catch { /* fall through */ }
+  }
+
+  return res.json({
+    jobType:     safeJobType,
+    currentScore: score,
+    totalActions: actions.length,
+    criticalCount: actions.filter(a => a.priority === "CRITICAL").length,
+    highCount:     actions.filter(a => a.priority === "HIGH").length,
+    actions,
+    aiSummary,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /job-pack  — Assemble a complete job documentation pack for a single job
+app.post("/job-pack", apiKeyAuth, (req, res) => {
+  const { jobId, jobType, contractorName, contractorLicence, contractorAbn,
+          clientName, address, completionDate, complianceScore, grade,
+          itemsDetected, itemsMissing, certificateFiled, gpsRecorded,
+          signatureObtained, photoCount, testResults, notes } = req.body;
+
+  if (!jobType || !contractorName) {
+    return res.status(400).json({ error: "jobType and contractorName are required." });
+  }
+
+  const safeJobType    = sanitiseInput(String(jobType)).toLowerCase();
+  const safeContractor = sanitiseInput(String(contractorName));
+  const safeAddress    = sanitiseInput(String(address || "Not specified"));
+  const safeDate       = sanitiseInput(String(completionDate || new Date().toISOString().slice(0, 10)));
+  const score          = parseFloat(complianceScore) || null;
+  const numPhotos      = parseInt(photoCount) || 0;
+  const detected       = Array.isArray(itemsDetected) ? itemsDetected.map(i => sanitiseInput(String(i))) : [];
+  const missing        = Array.isArray(itemsMissing)  ? itemsMissing.map(i  => sanitiseInput(String(i))) : [];
+
+  const liabilityPeriod = LIABILITY_PERIODS[safeJobType] || "6 years";
+
+  const packItems = [
+    { document: "Job summary",                  status: "GENERATED",  required: true  },
+    { document: "Certificate of Compliance",    status: certificateFiled ? "FILED" : "MISSING", required: true },
+    { document: "Photo documentation",          status: numPhotos >= 4 ? "COMPLETE" : numPhotos > 0 ? "PARTIAL" : "MISSING", required: true },
+    { document: "GPS location records",         status: gpsRecorded    ? "PRESENT" : "MISSING", required: false },
+    { document: "Client signature",             status: signatureObtained ? "OBTAINED" : "MISSING", required: false },
+    { document: "Test results",                 status: testResults    ? "PRESENT" : "MISSING", required: true  },
+    { document: "Compliance analysis",          status: score !== null ? "PRESENT" : "MISSING", required: true  },
+    { document: "Missing items register",       status: missing.length > 0 ? "ISSUES_FOUND" : "CLEAR", required: true },
+  ];
+
+  const missingRequired = packItems.filter(p => p.required && ["MISSING", "ISSUES_FOUND"].includes(p.status));
+  const packComplete    = missingRequired.length === 0;
+
+  const jobSummary = {
+    jobReference:    jobId ? sanitiseInput(String(jobId)) : `JOB-${Date.now().toString(36).toUpperCase()}`,
+    trade:           safeJobType,
+    contractor:      safeContractor,
+    licence:         contractorLicence ? sanitiseInput(String(contractorLicence)) : null,
+    abn:             contractorAbn    ? sanitiseInput(String(contractorAbn)).replace(/\D/g, "").slice(0, 11) : null,
+    client:          clientName       ? sanitiseInput(String(clientName)) : null,
+    address:         safeAddress,
+    completionDate:  safeDate,
+    complianceScore: score,
+    grade:           grade || null,
+    itemsDetected:   detected,
+    itemsMissing:    missing,
+    liabilityPeriod,
+  };
+
+  return res.json({
+    packId:           `PACK-${Date.now().toString(36).toUpperCase()}`,
+    packStatus:       packComplete ? "COMPLETE" : "INCOMPLETE",
+    jobSummary,
+    documentItems:    packItems,
+    missingDocuments: missingRequired.map(d => d.document),
+    retentionNote:    `All documents must be retained for ${liabilityPeriod} under Victorian statutory requirements.`,
+    notes:            sanitiseInput(String(notes || "")),
+    generatedAt:      new Date().toISOString(),
+  });
+});
+
+// GET /server-stats  — Extended server statistics including endpoint count and uptime
+app.get("/server-stats", apiKeyAuth, (req, res) => {
+  const uptimeSec   = process.uptime();
+  const uptimeHours = Math.round(uptimeSec / 3600 * 10) / 10;
+  const mem         = process.memoryUsage();
+
+  return res.json({
+    uptime: {
+      seconds: Math.round(uptimeSec),
+      hours:   uptimeHours,
+    },
+    memory: {
+      rss:        Math.round(mem.rss        / 1024 / 1024) + "MB",
+      heapUsed:   Math.round(mem.heapUsed   / 1024 / 1024) + "MB",
+      heapTotal:  Math.round(mem.heapTotal  / 1024 / 1024) + "MB",
+    },
+    usage: usageStats,
+    cache: {
+      size:   analysisCache.size,
+      maxSize: analysisCache.max || 500,
+    },
+    node:    process.version,
+    platform: process.platform,
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
