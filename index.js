@@ -66022,6 +66022,412 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /medical-surveillance-record — Occupational health medical surveillance per OHS Regulations 2017 (Vic)
+app.post("/medical-surveillance-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    workerId,
+    workerName,
+    workerCompany,
+    workerRole,
+    exposureType,         // noise | silica | lead | asbestos | vibration | chemicals | radiation | heat
+    surveillanceType,     // baseline | periodic | exit | targeted
+    examinationDate,
+    examiningDoctor,
+    clinicName,
+    audiometryResult,     // pass | fail | marked-threshold-shift
+    spirometryResult,     // normal | mild-obstruction | moderate-obstruction | severe
+    bloodLeadLevel_ug_dL, // action level 20 µg/dL; removal 40 µg/dL per OHS Regs 2017 Vic
+    xRayResult,
+    skinExaminationResult,
+    eyeExaminationResult,
+    bloodPressure_mmHg,
+    fitToWork,            // fit | fit-with-restrictions | unfit
+    restrictions,         // array of strings
+    referralRequired,
+    workerNotified,
+    employerNotified,
+    nextSurveillanceDue,
+    occupationalExposureLimit,
+    currentExposureLevel,
+    exposureAboveOEL,
+    notes,
+  } = req.body;
+
+  const alerts = [];
+
+  // Blood lead level alerts
+  const bloodLead = parseFloat(bloodLeadLevel_ug_dL) || 0;
+  if (bloodLead >= 40) {
+    alerts.push(
+      `Blood lead level ${bloodLead} µg/dL — REMOVAL LEVEL reached (≥40 µg/dL). Worker must be removed from lead exposure immediately per OHS Regulations 2017 (Vic)`
+    );
+  } else if (bloodLead >= 20) {
+    alerts.push(
+      `Blood lead level ${bloodLead} µg/dL — ACTION LEVEL reached (≥20 µg/dL). Investigate exposure controls and increase monitoring frequency`
+    );
+  }
+
+  // Unfit to work
+  if (fitToWork === "unfit") {
+    alerts.push("Worker assessed as UNFIT for work — notify employer and WorkSafe if work-related");
+  }
+
+  // Audiometry threshold shift
+  if (audiometryResult === "marked-threshold-shift") {
+    alerts.push("Marked threshold shift identified — review noise controls and PPE. Notify WorkSafe if work-related hearing loss");
+  }
+
+  // Silica/spirometry
+  if (spirometryResult === "severe" || spirometryResult === "moderate-obstruction") {
+    alerts.push(`Spirometry result ${spirometryResult} — may indicate occupational lung disease. Refer to respiratory physician`);
+  }
+
+  // Current exposure above OEL
+  if (exposureAboveOEL === true || exposureAboveOEL === "true") {
+    alerts.push("Current exposure level exceeds OEL — review engineering controls and PPE immediately");
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    worker_id: sanitiseInput(workerId),
+    worker_name: sanitiseInput(workerName),
+    worker_company: sanitiseInput(workerCompany),
+    worker_role: sanitiseInput(workerRole),
+    exposure_type: sanitiseInput(exposureType),
+    surveillance_type: sanitiseInput(surveillanceType),
+    examination_date: examinationDate,
+    examining_doctor: sanitiseInput(examiningDoctor),
+    clinic_name: sanitiseInput(clinicName),
+    audiometry_result: sanitiseInput(audiometryResult),
+    spirometry_result: sanitiseInput(spirometryResult),
+    blood_lead_level_ug_dl: bloodLeadLevel_ug_dL,
+    x_ray_result: sanitiseInput(xRayResult),
+    skin_examination_result: sanitiseInput(skinExaminationResult),
+    eye_examination_result: sanitiseInput(eyeExaminationResult),
+    blood_pressure_mmhg: sanitiseInput(bloodPressure_mmHg),
+    fit_to_work: sanitiseInput(fitToWork),
+    restrictions: restrictions || [],
+    referral_required: referralRequired,
+    worker_notified: workerNotified,
+    employer_notified: employerNotified,
+    next_surveillance_due: nextSurveillanceDue,
+    occupational_exposure_limit: sanitiseInput(occupationalExposureLimit),
+    current_exposure_level: sanitiseInput(currentExposureLevel),
+    exposure_above_oel: exposureAboveOEL,
+    alerts,
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("medical_surveillance_records")
+      .insert(record);
+    if (dbErr) console.error("DB error /medical-surveillance-record:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Medical surveillance record saved",
+    fitToWork: sanitiseInput(fitToWork),
+    alertsCount: alerts.length,
+    alerts,
+    nextSurveillanceDue: nextSurveillanceDue || null,
+    applicableLegislation: [
+      "OHS Regulations 2017 (Vic) Part 4.3 (lead), Part 4.4 (asbestos)",
+      "Occupational Health and Safety Act 2004 (Vic)",
+      "NOHSC Guidelines on Occupational Health Surveillance",
+    ],
+    saved,
+  });
+});
+
+// POST /bridge-inspection-record — Bridge condition inspection per AUSTROADS Bridge Management guidelines
+app.post("/bridge-inspection-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    bridgeId,
+    bridgeName,
+    location,
+    inspectionDate,
+    inspectionType,       // routine | principal | special | underwater | post-event
+    inspector,
+    bridgeType,           // concrete-beam | PSC-girder | steel-truss | arch | suspension | timber | culvert | box-culvert
+    constructionYear,
+    span_m,
+    width_m,
+    designLoadRating,     // T44 | SM1600 | B-train | other
+    currentLoadRestriction_t,
+    deckCondition,        // 1-excellent to 5-failed
+    beamCondition,
+    abutmentCondition,
+    pilingCondition,
+    bearingsCondition,
+    jointCondition,
+    railingCondition,
+    drainageCondition,
+    paintCondition,       // structural steel only
+    scourDepth_m,         // scour around foundations
+    scourThreshold_m,
+    cracksPresent,
+    maxCrackWidth_mm,
+    spalling,
+    corrosion,            // none | superficial | moderate | severe
+    delamination,
+    deflectionUnderLoad_mm,
+    allowableDeflection_mm,
+    overallBCI,           // Bridge Condition Index 0-100
+    loadRatingMaintained,
+    postingRequired,      // weight restriction required
+    closureRequired,      // immediate closure required
+    defects,              // array of { component, description, severity, urgencyCode }
+    photos,
+    notes,
+  } = req.body;
+
+  // Urgency codes: U1=immediate, U2=urgent (3 months), U3=scheduled (12 months), U4=routine
+  const immediateDefects = Array.isArray(defects)
+    ? defects.filter((d) => d.urgencyCode === "U1" || d.urgencyCode === "U2")
+    : [];
+
+  // Scour check
+  const scour = parseFloat(scourDepth_m) || 0;
+  const scourThresh = parseFloat(scourThreshold_m) || 0;
+  const scourAlert = scourThresh > 0 && scour > scourThresh;
+
+  // Deflection check
+  const deflection = parseFloat(deflectionUnderLoad_mm) || 0;
+  const allowDef = parseFloat(allowableDeflection_mm) || 0;
+  const deflectionAlert = allowDef > 0 && deflection > allowDef;
+
+  const bci = parseFloat(overallBCI) || 0;
+  const bciGrade =
+    bci >= 80 ? "GOOD" :
+    bci >= 60 ? "SATISFACTORY" :
+    bci >= 40 ? "POOR" :
+    bci >= 20 ? "VERY POOR" : "FAILED";
+
+  if (closureRequired === true || closureRequired === "true" || bci < 20) {
+    return res.status(422).json({
+      error: "Bridge inspection — IMMEDIATE CLOSURE REQUIRED",
+      overallBCI: bci,
+      bciGrade,
+      immediateDefects: immediateDefects.map((d) => d.description),
+      immediateActions: [
+        "Close bridge to all traffic immediately",
+        "Notify road authority, VicRoads, and relevant councils",
+        "Engage structural engineer for emergency assessment",
+        "Establish detour route",
+        "Do not reopen without engineer certification",
+      ],
+      applicableStandards: ["AUSTROADS Guide to Bridge Technology Part 7", "AS 5100", "AS 3600"],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    bridge_id: sanitiseInput(bridgeId),
+    bridge_name: sanitiseInput(bridgeName),
+    location: sanitiseInput(location),
+    inspection_date: inspectionDate,
+    inspection_type: sanitiseInput(inspectionType),
+    inspector: sanitiseInput(inspector),
+    bridge_type: sanitiseInput(bridgeType),
+    construction_year: constructionYear,
+    span_m,
+    width_m,
+    design_load_rating: sanitiseInput(designLoadRating),
+    current_load_restriction_t: currentLoadRestriction_t,
+    deck_condition: deckCondition,
+    beam_condition: beamCondition,
+    abutment_condition: abutmentCondition,
+    piling_condition: pilingCondition,
+    bearings_condition: bearingsCondition,
+    joint_condition: jointCondition,
+    railing_condition: railingCondition,
+    drainage_condition: drainageCondition,
+    paint_condition: paintCondition,
+    scour_depth_m: scourDepth_m,
+    scour_threshold_m: scourThreshold_m,
+    cracks_present: cracksPresent,
+    max_crack_width_mm: maxCrackWidth_mm,
+    spalling,
+    corrosion: sanitiseInput(corrosion),
+    delamination,
+    deflection_under_load_mm: deflectionUnderLoad_mm,
+    allowable_deflection_mm: allowableDeflection_mm,
+    overall_bci: bci,
+    bci_grade: bciGrade,
+    load_rating_maintained: loadRatingMaintained,
+    posting_required: postingRequired,
+    scour_alert: scourAlert,
+    deflection_alert: deflectionAlert,
+    immediate_defects_count: immediateDefects.length,
+    defects: defects || [],
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("bridge_inspection_records")
+      .insert(record);
+    if (dbErr) console.error("DB error /bridge-inspection-record:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Bridge inspection record saved",
+    bridgeId: sanitiseInput(bridgeId),
+    overallBCI: bci,
+    bciGrade,
+    immediateDefectsCount: immediateDefects.length,
+    scourAlert,
+    deflectionAlert,
+    postingRequired: postingRequired || false,
+    nextInspectionDue: inspectionType === "routine" ? "In 12 months" : null,
+    applicableStandards: [
+      "AUSTROADS Guide to Bridge Technology Part 7",
+      "AS 5100.1",
+      "AS 5100.5",
+      "AS 3600",
+    ],
+    saved,
+  });
+});
+
+// POST /ai-bridge-condition-assessment — AI assesses bridge structural condition, priority maintenance, and load rating
+app.post("/ai-bridge-condition-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    bridgeType,
+    overallBCI,
+    deckCondition,
+    beamCondition,
+    corrosion,
+    scourDepth_m,
+    cracksPresent,
+    maxCrackWidth_mm,
+    constructionYear,
+    span_m,
+    trafficVolume_AADT,
+    heavyVehiclePct,
+    waterway,             // true | false
+    floodHistory,
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are a structural engineer specialising in bridge inspection and assessment with 25 years experience on Australian road bridges and infrastructure. Assess bridge condition per AUSTROADS Guide to Bridge Technology Part 7, AS 5100, and VicRoads Bridge Management System.
+
+Assess:
+1. Primary deterioration mechanisms — concrete carbonation/spalling, corrosion, fatigue, scour, deformation
+2. Structural deficiency — load rating reduction, overstress, redundancy loss
+3. Maintenance priority — U1 (immediate) / U2 (urgent 3 months) / U3 (scheduled 12 months) / U4 (routine)
+4. Scour risk at foundations — post-flood inspection requirements
+5. Cost-effective intervention — patch/repair vs overlay vs full rehabilitation vs replacement
+6. Bridge Management System (BMS) condition rating implications
+
+Respond with JSON: { "overallConditionRating": "good|satisfactory|poor|very-poor|failed", "primaryDefects": [], "deteriorationMechanisms": [], "loadRatingImpact": "none|minor|significant|severe", "scourRisk": "low|medium|high|critical", "maintenancePriority": "U1|U2|U3|U4", "immediateWorks": [], "scheduledWorks": [], "interventionStrategy": "string", "estimatedRemainingLife_years": number, "replacementConsidered": boolean, "postFloodInspectionRequired": boolean, "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Bridge type: ${bridgeType || "not specified"}
+BCI: ${overallBCI || "not assessed"}
+Deck condition: ${deckCondition || "not rated"}
+Beam condition: ${beamCondition || "not rated"}
+Corrosion: ${corrosion || "none"}
+Scour depth: ${scourDepth_m || "not measured"} m
+Cracks present: ${cracksPresent || "no"}
+Max crack width: ${maxCrackWidth_mm || "none"} mm
+Construction year: ${constructionYear || "unknown"}
+Span: ${span_m || "not specified"} m
+Traffic volume: ${trafficVolume_AADT || "not specified"} AADT
+Heavy vehicles: ${heavyVehiclePct || "not specified"}%
+Waterway crossing: ${waterway || "no"}
+Flood history: ${floodHistory || "unknown"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-bridge-condition-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        overallConditionRating: "satisfactory",
+        primaryDefects: [
+          "Concrete cracking and carbonation in beam soffits",
+          "Corrosion of reinforcement at concrete cover defects",
+          "Joint deterioration causing water ingress",
+        ],
+        deteriorationMechanisms: [
+          "Carbonation-induced corrosion at shallow cover zones",
+          "Chloride-induced corrosion at expansion joints",
+          "Fatigue from repeated heavy vehicle loading",
+        ],
+        loadRatingImpact: "minor",
+        scourRisk: "medium",
+        maintenancePriority: "U3",
+        immediateWorks: [
+          "Seal all joints to prevent water ingress",
+          "Patch exposed reinforcement locations",
+        ],
+        scheduledWorks: [
+          "Full deck waterproofing membrane overlay",
+          "Carbon fibre reinforcement of weakened beam zones",
+          "Bridge approach resurfacing for drainage improvement",
+        ],
+        interventionStrategy:
+          "Patch-and-seal maintenance for 5–10 years; full rehabilitation at BCI <60",
+        estimatedRemainingLife_years: 20,
+        replacementConsidered: false,
+        postFloodInspectionRequired: true,
+        applicableStandards: [
+          "AUSTROADS Guide to Bridge Technology Part 7",
+          "AS 5100.1",
+          "AS 5100.5",
+          "AS 3600",
+          "VicRoads Bridge Management System",
+        ],
+        recommendation:
+          "Patch exposed rebar and seal joints immediately. Schedule full deck waterproofing. Post-flood underwater inspection after every 1-in-10-year flood event.",
+        summary:
+          "Bridge is in satisfactory condition with typical age-related deterioration. Proactive joint sealing and rebar patching will extend service life. Full rehabilitation likely required at 10–15 years.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
