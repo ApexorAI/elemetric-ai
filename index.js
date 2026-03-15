@@ -82992,6 +82992,471 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 289 ─────────────────────────────────────────────────────────────────
+
+// POST /pool-safety-barrier-inspection — Record swimming pool/spa safety barrier inspection per Building Regulations 2018 (Vic)
+app.post("/pool-safety-barrier-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      propertyId, address, inspectionDate, inspectedBy,
+      inspectorLicenceNumber,
+      poolType, poolYear, poolInGround,
+      barrierHeightMm, minimumBarrierHeightMm,
+      climbingAidsWithin900mm, climbingAidDetails,
+      gateOpeningInward, gateLatched, gateSelfClosing, gateSelfLatching,
+      latchHeightMm, latchOnPoolSideOrTop,
+      poolFenceCompliant, fenceGapsMm, maximumAllowableGapMm,
+      doorToPoolZone, doorSelfClosing, doorSelfLatching,
+      cprSignageDisplayed, cprSignageCompliant,
+      poolDepthMarked, shallowEndMarked,
+      electricalEquipmentBonded, lightingCompliant,
+      nonCompliantItems, nonCompliantDetails,
+      certRef, nextInspectionDue, notes
+    } = req.body;
+
+    if (!propertyId || !address || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "propertyId, address, inspectionDate, inspectedBy are required." });
+    }
+
+    const safePropertyId = sanitiseInput(String(propertyId));
+    const safeAddress = sanitiseInput(String(address));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const criticalIssues = [];
+    const warnings = [];
+
+    const barrierH = parseFloat(barrierHeightMm) || null;
+    const minBarrierH = parseFloat(minimumBarrierHeightMm) || 1200; // Building Regulations 2018 (Vic) minimum 1200mm
+    const latchH = parseFloat(latchHeightMm) || null;
+    const fenceGap = parseFloat(fenceGapsMm) || null;
+    const maxGap = parseFloat(maximumAllowableGapMm) || 100; // maximum 100mm gap
+
+    // Building Regulations 2018 (Vic) Part 8 — Swimming pools and spas
+    // AS 1926.1 — Swimming pool safety — Safety barriers for swimming pools
+    if (barrierH !== null && barrierH < minBarrierH) {
+      criticalIssues.push(`Barrier height ${barrierH} mm below minimum ${minBarrierH} mm — non-compliant barrier. Child drowning risk. Increase barrier height immediately (Building Regulations 2018 (Vic) reg 186 / AS 1926.1).`);
+    }
+
+    if (climbingAidsWithin900mm === true || climbingAidsWithin900mm === "true") {
+      criticalIssues.push(`Climbing aid(s) within 900 mm of pool safety barrier — children can use these to climb over barrier. Remove or relocate immediately (AS 1926.1 cl.2.3).${climbingAidDetails ? " Items: " + sanitiseInput(String(climbingAidDetails)) : ""}`);
+    }
+
+    if (!gateOpeningInward) {
+      criticalIssues.push("Pool gate does not open inward towards pool — gate must open away from pool area to prevent children pushing it open (Building Regulations 2018 (Vic) reg 186 / AS 1926.1 cl.2.6).");
+    }
+
+    if (!gateSelfClosing) {
+      criticalIssues.push("Pool gate is not self-closing — all gates must close automatically from any position without human assistance (AS 1926.1 cl.2.6).");
+    }
+
+    if (!gateSelfLatching) {
+      criticalIssues.push("Pool gate is not self-latching — all gates must latch automatically when released (AS 1926.1 cl.2.6).");
+    }
+
+    if (latchH !== null && latchH < 1500 && !latchOnPoolSideOrTop) {
+      criticalIssues.push(`Gate latch at ${latchH} mm — if latch is below 1500 mm, it must be on the pool side of the gate or within the top 100 mm of gate to prevent child access (AS 1926.1 cl.2.6).`);
+    }
+
+    if (fenceGap !== null && fenceGap > maxGap) {
+      criticalIssues.push(`Fence gap ${fenceGap} mm exceeds maximum ${maxGap} mm — gaps allow child body access. Repair fence to achieve compliant gap clearances (AS 1926.1 cl.2.3).`);
+    }
+
+    if (!poolFenceCompliant) {
+      criticalIssues.push("Pool safety barrier assessed as non-compliant — pool must not be accessible to unsupervised children until barrier is rectified (Building Regulations 2018 (Vic)).");
+    }
+
+    if (!cprSignageDisplayed) {
+      criticalIssues.push("CPR resuscitation sign not displayed — mandatory at all swimming pools and spas (Building Regulations 2018 (Vic) reg 188 / AS 1926.1).");
+    } else if (!cprSignageCompliant) {
+      warnings.push("CPR signage displayed but may not be current format — verify sign meets current AS 1926.1 Appendix B requirements.");
+    }
+
+    if (doorToPoolZone === true || doorToPoolZone === "true") {
+      if (!doorSelfClosing || !doorSelfLatching) {
+        criticalIssues.push("Door/window providing direct access to pool zone not self-closing and self-latching — must comply with same requirements as pool barrier gate (Building Regulations 2018 (Vic) reg 186).");
+      }
+    }
+
+    if (!electricalEquipmentBonded) {
+      warnings.push("Pool electrical equipment bonding not confirmed — all metallic components near pool must be bonded to earth (AS/NZS 3000 cl.7.2 / NCC 2022).");
+    }
+
+    if (!poolDepthMarked) {
+      warnings.push("Pool depth not marked — depth markers required at regular intervals for bather safety.");
+    }
+
+    if (!inspectorLicenceNumber) {
+      warnings.push("Inspector licence number not recorded — pool safety barrier inspections in Victoria must be conducted by a registered building inspector.");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "CONDITIONAL" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("pool_safety_inspections")
+        .insert({
+          property_id: safePropertyId,
+          address: safeAddress,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          inspector_licence: inspectorLicenceNumber ? sanitiseInput(String(inspectorLicenceNumber)) : null,
+          pool_type: poolType ? sanitiseInput(String(poolType)) : null,
+          pool_year: parseInt(poolYear) || null,
+          pool_in_ground: poolInGround !== false && poolInGround !== "false",
+          barrier_height_mm: barrierH,
+          min_barrier_height_mm: minBarrierH,
+          climbing_aids_within_900mm: climbingAidsWithin900mm || false,
+          gate_opens_inward: gateOpeningInward !== false && gateOpeningInward !== "false",
+          gate_self_closing: gateSelfClosing !== false && gateSelfClosing !== "false",
+          gate_self_latching: gateSelfLatching !== false && gateSelfLatching !== "false",
+          latch_height_mm: latchH,
+          latch_pool_side: latchOnPoolSideOrTop !== false && latchOnPoolSideOrTop !== "false",
+          fence_gap_mm: fenceGap,
+          fence_compliant: poolFenceCompliant !== false && poolFenceCompliant !== "false",
+          cpr_sign_displayed: cprSignageDisplayed !== false && cprSignageDisplayed !== "false",
+          cpr_sign_compliant: cprSignageCompliant !== false && cprSignageCompliant !== "false",
+          electrical_bonded: electricalEquipmentBonded !== false && electricalEquipmentBonded !== "false",
+          depth_marked: poolDepthMarked !== false && poolDepthMarked !== "false",
+          non_compliant_items: nonCompliantDetails ? sanitiseInput(String(nonCompliantDetails)) : null,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          next_inspection_due: nextInspectionDue || null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Pool safety barrier NON-COMPLIANT — unsupervised child access to pool area must be prevented until all critical issues are rectified. Notify council if required.",
+        standards: ["Building Regulations 2018 (Vic) Part 8", "AS 1926.1", "AS 1926.2"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      propertyId: safePropertyId,
+      nextInspectionDue: nextInspectionDue || null,
+      standards: ["Building Regulations 2018 (Vic)", "AS 1926.1"],
+    });
+  } catch (err) {
+    console.error("POST /pool-safety-barrier-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record pool safety barrier inspection." });
+  }
+});
+
+// POST /playground-inspection — Record children's playground safety inspection per AS 4685
+app.post("/playground-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      siteId, playgroundId, location, inspectionDate, inspectedBy,
+      inspectionType, equipmentAge,
+      fallHeightM, safetyZoneClearanceM, impactAttenuatingMaterial,
+      impactAttenuatingDepthMm, criticalFallHeightM,
+      entrapmentHazards, entrapmentDetails,
+      protrusions, protrusionDetails,
+      sharpEdges, sharpEdgeDetails,
+      structuralIntegrityOk, anchorageOk, jointsOk, surfaceCorrosion,
+      splinteringTimber, paintChipping,
+      accessibilityCompliant, signageDisplayed, ageRangeSignage,
+      drainageAdequate, foreignObjectsFound,
+      defectsFound, defectDetails, nextInspectionDue, notes
+    } = req.body;
+
+    if (!playgroundId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "playgroundId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safePlayId = sanitiseInput(String(playgroundId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const defects = Array.isArray(defectDetails) ? defectDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const fallH = parseFloat(fallHeightM) || null;
+    const critFallH = parseFloat(criticalFallHeightM) || null;
+    const safetyZone = parseFloat(safetyZoneClearanceM) || null;
+    const impactDepth = parseFloat(impactAttenuatingDepthMm) || null;
+
+    // AS 4685.0–6 — Playground equipment and surfacing
+    // AS/NZS 4422 — Playground surfacing — specifications, requirements, and test methods
+    if (!impactAttenuatingMaterial) {
+      criticalIssues.push("No impact attenuating surfacing under/around playground equipment — required for equipment with fall height >600mm (AS/NZS 4422 / AS 4685).");
+    } else if (critFallH !== null && impactDepth !== null) {
+      // Simplified critical fall height check for common materials
+      const minDepth = critFallH <= 0.6 ? 50 : critFallH <= 1.5 ? 200 : critFallH <= 2.0 ? 250 : 300;
+      if (impactDepth < minDepth) {
+        criticalIssues.push(`Impact attenuating surface depth ${impactDepth} mm may be insufficient for critical fall height ${critFallH} m — verify against AS/NZS 4422 performance requirements. Minimum estimated: ${minDepth} mm.`);
+      }
+    }
+
+    if (entrapmentHazards === true || entrapmentHazards === "true") {
+      criticalIssues.push(`Entrapment hazards detected — head/neck entrapment risk can cause strangulation. Remove equipment from service immediately (AS 4685 cl.4.2). Details: ${entrapmentDetails || "not specified"}`);
+    }
+
+    if (protrusions === true || protrusions === "true") {
+      criticalIssues.push(`Hazardous protrusions detected — clothing/cord entanglement and impalement risk. Remove from service until rectified (AS 4685 cl.4.3). Details: ${protrusionDetails || "not specified"}`);
+    }
+
+    if (sharpEdges === true || sharpEdges === "true") {
+      criticalIssues.push(`Sharp edges/corners detected — laceration risk. Remove from service until rectified (AS 4685 cl.4.4). Details: ${sharpEdgeDetails || "not specified"}`);
+    }
+
+    if (!structuralIntegrityOk) {
+      criticalIssues.push("Structural integrity failure detected — playground equipment must be closed immediately. A structural failure can cause serious injury or death (AS 4685 cl.5).");
+    }
+
+    if (!anchorageOk) {
+      criticalIssues.push("Equipment anchorage defective — equipment can tip or fall. Close immediately and engage specialist for assessment (AS 4685 cl.5.2).");
+    }
+
+    if (safetyZone !== null && safetyZone < 1.5) {
+      criticalIssues.push(`Safety/fall zone clearance ${safetyZone} m is insufficient — minimum 1.5 m clearance required around all equipment within the fall zone (AS 4685.1 cl.4.5).`);
+    }
+
+    if (!jointsOk) {
+      warnings.push("Joint/connection defects detected — repair before next use to prevent structural deterioration.");
+    }
+
+    if (splinteringTimber === true || splinteringTimber === "true") {
+      warnings.push("Splintering timber detected — sand or replace affected timber components to prevent lacerations.");
+    }
+
+    if (paintChipping === true || paintChipping === "true") {
+      const equipAge = parseInt(equipmentAge) || null;
+      if (equipAge && equipAge > 1978) {
+        warnings.push("Paint chipping present — if equipment was manufactured before 1978, test for lead paint before sanding.");
+      } else {
+        warnings.push("Paint chipping detected — repaint to maintain surface protection.");
+      }
+    }
+
+    if (!accessibilityCompliant) {
+      warnings.push("Accessibility compliance not confirmed — playgrounds in public spaces should incorporate accessible play equipment per AS 1428.1 and inclusive design principles.");
+    }
+
+    if (!ageRangeSignage) {
+      warnings.push("Age range signage not displayed — AS 4685 recommends appropriate age range signs to guide parents and reduce misuse injuries.");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "CLOSED_UNSAFE" : warnings.length > 0 ? "OPEN_MONITOR" : "OPEN_COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("playground_inspections")
+        .insert({
+          site_id: siteId ? sanitiseInput(String(siteId)) : null,
+          playground_id: safePlayId,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          inspection_type: inspectionType ? sanitiseInput(String(inspectionType)) : null,
+          equipment_age: parseInt(equipmentAge) || null,
+          fall_height_m: fallH,
+          critical_fall_height_m: critFallH,
+          safety_zone_m: safetyZone,
+          impact_attenuating_material: impactAttenuatingMaterial ? sanitiseInput(String(impactAttenuatingMaterial)) : null,
+          impact_depth_mm: impactDepth,
+          entrapment_hazards: entrapmentHazards || false,
+          protrusions: protrusions || false,
+          sharp_edges: sharpEdges || false,
+          structural_ok: structuralIntegrityOk !== false && structuralIntegrityOk !== "false",
+          anchorage_ok: anchorageOk !== false && anchorageOk !== "false",
+          joints_ok: jointsOk !== false && jointsOk !== "false",
+          surface_corrosion: surfaceCorrosion || false,
+          splintering_timber: splinteringTimber || false,
+          paint_chipping: paintChipping || false,
+          accessibility_compliant: accessibilityCompliant !== false && accessibilityCompliant !== "false",
+          age_range_signage: ageRangeSignage !== false && ageRangeSignage !== "false",
+          drainage_adequate: drainageAdequate !== false && drainageAdequate !== "false",
+          defects_found: defectsFound || false,
+          defect_details: defects,
+          next_inspection_due: nextInspectionDue || null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Playground CLOSED — hazardous conditions identified. Do not permit access until all critical defects are rectified.",
+        standards: ["AS 4685.0", "AS 4685.1", "AS/NZS 4422"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      playgroundId: safePlayId,
+      nextInspectionDue: nextInspectionDue || null,
+      standards: ["AS 4685.0", "AS 4685.1", "AS/NZS 4422"],
+    });
+  } catch (err) {
+    console.error("POST /playground-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record playground inspection." });
+  }
+});
+
+// POST /ai-public-safety-compliance — AI assesses public amenity safety compliance
+app.post("/ai-public-safety-compliance", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      siteId, siteType, publicAccessAreas,
+      poolsCount, poolsCompliant, poolsOverdue,
+      playgroundsCount, playgroundsCompliant, playgroundsOverdue,
+      publicPathwaysCompliant, accessibilityAuditCurrent,
+      lightingAdequate, lightingLastAudit,
+      cctvInstalled, securityAuditCurrent,
+      slipHazardsIdentified, slipHazardManaged,
+      publicFurnitureCondition, publicToiletsCompliant,
+      incidentHistory, publicComplaintsReceived,
+      councilInspectionsPassed, lastCouncilInspection,
+      deficienciesNoted, notes
+    } = req.body;
+
+    if (!siteId) {
+      return res.status(400).json({ error: "siteId is required." });
+    }
+
+    const safeSite = sanitiseInput(String(siteId));
+    const deficiencies = Array.isArray(deficienciesNoted) ? deficienciesNoted : [];
+    const accessAreas = Array.isArray(publicAccessAreas) ? publicAccessAreas : [];
+
+    const prompt = `You are a public safety and amenity compliance expert. Assess this site's public safety compliance and liability risk.
+
+Site ID: ${safeSite}
+Site type: ${siteType || "Unknown"}
+Public access areas: ${accessAreas.join(", ") || "Not specified"}
+
+AQUATIC FACILITIES:
+- Swimming pools/spas: ${poolsCount || 0}
+- Compliant: ${poolsCompliant || 0}, overdue for inspection: ${poolsOverdue || 0}
+
+PLAYGROUNDS:
+- Playgrounds: ${playgroundsCount || 0}
+- Compliant: ${playgroundsCompliant || 0}, overdue: ${playgroundsOverdue || 0}
+
+INFRASTRUCTURE:
+- Pathways compliant: ${publicPathwaysCompliant ? "Yes" : "No/Unknown"}
+- Accessibility audit current: ${accessibilityAuditCurrent ? "Yes" : "No"}
+- Lighting adequate: ${lightingAdequate ? "Yes" : "No/Unknown"}
+- Lighting last audit: ${lightingLastAudit || "Unknown"}
+- CCTV installed: ${cctvInstalled ? "Yes" : "No"}
+- Security audit current: ${securityAuditCurrent ? "Yes" : "No/NA"}
+
+HAZARDS:
+- Slip hazards identified: ${slipHazardsIdentified || 0}
+- Slip hazards managed: ${slipHazardManaged ? "Yes" : "No/Unknown"}
+- Public furniture condition: ${publicFurnitureCondition || "Unknown"}
+- Public toilets compliant: ${publicToiletsCompliant ? "Yes" : "No/NA"}
+
+COMPLIANCE HISTORY:
+- Incident history: ${incidentHistory || "None recorded"}
+- Public complaints: ${publicComplaintsReceived || 0}
+- Council inspections passed: ${councilInspectionsPassed ? "Yes" : "No/Unknown"}
+- Last council inspection: ${lastCouncilInspection || "Unknown"}
+
+Deficiencies: ${deficiencies.join("; ") || "None"}
+
+Assess under:
+- Building Regulations 2018 (Vic) Part 8 (swimming pools)
+- AS 1926.1 (pool safety barriers)
+- AS 4685.0–6 (playground equipment)
+- AS/NZS 4422 (playground surfacing)
+- AS 1428.1–4 (access for people with disabilities)
+- OHS Act 2004 (Vic) — duty of care for public safety
+- Local Government Act 2020 (Vic)
+- Occupiers' Liability Act 1983 (Vic)
+- AS 1158 (road lighting)
+
+Provide:
+1. Overall public safety compliance risk
+2. Aquatic facility risk
+3. Playground safety risk
+4. Accessibility compliance risk
+5. Immediate actions required
+6. Recommended inspection schedule
+
+Respond ONLY in JSON:
+{
+  "overallRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "aquaticFacilityRisk": "LOW|MODERATE|HIGH|CRITICAL|NOT_APPLICABLE",
+  "playgroundRisk": "LOW|MODERATE|HIGH|CRITICAL|NOT_APPLICABLE",
+  "accessibilityRisk": "LOW|MODERATE|HIGH",
+  "liabilityExposure": "LOW|MODERATE|HIGH|VERY_HIGH",
+  "immediateActions": ["string"],
+  "aquaticFindings": ["string"],
+  "playgroundFindings": ["string"],
+  "accessibilityFindings": ["string"],
+  "recommendedInspectionSchedule": {"pools": "string", "playgrounds": "string", "pathways": "string"},
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 900,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallRisk: "MODERATE",
+        aquaticFacilityRisk: "MODERATE",
+        playgroundRisk: "MODERATE",
+        accessibilityRisk: "MODERATE",
+        liabilityExposure: "MODERATE",
+        immediateActions: ["Inspect all pool safety barriers for compliance with Building Regulations 2018 (Vic) Part 8", "Conduct routine playground inspection per AS 4685"],
+        aquaticFindings: ["AI assessment unavailable — verify pool safety barrier compliance with Building Regulations 2018 (Vic) reg 186 annually"],
+        playgroundFindings: ["AI assessment unavailable — conduct quarterly visual inspection and annual formal inspection per AS 4685.1"],
+        accessibilityFindings: ["AI assessment unavailable — commission AS 1428 accessibility audit"],
+        recommendedInspectionSchedule: { pools: "Annual compliance inspection per Building Regulations 2018 (Vic)", playgrounds: "Weekly visual, monthly routine, annual formal per AS 4685.1", pathways: "Annual accessibility audit" },
+        applicableStandards: ["Building Regulations 2018 (Vic) Part 8", "AS 1926.1", "AS 4685.0", "AS 1428.1"],
+        summary: "AI public safety assessment unavailable. Engage qualified inspectors for formal compliance audits of all public amenities.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      siteId: safeSite,
+      standards: ["Building Regulations 2018 (Vic)", "AS 1926.1", "AS 4685.0", "AS 1428.1", "Occupiers' Liability Act 1983 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /ai-public-safety-compliance error:", err.message);
+    res.status(500).json({ error: "Failed to assess public safety compliance." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
