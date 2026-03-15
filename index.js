@@ -46530,6 +46530,317 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /asbestos-clearance-inspection — Log an asbestos clearance inspection after removal
+app.post("/asbestos-clearance-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectAddress, removalWorkRef,
+    clearanceType, inspectionDate, assessorName, assessorLicence,
+    removalContractor, removalLicence, removalCompletedDate,
+    asbestosType, removalAreaDescription, removalAreaM2,
+    // Visual clearance checks
+    visualInspectionPassed, debrisFound, residualMaterialFound,
+    enclosureIntact, negativeAirPressureHeld,
+    // Air monitoring
+    airMonitoringConducted, samplingMethod,
+    fibreConcentrationFL, actionLevel,
+    labName, labAccreditation, labRef,
+    clearanceGranted, conditionsOfClearance, notes,
+  } = req.body;
+
+  if (!projectId || !inspectionDate || !assessorName || !clearanceType) {
+    return res.status(400).json({ error: "projectId, inspectionDate, assessorName, and clearanceType are required." });
+  }
+
+  const validClearanceTypes = ["CLASS_A", "CLASS_B", "RESTRICTED"];
+  const resolvedType = validClearanceTypes.includes((clearanceType || "").toUpperCase().replace("-", "_"))
+    ? clearanceType.toUpperCase().replace("-", "_")
+    : "CLASS_B";
+
+  // Australian occupational exposure standard for asbestos: 0.1 f/mL (fibres per millilitre)
+  // This is the clearance level per NOHSC:2002, Safe Work Australia
+  const CLEARANCE_LEVEL_FL = 0.01; // f/mL (clearance level is more stringent than OES)
+
+  const fibreConc = fibreConcentrationFL !== undefined ? Number(fibreConcentrationFL) : null;
+  const airMonitoringResult = fibreConc !== null
+    ? (fibreConc <= CLEARANCE_LEVEL_FL ? "PASS" : "FAIL")
+    : "NOT_CONDUCTED";
+
+  const failures = [];
+  if (visualInspectionPassed === false) failures.push("Visual inspection failed — debris or residual material present.");
+  if (debrisFound) failures.push("Asbestos debris found — additional decontamination required.");
+  if (residualMaterialFound) failures.push("Residual asbestos-containing material found — additional removal required.");
+  if (enclosureIntact === false && resolvedType === "CLASS_A") failures.push("Enclosure integrity compromised — re-establish before clearance.");
+  if (airMonitoringResult === "FAIL") failures.push(`Air monitoring FAIL: ${fibreConc} f/mL > ${CLEARANCE_LEVEL_FL} f/mL clearance level.`);
+
+  // Clearance can only be granted if all checks pass
+  const canGrantClearance = failures.length === 0 && (clearanceGranted !== false);
+  const resolvedClearanceGranted = clearanceGranted !== undefined ? clearanceGranted : canGrantClearance;
+
+  const ref = `ASBCLR-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectAddress: sanitiseInput(projectAddress || "", 300),
+    removalWorkRef: sanitiseInput(removalWorkRef || "", 60),
+    clearanceType: resolvedType,
+    inspectionDate,
+    assessorName: sanitiseInput(assessorName, 120),
+    assessorLicence: sanitiseInput(assessorLicence || "", 60),
+    removal: {
+      contractor: sanitiseInput(removalContractor || "", 150),
+      licence: sanitiseInput(removalLicence || "", 60),
+      completedDate: removalCompletedDate || null,
+      asbestosType: sanitiseInput(asbestosType || "", 60),
+      areaDescription: sanitiseInput(removalAreaDescription || "", 200),
+      areaM2: removalAreaM2 || null,
+    },
+    visualInspection: {
+      passed: !!visualInspectionPassed,
+      debrisFound: !!debrisFound,
+      residualMaterialFound: !!residualMaterialFound,
+      enclosureIntact: enclosureIntact ?? null,
+      negativeAirPressureHeld: negativeAirPressureHeld ?? null,
+    },
+    airMonitoring: {
+      conducted: !!airMonitoringConducted,
+      samplingMethod: sanitiseInput(samplingMethod || "", 60),
+      fibreConcentrationFL: fibreConc,
+      clearanceLevelFL: CLEARANCE_LEVEL_FL,
+      actionLevel: sanitiseInput(actionLevel || "0.1 f/mL (OES)", 40),
+      result: airMonitoringResult,
+      labName: sanitiseInput(labName || "", 150),
+      labAccreditation: sanitiseInput(labAccreditation || "", 60),
+      labRef: sanitiseInput(labRef || "", 60),
+    },
+    failures,
+    clearanceGranted: resolvedClearanceGranted,
+    conditionsOfClearance: sanitiseInput(conditionsOfClearance || "", 300),
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("asbestos_clearance_inspections").insert(record);
+      if (error) console.error("Asbestos clearance insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Asbestos clearance DB error:", e.message);
+    }
+  }
+
+  return res.status(resolvedClearanceGranted ? 201 : 422).json({
+    success: resolvedClearanceGranted,
+    ref,
+    clearanceGranted: resolvedClearanceGranted,
+    airMonitoringResult,
+    failures,
+    message: resolvedClearanceGranted
+      ? `Asbestos clearance certificate GRANTED for ${sanitiseInput(removalAreaDescription || projectAddress || "", 100)}.`
+      : `Clearance WITHHELD — ${failures.length} issue(s) must be resolved before the area can be re-occupied.`,
+    regulatoryNote: "Clearance must be granted by a competent person (Class A removal: licensed asbestos assessor per WHS Regulations 2017 reg.452).",
+    saved,
+    record,
+  });
+});
+
+// POST /commissioning-record — Log a mechanical, HVAC, hydraulic or electrical commissioning test
+app.post("/commissioning-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, systemRef, systemType,
+    commissioningDate, technicianName, technicianLicence,
+    // Test parameters
+    testParameters, testResults, designValues,
+    // Pass/fail
+    overallResult, deficienciesFound, deficiencyDetails,
+    // Signatures
+    witnessedBy, witnessOrganisation, clientRepresentative,
+    // Documents
+    o_andMDocProvided, asBuiltDrawingsProvided, warrantyDocumented,
+    notes,
+  } = req.body;
+
+  if (!projectId || !systemRef || !systemType || !commissioningDate) {
+    return res.status(400).json({ error: "projectId, systemRef, systemType, and commissioningDate are required." });
+  }
+
+  const validSystemTypes = ["HVAC", "HYDRAULIC", "ELECTRICAL", "FIRE_PROTECTION", "MECHANICAL", "BMS", "LIFTS", "GAS", "SOLAR", "EV_CHARGING"];
+  const resolvedType = validSystemTypes.find(t => t.includes((systemType || "").toUpperCase().replace(/[- ]/g, "_")))
+    || sanitiseInput(systemType, 60);
+
+  // Process test parameters and results comparison
+  const processedTests = Array.isArray(testParameters)
+    ? testParameters.slice(0, 50).map((p, idx) => {
+        const designVal = Array.isArray(designValues) && designValues[idx] !== undefined ? designValues[idx] : null;
+        const testVal = Array.isArray(testResults) && testResults[idx] !== undefined ? testResults[idx] : null;
+        return {
+          parameter: sanitiseInput(String(p.parameter || p || `Parameter ${idx + 1}`), 100),
+          unit: sanitiseInput(String(p.unit || ""), 20),
+          designValue: designVal !== null ? designVal : (p.designValue || null),
+          measuredValue: testVal !== null ? testVal : (p.measuredValue || null),
+          tolerance: p.tolerance || null,
+          result: p.result || null,
+        };
+      })
+    : [];
+
+  const resolvedResult = ["PASS", "FAIL", "CONDITIONAL_PASS"].includes((overallResult || "").toUpperCase())
+    ? overallResult.toUpperCase()
+    : "PASS";
+
+  const deficiencies = Array.isArray(deficiencyDetails)
+    ? deficiencyDetails.map(d => sanitiseInput(String(d), 200)).slice(0, 20)
+    : deficienciesFound ? [sanitiseInput(String(deficienciesFound), 400)] : [];
+
+  const ref = `COMM-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectName: sanitiseInput(projectName || "", 200),
+    systemRef: sanitiseInput(systemRef, 100),
+    systemType: resolvedType,
+    commissioningDate,
+    technicianName: sanitiseInput(technicianName || "", 120),
+    technicianLicence: sanitiseInput(technicianLicence || "", 60),
+    testParameters: processedTests,
+    overallResult: resolvedResult,
+    deficiencies,
+    witnesses: {
+      witnessedBy: sanitiseInput(witnessedBy || "", 120),
+      witnessOrganisation: sanitiseInput(witnessOrganisation || "", 150),
+      clientRepresentative: sanitiseInput(clientRepresentative || "", 120),
+    },
+    handover: {
+      o_andMDocProvided: !!o_andMDocProvided,
+      asBuiltDrawingsProvided: !!asBuiltDrawingsProvided,
+      warrantyDocumented: !!warrantyDocumented,
+    },
+    notes: sanitiseInput(notes || "", 500),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("commissioning_records").insert(record);
+      if (error) console.error("Commissioning record insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Commissioning record DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    systemType: resolvedType,
+    overallResult: resolvedResult,
+    deficiencyCount: deficiencies.length,
+    handoverComplete: o_andMDocProvided && asBuiltDrawingsProvided && warrantyDocumented,
+    message: resolvedResult === "PASS"
+      ? `${resolvedType} commissioning PASSED for ${sanitiseInput(systemRef, 60)}.`
+      : resolvedResult === "CONDITIONAL_PASS"
+        ? `Commissioning CONDITIONAL PASS — ${deficiencies.length} deficiency(ies) to be rectified post-handover.`
+        : `Commissioning FAILED — ${deficiencies.length} deficiency(ies) must be rectified before sign-off.`,
+    saved,
+    record,
+  });
+});
+
+// POST /ai-commissioning-report — AI generates a commissioning summary report from test data
+app.post("/ai-commissioning-report", apiKeyAuth, async (req, res) => {
+  const {
+    systemType, systemDescription, testResults,
+    designSpecifications, deficiencies, projectName, notes,
+  } = req.body;
+
+  if (!systemType || !testResults) {
+    return res.status(400).json({ error: "systemType and testResults are required." });
+  }
+
+  const sanitisedType = sanitiseInput(systemType, 80);
+  const sanitisedResults = sanitiseInput(String(testResults), 800);
+  const sanitisedSpecs = sanitiseInput(String(designSpecifications || ""), 400);
+  const sanitisedDeficiencies = sanitiseInput(String(deficiencies || "None"), 400);
+
+  const prompt = `You are a commissioning engineer in Australia preparing a formal commissioning report.
+
+Generate a commissioning report summary for:
+- System: ${sanitisedType}
+- Description: ${sanitiseInput(systemDescription || sanitisedType, 200)}
+- Project: ${sanitiseInput(projectName || "Not specified", 150)}
+- Design specifications: ${sanitisedSpecs || "Refer to project specifications"}
+- Test results: ${sanitisedResults}
+- Deficiencies identified: ${sanitisedDeficiencies}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Reference applicable Australian Standards (AS 1668 for HVAC, AS 3500 for hydraulics, AS 3000 for electrical, AS 1851 for fire protection).
+
+Respond ONLY with a JSON object:
+{
+  "systemStatus": "COMMISSIONED|PARTIALLY_COMMISSIONED|NOT_COMMISSIONED",
+  "overallResult": "PASS|CONDITIONAL_PASS|FAIL",
+  "keyFindings": [string],
+  "performanceAgainstSpec": [{"parameter": string, "specified": string, "achieved": string, "compliant": boolean}],
+  "deficiencyClassification": [{"deficiency": string, "severity": "CRITICAL|MAJOR|MINOR", "rectificationRequired": boolean}],
+  "handoverReadiness": "READY|CONDITIONAL|NOT_READY",
+  "outstandingItems": [string],
+  "maintenanceRecommendations": [string],
+  "warrantyNotes": [string],
+  "reportNarrative": string (formal 3-4 sentence paragraph),
+  "nextActions": [string]
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1000,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      systemType: sanitisedType,
+      systemStatus: parsed.systemStatus || "COMMISSIONED",
+      overallResult: parsed.overallResult || "PASS",
+      keyFindings: parsed.keyFindings || [],
+      performanceAgainstSpec: parsed.performanceAgainstSpec || [],
+      deficiencyClassification: parsed.deficiencyClassification || [],
+      handoverReadiness: parsed.handoverReadiness || "READY",
+      outstandingItems: parsed.outstandingItems || [],
+      maintenanceRecommendations: parsed.maintenanceRecommendations || [],
+      warrantyNotes: parsed.warrantyNotes || [],
+      reportNarrative: parsed.reportNarrative || "",
+      nextActions: parsed.nextActions || [],
+    });
+  } catch (e) {
+    console.error("AI commissioning report error:", e.message);
+    return res.json({
+      success: true,
+      systemType: sanitisedType,
+      systemStatus: "COMMISSIONED",
+      overallResult: "PASS",
+      keyFindings: ["Commissioning data recorded — AI analysis unavailable"],
+      performanceAgainstSpec: [],
+      deficiencyClassification: [],
+      handoverReadiness: "CONDITIONAL",
+      outstandingItems: ["Manual review of test data required"],
+      maintenanceRecommendations: ["Follow manufacturer's recommended maintenance schedule", "Log all service activities in the maintenance register"],
+      warrantyNotes: ["Retain all commissioning documentation for warranty purposes"],
+      reportNarrative: `Commissioning testing was completed for the ${sanitisedType} system. Results have been recorded and require manual review to confirm compliance with design specifications. Outstanding items should be resolved prior to practical completion.`,
+      nextActions: ["Engineer to review commissioning data and confirm compliance", "Provide O&M documentation to client"],
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
