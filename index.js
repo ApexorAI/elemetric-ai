@@ -73944,6 +73944,410 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 266 ─────────────────────────────────────────────────────────────────
+
+// POST /access-audit-record — Record accessibility compliance audit per AS 1428
+app.post("/access-audit-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, buildingAddress, auditDate, auditedBy,
+      buildingClass, elements,
+      carParkingAccessible, accessibleSpaceCount, requiredAccessibleSpaces,
+      entranceLevelAccessible, rampPresent, rampGradientPercent, rampWidthMm,
+      doorWidthMm, requiredDoorWidthMm, doorForceN, maximumDoorForceN,
+      toiletAccessible, accessibleToiletCount, requiredAccessibleToilets,
+      liftPresent, liftDimensionsOk, tactileGroundSurface,
+      corridorWidthMm, requiredCorridorWidthMm,
+      contrastMarkingOk, signageOk, hearingLoopInstalled,
+      deficienciesFound, deficiencyDetails, notes
+    } = req.body;
+
+    if (!projectId || !buildingAddress || !auditDate || !auditedBy) {
+      return res.status(400).json({ error: "projectId, buildingAddress, auditDate, auditedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeAddress = sanitiseInput(String(buildingAddress));
+    const safeAuditedBy = sanitiseInput(String(auditedBy));
+
+    const deficiencies = Array.isArray(deficiencyDetails) ? deficiencyDetails : [];
+    const elementsList = Array.isArray(elements) ? elements : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const doorWidth = parseFloat(doorWidthMm) || null;
+    const reqDoorWidth = parseFloat(requiredDoorWidthMm) || 850; // AS 1428.1 minimum 850mm
+    const corridorWidth = parseFloat(corridorWidthMm) || null;
+    const reqCorridorWidth = parseFloat(requiredCorridorWidthMm) || 1000; // AS 1428.1 minimum 1000mm
+    const rampGrad = parseFloat(rampGradientPercent) || null;
+    const rampWidth = parseFloat(rampWidthMm) || null;
+    const doorForce = parseFloat(doorForceN) || null;
+    const maxDoorForce = parseFloat(maximumDoorForceN) || 20; // AS 1428.1 maximum 20N for accessible doors
+    const accessSpaces = parseInt(accessibleSpaceCount) || 0;
+    const reqAccessSpaces = parseInt(requiredAccessibleSpaces) || 0;
+    const accessToilets = parseInt(accessibleToiletCount) || 0;
+    const reqAccessToilets = parseInt(requiredAccessibleToilets) || 0;
+
+    // AS 1428.1 — Design for access and mobility (general requirements)
+    // AS 1428.2 — Enhanced and additional requirements
+    // NCC 2022 Section D — access and egress
+
+    if (!entranceLevelAccessible) {
+      criticalIssues.push("Building entrance not accessible at level entry — step-free access required (AS 1428.1 cl.3.1).");
+    }
+
+    if (rampPresent === true || rampPresent === "true") {
+      if (rampGrad !== null && rampGrad > 1 / 14 * 100) { // 1:14 maximum for AS 1428.1
+        const gradRatio = rampGrad ? (100 / rampGrad).toFixed(0) : "?";
+        criticalIssues.push(`Ramp gradient ${rampGrad.toFixed(1)}% (1:${gradRatio}) exceeds maximum 1:14 — non-compliant (AS 1428.1 cl.8.3).`);
+      }
+      if (rampWidth !== null && rampWidth < 1000) {
+        criticalIssues.push(`Ramp width ${rampWidth}mm below minimum 1000mm (AS 1428.1 cl.8.3).`);
+      }
+    }
+
+    if (doorWidth !== null && doorWidth < reqDoorWidth) {
+      criticalIssues.push(`Door clear width ${doorWidth}mm below required ${reqDoorWidth}mm (AS 1428.1 cl.12.2).`);
+    }
+
+    if (doorForce !== null && doorForce > maxDoorForce) {
+      criticalIssues.push(`Door opening force ${doorForce}N exceeds maximum ${maxDoorForce}N for accessible doors (AS 1428.1 cl.12.4).`);
+    }
+
+    if (corridorWidth !== null && corridorWidth < reqCorridorWidth) {
+      criticalIssues.push(`Corridor width ${corridorWidth}mm below minimum ${reqCorridorWidth}mm (AS 1428.1 cl.6.2).`);
+    }
+
+    if (reqAccessSpaces > 0 && accessSpaces < reqAccessSpaces) {
+      criticalIssues.push(`Only ${accessSpaces} accessible car spaces provided — ${reqAccessSpaces} required (AS 2890.6 / NCC 2022).`);
+    }
+
+    if (reqAccessToilets > 0 && accessToilets < reqAccessToilets) {
+      criticalIssues.push(`Only ${accessToilets} accessible toilets — ${reqAccessToilets} required (AS 1428.1 / NCC 2022 D3.8).`);
+    }
+
+    if (!tactileGroundSurface) {
+      warnings.push("Tactile ground surface indicators not confirmed at hazard locations — required per AS 1428.4.1.");
+    }
+    if (!contrastMarkingOk) {
+      warnings.push("Visual contrast marking not confirmed — required on doors, steps, and hazard areas (AS 1428.1 cl.5.2).");
+    }
+    if (!signageOk) {
+      warnings.push("Accessible signage not confirmed — international symbol of access required at all accessible facilities.");
+    }
+
+    if (deficienciesFound === true || deficienciesFound === "true") {
+      if (deficiencies.length > 0) {
+        warnings.push(`Additional deficiencies: ${deficiencies.map(d => sanitiseInput(String(d))).join("; ")}`);
+      } else {
+        warnings.push("Deficiencies flagged but not documented — record all non-conformances.");
+      }
+    }
+
+    const auditStatus = criticalIssues.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "MINOR_NON_COMPLIANCES" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("access_audit_records")
+        .insert({
+          project_id: safeProject,
+          building_address: safeAddress,
+          audit_date: auditDate,
+          audited_by: safeAuditedBy,
+          building_class: buildingClass || null,
+          elements_audited: elementsList,
+          entrance_accessible: entranceLevelAccessible || false,
+          ramp_gradient_percent: rampGrad,
+          ramp_width_mm: rampWidth,
+          door_width_mm: doorWidth,
+          door_force_n: doorForce,
+          corridor_width_mm: corridorWidth,
+          accessible_car_spaces: accessSpaces || null,
+          required_accessible_spaces: reqAccessSpaces || null,
+          accessible_toilets: accessToilets || null,
+          required_accessible_toilets: reqAccessToilets || null,
+          tactile_ground_surface: tactileGroundSurface || false,
+          contrast_marking_ok: contrastMarkingOk || false,
+          signage_ok: signageOk || false,
+          hearing_loop_installed: hearingLoopInstalled || false,
+          audit_status: auditStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        auditStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Accessibility non-compliant — rectification required before occupation.",
+        standards: ["AS 1428.1", "AS 1428.2", "AS 1428.4.1", "NCC 2022 Section D", "Disability Discrimination Act 1992"],
+      });
+    }
+
+    res.json({
+      auditStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      standards: ["AS 1428.1", "AS 1428.2", "NCC 2022 Section D"],
+    });
+  } catch (err) {
+    console.error("POST /access-audit-record error:", err.message);
+    res.status(500).json({ error: "Failed to record access audit." });
+  }
+});
+
+// POST /commissioning-record — Record building services commissioning results
+app.post("/commissioning-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, systemType, location, commissioningDate, commissionedBy,
+      contractorCompany, designSetpoint, measuredValue, measuredUnit,
+      withinTolerance, tolerancePercent,
+      certificateIssued, certificateReference,
+      hvacAirflowTested, hvacAirflowResultLs,
+      hvacAirflowSpecifiedLs, hvacBalanceOk,
+      electricalPolarity, earthContinuityOhm, rcdTestPassed,
+      plumbingFlowTestPassed, plumbingPressureKpa, plumbingPressureSpec,
+      fireSystemCommissioned, fireSystemCertRef,
+      liftsCommissioned, liftsCertRef,
+      failureDetails, reworkRequired, notes
+    } = req.body;
+
+    if (!projectId || !systemType || !commissioningDate || !commissionedBy) {
+      return res.status(400).json({ error: "projectId, systemType, commissioningDate, commissionedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeSystem = sanitiseInput(String(systemType));
+    const safeCommissioner = sanitiseInput(String(commissionedBy));
+    const safeLocation = location ? sanitiseInput(String(location)) : null;
+
+    const criticalIssues = [];
+    const warnings = [];
+
+    const tolerancePct = parseFloat(tolerancePercent) || 10;
+    const designVal = parseFloat(designSetpoint) || null;
+    const measuredVal = parseFloat(measuredValue) || null;
+
+    // Check tolerance breach
+    if (designVal !== null && measuredVal !== null) {
+      const deviation = Math.abs(measuredVal - designVal) / Math.abs(designVal) * 100;
+      if (deviation > tolerancePct) {
+        criticalIssues.push(`Measured ${measuredVal}${measuredUnit || ""} deviates ${deviation.toFixed(1)}% from design ${designVal}${measuredUnit || ""} — exceeds ${tolerancePct}% tolerance. Rework required.`);
+      } else if (deviation > tolerancePct * 0.7) {
+        warnings.push(`Measured value ${measuredVal}${measuredUnit || ""} approaching tolerance boundary (${deviation.toFixed(1)}% deviation).`);
+      }
+    }
+
+    if (withinTolerance === false || withinTolerance === "false") {
+      criticalIssues.push("Commissioning result outside tolerance — system does not meet design specification.");
+    }
+
+    // HVAC
+    const hvacFlow = parseFloat(hvacAirflowResultLs) || null;
+    const hvacSpec = parseFloat(hvacAirflowSpecifiedLs) || null;
+    if (hvacFlow !== null && hvacSpec !== null) {
+      const hvacDeviation = Math.abs(hvacFlow - hvacSpec) / hvacSpec * 100;
+      if (hvacDeviation > 15) {
+        criticalIssues.push(`HVAC airflow ${hvacFlow}L/s deviates ${hvacDeviation.toFixed(1)}% from specified ${hvacSpec}L/s — exceeds AIRAH 15% tolerance. Rebalance required (AS 1668.2).`);
+      }
+    }
+    if (hvacBalanceOk === false || hvacBalanceOk === "false") {
+      criticalIssues.push("HVAC air balance failed — system must be rebalanced before handover (AS 1668.1).");
+    }
+
+    // Electrical
+    if (electricalPolarity === false || electricalPolarity === "false") {
+      criticalIssues.push("Electrical polarity incorrect — live safety issue. Do not energise until rectified (AS/NZS 3000).");
+    }
+    if (rcdTestPassed === false || rcdTestPassed === "false") {
+      criticalIssues.push("RCD test failed — safety device non-functional. Must be replaced before occupation (AS/NZS 3000).");
+    }
+    const earthOhm = parseFloat(earthContinuityOhm) || null;
+    if (earthOhm !== null && earthOhm > 1.0) {
+      criticalIssues.push(`Earth continuity resistance ${earthOhm}Ω exceeds 1.0Ω limit — earthing defective. Inspect before energising.`);
+    }
+
+    // Plumbing
+    const plumbPressure = parseFloat(plumbingPressureKpa) || null;
+    const plumbSpec = parseFloat(plumbingPressureSpec) || null;
+    if (plumbingFlowTestPassed === false || plumbingFlowTestPassed === "false") {
+      criticalIssues.push("Plumbing flow/pressure test failed — hydraulic design requirements not met.");
+    }
+    if (plumbPressure !== null && plumbSpec !== null && plumbPressure < plumbSpec * 0.9) {
+      warnings.push(`Plumbing pressure ${plumbPressure}kPa below specified ${plumbSpec}kPa — check for restrictions or pump sizing.`);
+    }
+
+    // Fire systems
+    if (systemType.toLowerCase().includes("fire") || fireSystemCommissioned === true || fireSystemCommissioned === "true") {
+      if (!fireSystemCertRef) {
+        criticalIssues.push("Fire system commissioning certificate reference not recorded — required for occupancy permit (Building Act 1993 Vic).");
+      }
+    }
+
+    // Lifts
+    if (liftsCommissioned === true || liftsCommissioned === "true") {
+      if (!liftsCertRef) {
+        criticalIssues.push("Lift commissioning certificate reference not recorded — required for occupancy permit (AS 1418.1).");
+      }
+    }
+
+    if (!certificateIssued) {
+      warnings.push("Commissioning certificate not yet issued — required for building permit close-out.");
+    }
+
+    const status = criticalIssues.length > 0 ? "FAIL" : warnings.length > 0 ? "CONDITIONAL_PASS" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("commissioning_records")
+        .insert({
+          project_id: safeProject,
+          system_type: safeSystem,
+          location: safeLocation,
+          commissioning_date: commissioningDate,
+          commissioned_by: safeCommissioner,
+          contractor_company: contractorCompany ? sanitiseInput(String(contractorCompany)) : null,
+          design_setpoint: designVal,
+          measured_value: measuredVal,
+          measured_unit: measuredUnit || null,
+          within_tolerance: withinTolerance !== false && withinTolerance !== "false",
+          certificate_issued: certificateIssued || false,
+          certificate_reference: certificateReference ? sanitiseInput(String(certificateReference)) : null,
+          rework_required: reworkRequired || false,
+          failure_details: failureDetails ? sanitiseInput(String(failureDetails)) : null,
+          commissioning_status: status,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        commissioningStatus: status,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Commissioning failed — rework required before occupancy permit.",
+        standards: ["AS 1668.1", "AS 1668.2", "AS/NZS 3000", "AS 1418.1", "Building Act 1993 (Vic)"],
+      });
+    }
+
+    res.json({
+      commissioningStatus: status,
+      criticalIssues,
+      warnings,
+      savedId,
+      systemType: safeSystem,
+      standards: ["AS 1668.1", "AS 1668.2", "AS/NZS 3000"],
+    });
+  } catch (err) {
+    console.error("POST /commissioning-record error:", err.message);
+    res.status(500).json({ error: "Failed to record commissioning." });
+  }
+});
+
+// POST /ai-commissioning-deviation-analysis — AI analyses commissioning deviations and recommends rectification
+app.post("/ai-commissioning-deviation-analysis", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      systemType, deviations, designIntent, buildingClass,
+      occupancyDate, criticalSystems, siteContext
+    } = req.body;
+
+    if (!systemType || !deviations) {
+      return res.status(400).json({ error: "systemType and deviations are required." });
+    }
+
+    const safeSystem = sanitiseInput(String(systemType));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const deviationList = Array.isArray(deviations) ? deviations.map(d => sanitiseInput(String(d))) : [sanitiseInput(String(deviations))];
+    const critSystems = Array.isArray(criticalSystems) ? criticalSystems.map(s => sanitiseInput(String(s))) : [];
+
+    const prompt = `You are a building services commissioning engineer analysing commissioning deviations for a Victorian building project.
+
+System: ${safeSystem}
+Building class: ${buildingClass || "Unknown"}
+Design intent: ${designIntent || "Not stated"}
+Deviations recorded: ${deviationList.join("; ")}
+Critical systems: ${critSystems.join(", ") || "Not specified"}
+Target occupancy: ${occupancyDate || "Not stated"}
+Location: ${safeSite}
+
+Analyse each deviation under AIRAH commissioning guidelines, NCC 2022, and relevant Australian standards (AS 1668, AS/NZS 3000, AS 1428, AS 1418):
+1. Root cause of each deviation (design, installation, product, balance)
+2. Impact on occupant comfort, safety, and regulatory compliance
+3. Rectification method and priority
+4. Whether occupancy can proceed with deviations pending
+5. Hold points before practical completion sign-off
+
+Respond ONLY in JSON:
+{
+  "overallRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "deviationAnalysis": [{"deviation": "string", "rootCause": "string", "impact": "string", "rectification": "string", "priority": "IMMEDIATE|URGENT|SCHEDULED"}],
+  "occupancyRecommendation": "PROCEED|PROCEED_WITH_CONDITIONS|DEFER",
+  "holdPoints": ["string"],
+  "rectificationSchedule": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 900,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallRisk: "MODERATE",
+        deviationAnalysis: deviationList.map(d => ({
+          deviation: d,
+          rootCause: "AI analysis unavailable",
+          impact: "Unknown — requires manual assessment",
+          rectification: "Engage commissioning engineer for root cause analysis",
+          priority: "URGENT",
+        })),
+        occupancyRecommendation: "DEFER",
+        holdPoints: ["All deviations must be assessed before occupancy permit"],
+        rectificationSchedule: ["Engage commissioning engineer within 5 business days"],
+        applicableStandards: ["AIRAH Commissioning Guidelines", "NCC 2022", "AS 1668.1", "AS 1668.2"],
+        summary: "AI analysis unavailable. Commissioning engineer must assess all deviations before occupancy.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      systemType: safeSystem,
+      deviationCount: deviationList.length,
+      standards: ["AIRAH Commissioning Guidelines", "NCC 2022", "AS 1668.1", "AS 1668.2"],
+    });
+  } catch (err) {
+    console.error("POST /ai-commissioning-deviation-analysis error:", err.message);
+    res.status(500).json({ error: "Failed to analyse commissioning deviations." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
