@@ -4972,6 +4972,322 @@ app.post("/analyse-trends", async (req, res) => {
   }
 });
 
+// ── Task 22: Fraud Detection Layer ───────────────────────────────────────────
+// Detects suspicious patterns in job submissions.
+
+// In-memory fraud tracking store (keyed by plumber/user ID)
+const fraudStore = {
+  gpsUsage:      new Map(), // gpsKey → { userIds: Set, count }
+  photoHashes:   new Map(), // photoHash → { userId, jobId, date }
+  jobTimings:    new Map(), // jobId → { userId, startTime }
+  fraudFlags:    new Map(), // jobId → flagDetails
+};
+
+function computePhotoHash(data) {
+  // Hash just the first 2048 chars of base64 data for efficiency
+  return crypto.createHash("sha256").update((data || "").slice(0, 2048)).digest("hex").slice(0, 16);
+}
+
+async function runFraudDetection(jobData) {
+  const {
+    userId,
+    jobId,
+    gpsLat,
+    gpsLng,
+    images = [],
+    startedAt,
+    completedAt,
+    confidenceScore,
+    photoCount,
+  } = jobData;
+
+  const flags = [];
+
+  // Check 1: GPS reuse — same coordinates on 10+ different jobs from different users
+  if (gpsLat && gpsLng) {
+    const gpsKey = `${parseFloat(gpsLat).toFixed(4)},${parseFloat(gpsLng).toFixed(4)}`;
+    if (!fraudStore.gpsUsage.has(gpsKey)) {
+      fraudStore.gpsUsage.set(gpsKey, { userIds: new Set(), count: 0 });
+    }
+    const gpsEntry = fraudStore.gpsUsage.get(gpsKey);
+    gpsEntry.userIds.add(userId);
+    gpsEntry.count++;
+
+    if (gpsEntry.count >= 10 && gpsEntry.userIds.size >= 3) {
+      flags.push({
+        type:     "gps_reuse",
+        severity: "high",
+        detail:   `GPS coordinates (${gpsLat}, ${gpsLng}) used on ${gpsEntry.count} jobs by ${gpsEntry.userIds.size} different users.`,
+      });
+    }
+  }
+
+  // Check 2: Duplicate photos (identical to a previous job)
+  for (const img of images) {
+    const hash = computePhotoHash(img.data);
+    if (fraudStore.photoHashes.has(hash)) {
+      const prev = fraudStore.photoHashes.get(hash);
+      if (prev.userId !== userId || prev.jobId !== jobId) {
+        flags.push({
+          type:     "duplicate_photo",
+          severity: "high",
+          detail:   `Photo "${img.label}" appears to be identical to a photo submitted on a previous job (${prev.jobId}).`,
+        });
+      }
+    } else {
+      fraudStore.photoHashes.set(hash, { userId, jobId, date: new Date().toISOString() });
+    }
+  }
+
+  // Check 3: Impossible completion time (under 2 minutes)
+  if (startedAt && completedAt) {
+    const durationMs = new Date(completedAt) - new Date(startedAt);
+    if (durationMs > 0 && durationMs < 2 * 60 * 1000) {
+      flags.push({
+        type:     "impossible_speed",
+        severity: "medium",
+        detail:   `Job completed in ${Math.round(durationMs / 1000)} seconds — this is too fast for genuine photo documentation.`,
+      });
+    }
+  }
+
+  // Check 4: Suspiciously high confidence on minimal photos
+  if (typeof confidenceScore === "number" && confidenceScore >= 95 && photoCount <= 2) {
+    flags.push({
+      type:     "suspicious_score",
+      severity: "medium",
+      detail:   `Confidence score of ${confidenceScore}% on only ${photoCount} photo(s) is statistically unusual.`,
+    });
+  }
+
+  const fraudFlag = flags.length > 0;
+
+  if (fraudFlag) {
+    fraudStore.fraudFlags.set(jobId, { jobId, userId, flags, detectedAt: new Date().toISOString() });
+    console.warn(`[fraud] Suspicious job detected: jobId=${jobId} userId=${userId} flags=${flags.map(f => f.type).join(",")}`);
+  }
+
+  return { fraudFlag, flags };
+}
+
+// POST /fraud-check — manually run fraud detection on a job
+app.post("/fraud-check", async (req, res) => {
+  const {
+    userId, jobId, gpsLat, gpsLng, images,
+    startedAt, completedAt, confidenceScore, photoCount,
+  } = req.body || {};
+
+  if (!userId || !jobId) {
+    return res.status(400).json({ error: "userId and jobId are required." });
+  }
+
+  const result = await runFraudDetection({
+    userId, jobId, gpsLat, gpsLng, images: images || [],
+    startedAt, completedAt, confidenceScore, photoCount,
+  });
+
+  // If fraud detected and DB available, flag the job record
+  if (result.fraudFlag && supabaseAdmin) {
+    try {
+      await supabaseAdmin
+        .from("analyses")
+        .update({ fraud_flag: true, fraud_flags: result.flags })
+        .eq("id", jobId);
+    } catch (dbErr) {
+      console.error("[fraud] Failed to update fraud flag in DB:", dbErr.message);
+    }
+  }
+
+  return res.json({
+    jobId,
+    userId,
+    fraudFlag:    result.fraudFlag,
+    flags:        result.flags,
+    severity:     result.flags.length > 0 ? result.flags.sort((a, b) => (a.severity === "high" ? -1 : 1))[0].severity : null,
+    checkedAt:    new Date().toISOString(),
+    totalFlagged: fraudStore.fraudFlags.size,
+  });
+});
+
+// GET /fraud-flags — returns summary of all flagged jobs (protected by API key)
+app.get("/fraud-flags", (_req, res) => {
+  const flags = Array.from(fraudStore.fraudFlags.values()).slice(-100);
+  return res.json({ total: fraudStore.fraudFlags.size, flags });
+});
+
+// ── Task 23: Regulatory Compliance Calendar ───────────────────────────────────
+// Important dates and service intervals for Victorian tradespeople.
+
+const COMPLIANCE_CALENDAR_ITEMS = [
+  { id: "CC-01", trade: "plumbing",  event: "VBA Plumbing Licence Renewal", recurrenceYears: 3, description: "Victorian Building Authority (VBA) plumbing licence must be renewed every 3 years. Renewal applications should be lodged 90 days before expiry.", link: "https://www.vba.vic.gov.au" },
+  { id: "CC-02", trade: "gas",       event: "Gas Type B Appliance Service", recurrenceYears: 1, description: "Commercial Type B gas appliances (>10 MJ/h) must be serviced annually by a licenced gas fitter. Service records must be retained.", link: null },
+  { id: "CC-03", trade: "electrical",event: "VBA Electrical Licence Renewal", recurrenceYears: 3, description: "Energy Safe Victoria (ESV) electrical licence must be renewed every 3 years. CPD points required for renewal.", link: "https://www.esv.vic.gov.au" },
+  { id: "CC-04", trade: "electrical",event: "Test & Tag (Commercial) — 6 Monthly", recurrenceMonths: 6, description: "Electrical equipment used in commercial kitchens, construction sites, and workshops must be tested and tagged every 6 months under AS/NZS 3760.", link: null },
+  { id: "CC-05", trade: "electrical",event: "Test & Tag (Office Equipment) — 12 Monthly", recurrenceMonths: 12, description: "Office electrical equipment must be tested and tagged at least annually under AS/NZS 3760.", link: null },
+  { id: "CC-06", trade: "gas",       event: "Gas Appliance Compliance Inspection (Type A)", recurrenceYears: 5, description: "Domestic gas appliances should be inspected every 5 years to check for carbon monoxide risk, flue integrity, and safety device function.", link: null },
+  { id: "CC-07", trade: "plumbing",  event: "Thermostatic Mixing Valve (TMV) Service", recurrenceYears: 1, description: "AS 4032.1 requires TMVs to be serviced and temperature-verified annually in healthcare, aged care, and disability accommodation.", link: null },
+  { id: "CC-08", trade: "plumbing",  event: "Backflow Prevention Device Test", recurrenceYears: 1, description: "Registered backflow prevention devices (RPZ, DCA) must be tested annually by a VBA-endorsed backflow prevention plumber.", link: null },
+  { id: "CC-09", trade: "drainage",  event: "Grease Trap Service — Hospitality", recurrenceWeeks: 12, description: "Commercial grease traps must be pumped and serviced at intervals not exceeding 12 weeks (or as specified by the authority). Service records must be kept.", link: null },
+  { id: "CC-10", trade: "hvac",      event: "VBA Refrigeration & Air Conditioning Licence Renewal", recurrenceYears: 5, description: "ARC Tick refrigerant handling licences must be renewed every 5 years. Renewal requires evidence of ongoing industry activity.", link: "https://www.arctick.org" },
+  { id: "CC-11", trade: "electrical",event: "Emergency Lighting Test — 6 Monthly", recurrenceMonths: 6, description: "AS 2293 requires emergency and exit lighting to be tested every 6 months. Annual 90-minute discharge test also required.", link: null },
+  { id: "CC-12", trade: "plumbing",  event: "Water Heater Anode Rod Inspection", recurrenceYears: 5, description: "Storage hot water system sacrificial anode rods should be inspected every 5 years and replaced if corroded to extend tank life.", link: null },
+];
+
+app.get("/compliance-calendar", (req, res) => {
+  const { trade, jobCompletedDate } = req.query;
+
+  const now = new Date();
+  let items = COMPLIANCE_CALENDAR_ITEMS;
+
+  if (trade) {
+    items = items.filter(i => i.trade === trade.toLowerCase());
+  }
+
+  // If jobCompletedDate provided, calculate upcoming due dates relative to that job
+  const baseDate = jobCompletedDate ? new Date(jobCompletedDate) : now;
+
+  const calendarEntries = items.map(item => {
+    let nextDue = null;
+    if (item.recurrenceYears)  { nextDue = new Date(baseDate); nextDue.setFullYear(nextDue.getFullYear() + item.recurrenceYears); }
+    if (item.recurrenceMonths) { nextDue = new Date(baseDate); nextDue.setMonth(nextDue.getMonth() + item.recurrenceMonths); }
+    if (item.recurrenceWeeks)  { nextDue = new Date(baseDate); nextDue.setDate(nextDue.getDate() + item.recurrenceWeeks * 7); }
+
+    const daysUntilDue = nextDue ? Math.ceil((nextDue - now) / (1000 * 60 * 60 * 24)) : null;
+    const urgency = daysUntilDue !== null
+      ? daysUntilDue <= 30 ? "urgent" : daysUntilDue <= 90 ? "upcoming" : "future"
+      : "ongoing";
+
+    return {
+      ...item,
+      nextDue:      nextDue ? nextDue.toISOString().split("T")[0] : null,
+      daysUntilDue,
+      urgency,
+    };
+  }).sort((a, b) => (a.daysUntilDue ?? 9999) - (b.daysUntilDue ?? 9999));
+
+  return res.json({
+    jurisdiction:   "Victoria, Australia",
+    basedOnDate:    baseDate.toISOString().split("T")[0],
+    trade:          trade || "all",
+    calendarEntries,
+    urgent:         calendarEntries.filter(e => e.urgency === "urgent").length,
+    upcoming:       calendarEntries.filter(e => e.urgency === "upcoming").length,
+    generatedAt:    new Date().toISOString(),
+  });
+});
+
+// ── Task 24: Job Cost Analyser ────────────────────────────────────────────────
+// Analyses job economics — labour, materials, comparison, and profit margin.
+
+// Victorian Award hourly rates (AUD, 2025-2026 rates, inclusive of super)
+const AWARD_RATES = {
+  plumbing:  { rate: 58, description: "Plumber Level 1 (Metal, Engineering & Associated Industries Award)" },
+  gas:       { rate: 62, description: "Gasfitter Level 1 (with gas licence loading)" },
+  electrical:{ rate: 64, description: "Electrician Level 1 (Electrical, Electronic and Communications Contracting Industry Award)" },
+  drainage:  { rate: 56, description: "Plumber/Drainer Level 1" },
+  carpentry: { rate: 55, description: "Carpenter Grade 3 (Building and Construction General On-site Award)" },
+  hvac:      { rate: 60, description: "HVAC/Refrigeration Technician Level 1" },
+};
+
+// Industry average job values by type (AUD, Victorian small business)
+const INDUSTRY_AVERAGE_JOB_VALUES = {
+  plumbing:  { simpleJob: 350, moderateJob: 850, complexJob: 1800 },
+  gas:       { simpleJob: 420, moderateJob: 950, complexJob: 2200 },
+  electrical:{ simpleJob: 380, moderateJob: 900, complexJob: 2000 },
+  drainage:  { simpleJob: 450, moderateJob: 1100, complexJob: 2500 },
+  carpentry: { simpleJob: 600, moderateJob: 1500, complexJob: 3500 },
+  hvac:      { simpleJob: 500, moderateJob: 1200, complexJob: 2800 },
+};
+
+app.post("/analyse-cost", (req, res) => {
+  const {
+    jobType,
+    timeOnSiteMinutes,
+    materialsList = [],
+    jobValue,
+    suburb,
+  } = req.body || {};
+
+  if (!jobType || typeof jobType !== "string") {
+    return res.status(400).json({ error: "jobType is required." });
+  }
+
+  const awardRate   = AWARD_RATES[jobType];
+  const industryAvg = INDUSTRY_AVERAGE_JOB_VALUES[jobType];
+
+  if (!awardRate) {
+    return res.status(400).json({ error: `Unknown jobType: ${jobType}` });
+  }
+
+  // Labour cost
+  const hours      = typeof timeOnSiteMinutes === "number" ? timeOnSiteMinutes / 60 : null;
+  const labourCost = hours !== null ? parseFloat((hours * awardRate.rate).toFixed(2)) : null;
+
+  // Materials cost from list
+  const pricingTable = MATERIALS_PRICING[jobType] || {};
+  let materialsCost  = 0;
+  const materialLines = [];
+
+  for (const entry of materialsList) {
+    const name = (entry.name || "").toLowerCase();
+    const qty  = typeof entry.quantity === "number" ? entry.quantity : 1;
+    const key  = Object.keys(pricingTable).find(k => name.includes(k) || k.includes(name));
+    if (key) {
+      const line = pricingTable[key].price * qty;
+      materialsCost += line;
+      materialLines.push({ name: entry.name, qty, lineTotal: parseFloat(line.toFixed(2)) });
+    }
+  }
+
+  const totalCost = parseFloat(((labourCost || 0) + materialsCost).toFixed(2));
+
+  // Profit margin estimate (if job value provided)
+  let profitMargin = null;
+  let profitAmt    = null;
+  if (typeof jobValue === "number" && jobValue > 0 && totalCost > 0) {
+    profitAmt    = parseFloat((jobValue - totalCost).toFixed(2));
+    profitMargin = parseFloat(((profitAmt / jobValue) * 100).toFixed(1));
+  }
+
+  // Industry comparison
+  let comparisonBand = null;
+  if (industryAvg && totalCost > 0) {
+    comparisonBand = totalCost <= industryAvg.simpleJob ? "below_average"
+      : totalCost <= industryAvg.moderateJob ? "average"
+      : totalCost <= industryAvg.complexJob  ? "above_average"
+      : "high_complexity";
+  }
+
+  return res.json({
+    jobType,
+    suburb:         suburb || null,
+    labour: {
+      hoursOnSite:    hours !== null ? parseFloat(hours.toFixed(2)) : null,
+      awardRateAUD:   awardRate.rate,
+      awardSource:    awardRate.description,
+      labourCostAUD:  labourCost,
+    },
+    materials: {
+      items:          materialLines,
+      totalAUD:       parseFloat(materialsCost.toFixed(2)),
+    },
+    totals: {
+      totalCostAUD:   totalCost,
+      jobValueAUD:    jobValue || null,
+      profitAUD:      profitAmt,
+      profitMarginPct: profitMargin,
+    },
+    industryComparison: {
+      band:           comparisonBand,
+      avgSimpleJob:   industryAvg?.simpleJob,
+      avgModerateJob: industryAvg?.moderateJob,
+      avgComplexJob:  industryAvg?.complexJob,
+      note:           "Victorian small business averages — exclusive of GST.",
+    },
+    disclaimer: "Labour rates based on applicable Modern Award base rates. Actual costs may vary. Not financial or tax advice.",
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
