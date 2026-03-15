@@ -22129,6 +22129,168 @@ app.post("/site-induction", apiKeyAuth, async (req, res) => {
   return res.status(201).json({ ...record, saved: !!supabaseAdmin });
 });
 
+// POST /site-diary  — Log a daily site diary entry
+app.post("/site-diary", apiKeyAuth, async (req, res) => {
+  const { siteId, contractorId, date, weather, workers, hoursWorked, workCompleted, issuesEncountered, visitorsOnSite, materials, notes } = req.body || {};
+  if (!siteId) return res.status(400).json({ error: "siteId required." });
+
+  const safeSiteId  = sanitiseInput(String(siteId)).slice(0, 80);
+  const safeCId     = contractorId ? sanitiseInput(String(contractorId)).slice(0, 80) : null;
+  const safeDate    = date ? sanitiseInput(String(date)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeWeather = weather ? sanitiseInput(String(weather)).slice(0, 50) : null;
+  const safeWork    = workCompleted ? sanitiseInput(String(workCompleted)).slice(0, 1000) : null;
+  const safeIssues  = issuesEncountered ? sanitiseInput(String(issuesEncountered)).slice(0, 500) : null;
+  const safeNotes   = notes ? sanitiseInput(String(notes)).slice(0, 500) : null;
+  const safeMats    = materials ? sanitiseInput(String(materials)).slice(0, 300) : null;
+  const workerCount = Math.max(0, parseInt(workers) || 0);
+  const hoursTotal  = Math.max(0, parseFloat(hoursWorked) || 0);
+
+  const entry = {
+    siteId: safeSiteId, contractorId: safeCId, date: safeDate,
+    weather: safeWeather, workers: workerCount, hoursWorked: hoursTotal,
+    workCompleted: safeWork, issuesEncountered: safeIssues,
+    visitorsOnSite: Math.max(0, parseInt(visitorsOnSite) || 0),
+    materials: safeMats, notes: safeNotes,
+    diaryRef: `SD-${safeSiteId.slice(0, 6).toUpperCase()}-${safeDate.replace(/-/g, "")}`,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("site_diary").insert({
+        site_id: entry.siteId, contractor_id: entry.contractorId, date: entry.date,
+        weather: entry.weather, workers: entry.workers, hours_worked: entry.hoursWorked,
+        work_completed: entry.workCompleted, issues_encountered: entry.issuesEncountered,
+        visitors_on_site: entry.visitorsOnSite, materials: entry.materials,
+        notes: entry.notes, diary_ref: entry.diaryRef, created_at: entry.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...entry, saved: !!supabaseAdmin });
+});
+
+// GET /site-diary/:siteId  — Get diary entries for a site
+app.get("/site-diary/:siteId", apiKeyAuth, async (req, res) => {
+  const siteId = sanitiseInput(String(req.params.siteId || "")).slice(0, 80);
+  const limit  = Math.min(parseInt(req.query.limit) || 30, 100);
+  if (!siteId) return res.status(400).json({ error: "siteId required." });
+
+  let entries = [];
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin
+        .from("site_diary")
+        .select("*")
+        .eq("site_id", siteId)
+        .order("date", { ascending: false })
+        .limit(limit);
+      entries = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const totalHours   = entries.reduce((s, e) => s + (e.hours_worked || 0), 0);
+  const totalWorkers = entries.reduce((s, e) => s + (e.workers || 0), 0);
+
+  return res.json({
+    siteId, entryCount: entries.length,
+    totalHoursLogged: parseFloat(totalHours.toFixed(1)),
+    totalWorkerDays: totalWorkers,
+    entries,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /punch-list  — Create punch list items (outstanding before handover)
+app.post("/punch-list", apiKeyAuth, async (req, res) => {
+  const { jobId, items = [] } = req.body || {};
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "items array required." });
+
+  const safeJobId = sanitiseInput(String(jobId)).slice(0, 80);
+  const VALID_PRIORITIES = ["critical", "high", "medium", "low"];
+
+  const punchItems = items.slice(0, 100).map((item, idx) => ({
+    itemId:      `PI-${safeJobId.slice(0, 6).toUpperCase()}-${String(idx + 1).padStart(3, "0")}`,
+    description: sanitiseInput(String(item.description || item || "")).slice(0, 300),
+    location:    item.location ? sanitiseInput(String(item.location)).slice(0, 100) : null,
+    assignedTo:  item.assignedTo ? sanitiseInput(String(item.assignedTo)).slice(0, 100) : null,
+    priority:    VALID_PRIORITIES.includes(String(item.priority || "").toLowerCase()) ? String(item.priority).toLowerCase() : "medium",
+    dueDate:     item.dueDate ? sanitiseInput(String(item.dueDate)).slice(0, 20) : null,
+    status:      "OPEN",
+    createdAt:   new Date().toISOString(),
+  }));
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("punch_list").insert(
+        punchItems.map(p => ({
+          job_id: safeJobId, item_id: p.itemId, description: p.description,
+          location: p.location, assigned_to: p.assignedTo, priority: p.priority,
+          due_date: p.dueDate, status: p.status, created_at: p.createdAt,
+        }))
+      );
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({
+    jobId: safeJobId, itemsCreated: punchItems.length,
+    critical: punchItems.filter(p => p.priority === "critical").length,
+    high:     punchItems.filter(p => p.priority === "high").length,
+    items: punchItems,
+    savedAt: new Date().toISOString(),
+  });
+});
+
+// GET /punch-list/:jobId  — Get open punch list items for a job
+app.get("/punch-list/:jobId", apiKeyAuth, async (req, res) => {
+  const jobId = sanitiseInput(String(req.params.jobId || "")).slice(0, 80);
+  const status = req.query.status ? sanitiseInput(String(req.query.status)).toUpperCase() : null;
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  let items = [];
+  if (supabaseAdmin) {
+    try {
+      let q = supabaseAdmin.from("punch_list").select("*").eq("job_id", jobId).order("created_at", { ascending: true });
+      if (status) q = q.eq("status", status);
+      const { data } = await q.limit(200);
+      items = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const counts = { OPEN: 0, IN_PROGRESS: 0, RESOLVED: 0 };
+  items.forEach(i => { if (counts[i.status] !== undefined) counts[i.status]++; });
+
+  return res.json({
+    jobId, totalItems: items.length, statusCounts: counts,
+    readyForHandover: counts.OPEN === 0 && counts.IN_PROGRESS === 0,
+    items,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /punch-list-close  — Mark a punch list item as resolved
+app.post("/punch-list-close", apiKeyAuth, async (req, res) => {
+  const { jobId, itemId, resolvedBy, resolution } = req.body || {};
+  if (!jobId || !itemId) return res.status(400).json({ error: "jobId and itemId required." });
+
+  const safeJobId   = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeItemId  = sanitiseInput(String(itemId)).slice(0, 30);
+  const safeResBy   = resolvedBy ? sanitiseInput(String(resolvedBy)).slice(0, 100) : null;
+  const safeResNote = resolution ? sanitiseInput(String(resolution)).slice(0, 300) : null;
+  const resolvedAt  = new Date().toISOString();
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("punch_list")
+        .update({ status: "RESOLVED", resolved_by: safeResBy, resolution_notes: safeResNote, resolved_at: resolvedAt })
+        .eq("job_id", safeJobId).eq("item_id", safeItemId);
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.json({ jobId: safeJobId, itemId: safeItemId, status: "RESOLVED", resolvedBy: safeResBy, resolution: safeResNote, resolvedAt });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
