@@ -70844,6 +70844,384 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 258 ─────────────────────────────────────────────────────────────────
+
+// POST /underground-services-detection — Record underground service detection (dial before you dig)
+app.post("/underground-services-detection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, siteAddress, detectionDate, detectedBy,
+      referenceNumbers, servicesIdentified, pothollingCompleted,
+      gpsPlotsRecorded, markingsApplied, cableAvoidanceTool,
+      groundPenetratingRadarUsed, unexpectedServicesFound,
+      clearanceFromExcavation, excavationMethodHand, conflictsResolved,
+      supervisorApproval, notes
+    } = req.body;
+
+    if (!siteAddress || !detectionDate || !detectedBy) {
+      return res.status(400).json({ error: "siteAddress, detectionDate, detectedBy are required." });
+    }
+
+    const safeSite = sanitiseInput(String(siteAddress));
+    const safeDetectedBy = sanitiseInput(String(detectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+
+    const services = Array.isArray(servicesIdentified) ? servicesIdentified : [];
+    const refs = Array.isArray(referenceNumbers) ? referenceNumbers : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    // Dial Before You Dig — mandatory under OHS Regulations 2017 (Vic) reg 3.3
+    if (refs.length === 0) {
+      criticalIssues.push("No Dial Before You Dig reference numbers recorded — mandatory before any excavation (OHS Regs 2017 Vic reg 3.3.19).");
+    }
+
+    if (!cableAvoidanceTool) {
+      warnings.push("Cable avoidance tool use not confirmed — required for all mechanical excavation near services.");
+    }
+
+    if (unexpectedServicesFound === true || unexpectedServicesFound === "true") {
+      criticalIssues.push("Unexpected services found — stop work, re-assess with principal contractor and asset owner before proceeding.");
+    }
+
+    const clearanceM = parseFloat(clearanceFromExcavation) || null;
+    if (clearanceM !== null && clearanceM < 0.5) {
+      criticalIssues.push(`Clearance ${clearanceM}m from excavation edge to identified service — minimum 500mm required (Dial Before You Dig Code of Practice).`);
+    }
+
+    if (!pothollingCompleted && services.some(s =>
+      /gas|electric|high.?voltage|HV|power/i.test(String(s))
+    )) {
+      warnings.push("High-risk services (gas/electrical/HV) identified but potholing not confirmed — potholing recommended before mechanical excavation.");
+    }
+
+    if (!gpsPlotsRecorded) {
+      warnings.push("GPS plots of located services not recorded — recommended for future reference and safety.");
+    }
+    if (!markingsApplied) {
+      warnings.push("Ground markings not confirmed — services should be marked before excavation commences.");
+    }
+
+    if (excavationMethodHand === false || excavationMethodHand === "false") {
+      if (services.length > 0) {
+        warnings.push("Mechanical excavation planned near known services — hand-dig within 300mm of services required.");
+      }
+    }
+
+    if (!supervisorApproval) {
+      warnings.push("Supervisor approval for excavation not recorded.");
+    }
+
+    if (!conflictsResolved && services.length > 0) {
+      warnings.push("Service conflicts not confirmed resolved — ensure all service owners notified before excavation.");
+    }
+
+    const status = criticalIssues.length > 0 ? "DO_NOT_EXCAVATE" : warnings.length > 0 ? "CONDITIONAL_APPROVAL" : "CLEARED_TO_EXCAVATE";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("underground_services_detections")
+        .insert({
+          project_id: safeProject,
+          site_address: safeSite,
+          detection_date: detectionDate,
+          detected_by: safeDetectedBy,
+          reference_numbers: refs,
+          services_identified: services,
+          potholing_completed: pothollingCompleted || false,
+          gps_plots_recorded: gpsPlotsRecorded || false,
+          markings_applied: markingsApplied || false,
+          cable_avoidance_tool: cableAvoidanceTool || false,
+          ground_penetrating_radar_used: groundPenetratingRadarUsed || false,
+          unexpected_services_found: unexpectedServicesFound || false,
+          clearance_from_excavation: clearanceM,
+          excavation_method_hand: excavationMethodHand || false,
+          conflicts_resolved: conflictsResolved || false,
+          supervisor_approval: supervisorApproval || false,
+          status,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        status,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Excavation must not proceed — underground service detection issues unresolved.",
+        standards: ["OHS Regulations 2017 (Vic) reg 3.3.19", "Dial Before You Dig Code of Practice", "AS 5488"],
+      });
+    }
+
+    res.json({
+      status,
+      criticalIssues,
+      warnings,
+      savedId,
+      serviceCount: services.length,
+      referenceCount: refs.length,
+      clearanceFromExcavation: clearanceM,
+      standards: ["OHS Regulations 2017 (Vic) reg 3.3.19", "Dial Before You Dig", "AS 5488"],
+    });
+  } catch (err) {
+    console.error("POST /underground-services-detection error:", err.message);
+    res.status(500).json({ error: "Failed to record underground services detection." });
+  }
+});
+
+// POST /first-aid-station-inspection — Record first aid station/kit adequacy inspection
+app.post("/first-aid-station-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, stationId, location, inspectionDate, inspectedBy,
+      workerCount, kitType, bandagesPresent, bandageCount, sterileGauzePads,
+      triangularBandage, eyeWashPresent, eyeWashExpiryDate,
+      aedPresent, aedBatteryOk, aedPadsExpiry, firstAidOfficerAvailable,
+      firstAidOfficerCertExpiry, contentsMissing, expiryIssues,
+      kitsRequiredCount, kitsAvailableCount, notes
+    } = req.body;
+
+    if (!stationId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "stationId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeStation = sanitiseInput(String(stationId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+
+    const missing = Array.isArray(contentsMissing) ? contentsMissing : [];
+    const expiries = Array.isArray(expiryIssues) ? expiryIssues : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const workers = parseInt(workerCount) || 0;
+    const kitsRequired = parseInt(kitsRequiredCount) || 0;
+    const kitsAvailable = parseInt(kitsAvailableCount) || 0;
+
+    // OHS Regulations 2017 (Vic) Part 3.4 — first aid
+    if (kitsRequired > 0 && kitsAvailable < kitsRequired) {
+      criticalIssues.push(`Only ${kitsAvailable} first aid kit(s) available — ${kitsRequired} required for ${workers} workers (OHS Regs 2017 Vic reg 3.4.5).`);
+    }
+
+    if (!firstAidOfficerAvailable) {
+      if (workers >= 10) {
+        criticalIssues.push(`No first aid officer on site for ${workers} workers — required for 10+ workers on construction sites (OHS Regs 2017 Vic reg 3.4.3).`);
+      } else {
+        warnings.push("No first aid officer confirmed on site — recommended for all construction sites.");
+      }
+    }
+
+    if (firstAidOfficerCertExpiry) {
+      const expiry = new Date(firstAidOfficerCertExpiry);
+      const now = new Date();
+      const daysToExpiry = Math.floor((expiry - now) / (1000 * 60 * 60 * 24));
+      if (daysToExpiry < 0) {
+        criticalIssues.push(`First aid officer certificate expired ${Math.abs(daysToExpiry)} days ago — must renew immediately.`);
+      } else if (daysToExpiry < 30) {
+        warnings.push(`First aid officer certificate expires in ${daysToExpiry} days — schedule renewal.`);
+      }
+    }
+
+    if (missing.length > 0) {
+      const critMissing = missing.filter(m => /bandage|gauze|glove|cpr|resus|eyewash|triangular/i.test(String(m)));
+      if (critMissing.length > 0) {
+        criticalIssues.push(`Critical items missing from kit: ${critMissing.join(", ")}`);
+      } else {
+        warnings.push(`Items missing from first aid kit: ${missing.join(", ")}`);
+      }
+    }
+
+    if (expiries.length > 0) {
+      warnings.push(`Expired items in kit: ${expiries.join(", ")} — replace before next use.`);
+    }
+
+    if (eyeWashPresent && eyeWashExpiryDate) {
+      const eyeExp = new Date(eyeWashExpiryDate);
+      if (eyeExp < new Date()) {
+        criticalIssues.push("Eye wash solution expired — replace immediately.");
+      }
+    } else if (!eyeWashPresent && workers > 0) {
+      warnings.push("No eye wash station confirmed — required where chemical/dust exposure risk exists (AS 4775).");
+    }
+
+    if (aedPresent) {
+      if (!aedBatteryOk) warnings.push("AED battery status not confirmed — check immediately.");
+      if (aedPadsExpiry) {
+        const padExp = new Date(aedPadsExpiry);
+        if (padExp < new Date()) {
+          criticalIssues.push("AED electrode pads expired — replace immediately before device is usable.");
+        }
+      }
+    }
+
+    if (!bandagesPresent) {
+      criticalIssues.push("No bandages present in first aid kit — minimum stock required.");
+    }
+
+    const overallStatus = criticalIssues.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "ATTENTION_REQUIRED" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("first_aid_station_inspections")
+        .insert({
+          project_id: projectId ? sanitiseInput(String(projectId)) : null,
+          station_id: safeStation,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          worker_count: workers || null,
+          kit_type: kitType || null,
+          aed_present: aedPresent || false,
+          aed_battery_ok: aedBatteryOk || false,
+          first_aid_officer_available: firstAidOfficerAvailable || false,
+          first_aid_officer_cert_expiry: firstAidOfficerCertExpiry || null,
+          contents_missing: missing,
+          expiry_issues: expiries,
+          kits_required_count: kitsRequired || null,
+          kits_available_count: kitsAvailable || null,
+          overall_status: overallStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        overallStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "First aid non-compliant — rectify immediately before continuing work.",
+        standards: ["OHS Regulations 2017 (Vic) Part 3.4", "AS 4775"],
+      });
+    }
+
+    res.json({
+      overallStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      kitsRequired,
+      kitsAvailable,
+      firstAidOfficerAvailable: !!firstAidOfficerAvailable,
+      standards: ["OHS Regulations 2017 (Vic) Part 3.4", "AS 4775"],
+    });
+  } catch (err) {
+    console.error("POST /first-aid-station-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record first aid inspection." });
+  }
+});
+
+// POST /ai-underground-services-risk — AI assesses excavation risk from underground services
+app.post("/ai-underground-services-risk", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      siteAddress, excavationDepthM, excavationMethodology, servicesIdentified,
+      proximityToHighVoltage, proximityToGasMain, proximityToWaterMain,
+      soilType, groundwaterPresent, trafficManagementRequired, siteContext
+    } = req.body;
+
+    if (!siteAddress || !excavationDepthM) {
+      return res.status(400).json({ error: "siteAddress and excavationDepthM are required." });
+    }
+
+    const safeSite = sanitiseInput(String(siteAddress));
+    const services = Array.isArray(servicesIdentified) ? servicesIdentified.map(s => sanitiseInput(String(s))) : [];
+    const safeSiteContext = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+
+    const prompt = `You are a construction safety engineer assessing the risk profile of an excavation job with respect to underground services in Victoria, Australia.
+
+Site: ${safeSite}
+Context: ${safeSiteContext}
+Excavation depth: ${excavationDepthM}m
+Excavation methodology: ${excavationMethodology || "Not specified"}
+Services identified: ${services.length > 0 ? services.join(", ") : "None confirmed"}
+Proximity to high voltage: ${proximityToHighVoltage || "Unknown"}
+Proximity to gas main: ${proximityToGasMain || "Unknown"}
+Proximity to water main: ${proximityToWaterMain || "Unknown"}
+Soil type: ${soilType || "Unknown"}
+Groundwater present: ${groundwaterPresent ? "Yes" : "No"}
+Traffic management required: ${trafficManagementRequired ? "Yes" : "No"}
+
+Assess:
+1. Overall excavation risk from underground services
+2. Highest-risk services and separation requirements
+3. Required safe work controls per Victorian OHS Regulations and AS 5488
+4. Hand-dig / potholing requirements
+5. Permit and notification requirements (gas, electrical, water authority)
+6. Emergency response considerations
+
+Respond ONLY in JSON:
+{
+  "overallRisk": "LOW|MODERATE|HIGH|EXTREME",
+  "highestRiskServices": ["string"],
+  "mandatoryControls": ["string"],
+  "handDigRequirements": "string",
+  "permitsRequired": ["string"],
+  "authorityNotifications": ["string"],
+  "emergencyConsiderations": ["string"],
+  "applicableStandards": ["string"],
+  "clearToExcavate": true|false,
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 750,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallRisk: "HIGH",
+        highestRiskServices: ["Unknown — AI assessment unavailable"],
+        mandatoryControls: [
+          "Obtain Dial Before You Dig plans",
+          "Complete cable avoidance tool sweep",
+          "Pothole all services within 500mm of excavation",
+          "Hand-dig within 300mm of identified services",
+        ],
+        handDigRequirements: "Hand excavation required within 300mm of all identified services.",
+        permitsRequired: ["Dial Before You Dig reference number", "Principal contractor approval"],
+        authorityNotifications: ["Contact all service authorities prior to commencing"],
+        emergencyConsiderations: ["Have emergency contacts for gas, electrical, and water ready on site"],
+        applicableStandards: ["AS 5488", "OHS Regulations 2017 (Vic) reg 3.3.19", "Dial Before You Dig Code of Practice"],
+        clearToExcavate: false,
+        summary: "AI analysis unavailable. Apply precautionary controls and consult service authority plans before excavation.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      siteAddress: safeSite,
+      excavationDepthM,
+      serviceCount: services.length,
+      standards: ["AS 5488", "OHS Regulations 2017 (Vic) reg 3.3.19"],
+    });
+  } catch (err) {
+    console.error("POST /ai-underground-services-risk error:", err.message);
+    res.status(500).json({ error: "Failed to assess underground services risk." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
