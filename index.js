@@ -59653,6 +59653,292 @@ Return a JSON object with:
   }
 });
 
+// POST /stormwater-quality-monitoring — Record stormwater quality monitoring for construction sites
+app.post("/stormwater-quality-monitoring", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      monitoringRef,
+      date,
+      time,
+      monitoredBy,
+      monitoringLocation,
+      sampleType,
+      rainfallEvent,
+      rainfallMm,
+      turbidityNtu,
+      phValue,
+      tssMilligramPerL,
+      oilGreasePresent,
+      chemicalPresent,
+      chemicalType,
+      sedimentControlsOperational,
+      sedimentFenceCondition,
+      baffleCondition,
+      catchmentCleared,
+      dischargeOccurred,
+      dischargeVolumeLitre,
+      dischargeReceivingEnvironment,
+      epaNotificationRequired,
+      complianceResult,
+      correctiveActions,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !monitoredBy || !monitoringLocation) {
+      return res.status(400).json({ error: "projectId, date, monitoredBy, and monitoringLocation are required" });
+    }
+
+    const flags = [];
+    // EPA Victoria SEPP Waters: construction site runoff turbidity limit 50 NTU at point of discharge
+    if (turbidityNtu !== undefined && Number(turbidityNtu) > 50) {
+      flags.push(`Turbidity ${turbidityNtu} NTU exceeds 50 NTU EPA SEPP Waters limit — implement additional sediment controls before next rain event`);
+    }
+    if (turbidityNtu !== undefined && Number(turbidityNtu) > 200) {
+      flags.push(`Turbidity ${turbidityNtu} NTU — severely turbid discharge. Cease discharge immediately and notify EPA Victoria`);
+      epaNotificationRequired = true;
+    }
+    if (phValue !== undefined && (Number(phValue) < 6.5 || Number(phValue) > 8.5)) {
+      flags.push(`pH ${phValue} outside acceptable range 6.5–8.5 for discharge — investigate source and contain discharge`);
+    }
+    if (oilGreasePresent) flags.push("Oil or grease detected in stormwater — contain spill and prevent discharge to stormwater system");
+    if (chemicalPresent) flags.push(`Chemical detected: ${sanitiseInput(chemicalType || "unspecified")} — notify EPA Victoria if discharged to waterway`);
+    if (!sedimentControlsOperational) flags.push("Sediment controls not operational — repair or replace before next rain event");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      monitoring_ref: sanitiseInput(monitoringRef || `SW-${Date.now()}`),
+      date,
+      time: sanitiseInput(time || ""),
+      monitored_by: sanitiseInput(monitoredBy),
+      monitoring_location: sanitiseInput(monitoringLocation),
+      sample_type: sanitiseInput(sampleType || "grab sample"),
+      rainfall_event: !!rainfallEvent,
+      rainfall_mm: rainfallMm || null,
+      turbidity_ntu: turbidityNtu !== undefined ? Number(turbidityNtu) : null,
+      ph_value: phValue !== undefined ? Number(phValue) : null,
+      tss_milligram_per_l: tssMilligramPerL || null,
+      oil_grease_present: !!oilGreasePresent,
+      chemical_present: !!chemicalPresent,
+      chemical_type: sanitiseInput(chemicalType || ""),
+      sediment_controls_operational: !!sedimentControlsOperational,
+      sediment_fence_condition: sanitiseInput(sedimentFenceCondition || ""),
+      baffle_condition: sanitiseInput(baffleCondition || ""),
+      catchment_cleared: !!catchmentCleared,
+      discharge_occurred: !!dischargeOccurred,
+      discharge_volume_litre: dischargeVolumeLitre || null,
+      discharge_receiving_environment: sanitiseInput(dischargeReceivingEnvironment || ""),
+      epa_notification_required: !!epaNotificationRequired,
+      compliance_result: sanitiseInput(complianceResult || (flags.length === 0 ? "COMPLIANT" : "NON_COMPLIANT")),
+      corrective_actions: Array.isArray(correctiveActions) ? correctiveActions.map(a => sanitiseInput(a)) : [],
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("stormwater_quality_monitoring").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      complianceResult: record.compliance_result,
+      flags,
+      limits: { turbidityNtu: 50, phRange: "6.5–8.5" },
+      applicableRegulations: ["EPA Victoria SEPP Waters", "Environment Protection Act 2017 (Vic)", "Melbourne Water Developer Works Code"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/stormwater-quality-monitoring error:", err.message);
+    res.status(500).json({ error: "Failed to record stormwater quality monitoring" });
+  }
+});
+
+// POST /ergonomics-assessment — Record a workplace ergonomics / musculoskeletal risk assessment
+app.post("/ergonomics-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      assessmentRef,
+      assessmentDate,
+      assessedBy,
+      workerName,
+      workerRole,
+      taskDescription,
+      bodyPosture,
+      repitition,
+      forceLevelRequired,
+      vibrationExposure,
+      awkwardPostures,
+      staticLoading,
+      manualHandlingLoad,
+      liftingFrequencyPerHour,
+      pushPullForceKg,
+      workDurationHours,
+      previousMskSymptoms,
+      symptomsDescription,
+      currentControls,
+      riskLevel,
+      recommendedControls,
+      engineeringControls,
+      adminControls,
+      ppeRequired,
+      medicalReferralRequired,
+      followUpRequired,
+      notes,
+    } = req.body;
+
+    if (!projectId || !assessmentDate || !assessedBy || !taskDescription || !riskLevel) {
+      return res.status(400).json({ error: "projectId, assessmentDate, assessedBy, taskDescription, and riskLevel are required" });
+    }
+
+    const flags = [];
+    // Manual handling guidance: >16 kg single lift for males, >9 kg for females without aids
+    if (manualHandlingLoad && Number(manualHandlingLoad) > 16) {
+      flags.push(`Manual handling load ${manualHandlingLoad} kg — above recommended guideline weight (16 kg for males, 9 kg for females). Mechanical aids or team lift required.`);
+    }
+    if (liftingFrequencyPerHour && Number(liftingFrequencyPerHour) > 12) flags.push(`Lifting frequency ${liftingFrequencyPerHour}/hr is high — significant cumulative MSK injury risk`);
+    if (previousMskSymptoms) flags.push(`Worker reports MSK symptoms: ${sanitiseInput(symptomsDescription || "not described")} — refer to occupational physician if symptoms persist`);
+    if (["HIGH", "EXTREME", "CRITICAL"].includes(String(riskLevel || "").toUpperCase())) {
+      flags.push(`MSK risk level ${riskLevel} — immediate engineering or administrative controls required before continuing task`);
+    }
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      assessment_ref: sanitiseInput(assessmentRef || `ERG-${Date.now()}`),
+      assessment_date: assessmentDate,
+      assessed_by: sanitiseInput(assessedBy),
+      worker_name: sanitiseInput(workerName || ""),
+      worker_role: sanitiseInput(workerRole || ""),
+      task_description: sanitiseInput(taskDescription),
+      body_posture: sanitiseInput(bodyPosture || ""),
+      repetition: sanitiseInput(String(repitition || "")),
+      force_level_required: sanitiseInput(forceLevelRequired || ""),
+      vibration_exposure: !!vibrationExposure,
+      awkward_postures: sanitiseInput(awkwardPostures || ""),
+      static_loading: !!staticLoading,
+      manual_handling_load: manualHandlingLoad || null,
+      lifting_frequency_per_hour: liftingFrequencyPerHour || null,
+      push_pull_force_kg: pushPullForceKg || null,
+      work_duration_hours: workDurationHours || null,
+      previous_msk_symptoms: !!previousMskSymptoms,
+      symptoms_description: sanitiseInput(symptomsDescription || ""),
+      current_controls: sanitiseInput(currentControls || ""),
+      risk_level: sanitiseInput(riskLevel),
+      recommended_controls: Array.isArray(recommendedControls) ? recommendedControls.map(r => sanitiseInput(r)) : [],
+      engineering_controls: sanitiseInput(engineeringControls || ""),
+      admin_controls: sanitiseInput(adminControls || ""),
+      ppe_required: sanitiseInput(ppeRequired || ""),
+      medical_referral_required: !!medicalReferralRequired,
+      follow_up_required: !!followUpRequired,
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("ergonomics_assessments").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      riskLevel,
+      flags,
+      manualHandlingGuidelines: { male: "16 kg", female: "9 kg", teamLift: "Required for loads > 25 kg" },
+      applicableGuidance: ["Safe Work Australia Code of Practice: Hazardous Manual Tasks 2021", "OHS Regulations 2017 (Vic) Part 3.1 — manual handling", "WorkSafe Victoria Ergonomics guidelines"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/ergonomics-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to record ergonomics assessment" });
+  }
+});
+
+// POST /ai-stormwater-compliance — AI assesses stormwater management compliance for a construction site
+app.post("/ai-stormwater-compliance", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectDescription,
+      siteAreaM2,
+      imperviousCoverPercent,
+      receivingEnvironment,
+      distanceToWaterwayM,
+      soilType,
+      annualRainfallMm,
+      existingControls,
+      knownIssues,
+    } = req.body;
+
+    if (!projectDescription || !siteAreaM2) {
+      return res.status(400).json({ error: "projectDescription and siteAreaM2 are required" });
+    }
+
+    const prompt = `You are an environmental engineer and stormwater management specialist familiar with EPA Victoria SEPP Waters, Melbourne Water Developer Works Code, and Victorian stormwater regulations.
+
+Assess stormwater management compliance for:
+- Project: ${sanitiseInput(projectDescription)}
+- Site area: ${sanitiseInput(String(siteAreaM2))} m²
+- Impervious cover: ${sanitiseInput(String(imperviousCoverPercent || "not specified"))}%
+- Receiving environment: ${sanitiseInput(receivingEnvironment || "stormwater drain/creek")}
+- Distance to waterway: ${sanitiseInput(String(distanceToWaterwayM || "not specified"))} m
+- Soil type: ${sanitiseInput(soilType || "not specified")}
+- Annual rainfall: ${sanitiseInput(String(annualRainfallMm || "650 (Melbourne average)"))} mm
+- Existing controls: ${sanitiseInput(existingControls || "none")}
+- Known issues: ${sanitiseInput(knownIssues || "none")}
+
+Return a JSON object with:
+{
+  "riskLevel": "LOW|MEDIUM|HIGH|EXTREME",
+  "mandatoryControls": [string],
+  "sedimentFenceRequirements": string,
+  "interceptorRequirements": string,
+  "waterQualityTargets": string,
+  "monitoringFrequency": string,
+  "spillResponsePlan": string,
+  "epaNotificationTriggers": string,
+  "environmentalBondRisk": boolean,
+  "applicableRegulations": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ projectDescription, siteAreaM2, assessment });
+  } catch (err) {
+    console.error("/ai-stormwater-compliance error:", err.message);
+    res.json({
+      projectDescription: req.body.projectDescription || "",
+      siteAreaM2: req.body.siteAreaM2 || null,
+      assessment: {
+        riskLevel: "HIGH",
+        mandatoryControls: ["Silt fence/sediment fence on all downslope boundaries", "Sediment basin for sites > 1000 m²", "Stabilised construction entrance to prevent mud tracking", "Concrete washout bunded and contained on site", "Cover stockpiles with geotextile in rain events"],
+        sedimentFenceRequirements: "Install silt fence on all downslope site boundaries. Maximum contributing drainage area 1000 m² per fence run. Install in-line stakes at 1.2–1.8 m spacing.",
+        interceptorRequirements: "Install level spreader or diversion drain to intercept upslope runoff and divert around disturbed areas. Required for slopes > 5% with contributing area > 500 m².",
+        waterQualityTargets: "Turbidity < 50 NTU at point of discharge per EPA Victoria SEPP Waters. No oil, chemical, or concrete washout discharge to stormwater.",
+        monitoringFrequency: "Inspect all sediment controls after each rainfall event > 10 mm. Record turbidity of any discharge. Daily visual inspection of site perimeter controls.",
+        spillResponsePlan: "Maintain spill kits at concrete washout, fuel storage, and chemical storage areas. Immediate containment and cleanup of all spills. Notify EPA Victoria (1300 372 842) for chemical spills reaching stormwater system.",
+        epaNotificationTriggers: "Notify EPA Victoria if: chemical spill reaches stormwater; turbidity discharge > 200 NTU; sewage or trade waste discharge; emergency spill of oils/fuels.",
+        environmentalBondRisk: true,
+        applicableRegulations: ["Environment Protection Act 2017 (Vic)", "EPA Victoria SEPP Waters", "Melbourne Water Developer Works Code 2021", "EPA Construction Guideline (Publication 960.4)"],
+        recommendation: "Prepare a site-specific Stormwater Management Plan before commencing earthworks. Install all required controls before disturbing more than 500 m² of soil. Inspect after each rain event.",
+        summary: "Construction stormwater management is a high-risk activity in Melbourne's wet seasons. Sediment controls, monitoring, and a spill response plan are mandatory for all sites disturbing more than 500 m² of soil.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
