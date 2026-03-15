@@ -8439,6 +8439,521 @@ app.post("/nearby-suppliers", (req, res) => {
   });
 });
 
+// ── POST /risk-matrix ─────────────────────────────────────────────────────────
+// Generates a 5×5 AS/NZS ISO 31000-style risk matrix for a job. Each risk
+// is scored for likelihood (1–5) and consequence (1–5) to produce a residual
+// risk level used by Victorian trade contractors.
+app.post("/risk-matrix", (req, res) => {
+  const { jobType, risks = [], siteConditions = [] } = req.body || {};
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+
+  if (!jobType || !SUPPORTED.includes(jobType.toLowerCase())) {
+    return res.status(400).json({ error: `jobType required. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+
+  // Default risk register per trade
+  const DEFAULT_RISKS = {
+    plumbing: [
+      { hazard: "Hot water scalding", likelihood: 3, consequence: 4 },
+      { hazard: "Water hammer / burst pipe", likelihood: 2, consequence: 3 },
+      { hazard: "Legionella in warm water system", likelihood: 2, consequence: 5 },
+      { hazard: "Backflow contamination of drinking water", likelihood: 2, consequence: 5 },
+    ],
+    gas: [
+      { hazard: "Gas leak leading to explosion", likelihood: 2, consequence: 5 },
+      { hazard: "Carbon monoxide poisoning", likelihood: 2, consequence: 5 },
+      { hazard: "Unignited gas accumulation", likelihood: 2, consequence: 4 },
+      { hazard: "Inadequate flue — combustion product intrusion", likelihood: 2, consequence: 4 },
+    ],
+    electrical: [
+      { hazard: "Electrocution from live conductor contact", likelihood: 2, consequence: 5 },
+      { hazard: "Electrical fire from overloaded circuit", likelihood: 3, consequence: 4 },
+      { hazard: "RCD failure during fault condition", likelihood: 2, consequence: 4 },
+      { hazard: "Arc flash during switchboard work", likelihood: 2, consequence: 5 },
+    ],
+    drainage: [
+      { hazard: "Sewage exposure — biological hazard", likelihood: 3, consequence: 3 },
+      { hazard: "Trench collapse during excavation", likelihood: 2, consequence: 5 },
+      { hazard: "Blocked drain causing property flooding", likelihood: 3, consequence: 3 },
+      { hazard: "Hydrogen sulfide in sewer confined space", likelihood: 2, consequence: 5 },
+    ],
+    carpentry: [
+      { hazard: "Structural collapse during propping removal", likelihood: 2, consequence: 5 },
+      { hazard: "Fall from height > 2 m", likelihood: 3, consequence: 4 },
+      { hazard: "Silica dust inhalation (cement sheet / tile cutting)", likelihood: 3, consequence: 4 },
+      { hazard: "Power tool kickback injury", likelihood: 3, consequence: 3 },
+    ],
+    hvac: [
+      { hazard: "Refrigerant release — A2L/A3 ignition risk", likelihood: 2, consequence: 4 },
+      { hazard: "Electrical isolation failure during refrigerant work", likelihood: 2, consequence: 5 },
+      { hazard: "Manual handling injury — heavy equipment", likelihood: 4, consequence: 2 },
+      { hazard: "Legionella in cooling tower water", likelihood: 2, consequence: 5 },
+    ],
+  };
+
+  // Risk level lookup: product of likelihood × consequence
+  const getRiskLevel = (l, c) => {
+    const score = l * c;
+    if (score >= 15) return { level: "Extreme",  colour: "red",    action: "Do not proceed — eliminate or substitute hazard before starting" };
+    if (score >= 8)  return { level: "High",     colour: "orange", action: "Senior review required — implement controls before proceeding" };
+    if (score >= 4)  return { level: "Medium",   colour: "yellow", action: "Implement controls and document in SWMS" };
+    return              { level: "Low",      colour: "green",  action: "Manage by routine procedures" };
+  };
+
+  const allRisks = [
+    ...(DEFAULT_RISKS[jobType.toLowerCase()] || []),
+    ...risks.map(r => ({
+      hazard:      r.hazard || String(r),
+      likelihood:  Math.min(5, Math.max(1, Number(r.likelihood) || 3)),
+      consequence: Math.min(5, Math.max(1, Number(r.consequence) || 3)),
+      custom:      true,
+    })),
+  ];
+
+  // Site condition modifiers
+  const siteLower = siteConditions.map(s => String(s).toLowerCase());
+  const modifiers = [];
+  if (siteLower.some(s => s.includes("rain") || s.includes("wet"))) {
+    modifiers.push("Wet conditions — increase electrical and fall likelihood scores by 1");
+  }
+  if (siteLower.some(s => s.includes("confined") || s.includes("pit"))) {
+    modifiers.push("Confined space — hydrogen sulfide and oxygen deficiency risks elevated");
+  }
+  if (siteLower.some(s => s.includes("asbestos") || s.includes("fibro"))) {
+    modifiers.push("Asbestos present — additional respiratory protection and licensed removalist required");
+  }
+
+  const matrix = allRisks.map(r => {
+    const riskData = getRiskLevel(r.likelihood, r.consequence);
+    return {
+      hazard:      r.hazard,
+      likelihood:  r.likelihood,
+      consequence: r.consequence,
+      riskScore:   r.likelihood * r.consequence,
+      riskLevel:   riskData.level,
+      colour:      riskData.colour,
+      action:      riskData.action,
+      custom:      r.custom || false,
+    };
+  }).sort((a, b) => b.riskScore - a.riskScore);
+
+  const extreme = matrix.filter(r => r.riskLevel === "Extreme").length;
+  const high    = matrix.filter(r => r.riskLevel === "High").length;
+
+  return res.json({
+    jobType,
+    siteConditions,
+    riskCount:     matrix.length,
+    extremeCount:  extreme,
+    highCount:     high,
+    siteModifiers: modifiers,
+    matrix,
+    overallSiteRisk: extreme > 0 ? "Extreme" : high > 1 ? "High" : high === 1 ? "Medium-High" : "Medium",
+    regulatoryRef:   "AS/NZS ISO 31000:2018 Risk Management, OHS Regulations 2017 (Vic)",
+    generatedAt:     new Date().toISOString(),
+  });
+});
+
+// ── POST /photo-tags ──────────────────────────────────────────────────────────
+// Auto-tags photo labels into compliance categories. Useful for organising
+// a job's photo set before uploading to /review.
+app.post("/photo-tags", (req, res) => {
+  const { jobType, photoLabels = [] } = req.body || {};
+
+  if (!Array.isArray(photoLabels) || photoLabels.length === 0) {
+    return res.status(400).json({ error: "photoLabels array is required." });
+  }
+
+  const TAG_RULES = [
+    { tag: "certificate",   keywords: ["certificate", "coc", "coes", "compliance cert", "gas cert", "lodged"] },
+    { tag: "pressure-test", keywords: ["pressure test", "tightness test", "hydro test", "air test", "gauge"] },
+    { tag: "safety-device", keywords: ["rcd", "ptr valve", "pressure relief", "backflow", "isolation valve", "gas detector", "safety switch"] },
+    { tag: "earthing",      keywords: ["earth", "bonding", "equipotential"] },
+    { tag: "structural",    keywords: ["beam", "joist", "stud", "rafter", "tie-down", "brace", "lintel", "footing", "slab"] },
+    { tag: "electrical",    keywords: ["switchboard", "circuit", "cable", "conduit", "outlet", "socket", "distribution board"] },
+    { tag: "gas-fitting",   keywords: ["gas", "flue", "appliance", "regulator", "meter", "lpg"] },
+    { tag: "plumbing",      keywords: ["pipe", "fitting", "tap", "valve", "hot water", "toilet", "basin"] },
+    { tag: "drainage",      keywords: ["drain", "sewer", "trap", "grate", "pit", "inspection opening", "stormwater"] },
+    { tag: "hvac",          keywords: ["hvac", "split system", "ductwork", "condenser", "evaporator", "refrigerant", "aircon"] },
+    { tag: "gps-photo",     keywords: ["gps", "location", "arrival", "site photo"] },
+    { tag: "waterproofing", keywords: ["waterproof", "membrane", "wet area", "bathroom"] },
+    { tag: "insulation",    keywords: ["insulation", "r-value", "batts", "foil"] },
+    { tag: "documentation", keywords: ["permit", "plans", "drawing", "approval", "sign-off", "signature"] },
+    { tag: "overview",      keywords: ["overview", "wide shot", "before", "after", "general view", "site"] },
+  ];
+
+  const tagged = photoLabels.map((label, idx) => {
+    const lower = String(label).toLowerCase();
+    const matchedTags = TAG_RULES
+      .filter(rule => rule.keywords.some(kw => lower.includes(kw)))
+      .map(rule => rule.tag);
+
+    return {
+      index:  idx,
+      label:  label,
+      tags:   matchedTags.length > 0 ? matchedTags : ["untagged"],
+      tagged: matchedTags.length > 0,
+    };
+  });
+
+  const untagged = tagged.filter(p => !p.tagged).length;
+  const tagCounts = {};
+  for (const photo of tagged) {
+    for (const tag of photo.tags) {
+      tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+    }
+  }
+
+  return res.json({
+    jobType:       jobType || null,
+    photoCount:    photoLabels.length,
+    taggedCount:   photoLabels.length - untagged,
+    untaggedCount: untagged,
+    tagSummary:    tagCounts,
+    photos:        tagged,
+    taggedAt:      new Date().toISOString(),
+  });
+});
+
+// ── GET /vba-requirements/:jobType ────────────────────────────────────────────
+// Returns detailed VBA (or ESV) compliance requirements for a given trade type.
+// Covers the full regulatory obligation chain from pre-work to archiving.
+app.get("/vba-requirements/:jobType", (req, res) => {
+  const jobType = req.params.jobType?.toLowerCase();
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+
+  if (!SUPPORTED.includes(jobType)) {
+    return res.status(400).json({ error: `Unsupported jobType. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+
+  const REQUIREMENTS = {
+    plumbing: {
+      regulatoryBody: "Victorian Building Authority (VBA)",
+      licenceRequired: "Plumbing Licence (L-number)",
+      preWork: [
+        "Hold a current VBA plumbing licence",
+        "Notify owner/occupier of planned work and timeframe",
+        "Obtain plumbing permit if required (roof plumbing, new HWS, significant alterations)",
+      ],
+      duringWork: [
+        "Comply with AS/NZS 3500 series",
+        "Install only WaterMark-certified products",
+        "Test all systems before concealing work",
+        "Document installation details for Certificate of Compliance",
+      ],
+      postWork: [
+        "Complete Certificate of Compliance (CoC) using VBA plumber portal",
+        "Lodge CoC with VBA within 2 business days of completion",
+        "Provide owner with a copy of the CoC",
+        "Retain test records for 7 years",
+      ],
+      penalties: "Failure to lodge CoC: up to $19,652 (individual) or $98,262 (company) per Plumbing Regulations 2018 (Vic)",
+    },
+    gas: {
+      regulatoryBody: "Energy Safe Victoria (ESV)",
+      licenceRequired: "Type A Gas Appliance Service Licence or Gas Fitting Licence (GF-number)",
+      preWork: [
+        "Hold a current ESV gas fitting or appliance servicing licence",
+        "Identify gas supply type (NG or LPG) and pressure requirements",
+        "Verify all appliances carry current AGA/SAA certification",
+      ],
+      duringWork: [
+        "Comply with AS/NZS 5601.1",
+        "Conduct working pressure test and tightness test on all new/altered gas work",
+        "Ensure adequate ventilation for all appliances",
+        "Maintain required clearances for flue terminals",
+      ],
+      postWork: [
+        "Complete Gas Compliance Certificate via ESV portal",
+        "Lodge certificate with ESV within 48 hours",
+        "Provide owner with copy and advise location of isolation valve",
+        "Retain pressure test records for 5 years",
+      ],
+      penalties: "Unlicensed gas fitting: up to $50,000 (Gas Safety Act 1997 Vic s.8)",
+    },
+    electrical: {
+      regulatoryBody: "Energy Safe Victoria (ESV)",
+      licenceRequired: "Registered Electrical Contractor (REC-number) or Electrical Worker Licence",
+      preWork: [
+        "Hold a current REC (for business) or electrical worker licence",
+        "Perform and document LOTO (lock-out/tag-out) before starting",
+        "Prepare an Electrical Safety Management Scheme (commercial/industrial)",
+      ],
+      duringWork: [
+        "Comply with AS/NZS 3000 (Wiring Rules)",
+        "Install RCD protection on all required circuits",
+        "Test insulation resistance and earth continuity on all circuits",
+        "Label all circuits clearly at the switchboard",
+      ],
+      postWork: [
+        "Lodge Certificate of Electrical Safety (CoES) with ESV via e-licensing portal",
+        "Lodge within 5 days (residential) or 2 days (commercial)",
+        "Provide owner with RCD testing instructions",
+        "Retain test records for 5 years",
+      ],
+      penalties: "Failure to lodge CoES: up to $42,000 (Electricity Safety Act 1998 Vic)",
+    },
+    drainage: {
+      regulatoryBody: "Victorian Building Authority (VBA)",
+      licenceRequired: "Drainer Licence (D-number)",
+      preWork: [
+        "Hold a current VBA drainer licence",
+        "Dial Before You Dig — locate underground services",
+        "Obtain plumbing permit if required (new house drain, alterations)",
+      ],
+      duringWork: [
+        "Comply with AS/NZS 3500.2 — minimum 1:40 fall on all drains",
+        "Install inspection openings at all change-of-direction > 45°",
+        "Bed and haunch all rigid pipe in approved material",
+        "Hydraulic or air test before backfilling",
+      ],
+      postWork: [
+        "Lodge Certificate of Compliance (CoC) with VBA within 2 business days",
+        "Provide owner with CoC copy",
+        "Retain hydraulic test records for 7 years",
+      ],
+      penalties: "Same penalty regime as plumbing — up to $19,652 individual per Plumbing Regulations 2018",
+    },
+    carpentry: {
+      regulatoryBody: "Victorian Building Authority (VBA)",
+      licenceRequired: "Domestic Builder Licence (DB-L or DB-U) or Commercial Builder",
+      preWork: [
+        "Hold appropriate VBA builder registration",
+        "Engage a Registered Building Surveyor (RBS) to issue building permit",
+        "Obtain all necessary council planning permits before building permit application",
+        "Sign Domestic Building Contract (if value > $10,000) before commencing",
+      ],
+      duringWork: [
+        "Comply with NCC 2022 and all referenced standards",
+        "Arrange mandatory inspections with RBS (footing, frame, lock-up, final)",
+        "Display building permit on site at all times",
+        "Comply with BAL construction requirements if in bushfire zone",
+      ],
+      postWork: [
+        "Obtain Certificate of Occupancy / Final Certificate from RBS",
+        "Provide NatHERS energy rating certificate to owner",
+        "Provide maintenance manual for any specialised products installed",
+        "Rectify any defects notified within 7 years under Domestic Building Contracts Act 1995",
+      ],
+      penalties: "Building without a permit: up to $85,000 (Building Act 1993 Vic s.16)",
+    },
+    hvac: {
+      regulatoryBody: "Australian Refrigeration Council (ARC) + VBA (for some ducted work)",
+      licenceRequired: "ARC Refrigerant Handling Licence + Plumbing/Electrical licence for associated work",
+      preWork: [
+        "Hold current ARC licence (RAC — refrigeration and air conditioning)",
+        "Identify refrigerant type and GWP (Global Warming Potential)",
+        "Confirm ARC Service Record is current and accessible",
+      ],
+      duringWork: [
+        "Comply with AS/NZS 5149.1, AIRAH DA09, and NCC J-provisions",
+        "Recover all refrigerant before opening circuits",
+        "Log all refrigerant used/recovered in ARC service record",
+        "Test and commission system — record supply/return temps and airflow",
+      ],
+      postWork: [
+        "Update ARC service record within 24 hours",
+        "Provide owner with commissioning report, manual, and filter schedule",
+        "Register product warranty within 30 days",
+        "Plumbing CoC required if condensate drainage is prescribed plumbing work",
+      ],
+      penalties: "Unlicensed refrigerant handling: up to $12,000 (Ozone Protection and Synthetic Greenhouse Gas Act)",
+    },
+  };
+
+  return res.json({
+    jobType,
+    ...REQUIREMENTS[jobType],
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /escalation-check ────────────────────────────────────────────────────
+// Determines if a non-compliant job should be escalated to the VBA, ESV,
+// or WorkSafe based on severity, trade type, and specific failure conditions.
+app.post("/escalation-check", (req, res) => {
+  const {
+    jobType,
+    complianceScore,
+    missingItems     = [],
+    incidentOccurred = false,
+    workerInjured    = false,
+    publicRisk       = false,
+    certificateNeverFiled = false,
+    suspectedFraud   = false,
+  } = req.body || {};
+
+  if (!jobType) {
+    return res.status(400).json({ error: "jobType is required." });
+  }
+
+  const escalations = [];
+
+  // WorkSafe escalation
+  if (workerInjured) {
+    escalations.push({
+      authority: "WorkSafe Victoria",
+      reason:    "Worker injured on site",
+      urgency:   "immediate",
+      action:    "Notify WorkSafe within 1 hour of a serious injury or dangerous incident. Phone: 13 23 60",
+      mandatory: true,
+    });
+  }
+  if (incidentOccurred && publicRisk) {
+    escalations.push({
+      authority: "WorkSafe Victoria",
+      reason:    "Dangerous incident with public risk",
+      urgency:   "immediate",
+      action:    "Notify WorkSafe immediately. Preserve the scene. Phone: 13 23 60",
+      mandatory: true,
+    });
+  }
+
+  // ESV escalation (gas and electrical)
+  if (["gas", "electrical"].includes(jobType?.toLowerCase())) {
+    const criticalMissing = missingItems.some(i =>
+      i.toLowerCase().includes("certificate") || i.toLowerCase().includes("gas compliance") || i.toLowerCase().includes("coes")
+    );
+    if (certificateNeverFiled || criticalMissing) {
+      const esvPhone = jobType.toLowerCase() === "gas" ? "1800 652 563" : "1800 000 540";
+      escalations.push({
+        authority: `Energy Safe Victoria (ESV)`,
+        reason:    "Compliance certificate not filed / critical items missing",
+        urgency:   "within 48 hours",
+        action:    `Contact ESV and lodge the required certificate. ESV: ${esvPhone}`,
+        mandatory: true,
+      });
+    }
+  }
+
+  // VBA escalation (plumbing, drainage, carpentry)
+  if (["plumbing", "drainage", "carpentry"].includes(jobType?.toLowerCase())) {
+    if (certificateNeverFiled) {
+      escalations.push({
+        authority: "Victorian Building Authority (VBA)",
+        reason:    "Certificate of Compliance not filed",
+        urgency:   "within 2 business days",
+        action:    "Lodge the Certificate of Compliance via the VBA portal immediately. VBA: 1300 815 127",
+        mandatory: true,
+      });
+    }
+    if ((complianceScore ?? 100) < 40) {
+      escalations.push({
+        authority: "Victorian Building Authority (VBA)",
+        reason:    "Very low compliance score — potential serious non-conformance",
+        urgency:   "within 5 business days",
+        action:    "Contact VBA to determine if a mandatory inspection is required. VBA: 1300 815 127",
+        mandatory: false,
+      });
+    }
+  }
+
+  // Fraud escalation
+  if (suspectedFraud) {
+    escalations.push({
+      authority: "Victorian Building Authority (VBA) — Complaints & Investigations",
+      reason:    "Suspected fraud or falsified compliance documentation",
+      urgency:   "within 24 hours",
+      action:    "Lodge a formal complaint with VBA Investigations. Phone: 1300 815 127. Preserve all evidence.",
+      mandatory: true,
+    });
+  }
+
+  const mandatoryCount = escalations.filter(e => e.mandatory).length;
+  const immediateCount = escalations.filter(e => e.urgency === "immediate").length;
+
+  return res.json({
+    jobType,
+    complianceScore:  complianceScore ?? null,
+    requiresEscalation: escalations.length > 0,
+    mandatoryEscalations: mandatoryCount,
+    immediateActions:     immediateCount,
+    escalations,
+    summary: escalations.length === 0
+      ? "No escalation required at this time."
+      : immediateCount > 0
+      ? "IMMEDIATE ACTION REQUIRED — contact the relevant authority now."
+      : `${mandatoryCount} mandatory escalation(s) required. Act within specified timeframes.`,
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /job-diff ────────────────────────────────────────────────────────────
+// Compares two analysis snapshots of the same job (e.g., original vs re-analysis
+// after remediation). Returns a structured diff with improvements, regressions.
+app.post("/job-diff", (req, res) => {
+  const { v1, v2, jobType } = req.body || {};
+
+  if (!v1 || !v2) {
+    return res.status(400).json({ error: "v1 (original) and v2 (updated) analysis objects are required." });
+  }
+
+  const extractSnap = (obj) => ({
+    score:          typeof obj.complianceScore === "number" ? obj.complianceScore : null,
+    confidence:     typeof obj.confidence      === "number" ? obj.confidence      : null,
+    detected:       Array.isArray(obj.itemsDetected) ? obj.itemsDetected : [],
+    missing:        Array.isArray(obj.itemsMissing)  ? obj.itemsMissing  : [],
+    unclear:        Array.isArray(obj.itemsUnclear)  ? obj.itemsUnclear  : [],
+    gpsRecorded:    obj.gpsRecorded      ?? null,
+    signatureObtained: obj.signatureObtained ?? null,
+    photoCount:     typeof obj.photoCount === "number" ? obj.photoCount  : null,
+    prompt_version: obj.prompt_version   || null,
+    analysedAt:     obj.analysedAt       || obj.created_at || null,
+  });
+
+  const a = extractSnap(v1);
+  const b = extractSnap(v2);
+
+  // Items resolved (were missing, now detected)
+  const resolved = a.missing.filter(item =>
+    b.detected.some(d => d.toLowerCase().includes(item.toLowerCase().substring(0, 20)))
+  );
+
+  // Items regressed (were detected, now missing)
+  const regressed = b.missing.filter(item =>
+    a.detected.some(d => d.toLowerCase().includes(item.toLowerCase().substring(0, 20)))
+  );
+
+  // Items newly detected in v2 (not previously detected or missing)
+  const newlyDetected = b.detected.filter(item =>
+    !a.detected.some(d => d.toLowerCase().includes(item.toLowerCase().substring(0, 20))) &&
+    !a.missing.some(m => m.toLowerCase().includes(item.toLowerCase().substring(0, 20)))
+  );
+
+  const scoreChange       = (a.score !== null && b.score !== null)      ? b.score      - a.score      : null;
+  const confidenceChange  = (a.confidence !== null && b.confidence !== null) ? b.confidence - a.confidence : null;
+
+  const trend = scoreChange === null ? "unknown"
+    : scoreChange > 5  ? "improving"
+    : scoreChange < -5 ? "declining"
+    : "stable";
+
+  return res.json({
+    jobType:         jobType || null,
+    trend,
+    v1: { ...a, label: "Original Analysis" },
+    v2: { ...b, label: "Updated Analysis" },
+    diff: {
+      scoreChange:       scoreChange !== null ? Math.round(scoreChange * 10) / 10 : null,
+      confidenceChange:  confidenceChange !== null ? Math.round(confidenceChange * 10) / 10 : null,
+      resolvedItems:     resolved,
+      resolvedCount:     resolved.length,
+      regressedItems:    regressed,
+      regressedCount:    regressed.length,
+      newlyDetected,
+      newlyDetectedCount: newlyDetected.length,
+      stillMissing:      b.missing,
+      stillMissingCount: b.missing.length,
+    },
+    summary: trend === "improving"
+      ? `Score improved by ${scoreChange?.toFixed(1)} pts. ${resolved.length} item(s) resolved. ${b.missing.length} still outstanding.`
+      : trend === "declining"
+      ? `Score declined by ${Math.abs(scoreChange || 0).toFixed(1)} pts. ${regressed.length} regression(s) detected.`
+      : `Score stable. ${resolved.length} item(s) resolved, ${b.missing.length} still outstanding.`,
+    diffedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
