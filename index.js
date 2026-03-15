@@ -16757,6 +16757,229 @@ app.get("/trade-contacts", apiKeyAuth, (req, res) => {
   });
 });
 
+// ── Round 37 ──────────────────────────────────────────────────────────────────
+
+// POST /quote-comparison  — Compare multiple supplier quotes for a job
+app.post("/quote-comparison", apiKeyAuth, (req, res) => {
+  const { jobType, quotes } = req.body;
+
+  if (!quotes || !Array.isArray(quotes) || quotes.length < 2) {
+    return res.status(400).json({ error: "quotes array with at least 2 entries is required." });
+  }
+
+  const safeJobType = sanitiseInput(String(jobType || "general")).toLowerCase();
+
+  const processed = quotes.slice(0, 10).map((q, i) => {
+    const supplier     = sanitiseInput(String(q.supplierName || `Supplier ${i + 1}`));
+    const labourCost   = parseFloat(q.labourCost)   || 0;
+    const materialCost = parseFloat(q.materialCost) || 0;
+    const callout      = parseFloat(q.calloutFee)   || 0;
+    const gst          = parseFloat(q.gst)          || (labourCost + materialCost + callout) * 0.1;
+    const total        = Math.round((labourCost + materialCost + callout + gst) * 100) / 100;
+    const turnaround   = parseInt(q.turnaroundDays) || null;
+    const warrantyYrs  = parseFloat(q.warrantyYears) || null;
+
+    return {
+      rank:         0,
+      quoteIndex:   i + 1,
+      supplierName: supplier,
+      breakdown: { labourCost, materialCost, calloutFee: callout, gst: Math.round(gst * 100) / 100 },
+      totalIncGst:  total,
+      turnaroundDays: turnaround,
+      warrantyYears: warrantyYrs,
+      notes:         q.notes ? sanitiseInput(String(q.notes)).slice(0, 200) : null,
+    };
+  });
+
+  processed.sort((a, b) => a.totalIncGst - b.totalIncGst);
+  processed.forEach((q, i) => { q.rank = i + 1; });
+
+  const cheapest   = processed[0];
+  const mostExpensive = processed[processed.length - 1];
+  const saving     = Math.round((mostExpensive.totalIncGst - cheapest.totalIncGst) * 100) / 100;
+  const savingPct  = Math.round((saving / mostExpensive.totalIncGst) * 100);
+
+  return res.json({
+    jobType:       safeJobType,
+    quotesCompared: processed.length,
+    bestValue:     cheapest.supplierName,
+    cheapestQuote: cheapest.totalIncGst,
+    mostExpensive: mostExpensive.totalIncGst,
+    potentialSaving: saving,
+    savingPercentage: `${savingPct}%`,
+    recommendation: `${cheapest.supplierName} offers the lowest price at $${cheapest.totalIncGst} inc. GST — $${saving} less than the highest quote.`,
+    quotes:        processed,
+    note:          "Price is not the only consideration. Also weigh warranty, turnaround time, and contractor reputation.",
+    generatedAt:   new Date().toISOString(),
+  });
+});
+
+// POST /project-milestone  — Record and track project milestones
+app.post("/project-milestone", apiKeyAuth, async (req, res) => {
+  const { projectId, milestoneName, dueDate, completedDate, status,
+          contractorId, notes, percentComplete } = req.body;
+
+  if (!projectId || !milestoneName) {
+    return res.status(400).json({ error: "projectId and milestoneName are required." });
+  }
+
+  const safeProjectId  = sanitiseInput(String(projectId));
+  const safeMilestone  = sanitiseInput(String(milestoneName));
+  const safeStatus     = sanitiseInput(String(status || "pending")).toLowerCase();
+  const safeNotes      = sanitiseInput(String(notes || ""));
+  const safePct        = Math.min(100, Math.max(0, parseInt(percentComplete) || 0));
+
+  const VALID_STATUSES = ["pending", "in_progress", "completed", "delayed", "cancelled"];
+  const resolvedStatus = VALID_STATUSES.includes(safeStatus) ? safeStatus : "pending";
+
+  const now = new Date();
+  const dueDateObj = dueDate ? new Date(dueDate) : null;
+  const completedDateObj = completedDate ? new Date(completedDate) : null;
+
+  const isOverdue = dueDateObj && !isNaN(dueDateObj.getTime()) && dueDateObj < now && resolvedStatus !== "completed";
+  const daysOverdue = isOverdue ? Math.round((now - dueDateObj) / (1000 * 60 * 60 * 24)) : null;
+
+  const milestoneId = `MS-${Date.now().toString(36).toUpperCase()}`;
+
+  const milestone = {
+    milestoneId,
+    projectId:      safeProjectId,
+    milestoneName:  safeMilestone,
+    status:         resolvedStatus.toUpperCase(),
+    percentComplete: resolvedStatus === "completed" ? 100 : safePct,
+    dueDate:        dueDateObj ? dueDateObj.toISOString().slice(0, 10) : null,
+    completedDate:  completedDateObj ? completedDateObj.toISOString().slice(0, 10) : null,
+    isOverdue,
+    daysOverdue,
+    notes:          safeNotes || null,
+    createdAt:      now.toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("project_milestones").insert({
+      milestone_id:    milestoneId,
+      project_id:      safeProjectId,
+      milestone_name:  safeMilestone,
+      status:          resolvedStatus,
+      percent_complete: milestone.percentComplete,
+      due_date:        dueDateObj ? dueDateObj.toISOString() : null,
+      completed_date:  completedDateObj ? completedDateObj.toISOString() : null,
+      contractor_id:   contractorId ? sanitiseInput(String(contractorId)) : null,
+      created_at:      now.toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...milestone, saved });
+});
+
+// GET /project-milestones/:projectId  — Retrieve all milestones for a project
+app.get("/project-milestones/:projectId", apiKeyAuth, async (req, res) => {
+  const projectId = sanitiseInput(String(req.params.projectId || ""));
+  if (!projectId) return res.status(400).json({ error: "projectId is required." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  const { data, error } = await supabaseAdmin
+    .from("project_milestones")
+    .select("*")
+    .eq("project_id", projectId)
+    .order("due_date", { ascending: true });
+
+  if (error) return res.status(500).json({ error: "Failed to retrieve milestones." });
+
+  const milestones = data || [];
+  const total      = milestones.length;
+  const completed  = milestones.filter(m => m.status === "completed").length;
+  const overdue    = milestones.filter(m => m.due_date && new Date(m.due_date) < new Date() && m.status !== "completed").length;
+
+  return res.json({
+    projectId,
+    totalMilestones: total,
+    completedMilestones: completed,
+    overdueMilestones: overdue,
+    completionRate: total ? `${Math.round((completed / total) * 100)}%` : "0%",
+    milestones,
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
+// POST /photo-gps-check  — Verify that photos were taken within an expected geofence
+app.post("/photo-gps-check", apiKeyAuth, (req, res) => {
+  const { photos, siteLatitude, siteLongitude, radiusMetres } = req.body;
+
+  if (!photos || !Array.isArray(photos) || photos.length === 0) {
+    return res.status(400).json({ error: "photos array is required." });
+  }
+  if (siteLatitude === undefined || siteLongitude === undefined) {
+    return res.status(400).json({ error: "siteLatitude and siteLongitude are required." });
+  }
+
+  const siteLat  = parseFloat(siteLatitude);
+  const siteLng  = parseFloat(siteLongitude);
+  const radius   = parseFloat(radiusMetres) || 200;
+
+  if (isNaN(siteLat) || isNaN(siteLng)) {
+    return res.status(400).json({ error: "siteLatitude and siteLongitude must be valid numbers." });
+  }
+
+  // Haversine distance formula
+  const haversine = (lat1, lng1, lat2, lng2) => {
+    const R    = 6371000; // Earth radius in metres
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLng = (lng2 - lng1) * Math.PI / 180;
+    const a    = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+    return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+  };
+
+  const results = photos.slice(0, 50).map((p, i) => {
+    const lat = parseFloat(p.latitude  || p.gpsLat || "");
+    const lng = parseFloat(p.longitude || p.gpsLng || "");
+
+    if (isNaN(lat) || isNaN(lng)) {
+      return {
+        photoIndex: i + 1,
+        filename:   p.filename ? sanitiseInput(String(p.filename)) : null,
+        hasGps:     false,
+        withinSite: null,
+        distanceMetres: null,
+        flag:       "NO_GPS",
+      };
+    }
+
+    const distance     = haversine(siteLat, siteLng, lat, lng);
+    const withinSite   = distance <= radius;
+
+    return {
+      photoIndex:     i + 1,
+      filename:       p.filename ? sanitiseInput(String(p.filename)) : null,
+      hasGps:         true,
+      photoLat:       lat,
+      photoLng:       lng,
+      distanceMetres: distance,
+      withinSite,
+      flag:           withinSite ? "OK" : "OUTSIDE_GEOFENCE",
+    };
+  });
+
+  const withGps      = results.filter(r => r.hasGps).length;
+  const withinSite   = results.filter(r => r.withinSite === true).length;
+  const outside      = results.filter(r => r.withinSite === false).length;
+  const noGps        = results.filter(r => !r.hasGps).length;
+
+  return res.json({
+    totalPhotos:    results.length,
+    site:           { latitude: siteLat, longitude: siteLng, radiusMetres: radius },
+    withGps,
+    withinSiteCount: withinSite,
+    outsideSiteCount: outside,
+    noGpsCount:     noGps,
+    overallStatus:  outside > 0 ? "LOCATION_MISMATCH" : noGps > 0 ? "MISSING_GPS" : "ALL_ON_SITE",
+    results,
+    checkedAt:      new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
