@@ -1692,9 +1692,29 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
 
     // Step 3: Run Stable Diffusion inpainting via Replicate
     // Only the masked (white) region is edited; everything else is preserved exactly.
+    //
+    // Prompt engineering principles applied:
+    //  • Lead with the exact product model so SD focuses on the specific unit shape/colour
+    //  • Anchor physical dimensions ("900mm wide × 300mm tall") to guide scale relative to the wall
+    //  • Room-context suffix (from GPT-4.1-mini vision) grounds lighting, colour temperature, and style
+    //  • Instruction-style suffix ("mounted flush", "installation photo") shifts SD toward
+    //    a photographic rather than artistic render
+    //  • Negative prompt aggressively kills scale errors, perspective issues, and artistic artifacts
+    const roomCtx = roomDescription && roomDescription.length > 10
+      ? `, ${roomDescription}`
+      : ", interior room, natural lighting";
+
     const prompt =
-      `A ${modelNumber} air conditioning unit approximately 80cm wide mounted on the wall, correct scale and ` +
-      `proportion relative to the room, professional installation photo, photorealistic, natural shadows, ${roomDescription}`;
+      `Photorealistic product photo of a ${modelNumber} split-system air conditioner, white rectangular wall-mounted indoor unit, ` +
+      `900mm wide by 300mm tall, mounted flush on the wall at eye level, horizontal louvre at the bottom, ` +
+      `manufacturer logo visible on fascia, refrigerant line set exiting neatly through wall at left or right side, ` +
+      `professional HVAC installation, sharp detail, RAW photo quality${roomCtx}`;
+
+    const negativePrompt =
+      "ceiling, floor, outdoors, outdoor unit, condenser, distorted, warped, cropped, cut off, floating, " +
+      "incorrect scale, oversized, undersized, giant unit, tiny unit, blurry, low quality, cartoon, painting, " +
+      "illustration, 3d render, CGI, sketch, duplicate units, multiple units, extra heads, extra limbs, " +
+      "text, watermark, label overlay, wrong perspective, fish-eye, wide-angle distortion";
 
     console.log("[visualise] Step 3 - Calling Replicate with prompt:", prompt, "| image size:", correctedWallImage.length);
 
@@ -1705,14 +1725,14 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
         "stability-ai/stable-diffusion-inpainting:95b7223104132402a9ae91cc677285bc5eb997834bd2349fa486f53910fd68b3",
         {
           input: {
-            image:            `data:${correctedMime};base64,${correctedWallImage}`,
-            mask:             `data:image/png;base64,${maskBase64}`,
+            image:               `data:${correctedMime};base64,${correctedWallImage}`,
+            mask:                `data:image/png;base64,${maskBase64}`,
             prompt,
-            negative_prompt:  "ceiling, roof, floor, distorted, blurry, cartoon, painting, unrealistic, floating, oversized, too large, giant, distorted proportions, wrong scale",
-            strength:         0.95,
-            guidance_scale:   9,
-            num_inference_steps: 50,
-            num_outputs:      1,
+            negative_prompt:     negativePrompt,
+            strength:            0.92,
+            guidance_scale:      11,
+            num_inference_steps: 60,
+            num_outputs:         1,
           },
         }
       );
