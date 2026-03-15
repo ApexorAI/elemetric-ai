@@ -31516,6 +31516,194 @@ Return a JSON object with:
   }
 });
 
+// ── Round 114: Crane register, lift study, load calculations ─────────────────
+
+// POST /crane-register — Register a crane or lifting equipment on a project
+app.post("/crane-register", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, projectId, craneType, make, model, serialNumber,
+    maxLiftCapacityTonne, boomLengthM, ownerCompany,
+    operatorName, operatorLicenceNumber, riggerName, riggerLicenceNumber,
+    inspectionDate, nextInspectionDue, engineerEngaged,
+    plantRegistrationNumber, notes,
+  } = req.body;
+
+  if (!siteId || !craneType) return res.status(400).json({ error: "siteId and craneType required." });
+
+  const validTypes = ["TOWER_CRANE", "MOBILE_CRANE", "CRAWLER_CRANE", "FRANNA", "OVERHEAD_CRANE", "GANTRY", "TELEHANDLER", "FORKLIFT", "OTHER"];
+  const type = (craneType || "OTHER").toUpperCase();
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    project_id: sanitiseInput(projectId || ""),
+    crane_type: validTypes.includes(type) ? type : "OTHER",
+    make: sanitiseInput(make || ""),
+    model: sanitiseInput(model || ""),
+    serial_number: sanitiseInput(serialNumber || ""),
+    max_lift_capacity_tonne: Number(maxLiftCapacityTonne) || null,
+    boom_length_m: Number(boomLengthM) || null,
+    owner_company: sanitiseInput(ownerCompany || ""),
+    operator_name: sanitiseInput(operatorName || ""),
+    operator_licence_number: sanitiseInput(operatorLicenceNumber || ""),
+    rigger_name: sanitiseInput(riggerName || ""),
+    rigger_licence_number: sanitiseInput(riggerLicenceNumber || ""),
+    inspection_date: inspectionDate || null,
+    next_inspection_due: nextInspectionDue || null,
+    engineer_engaged: Boolean(engineerEngaged),
+    plant_registration_number: sanitiseInput(plantRegistrationNumber || ""),
+    notes: sanitiseInput(notes || ""),
+    status: "ACTIVE",
+    registered_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("crane_register")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, craneId: data.id, ...record });
+  }
+
+  res.json({ success: true, craneId: null, ...record, saved: false });
+});
+
+// POST /lift-study — Record a critical lift study plan
+app.post("/lift-study", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, projectId, liftDescription, liftDate,
+    craneId, loadWeightTonne, loadDescription,
+    liftRadiusM, hookHeightM, liftCategory,
+    groundCondition, engineerName, engineerApproved = false,
+    hazards = [], controlMeasures = [],
+    signallerName, dogmanName, liftSupervisorName,
+    notes,
+  } = req.body;
+
+  if (!siteId || !liftDescription || !loadWeightTonne)
+    return res.status(400).json({ error: "siteId, liftDescription, loadWeightTonne required." });
+
+  const validCategories = ["ROUTINE", "COMPLEX", "CRITICAL"];
+  const cat = (liftCategory || "ROUTINE").toUpperCase();
+
+  // Rough capacity check advisory (not engineering — always consult engineer)
+  const capacityAdvisory = `Always verify lift capacity with qualified crane engineer. Ensure load + rigging weight does not exceed rated crane capacity at working radius.`;
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    project_id: sanitiseInput(projectId || ""),
+    lift_description: sanitiseInput(liftDescription),
+    lift_date: liftDate || null,
+    crane_id: sanitiseInput(craneId || ""),
+    load_weight_tonne: Number(loadWeightTonne),
+    load_description: sanitiseInput(loadDescription || ""),
+    lift_radius_m: Number(liftRadiusM) || null,
+    hook_height_m: Number(hookHeightM) || null,
+    lift_category: validCategories.includes(cat) ? cat : "ROUTINE",
+    ground_condition: sanitiseInput(groundCondition || ""),
+    engineer_name: sanitiseInput(engineerName || ""),
+    engineer_approved: Boolean(engineerApproved),
+    hazards: hazards.map(h => sanitiseInput(h)),
+    control_measures: controlMeasures.map(c => sanitiseInput(c)),
+    signaller_name: sanitiseInput(signallerName || ""),
+    dogman_name: sanitiseInput(dogmanName || ""),
+    lift_supervisor_name: sanitiseInput(liftSupervisorName || ""),
+    capacity_advisory: capacityAdvisory,
+    notes: sanitiseInput(notes || ""),
+    status: engineerApproved ? "APPROVED" : "PENDING_APPROVAL",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("lift_studies")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, liftStudyId: data.id, ...record });
+  }
+
+  res.json({ success: true, liftStudyId: null, ...record, saved: false });
+});
+
+// POST /rigging-register — Register rigging equipment (slings, shackles, etc.)
+app.post("/rigging-register", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, itemType, description, wll, wllUnit = "tonnes",
+    serialNumber, manufacturer, certificationDate,
+    nextInspectionDue, assignedTo, colour,
+    status = "IN_SERVICE",
+  } = req.body;
+
+  if (!siteId || !itemType || !wll)
+    return res.status(400).json({ error: "siteId, itemType, wll required." });
+
+  const validTypes = ["CHAIN_SLING", "WIRE_ROPE_SLING", "SYNTHETIC_SLING", "SHACKLE", "HOOK", "BEAM_CLAMP", "PLATE_CLAMP", "SPREADER_BAR", "EYE_BOLT", "D_RING", "OTHER"];
+  const validStatuses = ["IN_SERVICE", "OUT_OF_SERVICE", "SCRAPPED", "AWAITING_INSPECTION"];
+  const type = (itemType || "OTHER").toUpperCase();
+  const st = (status || "IN_SERVICE").toUpperCase();
+
+  const nextInspection = nextInspectionDue || null;
+  const inspectionOverdue = nextInspection ? new Date(nextInspection) < new Date() : false;
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    item_type: validTypes.includes(type) ? type : "OTHER",
+    description: sanitiseInput(description || ""),
+    wll: Number(wll),
+    wll_unit: sanitiseInput(wllUnit),
+    serial_number: sanitiseInput(serialNumber || ""),
+    manufacturer: sanitiseInput(manufacturer || ""),
+    certification_date: certificationDate || null,
+    next_inspection_due: nextInspection,
+    inspection_overdue: inspectionOverdue,
+    assigned_to: sanitiseInput(assignedTo || ""),
+    colour: sanitiseInput(colour || ""),
+    status: validStatuses.includes(st) ? st : "IN_SERVICE",
+    registered_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("rigging_register")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, riggingId: data.id, inspectionOverdue, ...record });
+  }
+
+  res.json({ success: true, riggingId: null, inspectionOverdue, ...record, saved: false });
+});
+
+// GET /rigging-register/:siteId — List rigging equipment for a site
+app.get("/rigging-register/:siteId", apiKeyAuth, async (req, res) => {
+  const { siteId } = req.params;
+  const { overdueOnly } = req.query;
+
+  if (supabaseAdmin) {
+    let query = supabaseAdmin
+      .from("rigging_register")
+      .select("*")
+      .eq("site_id", siteId)
+      .order("item_type", { ascending: true });
+
+    if (overdueOnly === "true") query = query.eq("inspection_overdue", true);
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "DB error." });
+
+    const overdueCount = (data || []).filter(r => r.inspection_overdue).length;
+    const outOfService = (data || []).filter(r => r.status === "OUT_OF_SERVICE" || r.status === "SCRAPPED").length;
+
+    return res.json({ siteId, equipment: data || [], count: (data || []).length, overdueInspectionCount: overdueCount, outOfServiceCount: outOfService });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
