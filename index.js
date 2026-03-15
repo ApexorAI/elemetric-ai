@@ -15492,6 +15492,253 @@ app.get("/feedback-summary/:contractorId", apiKeyAuth, async (req, res) => {
   });
 });
 
+// ── Round 32 ──────────────────────────────────────────────────────────────────
+
+// POST /service-reminder  — Schedule a future service or maintenance reminder
+app.post("/service-reminder", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, contractorId, clientEmail, clientName, assetDescription,
+          lastServiceDate, intervalMonths, customMessage, notifyDaysBefore } = req.body;
+
+  if (!assetDescription || !lastServiceDate) {
+    return res.status(400).json({ error: "assetDescription and lastServiceDate are required." });
+  }
+
+  const safeAsset    = sanitiseInput(String(assetDescription));
+  const safeClient   = sanitiseInput(String(clientName || "Client"));
+  const safeJobType  = sanitiseInput(String(jobType || "general")).toLowerCase();
+  const safeMsg      = sanitiseInput(String(customMessage || ""));
+  const interval     = parseInt(intervalMonths) || 12;
+  const notifyDays   = parseInt(notifyDaysBefore) || 30;
+
+  const lastDate = new Date(lastServiceDate);
+  if (isNaN(lastDate.getTime())) {
+    return res.status(400).json({ error: "lastServiceDate must be a valid date." });
+  }
+
+  const nextServiceDate = new Date(lastDate);
+  nextServiceDate.setMonth(nextServiceDate.getMonth() + interval);
+
+  const notifyDate = new Date(nextServiceDate);
+  notifyDate.setDate(notifyDate.getDate() - notifyDays);
+
+  const reminderId = `REM-${Date.now().toString(36).toUpperCase()}`;
+  const now        = new Date();
+  const daysUntilService = Math.round((nextServiceDate - now) / (1000 * 60 * 60 * 24));
+
+  const reminder = {
+    reminderId,
+    status:           daysUntilService < 0 ? "OVERDUE" : daysUntilService <= notifyDays ? "DUE_SOON" : "SCHEDULED",
+    jobId:            jobId || null,
+    jobType:          safeJobType,
+    clientName:       safeClient,
+    clientEmail:      clientEmail && isValidEmail(clientEmail) ? clientEmail : null,
+    assetDescription: safeAsset,
+    lastServiceDate:  lastDate.toISOString().slice(0, 10),
+    intervalMonths:   interval,
+    nextServiceDate:  nextServiceDate.toISOString().slice(0, 10),
+    notifyDate:       notifyDate.toISOString().slice(0, 10),
+    daysUntilService,
+    customMessage:    safeMsg || null,
+    createdAt:        now.toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("service_reminders").insert({
+      reminder_id:        reminderId,
+      job_id:             jobId || null,
+      job_type:           safeJobType,
+      contractor_id:      contractorId ? sanitiseInput(String(contractorId)) : null,
+      client_email:       reminder.clientEmail,
+      asset_description:  safeAsset,
+      last_service_date:  lastDate.toISOString(),
+      next_service_date:  nextServiceDate.toISOString(),
+      notify_date:        notifyDate.toISOString(),
+      status:             reminder.status,
+      created_at:         now.toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...reminder, saved });
+});
+
+// POST /batch-job-score  — Score a batch of jobs and return ranked results
+app.post("/batch-job-score", apiKeyAuth, (req, res) => {
+  const { jobs } = req.body;
+
+  if (!jobs || !Array.isArray(jobs) || jobs.length === 0) {
+    return res.status(400).json({ error: "jobs array is required." });
+  }
+
+  const scored = jobs.slice(0, 100).map((j, idx) => {
+    const safeJobType = sanitiseInput(String(j.jobType || "general")).toLowerCase();
+
+    // Reuse compliance score if provided, otherwise compute from available fields
+    const baseScore   = parseFloat(j.complianceScore) || null;
+    const photoScore  = Math.min((parseInt(j.photoCount) || 0) / (parseInt(j.requiredPhotos) || 4), 1) * 25;
+    const certScore   = j.certificateFiled ? 20 : 0;
+    const gpsScore    = j.gpsRecorded      ? 10 : 0;
+    const sigScore    = j.signatureObtained? 10 : 0;
+    const missingPenalty = Math.min((parseInt(j.missingItemCount) || 0) * 5, 35);
+
+    const computedScore = baseScore !== null ? baseScore : Math.max(0, Math.round(photoScore + certScore + gpsScore + sigScore + 35 - missingPenalty));
+
+    let grade;
+    if (computedScore >= 90)      grade = "A";
+    else if (computedScore >= 80) grade = "B";
+    else if (computedScore >= 70) grade = "C";
+    else if (computedScore >= 60) grade = "D";
+    else                          grade = "F";
+
+    return {
+      rank:           0,  // filled below
+      originalIndex:  idx,
+      jobId:          j.jobId ? sanitiseInput(String(j.jobId)) : null,
+      jobType:        safeJobType,
+      address:        j.address ? sanitiseInput(String(j.address)) : null,
+      complianceScore: computedScore,
+      grade,
+      wasProvided:    baseScore !== null,
+    };
+  });
+
+  scored.sort((a, b) => b.complianceScore - a.complianceScore);
+  scored.forEach((s, i) => { s.rank = i + 1; });
+
+  const scores      = scored.map(s => s.complianceScore);
+  const average     = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
+  const topQuartile = scored.slice(0, Math.ceil(scored.length / 4)).map(s => s.jobId || `Index ${s.originalIndex}`);
+  const botQuartile = scored.slice(-Math.ceil(scored.length / 4)).map(s => s.jobId || `Index ${s.originalIndex}`);
+
+  return res.json({
+    jobsScored:      scored.length,
+    averageScore:    average,
+    highestScore:    Math.max(...scores),
+    lowestScore:     Math.min(...scores),
+    topQuartileJobs: topQuartile,
+    bottomQuartileJobs: botQuartile,
+    results:         scored,
+    generatedAt:     new Date().toISOString(),
+  });
+});
+
+// GET /regulatory-calendar  — Return upcoming Victorian regulatory events and deadlines
+app.get("/regulatory-calendar", apiKeyAuth, (req, res) => {
+  const { month, year, trade } = req.query;
+
+  const CALENDAR = [
+    { month: 1,  event: "New Year compliance review", description: "Review all open CoCs and pending certificates from prior year.", trades: ["all"], recurrence: "Annual" },
+    { month: 2,  event: "VBA licence renewal reminder", description: "Most Victorian trade licences expire in February/March. Check renewal status.", trades: ["plumbing", "gas", "drainage", "carpentry"], recurrence: "Annual" },
+    { month: 3,  event: "Autumn storm preparation", description: "Inspect and clear roof drainage systems before autumn rainfall season.", trades: ["plumbing", "drainage"], recurrence: "Annual" },
+    { month: 4,  event: "Energy Safe Victoria licence renewal", description: "Electrician and gasfitter licences due for renewal — check ESV portal.", trades: ["electrical", "gas"], recurrence: "Annual" },
+    { month: 5,  event: "Winter heating season commencement", description: "Gas appliance servicing demand peaks. Ensure all certificates are current.", trades: ["gas", "hvac"], recurrence: "Annual" },
+    { month: 6,  event: "Financial year end — compliance records audit", description: "Archive all job records, CoCs, and permits for the financial year ending 30 June.", trades: ["all"], recurrence: "Annual" },
+    { month: 7,  event: "NCC update review", description: "Check for any NCC amendments effective July 1. Update checklists and procedures accordingly.", trades: ["all"], recurrence: "Annual" },
+    { month: 8,  event: "ARCtick refrigerant log audit", description: "Reconcile refrigerant handling logs for all RAC work completed YTD.", trades: ["hvac"], recurrence: "Annual" },
+    { month: 9,  event: "Spring storm preparation", description: "Inspect gutters, stormwater pits, and roof penetrations before spring rains.", trades: ["plumbing", "drainage"], recurrence: "Annual" },
+    { month: 10, event: "Bushfire season risk review", description: "Check ember protection and roof penetration sealing on properties in Bushfire Attack Level (BAL) zones.", trades: ["plumbing", "carpentry"], recurrence: "Annual" },
+    { month: 11, event: "Pre-summer HVAC commissioning", description: "Complete all HVAC installations and service calls before peak summer demand.", trades: ["hvac", "electrical"], recurrence: "Annual" },
+    { month: 12, event: "Year-end compliance close-out", description: "File all outstanding certificates, permits, and test records before 31 December.", trades: ["all"], recurrence: "Annual" },
+  ];
+
+  let filtered = CALENDAR;
+
+  if (month) {
+    const m = parseInt(month);
+    if (!isNaN(m)) filtered = filtered.filter(e => e.month === m);
+  }
+
+  if (trade) {
+    const key = sanitiseInput(String(trade)).toLowerCase();
+    filtered = filtered.filter(e => e.trades.includes(key) || e.trades.includes("all"));
+  }
+
+  const targetYear = parseInt(year) || new Date().getFullYear();
+  const withDates = filtered.map(e => ({
+    ...e,
+    date: `${targetYear}-${String(e.month).padStart(2, "0")}-01`,
+    trades: e.trades,
+  }));
+
+  return res.json({
+    year: targetYear,
+    filter: { month: month || null, trade: trade || null },
+    count:   withDates.length,
+    events:  withDates,
+  });
+});
+
+// POST /subcontractor-register  — Register a subcontractor on a project
+app.post("/subcontractor-register", apiKeyAuth, async (req, res) => {
+  const { projectId, companyName, tradeType, contactName, contactPhone, contactEmail,
+          licenceNumber, insuranceExpiry, notes } = req.body;
+
+  if (!companyName || !tradeType) {
+    return res.status(400).json({ error: "companyName and tradeType are required." });
+  }
+
+  const safeCompany  = sanitiseInput(String(companyName));
+  const safeContact  = sanitiseInput(String(contactName || ""));
+  const safePhone    = sanitiseInput(String(contactPhone || ""));
+  const safeEmail    = contactEmail && isValidEmail(contactEmail) ? contactEmail : null;
+  const safeTrade    = sanitiseInput(String(tradeType)).toLowerCase();
+  const safeLicence  = sanitiseInput(String(licenceNumber || "Not provided"));
+  const safeNotes    = sanitiseInput(String(notes || ""));
+
+  const insExpiry    = insuranceExpiry ? new Date(insuranceExpiry) : null;
+  const now          = new Date();
+  const daysToInsuranceExpiry = insExpiry && !isNaN(insExpiry.getTime())
+    ? Math.round((insExpiry - now) / (1000 * 60 * 60 * 24))
+    : null;
+
+  const warnings = [];
+  if (!licenceNumber) warnings.push("Licence number not provided — verify before allowing on site");
+  if (!insuranceExpiry) warnings.push("Insurance expiry not provided — request certificate of currency");
+  if (daysToInsuranceExpiry !== null && daysToInsuranceExpiry < 30) {
+    warnings.push(`Insurance expires in ${daysToInsuranceExpiry} days — request renewal before site access`);
+  }
+  if (daysToInsuranceExpiry !== null && daysToInsuranceExpiry < 0) {
+    warnings.push("CRITICAL: Insurance appears expired — do not allow on site");
+  }
+
+  const subId = `SUB-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    subcontractorId:  subId,
+    projectId:        projectId ? sanitiseInput(String(projectId)) : null,
+    companyName:      safeCompany,
+    tradeType:        safeTrade,
+    contactName:      safeContact || null,
+    contactPhone:     safePhone   || null,
+    contactEmail:     safeEmail,
+    licenceNumber:    safeLicence,
+    insuranceExpiry:  insExpiry ? insExpiry.toISOString().slice(0, 10) : null,
+    daysToInsuranceExpiry,
+    warnings,
+    notes:            safeNotes || null,
+    registeredAt:     now.toISOString(),
+    status:           warnings.some(w => w.startsWith("CRITICAL")) ? "BLOCKED" : warnings.length > 0 ? "WARNING" : "APPROVED",
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("subcontractor_register").insert({
+      subcontractor_id:   subId,
+      project_id:         record.projectId,
+      company_name:       safeCompany,
+      trade_type:         safeTrade,
+      licence_number:     safeLicence,
+      insurance_expiry:   insExpiry ? insExpiry.toISOString() : null,
+      status:             record.status,
+      created_at:         now.toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...record, saved });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
