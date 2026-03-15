@@ -8954,6 +8954,344 @@ app.post("/job-diff", (req, res) => {
   });
 });
 
+// ── GET /performance-summary/:userId ─────────────────────────────────────────
+// Retrieves and aggregates all jobs for a specific user from Supabase to
+// generate a personal performance summary with trend data.
+app.get("/performance-summary/:userId", async (req, res) => {
+  const { userId } = req.params;
+  const { limit = 50 } = req.query;
+
+  if (!userId) return res.status(400).json({ error: "userId is required." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("analyses")
+      .select("id, job_type, confidence, compliance_score, created_at, suburb, missing_items, items_detected, risk_rating")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(Math.min(Number(limit) || 50, 200));
+
+    if (error) return res.status(500).json({ error: "Failed to retrieve job history." });
+
+    const jobs = data || [];
+    if (jobs.length === 0) {
+      return res.json({ userId, jobCount: 0, message: "No jobs found for this user." });
+    }
+
+    // Aggregate by trade type
+    const byTrade = {};
+    for (const job of jobs) {
+      const t = (job.job_type || "unknown").toLowerCase();
+      if (!byTrade[t]) byTrade[t] = { count: 0, scores: [], recentJob: null };
+      byTrade[t].count++;
+      const s = job.compliance_score ?? job.confidence;
+      if (typeof s === "number") byTrade[t].scores.push(s);
+      if (!byTrade[t].recentJob) byTrade[t].recentJob = job.created_at;
+    }
+
+    const tradeBreakdown = Object.entries(byTrade).map(([trade, d]) => ({
+      trade,
+      jobCount: d.count,
+      avgScore: d.scores.length > 0 ? Math.round(d.scores.reduce((a, b) => a + b, 0) / d.scores.length * 10) / 10 : null,
+      recentJob: d.recentJob,
+    }));
+
+    const allScores = jobs.map(j => j.compliance_score ?? j.confidence).filter(s => typeof s === "number");
+    const avgScore  = allScores.length > 0 ? Math.round(allScores.reduce((a, b) => a + b, 0) / allScores.length * 10) / 10 : null;
+    const passRate  = allScores.length > 0 ? Math.round((allScores.filter(s => s >= 70).length / allScores.length) * 100) : null;
+
+    // Trend: compare first half vs second half of jobs
+    const half = Math.floor(allScores.length / 2);
+    const recentHalf = allScores.slice(0, half);
+    const olderHalf  = allScores.slice(half);
+    const recentAvg  = recentHalf.length > 0 ? recentHalf.reduce((a, b) => a + b, 0) / recentHalf.length : null;
+    const olderAvg   = olderHalf.length  > 0 ? olderHalf.reduce((a, b) => a + b, 0)  / olderHalf.length  : null;
+    const trend      = recentAvg !== null && olderAvg !== null
+      ? recentAvg > olderAvg + 2 ? "improving"
+      : recentAvg < olderAvg - 2 ? "declining" : "stable"
+      : "insufficient data";
+
+    return res.json({
+      userId,
+      jobCount:        jobs.length,
+      avgScore,
+      passRate:        passRate !== null ? `${passRate}%` : null,
+      trend,
+      tradeBreakdown,
+      recentJobs:      jobs.slice(0, 5).map(j => ({ id: j.id, jobType: j.job_type, score: j.compliance_score ?? j.confidence, date: j.created_at })),
+      generatedAt:     new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("performance-summary error:", err);
+    return res.status(500).json({ error: "Failed to generate performance summary." });
+  }
+});
+
+// ── POST /compare-periods ─────────────────────────────────────────────────────
+// Compares compliance metrics between two date ranges from Supabase analytics.
+// Useful for monthly or quarterly reports.
+app.post("/compare-periods", async (req, res) => {
+  const { periodA, periodB, jobType, userId } = req.body || {};
+
+  if (!periodA?.start || !periodA?.end || !periodB?.start || !periodB?.end) {
+    return res.status(400).json({ error: "periodA and periodB with start/end ISO dates are required." });
+  }
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  const fetchPeriod = async (start, end) => {
+    let q = supabaseAdmin
+      .from("analyses")
+      .select("compliance_score, confidence, job_type, created_at, missing_items")
+      .gte("created_at", start)
+      .lte("created_at", end);
+    if (jobType) q = q.eq("job_type", jobType);
+    if (userId)  q = q.eq("user_id", userId);
+    const { data, error } = await q;
+    return error ? [] : (data || []);
+  };
+
+  try {
+    const [jobsA, jobsB] = await Promise.all([
+      fetchPeriod(periodA.start, periodA.end),
+      fetchPeriod(periodB.start, periodB.end),
+    ]);
+
+    const summarise = (jobs, label) => {
+      const scores = jobs.map(j => j.compliance_score ?? j.confidence).filter(s => typeof s === "number");
+      const avg    = scores.length > 0 ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length * 10) / 10 : null;
+      const pass   = scores.filter(s => s >= 70).length;
+      return { label, jobCount: jobs.length, avgScore: avg, passCount: pass, passRate: scores.length > 0 ? Math.round(pass / scores.length * 100) : null };
+    };
+
+    const sumA = summarise(jobsA, `${periodA.start} to ${periodA.end}`);
+    const sumB = summarise(jobsB, `${periodB.start} to ${periodB.end}`);
+
+    const scoreDelta = (sumA.avgScore !== null && sumB.avgScore !== null) ? Math.round((sumB.avgScore - sumA.avgScore) * 10) / 10 : null;
+
+    return res.json({
+      jobType: jobType || "all",
+      userId:  userId  || "all",
+      periodA: sumA,
+      periodB: sumB,
+      scoreDelta,
+      trend:   scoreDelta === null ? "unknown" : scoreDelta > 2 ? "improving" : scoreDelta < -2 ? "declining" : "stable",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("compare-periods error:", err);
+    return res.status(500).json({ error: "Comparison failed." });
+  }
+});
+
+// ── POST /site-history ────────────────────────────────────────────────────────
+// Retrieves all jobs associated with a specific site address or GPS coordinates
+// from Supabase. Supports address search and lat/lng proximity.
+app.post("/site-history", async (req, res) => {
+  const { address, gpsLat, gpsLng, radiusKm = 0.5, limit: limitParam = 20 } = req.body || {};
+
+  if (!address && (gpsLat === undefined || gpsLng === undefined)) {
+    return res.status(400).json({ error: "Provide either address or gpsLat + gpsLng." });
+  }
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  const limit = Math.min(Number(limitParam) || 20, 50);
+
+  try {
+    let query = supabaseAdmin
+      .from("analyses")
+      .select("id, job_type, confidence, compliance_score, created_at, address, suburb, gps_lat, gps_lng, missing_items, risk_rating")
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (address) {
+      query = query.ilike("address", `%${sanitiseInput(address).substring(0, 100)}%`);
+    }
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "Failed to retrieve site history." });
+
+    let results = data || [];
+
+    // GPS filtering in memory if coordinates provided
+    if (gpsLat !== undefined && gpsLng !== undefined) {
+      const lat = parseFloat(gpsLat);
+      const lng = parseFloat(gpsLng);
+      results = results.filter(job => {
+        if (!job.gps_lat || !job.gps_lng) return false;
+        const dLat = (parseFloat(job.gps_lat) - lat) * 111;
+        const dLng = (parseFloat(job.gps_lng) - lng) * 85;
+        return Math.sqrt(dLat * dLat + dLng * dLng) <= radiusKm;
+      });
+    }
+
+    const scores = results.map(j => j.compliance_score ?? j.confidence).filter(s => typeof s === "number");
+    const avgScore = scores.length > 0 ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length * 10) / 10 : null;
+
+    return res.json({
+      searchAddress: address || null,
+      searchGps:     gpsLat !== undefined ? { lat: gpsLat, lng: gpsLng, radiusKm } : null,
+      jobCount:      results.length,
+      avgScore,
+      jobs:          results,
+      generatedAt:   new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("site-history error:", err);
+    return res.status(500).json({ error: "Failed to retrieve site history." });
+  }
+});
+
+// ── POST /training-assessment ─────────────────────────────────────────────────
+// Analyses a tradesperson's job history patterns to identify knowledge gaps
+// and generate a personalised training recommendation report.
+app.post("/training-assessment", (req, res) => {
+  const {
+    jobType,
+    jobHistory = [],
+    traderName,
+  } = req.body || {};
+
+  if (!jobType || jobHistory.length === 0) {
+    return res.status(400).json({ error: "jobType and jobHistory (array of job objects) are required." });
+  }
+
+  // Count frequency of missing items
+  const missingFreq = {};
+  const scores = [];
+
+  for (const job of jobHistory) {
+    if (Array.isArray(job.itemsMissing)) {
+      for (const item of job.itemsMissing) {
+        missingFreq[item] = (missingFreq[item] || 0) + 1;
+      }
+    }
+    const s = job.complianceScore ?? job.confidence;
+    if (typeof s === "number") scores.push(s);
+  }
+
+  const avgScore = scores.length > 0 ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length * 10) / 10 : null;
+
+  const topMissing = Object.entries(missingFreq)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([item, count]) => ({
+      item,
+      occurrences: count,
+      frequency:   `${Math.round((count / jobHistory.length) * 100)}% of jobs`,
+    }));
+
+  // Map missing items to training topics
+  const TRAINING_TOPICS = {
+    "certificate":           { topic: "Certificate Filing", resource: "VBA Plumber/Drainer CPD Module: Compliance Certificates" },
+    "pressure test":         { topic: "Pressure Testing Procedures", resource: "AS/NZS 3500 / AS/NZS 5601 testing requirements" },
+    "rcd":                   { topic: "RCD Protection Requirements", resource: "ESV: RCD Compliance Guide, AS/NZS 3000 cl.2.6.3" },
+    "ptr valve":             { topic: "PTR Valve Installation", resource: "AS/NZS 3500.4 — Heated Water Services" },
+    "backflow":              { topic: "Backflow Prevention", resource: "AS/NZS 2845 — Backflow prevention devices" },
+    "gps":                   { topic: "Digital Documentation Practices", resource: "Elemetric AI onboarding guide" },
+    "signature":             { topic: "Customer Sign-Off Process", resource: "Domestic Building Contracts Act 1995 (Vic)" },
+    "ventilation":           { topic: "Gas Appliance Ventilation Requirements", resource: "AS/NZS 5601.1 Section 6" },
+    "flue":                  { topic: "Flue Terminal Clearances", resource: "AS/NZS 5601.1 Section 7" },
+    "earth":                 { topic: "Earthing and Bonding", resource: "AS/NZS 3000 Section 5 — Earthing arrangements" },
+    "bracing":               { topic: "Structural Bracing", resource: "AS 1684.2 — Timber framed construction" },
+    "insulation":            { topic: "Thermal Insulation Requirements", resource: "NCC 2022 J-provisions" },
+  };
+
+  const trainingTopics = [];
+  for (const { item } of topMissing) {
+    const lower = item.toLowerCase();
+    for (const [keyword, data] of Object.entries(TRAINING_TOPICS)) {
+      if (lower.includes(keyword) && !trainingTopics.find(t => t.topic === data.topic)) {
+        trainingTopics.push({ ...data, triggerItem: item, priority: missingFreq[item] >= jobHistory.length * 0.5 ? "high" : "medium" });
+      }
+    }
+  }
+
+  const performanceTier = avgScore === null ? "unknown"
+    : avgScore >= 85 ? "excellent"
+    : avgScore >= 75 ? "proficient"
+    : avgScore >= 65 ? "developing"
+    : "needs improvement";
+
+  return res.json({
+    traderName:       traderName || null,
+    jobType,
+    jobsAnalysed:     jobHistory.length,
+    avgComplianceScore: avgScore,
+    performanceTier,
+    topKnowledgeGaps: topMissing,
+    trainingRecommendations: trainingTopics,
+    priorityTopics:   trainingTopics.filter(t => t.priority === "high").map(t => t.topic),
+    cpd: {
+      note: "Victorian licensed tradespeople must complete CPD hours annually. Address identified gaps in your next CPD cycle.",
+      vbaLink: "vba.vic.gov.au/builders-and-designers/cpd",
+      esvLink: "esv.vic.gov.au/resources/training",
+    },
+    assessedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /ai-review-quality ───────────────────────────────────────────────────
+// Meta-assessment of an AI analysis result's quality. Checks for completeness,
+// confidence calibration, and internal consistency of the response.
+app.post("/ai-review-quality", (req, res) => {
+  const {
+    jobType,
+    itemsDetected    = [],
+    itemsMissing     = [],
+    itemsUnclear     = [],
+    overallConfidence,
+    complianceScore,
+    confidenceBreakdown,
+    photoCount,
+    promptVersion,
+  } = req.body || {};
+
+  if (!jobType) {
+    return res.status(400).json({ error: "jobType is required." });
+  }
+
+  const checks = [];
+
+  const check = (id, name, pass, detail = null) => {
+    checks.push({ id, name, pass, detail });
+  };
+
+  const total = itemsDetected.length + itemsMissing.length + itemsUnclear.length;
+  check("has_items",           "Analysis contains item classifications",   total > 0,               total === 0 ? "No items detected, missing, or unclear — AI may have returned empty response" : `${total} items classified`);
+  check("detected_not_empty",  "At least 1 item detected",                 itemsDetected.length > 0, itemsDetected.length === 0 ? "Nothing detected — verify photos are clear" : null);
+  check("confidence_present",  "Overall confidence provided",              overallConfidence !== undefined, overallConfidence === undefined ? "overallConfidence field missing from response" : null);
+  check("confidence_range",    "Confidence within 0–100 range",            overallConfidence === undefined || (overallConfidence >= 0 && overallConfidence <= 100), overallConfidence !== undefined ? `Confidence: ${overallConfidence}` : null);
+  check("score_present",       "Compliance score provided",                complianceScore !== undefined, complianceScore === undefined ? "complianceScore field missing" : null);
+  check("score_range",         "Score within 0–100 range",                 complianceScore === undefined || (complianceScore >= 0 && complianceScore <= 100), complianceScore !== undefined ? `Score: ${complianceScore}` : null);
+  check("score_confidence_align","Score and confidence roughly consistent", complianceScore === undefined || overallConfidence === undefined || Math.abs(complianceScore - overallConfidence) <= 25, "Score and confidence diverge by >25 points — review analysis");
+  check("breakdown_present",   "Confidence breakdown provided",            confidenceBreakdown && typeof confidenceBreakdown === "object" && Object.keys(confidenceBreakdown).length >= 2, "Confidence breakdown missing or has fewer than 2 dimensions");
+  check("photos_sufficient",   "Sufficient photos for analysis",           (photoCount ?? 0) >= 3, photoCount !== undefined ? `${photoCount} photos submitted` : "photoCount not provided");
+  check("no_all_unclear",      "Not all items marked unclear",             itemsUnclear.length < total || total === 0, `${itemsUnclear.length} of ${total} items unclear — may indicate poor photo quality`);
+
+  const passed = checks.filter(c => c.pass).length;
+  const failed = checks.filter(c => !c.pass).length;
+  const qualityScore = Math.round((passed / checks.length) * 100);
+
+  const qualityGrade = qualityScore >= 90 ? "A" : qualityScore >= 75 ? "B" : qualityScore >= 60 ? "C" : qualityScore >= 50 ? "D" : "F";
+
+  return res.json({
+    jobType,
+    promptVersion:    promptVersion || null,
+    qualityScore:     `${qualityScore}%`,
+    qualityGrade,
+    checksPassed:     passed,
+    checksFailed:     failed,
+    totalChecks:      checks.length,
+    checks,
+    failedChecks:     checks.filter(c => !c.pass).map(c => c.name),
+    recommendation:   qualityGrade === "A" ? "AI response is high quality — safe to trust."
+      : qualityGrade === "B" ? "Minor issues detected — review flagged checks."
+      : "Quality concerns detected — consider re-submitting with better quality photos.",
+    assessedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
