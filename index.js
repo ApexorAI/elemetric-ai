@@ -7241,6 +7241,390 @@ app.post("/job-score-card", (req, res) => {
   });
 });
 
+// ── POST /job-timeline ────────────────────────────────────────────────────────
+// Reconstructs a chronological event timeline from job metadata. Useful for
+// audits and displaying a job history to tradespeople or employers.
+app.post("/job-timeline", (req, res) => {
+  const {
+    analysisId,
+    jobType,
+    createdAt,
+    photosTakenAt = [],
+    analysedAt,
+    certificateFiledAt,
+    certificateNumber,
+    paymentReceivedAt,
+    issuesResolvedAt = [],
+    traderName,
+    siteAddress,
+  } = req.body || {};
+
+  if (!createdAt) {
+    return res.status(400).json({ error: "createdAt is required." });
+  }
+
+  const events = [];
+
+  const pushEvent = (timestamp, type, title, detail = null, status = "completed") => {
+    const ts = new Date(timestamp);
+    if (!isNaN(ts.getTime())) {
+      events.push({ timestamp: ts.toISOString(), type, title, detail, status });
+    }
+  };
+
+  pushEvent(createdAt,            "job_created",        "Job Created",                    siteAddress ? `Site: ${siteAddress}` : null);
+
+  for (const pt of photosTakenAt) {
+    if (pt.takenAt) {
+      pushEvent(pt.takenAt, "photo_taken", `Photo Taken — ${pt.label || "unnamed"}`, pt.label || null);
+    }
+  }
+
+  if (analysedAt) {
+    pushEvent(analysedAt,         "analysis_complete",  "AI Analysis Completed",          `Job type: ${jobType || "unknown"}`);
+  }
+  if (certificateFiledAt) {
+    pushEvent(certificateFiledAt, "certificate_filed",  "Compliance Certificate Filed",   certificateNumber ? `Certificate: ${certificateNumber}` : null);
+  }
+  if (paymentReceivedAt) {
+    pushEvent(paymentReceivedAt,  "payment_received",   "Payment Received",               null);
+  }
+  for (const issue of issuesResolvedAt) {
+    if (issue.resolvedAt) {
+      pushEvent(issue.resolvedAt, "issue_resolved", `Issue Resolved — ${issue.item || "unknown"}`, issue.item || null);
+    }
+  }
+
+  events.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+  // Calculate duration from job creation to certificate filing
+  let durationDays = null;
+  if (certificateFiledAt) {
+    const start = new Date(createdAt).getTime();
+    const end   = new Date(certificateFiledAt).getTime();
+    if (!isNaN(start) && !isNaN(end)) {
+      durationDays = Math.round((end - start) / 86_400_000 * 10) / 10;
+    }
+  }
+
+  return res.json({
+    analysisId:    analysisId  || null,
+    jobType:       jobType     || null,
+    traderName:    traderName  || null,
+    siteAddress:   siteAddress || null,
+    eventCount:    events.length,
+    durationDays:  durationDays,
+    status:        certificateFiledAt ? "complete" : analysedAt ? "analysed" : "in_progress",
+    timeline:      events,
+    generatedAt:   new Date().toISOString(),
+  });
+});
+
+// ── GET /supported-standards ──────────────────────────────────────────────────
+// Returns all Australian/New Zealand and Victorian standards referenced by
+// the Elemetric platform, organised by trade type.
+app.get("/supported-standards", (_req, res) => {
+  const STANDARDS = {
+    plumbing: [
+      { code: "AS/NZS 3500.1",   title: "Plumbing and Drainage — Water services",                               scope: "Cold and hot water supply systems" },
+      { code: "AS/NZS 3500.2",   title: "Plumbing and Drainage — Sanitary plumbing and drainage",               scope: "Drainage, fixtures, traps" },
+      { code: "AS/NZS 3500.4",   title: "Plumbing and Drainage — Heated water services",                        scope: "Hot water systems, PTR valves, solar" },
+      { code: "AS/NZS 3500.5",   title: "Plumbing and Drainage — Housing installations",                        scope: "Residential plumbing packages" },
+      { code: "AS/NZS 2712",     title: "Solar and heat pump water heaters",                                     scope: "Solar thermal, heat pump HWS" },
+      { code: "AS/NZS 3666.1",   title: "Air handling and water systems — Microbial control",                   scope: "Legionella prevention" },
+      { code: "Plumbing Regs 2018 (Vic)", title: "Plumbing Regulations 2018 (Victoria)", scope: "CoC lodgement, licence requirements" },
+    ],
+    gas: [
+      { code: "AS/NZS 5601.1",   title: "Gas Installations — General installations",                            scope: "Domestic and commercial gas fitting" },
+      { code: "AS/NZS 5601.2",   title: "Gas Installations — LP gas installations in caravans and motorhomes",  scope: "Mobile LPG" },
+      { code: "AS 3814",         title: "Industrial and commercial gas-fired appliances",                        scope: "Commercial kitchen, boiler appliances" },
+      { code: "AS/NZS 1596",     title: "LP Gas — Storage and handling",                                        scope: "LPG bulk storage, cylinder restraint" },
+      { code: "Gas Safety Act 1997 (Vic)", title: "Gas Safety Act 1997 (Victoria)", scope: "ESV notifications, licence obligations" },
+    ],
+    electrical: [
+      { code: "AS/NZS 3000",     title: "Wiring Rules",                                                         scope: "All electrical installations" },
+      { code: "AS/NZS 3017",     title: "Electrical installations — Verification guidelines",                   scope: "Testing and inspection procedures" },
+      { code: "AS/NZS 5033",     title: "Installation and safety requirements for photovoltaic arrays",          scope: "Solar PV systems" },
+      { code: "AS/NZS 4777.1",   title: "Grid connection of energy systems via inverters",                       scope: "Solar inverter grid connection" },
+      { code: "AS 3811",         title: "Hard wired controls",                                                   scope: "Isolating switches" },
+      { code: "Electricity Safety Act 1998 (Vic)", title: "Electricity Safety Act 1998 (Victoria)", scope: "CoES lodgement, ESV obligations" },
+    ],
+    drainage: [
+      { code: "AS/NZS 3500.2",   title: "Sanitary plumbing and drainage",                                       scope: "All drainage work" },
+      { code: "AS/NZS 3500.3",   title: "Plumbing and Drainage — Stormwater drainage",                          scope: "Stormwater, kerb connections" },
+      { code: "AS 1288",         title: "Glass in buildings",                                                    scope: "Relevant where drainage intersects glazed areas" },
+    ],
+    carpentry: [
+      { code: "NCC 2022 Vol 2",  title: "National Construction Code — Class 1 and 10 buildings",                scope: "All residential construction" },
+      { code: "AS 1684.2",       title: "Residential timber-framed construction — Non-cyclonic areas",           scope: "Wall, floor, roof framing" },
+      { code: "AS 1684.4",       title: "Residential timber-framed construction — Simplified",                   scope: "Single-storey simplified framing" },
+      { code: "AS 4100",         title: "Steel structures",                                                      scope: "Steel beams, columns, connections" },
+      { code: "AS 3740",         title: "Waterproofing of domestic wet areas",                                   scope: "Bathrooms, laundries" },
+      { code: "Building Act 1993 (Vic)", title: "Building Act 1993 (Victoria)", scope: "Permits, inspections, Building Surveyor obligations" },
+    ],
+    hvac: [
+      { code: "AS/NZS 1668.1",   title: "The use of ventilation and airconditioning — Fire and smoke",          scope: "Fire/smoke control in HVAC systems" },
+      { code: "AS/NZS 1668.2",   title: "The use of ventilation and airconditioning — Ventilation design",      scope: "Fresh air rates, exhaust design" },
+      { code: "AIRAH DA09",      title: "HVAC&R Design for Buildings",                                          scope: "Commissioning, air balancing, condensate" },
+      { code: "AS/NZS 5149.1",   title: "Refrigerating systems and heat pumps",                                 scope: "Safety requirements for refrigeration" },
+      { code: "NCC 2022 J-Prov", title: "NCC 2022 — Section J Energy Efficiency",                              scope: "HVAC energy efficiency compliance" },
+    ],
+  };
+
+  const all = Object.values(STANDARDS).flat();
+  return res.json({
+    totalStandards: all.length,
+    standardsByTrade: STANDARDS,
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /check-expiry ────────────────────────────────────────────────────────
+// Checks whether a compliance certificate is approaching or past its valid
+// period. Victorian compliance certificates do not expire per se, but mandatory
+// re-inspection periods apply for some assets.
+app.post("/check-expiry", (req, res) => {
+  const { jobType, certificateDate, assetType } = req.body || {};
+  if (!jobType || !certificateDate) {
+    return res.status(400).json({ error: "jobType and certificateDate are required." });
+  }
+
+  const certTs = new Date(certificateDate);
+  if (isNaN(certTs.getTime())) {
+    return res.status(400).json({ error: "certificateDate must be a valid ISO date." });
+  }
+
+  const now = new Date();
+  const ageYears = (now.getTime() - certTs.getTime()) / (365.25 * 24 * 3_600_000);
+
+  // Re-inspection / maintenance intervals by trade + asset
+  const INSPECTION_INTERVALS = {
+    plumbing: {
+      default:       { years: 5,  description: "Backflow device test — annual for high hazard, 5-yearly for low hazard" },
+      backflow:      { years: 1,  description: "Testable backflow prevention device — annual test required (AS/NZS 2845.3)" },
+      hotwater:      { years: 5,  description: "Hot water system — service every 5 years or per manufacturer" },
+    },
+    gas: {
+      default:       { years: 2,  description: "Gas appliance service — every 2 years recommended by ESV" },
+      boiler:        { years: 1,  description: "Pressure vessel / boiler — annual inspection required" },
+      commercial:    { years: 1,  description: "Commercial gas installation — annual inspection best practice" },
+    },
+    electrical: {
+      default:       { years: 5,  description: "Electrical installation — recommended 5-yearly safety inspection" },
+      switchboard:   { years: 5,  description: "Switchboard — 5-yearly inspection recommended (ESV guidance)" },
+      rcd:           { years: 1,  description: "RCD — test quarterly (push-button); professional test annually" },
+    },
+    drainage: {
+      default:       { years: 10, description: "Drainage — CCTV inspection every 10 years for older properties" },
+    },
+    carpentry: {
+      default:       { years: 7,  description: "Defects liability — notify defects within 7 years of completion" },
+    },
+    hvac: {
+      default:       { years: 1,  description: "HVAC system — annual service recommended; filters quarterly" },
+      commercial:    { years: 1,  description: "Commercial HVAC — annual maintenance per AS 1668.2" },
+    },
+  };
+
+  const tradeIntervals = INSPECTION_INTERVALS[jobType?.toLowerCase()] || {};
+  const assetKey = assetType?.toLowerCase() || "default";
+  const interval = tradeIntervals[assetKey] || tradeIntervals.default || { years: 5, description: "Standard maintenance interval" };
+
+  const nextDueTs    = new Date(certTs.getTime() + interval.years * 365.25 * 24 * 3_600_000);
+  const daysUntilDue = Math.round((nextDueTs.getTime() - now.getTime()) / 86_400_000);
+  const isOverdue    = daysUntilDue < 0;
+  const isDueSoon    = daysUntilDue >= 0 && daysUntilDue <= 90;
+
+  let status = "current";
+  if (isOverdue)  status = "overdue";
+  else if (isDueSoon) status = "due_soon";
+
+  return res.json({
+    jobType,
+    assetType:       assetType  || "default",
+    certificateDate: certTs.toISOString(),
+    ageYears:        Math.round(ageYears * 10) / 10,
+    inspectionInterval: { years: interval.years, description: interval.description },
+    nextInspectionDue:  nextDueTs.toISOString(),
+    daysUntilDue,
+    status,
+    recommendation: isOverdue
+      ? `Overdue by ${Math.abs(daysUntilDue)} days — schedule inspection immediately.`
+      : isDueSoon
+      ? `Inspection due in ${daysUntilDue} days — book a qualified tradesperson soon.`
+      : `Current — next inspection due ${nextDueTs.toDateString()}.`,
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /compliance-forecast ─────────────────────────────────────────────────
+// Forecasts when a non-compliant job will cross into liability territory if
+// outstanding items are not resolved. Based on VBA guidelines and liability law.
+app.post("/compliance-forecast", (req, res) => {
+  const {
+    jobType,
+    complianceScore,
+    missingItems = [],
+    jobCreatedAt,
+    certificateFiledAt,
+  } = req.body || {};
+
+  if (!jobType || complianceScore === undefined) {
+    return res.status(400).json({ error: "jobType and complianceScore are required." });
+  }
+
+  const now          = new Date();
+  const created      = jobCreatedAt     ? new Date(jobCreatedAt)     : now;
+  const certified    = certificateFiledAt ? new Date(certificateFiledAt) : null;
+  const ageInDays    = Math.round((now.getTime() - created.getTime()) / 86_400_000);
+  const liability    = LIABILITY_PERIODS[jobType?.toLowerCase()] || { defects: 7, structuralDefects: 10 };
+
+  // Urgency classification of missing items
+  const CRITICAL_KEYWORDS = ["certificate", "rcd", "ptr valve", "gas compliance", "backflow", "earth", "permit", "isolation", "pressure test"];
+  const HIGH_KEYWORDS      = ["photo", "gps", "signature", "test record", "label"];
+
+  const classifiedItems = missingItems.map(item => {
+    const lower = String(item).toLowerCase();
+    const isCritical = CRITICAL_KEYWORDS.some(k => lower.includes(k));
+    const isHigh     = HIGH_KEYWORDS.some(k => lower.includes(k));
+    return {
+      item,
+      urgency:   isCritical ? "critical" : isHigh ? "high" : "medium",
+      deadline:  isCritical ? "Immediate (before certificate filing)" : isHigh ? "Within 7 days" : "Within 30 days",
+    };
+  });
+
+  const criticalCount = classifiedItems.filter(i => i.urgency === "critical").length;
+  const score         = Number(complianceScore) || 0;
+
+  // Liability exposure ramps up from day 0
+  const DEFECTS_LIABILITY_DAYS = liability.defects * 365;
+  const daysToLiabilityWindow  = Math.max(0, DEFECTS_LIABILITY_DAYS - ageInDays);
+  const liabilityWindowExpiresAt = new Date(created.getTime() + DEFECTS_LIABILITY_DAYS * 86_400_000);
+
+  // Projected score with no remediation (score degrades 1 pt per day over 30 days as risk accumulates)
+  const degradationRate  = criticalCount > 0 ? 0.5 : 0.1; // pts per day without fixes
+  const forecastDays     = [7, 14, 30, 60, 90];
+  const forecast = forecastDays.map(days => ({
+    daysFromNow:       days,
+    forecastDate:      new Date(now.getTime() + days * 86_400_000).toISOString().split("T")[0],
+    projectedScore:    Math.max(0, Math.round((score - degradationRate * days) * 10) / 10),
+    projectedGrade:    score - degradationRate * days >= 90 ? "A"
+                     : score - degradationRate * days >= 80 ? "B"
+                     : score - degradationRate * days >= 70 ? "C"
+                     : score - degradationRate * days >= 60 ? "D" : "F",
+    note: days <= 7 && criticalCount > 0 ? "Critical items unresolved — certificate filing blocked" : null,
+  }));
+
+  return res.json({
+    jobType,
+    currentScore:          score,
+    ageInDays,
+    certified:             !!certified,
+    certifiedAt:           certified?.toISOString() || null,
+    missingItemCount:      missingItems.length,
+    criticalItemCount:     criticalCount,
+    classifiedItems,
+    liabilityPeriodYears:  liability.defects,
+    liabilityWindowExpiry: liabilityWindowExpiresAt.toISOString(),
+    daysToLiabilityExpiry: daysToLiabilityWindow,
+    scoreForecast:         forecast,
+    overallRisk:           criticalCount > 0 ? "high" : score < 70 ? "medium" : "low",
+    recommendation:        criticalCount > 0
+      ? `Resolve ${criticalCount} critical item(s) immediately — compliance certificate cannot be filed until these are addressed.`
+      : score < 70
+      ? "Score is below 70% — remediate outstanding items before the ${liability.defects}-year liability window closes."
+      : "Score is acceptable. Continue to monitor and resolve outstanding items within 30 days.",
+    forecastedAt: now.toISOString(),
+  });
+});
+
+// ── POST /supervisor-report ───────────────────────────────────────────────────
+// Aggregates multiple job analyses into a single supervisor-level summary.
+// Designed for employers reviewing their team's compliance performance.
+app.post("/supervisor-report", (req, res) => {
+  const { jobs = [], supervisorName, period, siteOrEmployer } = req.body || {};
+
+  if (!Array.isArray(jobs) || jobs.length === 0) {
+    return res.status(400).json({ error: "jobs array is required (minimum 1 job)." });
+  }
+  if (jobs.length > 50) {
+    return res.status(400).json({ error: "Maximum 50 jobs per supervisor report." });
+  }
+
+  const scored = jobs.filter(j => typeof j.complianceScore === "number" || typeof j.confidence === "number");
+  const scores = scored.map(j => j.complianceScore ?? j.confidence ?? 0);
+  const avgScore = scores.length > 0 ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length * 10) / 10 : null;
+
+  // By trade breakdown
+  const byTrade = {};
+  for (const job of jobs) {
+    const t = (job.jobType || job.job_type || "unknown").toLowerCase();
+    if (!byTrade[t]) byTrade[t] = { count: 0, scores: [], missingItems: [] };
+    byTrade[t].count++;
+    const s = job.complianceScore ?? job.confidence;
+    if (typeof s === "number") byTrade[t].scores.push(s);
+    if (Array.isArray(job.itemsMissing)) byTrade[t].missingItems.push(...job.itemsMissing);
+  }
+  const tradeBreakdown = Object.entries(byTrade).map(([trade, data]) => ({
+    trade,
+    jobCount:    data.count,
+    avgScore:    data.scores.length > 0 ? Math.round(data.scores.reduce((a, b) => a + b, 0) / data.scores.length * 10) / 10 : null,
+    topMissing:  [...new Set(data.missingItems)].slice(0, 3),
+  }));
+
+  // Pass / fail breakdown (pass = score >= 70)
+  const passCount = scores.filter(s => s >= 70).length;
+  const failCount = scores.filter(s => s < 70).length;
+  const passRate  = scores.length > 0 ? Math.round((passCount / scores.length) * 100) : null;
+
+  // Top missing items across all jobs
+  const allMissing = jobs.flatMap(j => Array.isArray(j.itemsMissing) ? j.itemsMissing : []);
+  const missingFreq = {};
+  for (const item of allMissing) {
+    missingFreq[item] = (missingFreq[item] || 0) + 1;
+  }
+  const topMissing = Object.entries(missingFreq)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([item, count]) => ({ item, occurrences: count, percentage: Math.round((count / jobs.length) * 100) }));
+
+  // Risk flags
+  const highRiskJobs = jobs.filter(j => (j.complianceScore ?? j.confidence ?? 100) < 60);
+
+  return res.json({
+    documentType:   "Supervisor Compliance Report",
+    period:         period         || null,
+    siteOrEmployer: siteOrEmployer || null,
+    supervisorName: supervisorName || null,
+    generatedAt:    new Date().toISOString(),
+    jurisdiction:   "Victoria, Australia",
+
+    summary: {
+      totalJobs:   jobs.length,
+      scoredJobs:  scored.length,
+      avgScore,
+      passCount,
+      failCount,
+      passRate:    passRate !== null ? `${passRate}%` : null,
+      highRiskJobs: highRiskJobs.length,
+    },
+
+    tradeBreakdown,
+    topMissingItems: topMissing,
+
+    highRiskJobIds: highRiskJobs
+      .map(j => j.analysisId || j.id || null)
+      .filter(Boolean),
+
+    recommendation: avgScore !== null
+      ? avgScore >= 80 ? "Team performance is strong. Continue current documentation practices."
+      : avgScore >= 70 ? "Acceptable performance. Focus on the top missing items to improve scores."
+      : "Below-average performance detected. Mandatory training on documentation requirements is recommended."
+      : "Insufficient scored jobs to generate a recommendation.",
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
