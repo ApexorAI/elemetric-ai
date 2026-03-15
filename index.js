@@ -256,6 +256,47 @@ app.get("/timestamp", (_req, res) => {
   });
 });
 
+/**
+ * calculateComplexity — deterministic job complexity scorer.
+ *
+ * Scores a job 1–10 across four dimensions, then maps to a band:
+ *   1–3  simple   — few photos, few items, lower-risk trade
+ *   4–6  moderate — mid-range scope or regulated trade
+ *   7–10 complex  — large scope, high-risk trade, missing evidence
+ *
+ * @param {string} type        - job type string (e.g. "gas", "electrical")
+ * @param {number} photoCount  - number of photos submitted
+ * @param {number} totalItems  - detected + missing + unclear item count
+ * @param {number} missingCount - number of items that failed validation
+ * @returns {{ score: number, band: "simple"|"moderate"|"complex" }}
+ */
+function calculateComplexity(type, photoCount, totalItems, missingCount) {
+  // Regulatory/technical complexity of the trade type (0–3)
+  const typeScore =
+    type === "electrical" || type === "gas" ? 3 :
+    type === "plumbing"   || type === "drainage" || type === "hvac" ? 2 : 1;
+
+  // Job scope via photo count (0–3)
+  const photoScore =
+    photoCount >= 11 ? 3 :
+    photoCount >= 7  ? 2 :
+    photoCount >= 4  ? 1 : 0;
+
+  // Breadth of inspection via total items scoped (0–3)
+  const itemScore =
+    totalItems >= 10 ? 3 :
+    totalItems >= 7  ? 2 :
+    totalItems >= 4  ? 1 : 0;
+
+  // Incomplete evidence makes certification harder (+1 if any items missing)
+  const missingScore = missingCount >= 1 ? 1 : 0;
+
+  const raw   = typeScore + photoScore + itemScore + missingScore;
+  const score = Math.max(1, Math.min(10, raw));
+  const band  = score <= 3 ? "simple" : score <= 6 ? "moderate" : "complex";
+  return { score, band };
+}
+
 app.post("/review", reviewLimiter, async (req, res) => {
 try {
 const { type, images } = req.body || {};
@@ -756,9 +797,27 @@ const analysis = typeof parsed.analysis === "string"
   ? parsed.analysis
   : "AI review completed.";
 
+// ── Complexity scoring (deterministic, server-side) ───────────────────────
+const totalItems = itemsDetected.length + itemsMissing.length + itemsUnclear.length;
+const { score: complexityScore, band: complexityBand } = calculateComplexity(
+  type,
+  images.length,
+  totalItems,
+  itemsMissing.length
+);
+
+// Adjusted confidence: complex jobs get a charitable bonus because passing a
+// larger, higher-risk inspection at 70% is genuinely harder than passing a
+// simple one at 70%. Simple jobs receive no bonus — the bar is higher for them.
+const complexityBonus = complexityBand === "complex" ? 10 : complexityBand === "moderate" ? 5 : 0;
+const adjustedConfidence = Math.min(100, overallConfidence + complexityBonus);
+
 return res.json({
   relevant,
   overall_confidence: overallConfidence,
+  adjusted_confidence: adjustedConfidence,
+  complexity_score: complexityScore,
+  complexity_band: complexityBand,
   items_detected: itemsDetected,
   items_missing: itemsMissing,
   items_unclear: itemsUnclear,
