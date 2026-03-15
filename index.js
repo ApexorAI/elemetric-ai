@@ -18089,6 +18089,253 @@ app.get("/price-index", apiKeyAuth, (req, res) => {
   });
 });
 
+// ── Round 43 ──────────────────────────────────────────────────────────────────
+
+// POST /insurance-claim-pack  — Assemble an insurance claim support package from job data
+app.post("/insurance-claim-pack", apiKeyAuth, (req, res) => {
+  const { jobType, jobId, contractorName, contractorLicence, insurer,
+          claimDescription, incidentDate, propertyAddress, complianceScore,
+          itemsDetected, itemsMissing, certificateFiled, photoCount,
+          estimatedDamage, notes } = req.body;
+
+  if (!jobType || !claimDescription) {
+    return res.status(400).json({ error: "jobType and claimDescription are required." });
+  }
+
+  const safeJobType    = sanitiseInput(String(jobType)).toLowerCase();
+  const safeContractor = sanitiseInput(String(contractorName || "Unknown"));
+  const safeLicence    = sanitiseInput(String(contractorLicence || "Not provided"));
+  const safeInsurer    = sanitiseInput(String(insurer || "Not specified"));
+  const safeDesc       = sanitiseInput(String(claimDescription)).slice(0, 1000);
+  const safeAddress    = sanitiseInput(String(propertyAddress || "Not specified"));
+  const safeNotes      = sanitiseInput(String(notes || ""));
+
+  const detected = Array.isArray(itemsDetected) ? itemsDetected.map(i => sanitiseInput(String(i))) : [];
+  const missing  = Array.isArray(itemsMissing)  ? itemsMissing.map(i  => sanitiseInput(String(i))) : [];
+
+  const score  = parseFloat(complianceScore) || null;
+  const numPhotos = parseInt(photoCount) || 0;
+  const damage = parseFloat(estimatedDamage) || null;
+
+  const packId = `ICP-${Date.now().toString(36).toUpperCase()}`;
+
+  const requiredDocuments = [
+    { document: "Certificate of Compliance",      status: certificateFiled ? "HAVE" : "REQUIRED", priority: "HIGH" },
+    { document: "Photo documentation",             status: numPhotos >= 4   ? "HAVE" : numPhotos > 0 ? "PARTIAL" : "REQUIRED", priority: "HIGH" },
+    { document: "Compliance analysis report",      status: score !== null   ? "HAVE" : "REQUIRED", priority: "HIGH" },
+    { document: "Contractor licence copy",         status: safeLicence !== "Not provided" ? "HAVE" : "REQUIRED", priority: "HIGH" },
+    { document: "Incident/damage description",     status: safeDesc ? "HAVE" : "REQUIRED",         priority: "HIGH" },
+    { document: "Public liability insurance certificate", status: "REQUIRED",                       priority: "HIGH" },
+    { document: "As-installed drawings/sketches",  status: "RECOMMENDED",                          priority: "MEDIUM" },
+    { document: "Test results/commissioning report", status: "RECOMMENDED",                        priority: "MEDIUM" },
+    { document: "SWMS (if high-risk work involved)", status: "RECOMMENDED",                        priority: "MEDIUM" },
+    { document: "Quotes for rectification works",   status: "REQUIRED",                            priority: "HIGH" },
+  ];
+
+  const missingRequired = requiredDocuments.filter(d => d.priority === "HIGH" && d.status === "REQUIRED");
+
+  return res.json({
+    packId,
+    jobType:          safeJobType,
+    jobId:            jobId ? sanitiseInput(String(jobId)) : null,
+    contractor:       safeContractor,
+    contractorLicence: safeLicence,
+    insurer:          safeInsurer,
+    propertyAddress:  safeAddress,
+    incidentDate:     incidentDate ? sanitiseInput(String(incidentDate)) : null,
+    claimDescription: safeDesc,
+    estimatedDamage:  damage,
+    complianceSummary: {
+      score,
+      detected:         detected.slice(0, 15),
+      missing:          missing.slice(0, 10),
+      certificateFiled: !!certificateFiled,
+      photoCount:       numPhotos,
+    },
+    requiredDocuments,
+    missingRequiredDocs: missingRequired.map(d => d.document),
+    packStatus:       missingRequired.length === 0 ? "COMPLETE" : "INCOMPLETE",
+    notes:            safeNotes || null,
+    submissionTip:    "Lodge all supporting documents together to avoid delays. Most insurers require a completed claim form, CoC, photos, and itemised quote for rectification.",
+    generatedAt:      new Date().toISOString(),
+  });
+});
+
+// POST /job-costing  — Full job cost calculation with profit margin analysis
+app.post("/job-costing", apiKeyAuth, (req, res) => {
+  const { jobType, labourHours, labourRate, materialsCost, materialsMarkup,
+          calloutFee, subcontractorCost, overheadPercentage, targetMarginPercentage,
+          applyGst } = req.body;
+
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+
+  const safeJobType = sanitiseInput(String(jobType)).toLowerCase();
+  const rateTable   = AWARD_RATES[safeJobType] || AWARD_RATES.plumbing;
+  const defaultRate = (rateTable && rateTable.ordinary) ? rateTable.ordinary : 50;
+
+  const hours     = parseFloat(labourHours)           || 0;
+  const rate      = parseFloat(labourRate)            || defaultRate;
+  const mats      = parseFloat(materialsCost)         || 0;
+  const markup    = parseFloat(materialsMarkup)       || 20; // percentage
+  const callout   = parseFloat(calloutFee)            || 0;
+  const subcon    = parseFloat(subcontractorCost)     || 0;
+  const overhead  = parseFloat(overheadPercentage)    || 15; // percentage
+  const targetMgn = parseFloat(targetMarginPercentage)|| 25; // percentage
+
+  const labourCost       = Math.round(hours * rate * 100) / 100;
+  const materialsWithMarkup = Math.round(mats * (1 + markup / 100) * 100) / 100;
+  const directCost       = Math.round((labourCost + materialsWithMarkup + callout + subcon) * 100) / 100;
+  const overheadAmount   = Math.round(directCost * overhead / 100 * 100) / 100;
+  const totalCost        = Math.round((directCost + overheadAmount) * 100) / 100;
+  const targetSalePrice  = Math.round(totalCost / (1 - targetMgn / 100) * 100) / 100;
+  const grossProfit      = Math.round((targetSalePrice - totalCost) * 100) / 100;
+  const actualMargin     = Math.round((grossProfit / targetSalePrice) * 100);
+  const gstAmount        = applyGst ? Math.round(targetSalePrice * 0.1 * 100) / 100 : 0;
+  const totalInclGst     = Math.round((targetSalePrice + gstAmount) * 100) / 100;
+
+  return res.json({
+    jobType: safeJobType,
+    inputs: {
+      labourHours: hours, labourRate: rate, materialsCost: mats,
+      materialsMarkupPct: markup, calloutFee: callout, subcontractorCost: subcon,
+      overheadPct: overhead, targetMarginPct: targetMgn,
+    },
+    costs: {
+      labour:              labourCost,
+      materialsWithMarkup,
+      calloutFee:          callout,
+      subcontractors:      subcon,
+      overhead:            overheadAmount,
+      totalDirectCost:     directCost,
+      totalAllCosts:       totalCost,
+    },
+    pricing: {
+      recommendedSalePrice: targetSalePrice,
+      grossProfit,
+      actualMarginPct:      actualMargin,
+      gst:                  gstAmount,
+      totalInclGst,
+    },
+    profitability: actualMargin >= 20 ? "HEALTHY" : actualMargin >= 10 ? "MARGINAL" : "BELOW_TARGET",
+    note:         "Rates are estimates. Adjust labour rate and overhead to match your actual business costs.",
+    generatedAt:  new Date().toISOString(),
+  });
+});
+
+// POST /photo-watermark-check  — Check if photos have expected watermark data (GPS, timestamp, licence)
+app.post("/photo-watermark-check", apiKeyAuth, (req, res) => {
+  const { photos, expectedLicence, expectedAddress } = req.body;
+
+  if (!photos || !Array.isArray(photos) || photos.length === 0) {
+    return res.status(400).json({ error: "photos array is required." });
+  }
+
+  const safeLicence = expectedLicence ? sanitiseInput(String(expectedLicence)).toLowerCase() : null;
+  const safeAddress = expectedAddress ? sanitiseInput(String(expectedAddress)).toLowerCase() : null;
+
+  const results = photos.slice(0, 50).map((p, i) => {
+    const watermark    = p.watermark ? sanitiseInput(String(p.watermark)).toLowerCase() : null;
+    const hasTimestamp = !!(p.timestamp || p.watermarkTimestamp || p.takenAt);
+    const hasGps       = !!(p.gpsLat && p.gpsLng) || !!(p.gpsCoords);
+    const hasLicence   = safeLicence ? (watermark || "").includes(safeLicence) : !!p.contractorLicence;
+    const hasAddress   = safeAddress ? (watermark || "").includes(safeAddress.split(",")[0].trim().toLowerCase()) : false;
+
+    const flags = [];
+    if (!hasTimestamp) flags.push("missing_timestamp");
+    if (!hasGps)       flags.push("missing_gps");
+    if (safeLicence && !hasLicence) flags.push("licence_not_found_in_watermark");
+    if (safeAddress && !hasAddress) flags.push("address_not_found_in_watermark");
+
+    return {
+      photoIndex:   i + 1,
+      filename:     p.filename ? sanitiseInput(String(p.filename)) : null,
+      hasTimestamp,
+      hasGps,
+      hasLicence,
+      hasAddress:   safeAddress ? hasAddress : null,
+      flags,
+      compliant:    flags.length === 0,
+    };
+  });
+
+  const compliantCount = results.filter(r => r.compliant).length;
+  const allFlags       = results.flatMap(r => r.flags);
+  const flagFrequency  = allFlags.reduce((acc, f) => { acc[f] = (acc[f] || 0) + 1; return acc; }, {});
+
+  return res.json({
+    totalPhotos:     results.length,
+    compliantPhotos: compliantCount,
+    overallStatus:   compliantCount === results.length ? "ALL_COMPLIANT" : "ISSUES_FOUND",
+    flagFrequency,
+    results,
+    checkedAt:       new Date().toISOString(),
+  });
+});
+
+// GET /compliance-score-distribution  — Statistical distribution of compliance scores by trade
+app.get("/compliance-score-distribution", apiKeyAuth, async (req, res) => {
+  const { jobType } = req.query;
+
+  if (!supabaseAdmin) {
+    // Return synthetic benchmark distribution if no DB
+    const BENCHMARKS = {
+      plumbing:   { p25: 62, p50: 74, p75: 85, p90: 91, mean: 73 },
+      gas:        { p25: 65, p50: 76, p75: 86, p90: 92, mean: 75 },
+      electrical: { p25: 68, p50: 78, p75: 88, p90: 93, mean: 77 },
+      drainage:   { p25: 58, p50: 70, p75: 82, p90: 89, mean: 70 },
+      carpentry:  { p25: 60, p50: 72, p75: 83, p90: 90, mean: 71 },
+      hvac:       { p25: 63, p50: 74, p75: 84, p90: 91, mean: 73 },
+    };
+
+    const key = jobType ? sanitiseInput(String(jobType)).toLowerCase() : null;
+    if (key) {
+      const d = BENCHMARKS[key];
+      if (!d) return res.status(404).json({ error: `No benchmark data for: ${key}` });
+      return res.json({ jobType: key, source: "benchmark", distribution: d });
+    }
+
+    return res.json({ source: "benchmark", distributions: BENCHMARKS });
+  }
+
+  let query = supabaseAdmin.from("jobs").select("job_type, compliance_score").not("compliance_score", "is", null);
+  if (jobType) query = query.eq("job_type", sanitiseInput(String(jobType)).toLowerCase());
+
+  const { data, error } = await query.limit(10000);
+  if (error) return res.status(500).json({ error: "Failed to retrieve score data." });
+
+  const rows = (data || []).filter(r => parseFloat(r.compliance_score) > 0);
+  if (rows.length === 0) return res.status(404).json({ error: "No compliance score data found." });
+
+  const byTrade = {};
+  for (const r of rows) {
+    const t = r.job_type || "unknown";
+    if (!byTrade[t]) byTrade[t] = [];
+    byTrade[t].push(parseFloat(r.compliance_score));
+  }
+
+  const result = {};
+  for (const [trade, scores] of Object.entries(byTrade)) {
+    scores.sort((a, b) => a - b);
+    const n = scores.length;
+    const p = pct => scores[Math.floor(pct * n / 100)];
+    result[trade] = {
+      count:  n,
+      mean:   Math.round(scores.reduce((a, b) => a + b, 0) / n),
+      p25:    Math.round(p(25)),
+      p50:    Math.round(p(50)),
+      p75:    Math.round(p(75)),
+      p90:    Math.round(p(90)),
+    };
+  }
+
+  return res.json({
+    source: "live",
+    jobType: jobType || null,
+    distributions: jobType ? result[sanitiseInput(String(jobType)).toLowerCase()] : result,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
