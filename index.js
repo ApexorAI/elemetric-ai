@@ -2514,6 +2514,181 @@ app.post("/risk-assessment", (req, res) => {
   }
 });
 
+// ── Task 11: Victorian Regulation Checker ────────────────────────────────────
+// Checks a completed job's evidence against specific Victorian trade requirements.
+
+const VICTORIAN_CHECKLISTS = {
+  plumbing: [
+    { id: "P1", requirement: "Certificate of Compliance (Plumbing) lodged with VBA within 5 business days", standard: "Plumbing Regulations 2018 r.54" },
+    { id: "P2", requirement: "Permit obtained for notifiable work (drains, sewers, hot water, gas fitting)", standard: "Building Act 1993 s.16" },
+    { id: "P3", requirement: "AS/NZS 3500.1 complied with for water services", standard: "AS/NZS 3500.1:2021" },
+    { id: "P4", requirement: "AS/NZS 3500.2 complied with for sanitary plumbing and drainage", standard: "AS/NZS 3500.2:2021" },
+    { id: "P5", requirement: "Tempering valve installed on hot water systems serving aged/disability facilities", standard: "AS/NZS 3500.4:2018 cl.6.4" },
+    { id: "P6", requirement: "Backflow prevention device fitted where required", standard: "AS/NZS 3500.1 cl.4.6" },
+    { id: "P7", requirement: "Sanitary drainage tested at minimum 75mm water head for 15 minutes", standard: "AS/NZS 3500.2 cl.10.3" },
+    { id: "P8", requirement: "Licensed plumber registration verified and on-site", standard: "Plumbing Regulations 2018 r.10" },
+  ],
+  gas: [
+    { id: "G1", requirement: "Certificate of Compliance (Gas) issued to occupier immediately on completion", standard: "Gas Safety (Gas Installation) Regulations 2008 r.48" },
+    { id: "G2", requirement: "Pressure test performed and recorded (at least 1.1× working pressure)", standard: "AS/NZS 5601.1:2022 cl.8.3.2" },
+    { id: "G3", requirement: "All appliances tested for correct operation after installation", standard: "AS/NZS 5601.1:2022 cl.7.6" },
+    { id: "G4", requirement: "AGA/SAA approval marking verified on all appliances", standard: "Gas Safety Act 1997 s.7" },
+    { id: "G5", requirement: "Ventilation requirements met for combustion appliances", standard: "AS/NZS 5601.1:2022 cl.6.4" },
+    { id: "G6", requirement: "Flexible hose connections within maximum permitted length (1.2m)", standard: "AS/NZS 5601.1:2022 cl.5.5.3" },
+    { id: "G7", requirement: "Isolation valve accessible and correctly labelled", standard: "AS/NZS 5601.1:2022 cl.5.8" },
+    { id: "G8", requirement: "Gas-licensed person (Type A/B/C) performed all gas work", standard: "Gas Safety (Gas Installation) Regulations 2008 r.10" },
+  ],
+  electrical: [
+    { id: "E1", requirement: "Certificate of Electrical Safety (CES) submitted to ESV within 5 business days", standard: "Electricity Safety (Installations) Regulations 2009 r.46" },
+    { id: "E2", requirement: "RCD protection on all final sub-circuits in domestic installations", standard: "AS/NZS 3000:2018 cl.2.6.3.3" },
+    { id: "E3", requirement: "Smoke alarm installed/checked and interconnected where required", standard: "Building Regulations 2018 r.120" },
+    { id: "E4", requirement: "All switchboard work documented with circuit schedule", standard: "AS/NZS 3000:2018 cl.8.5.1" },
+    { id: "E5", requirement: "Earth continuity tested and recorded for each circuit", standard: "AS/NZS 3000:2018 cl.8.3.7" },
+    { id: "E6", requirement: "Insulation resistance test ≥1 MΩ for new circuits", standard: "AS/NZS 3000:2018 cl.8.3.6" },
+    { id: "E7", requirement: "Polarity correct and verified for all outlets and light fittings", standard: "AS/NZS 3000:2018 cl.8.3.3" },
+    { id: "E8", requirement: "Licensed electrician (Registered/Approved) performed all prescribed work", standard: "Electricity Safety Act 1998 s.34" },
+  ],
+  drainage: [
+    { id: "D1", requirement: "Stormwater and sewer systems kept separate and documented", standard: "AS/NZS 3500.3:2018 cl.3.1" },
+    { id: "D2", requirement: "CCTV or hydraulic test performed after drainage works", standard: "AS/NZS 3500.3:2018 cl.9.5" },
+    { id: "D3", requirement: "Overflow relief gully (ORG) installed and graded correctly", standard: "AS/NZS 3500.2:2021 cl.4.8" },
+    { id: "D4", requirement: "All drainage materials comply with AS/NZS 1260 or AS/NZS 1477", standard: "AS/NZS 3500.3:2018 cl.4.2" },
+    { id: "D5", requirement: "Permit obtained before connecting to Melbourne Water assets", standard: "Water Act 1989 s.152" },
+    { id: "D6", requirement: "Minimum 1:40 fall on drain runs ≤75mm diameter", standard: "AS/NZS 3500.3:2018 cl.5.4.2" },
+  ],
+  carpentry: [
+    { id: "C1", requirement: "Structural work complies with AS 1684 Residential Timber-Framed Construction", standard: "AS 1684.2:2010" },
+    { id: "C2", requirement: "Building permit obtained for structural alterations over $10,000 or load-bearing work", standard: "Building Act 1993 s.16" },
+    { id: "C3", requirement: "Engineer's report provided for non-standard framing or spans", standard: "Building Act 1993 s.38" },
+    { id: "C4", requirement: "Termite management system documented for new framing close to ground", standard: "AS 3660.1:2014" },
+    { id: "C5", requirement: "Moisture barrier installed where required for sub-floor and external cladding", standard: "AS/NZS 4200.1:2017" },
+    { id: "C6", requirement: "Frame inspection completed by building inspector before lining", standard: "Building Regulations 2018 r.58" },
+  ],
+  hvac: [
+    { id: "H1", requirement: "Refrigerant handling by ARCtick-licensed technician only", standard: "Ozone Protection and Synthetic Greenhouse Gas Management Act 1989" },
+    { id: "H2", requirement: "Electrical connection to HVAC performed by licensed electrician", standard: "Electricity Safety Act 1998 s.34" },
+    { id: "H3", requirement: "Ductwork leakage test performed and result recorded (Class 1 ≤2% leakage)", standard: "AS 4254.2:2012 cl.4.3" },
+    { id: "H4", requirement: "Fresh air ventilation rates meet minimum requirements", standard: "AS 1668.2:2012" },
+    { id: "H5", requirement: "Condensate drainage connected and tested", standard: "AS/NZS 3500.2:2021 cl.8.6" },
+    { id: "H6", requirement: "Commissioning report completed including airflow measurements", standard: "AIRAH DA19:2019" },
+  ],
+};
+
+/**
+ * checkVictorianCompliance — maps reported job evidence against VIC-specific
+ * regulatory requirements for the given trade type.
+ *
+ * @param {object} opts
+ * @param {string}   opts.jobType          - plumbing | gas | electrical | drainage | carpentry | hvac
+ * @param {string[]} opts.itemsDetected    - evidence items found by AI analysis
+ * @param {string[]} opts.itemsMissing     - evidence items flagged as missing
+ * @param {boolean}  opts.certificateFiled - true if compliance cert was filed
+ * @param {boolean}  opts.permitObtained   - true if permit/licence verified
+ * @param {boolean}  opts.testRecorded     - true if a pressure/continuity/etc test was recorded
+ * @returns {object} compliance report
+ */
+function checkVictorianCompliance({ jobType, itemsDetected = [], itemsMissing = [], certificateFiled = false, permitObtained = false, testRecorded = false }) {
+  const checklist = VICTORIAN_CHECKLISTS[jobType];
+  if (!checklist) {
+    return { error: `No Victorian checklist available for job type: ${jobType}` };
+  }
+
+  const detectedLower = itemsDetected.map(i => i.toLowerCase());
+  const missingLower  = itemsMissing.map(i => i.toLowerCase());
+
+  const results = checklist.map(item => {
+    const id = item.id;
+    const reqLower = item.requirement.toLowerCase();
+
+    // Heuristic pass/fail logic per item category
+    let status = "unknown";
+    let note = "";
+
+    if (id.endsWith("1") && (id[0] === "P" || id[0] === "G" || id[0] === "E")) {
+      // Certificate of compliance requirement
+      status = certificateFiled ? "pass" : "fail";
+      note = certificateFiled ? "Certificate filed" : "No certificate filing evidence provided";
+    } else if (reqLower.includes("permit") || reqLower.includes("licence") || reqLower.includes("licensed")) {
+      status = permitObtained ? "pass" : "uncertain";
+      note = permitObtained ? "Permit/licence verified" : "Permit or licence verification not confirmed";
+    } else if (reqLower.includes("test") || reqLower.includes("pressure") || reqLower.includes("insulation resistance") || reqLower.includes("earth continuity") || reqLower.includes("cctv")) {
+      status = testRecorded ? "pass" : "uncertain";
+      note = testRecorded ? "Test recorded" : "Test record not confirmed";
+    } else {
+      // Check if detected items contain evidence for this requirement
+      const evidenceKeywords = reqLower.split(/[\s,]+/).filter(w => w.length > 5);
+      const foundInDetected = evidenceKeywords.some(kw => detectedLower.some(d => d.includes(kw)));
+      const foundInMissing  = evidenceKeywords.some(kw => missingLower.some(m => m.includes(kw)));
+
+      if (foundInMissing) {
+        status = "fail";
+        note = "Required evidence identified as missing in analysis";
+      } else if (foundInDetected) {
+        status = "pass";
+        note = "Supporting evidence found in analysis";
+      } else {
+        status = "uncertain";
+        note = "No direct evidence found — manual verification recommended";
+      }
+    }
+
+    return { id, requirement: item.requirement, standard: item.standard, status, note };
+  });
+
+  const passed    = results.filter(r => r.status === "pass").length;
+  const failed    = results.filter(r => r.status === "fail").length;
+  const uncertain = results.filter(r => r.status === "uncertain").length;
+  const total     = results.length;
+  const score     = Math.round((passed / total) * 100);
+
+  const overallStatus =
+    failed > 0          ? "non-compliant" :
+    uncertain > total / 3 ? "requires-review" :
+    "compliant";
+
+  const criticalFailures = results.filter(r => r.status === "fail").map(r => r.id);
+
+  return {
+    jobType,
+    jurisdiction: "Victoria, Australia",
+    checkedAt: new Date().toISOString(),
+    overallStatus,
+    score,
+    summary: `${passed}/${total} requirements satisfied. ${failed} critical failure(s), ${uncertain} requiring manual review.`,
+    criticalFailures,
+    results,
+  };
+}
+
+app.post("/compliance-check", (req, res) => {
+  const {
+    jobType,
+    itemsDetected,
+    itemsMissing,
+    certificateFiled,
+    permitObtained,
+    testRecorded,
+  } = req.body || {};
+
+  if (!jobType || typeof jobType !== "string") {
+    return res.status(400).json({ error: "jobType is required (plumbing, gas, electrical, drainage, carpentry, hvac)" });
+  }
+  if (!VICTORIAN_CHECKLISTS[jobType]) {
+    return res.status(400).json({ error: `Unknown jobType: ${jobType}. Valid types: ${Object.keys(VICTORIAN_CHECKLISTS).join(", ")}` });
+  }
+
+  const report = checkVictorianCompliance({
+    jobType,
+    itemsDetected: Array.isArray(itemsDetected) ? itemsDetected : [],
+    itemsMissing:  Array.isArray(itemsMissing)  ? itemsMissing  : [],
+    certificateFiled: Boolean(certificateFiled),
+    permitObtained:   Boolean(permitObtained),
+    testRecorded:     Boolean(testRecorded),
+  });
+
+  return res.json(report);
+});
+
 // ── Task 9: Regulatory Change Monitoring ─────────────────────────────────────
 // Tracks known changes to Australian trade standards relevant to Elemetric users.
 
