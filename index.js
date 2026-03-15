@@ -42004,6 +42004,193 @@ Return JSON with:
   }
 });
 
+// POST /emergency-contact-register — Register emergency contacts for a project
+app.post("/emergency-contact-register", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, contacts = [], nearestHospital, nearestHospitalAddress,
+    nearestHospitalPhone, musterPoint, emergencyAssemblyArea,
+    firstAidOfficer, firstAidOfficerPhone, siteEmergencyNumber,
+    state = "VIC", notes,
+  } = req.body;
+  if (!projectId || !contacts.length) {
+    return res.status(400).json({ error: "projectId and at least one contact are required." });
+  }
+  const registerRef = `ECR-${Date.now().toString(36).toUpperCase()}`;
+  const processedContacts = contacts.map(c => ({
+    role: sanitiseInput(c.role || ""),
+    name: sanitiseInput(c.name || ""),
+    phone: sanitiseInput(c.phone || ""),
+    mobile: sanitiseInput(c.mobile || ""),
+    email: c.email && isValidEmail(c.email) ? c.email : null,
+    availableAfterHours: Boolean(c.availableAfterHours),
+  }));
+  const record = {
+    register_ref: registerRef,
+    project_id: projectId,
+    contacts: processedContacts,
+    nearest_hospital: sanitiseInput(nearestHospital || ""),
+    nearest_hospital_address: sanitiseInput(nearestHospitalAddress || ""),
+    nearest_hospital_phone: sanitiseInput(nearestHospitalPhone || ""),
+    muster_point: sanitiseInput(musterPoint || ""),
+    emergency_assembly_area: sanitiseInput(emergencyAssemblyArea || ""),
+    first_aid_officer: sanitiseInput(firstAidOfficer || ""),
+    first_aid_officer_phone: sanitiseInput(firstAidOfficerPhone || ""),
+    site_emergency_number: sanitiseInput(siteEmergencyNumber || "000"),
+    state: sanitiseInput(state),
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("emergency_contact_registers")
+      .upsert(record, { onConflict: "project_id" });
+    if (error) console.error("emergency-contact-register DB error:", error.message);
+  }
+  res.json({
+    registerRef, projectId, contactCount: processedContacts.length,
+    nearestHospital, musterPoint, saved: !!supabaseAdmin,
+  });
+});
+
+// GET /emergency-contact-register/:projectId — Get emergency contacts for a project
+app.get("/emergency-contact-register/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  const { data, error } = await supabaseAdmin
+    .from("emergency_contact_registers")
+    .select("*")
+    .eq("project_id", projectId)
+    .single();
+  if (error) return res.status(404).json({ error: "Emergency contact register not found." });
+  res.json(data);
+});
+
+// POST /visitor-briefing — Record a visitor site safety briefing
+app.post("/visitor-briefing", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, visitorName, visitorCompany, visitorRole,
+    visitDate, visitPurpose, hostName, ppeProvided = false,
+    ppeTypes = [], inductionCompleted = false,
+    inductionItems = [], escortRequired = true, accessAreas = [],
+    emergencyBriefingGiven = true, signedDeclaration = false, notes,
+  } = req.body;
+  if (!projectId || !visitorName || !visitDate) {
+    return res.status(400).json({ error: "projectId, visitorName, and visitDate are required." });
+  }
+  const briefingRef = `VB-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    briefing_ref: briefingRef,
+    project_id: projectId,
+    visitor_name: sanitiseInput(visitorName),
+    visitor_company: sanitiseInput(visitorCompany || ""),
+    visitor_role: sanitiseInput(visitorRole || ""),
+    visit_date: visitDate,
+    visit_purpose: sanitiseInput(visitPurpose || ""),
+    host_name: sanitiseInput(hostName || ""),
+    ppe_provided: Boolean(ppeProvided),
+    ppe_types: Array.isArray(ppeTypes) ? ppeTypes.map(p => sanitiseInput(p)) : [],
+    induction_completed: Boolean(inductionCompleted),
+    induction_items: Array.isArray(inductionItems) ? inductionItems.map(i => sanitiseInput(i)) : [],
+    escort_required: Boolean(escortRequired),
+    access_areas: Array.isArray(accessAreas) ? accessAreas.map(a => sanitiseInput(a)) : [],
+    emergency_briefing_given: Boolean(emergencyBriefingGiven),
+    signed_declaration: Boolean(signedDeclaration),
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("visitor_briefings").insert(record);
+    if (error) console.error("visitor-briefing DB error:", error.message);
+  }
+  res.json({
+    briefingRef, visitorName, visitDate, hostName,
+    inductionCompleted, emergencyBriefingGiven, signedDeclaration,
+    saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-site-induction — AI generates a personalised site induction package
+app.post("/ai-site-induction", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, siteAddress, trade, inducteeRole,
+    state = "VIC", siteHazards = [], emergencyProcedures = {},
+    siteRules = [], ppeMandatory = [], workingHours, supervisorName,
+    principalContractor,
+  } = req.body;
+  if (!projectName || !trade || !inducteeRole) {
+    return res.status(400).json({ error: "projectName, trade, and inducteeRole are required." });
+  }
+  const sanitisedProject = sanitiseInput(projectName);
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedRole = sanitiseInput(inducteeRole);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian WHS specialist. Create comprehensive, site-specific safety induction packages.`;
+  const userPrompt = `Generate a site safety induction for:
+Project: ${sanitisedProject}
+Site: ${sanitiseInput(siteAddress || "As specified")}
+Trade: ${sanitisedTrade}
+Role: ${sanitisedRole}
+State: ${sanitisedState}
+Principal contractor: ${sanitiseInput(principalContractor || "As specified")}
+Supervisor: ${sanitiseInput(supervisorName || "As specified")}
+Working hours: ${sanitiseInput(workingHours || "7am–4pm Monday–Friday")}
+Site hazards: ${siteHazards.map(h => sanitiseInput(h)).join(", ") || "Standard construction hazards"}
+Mandatory PPE: ${ppeMandatory.map(p => sanitiseInput(p)).join(", ") || "Standard PPE"}
+Site rules: ${siteRules.map(r => sanitiseInput(r)).join("; ") || "Standard site rules"}
+Emergency procedures: ${JSON.stringify(emergencyProcedures)}
+
+Return JSON with:
+{
+  "inductionTitle": "...",
+  "welcome": "...",
+  "projectOverview": "...",
+  "yourResponsibilities": ["...", "..."],
+  "siteHazardsAndControls": [{"hazard": "...", "controls": ["..."]}],
+  "mandatoryPPE": ["...", "..."],
+  "siteRules": ["...", "..."],
+  "workingHours": "...",
+  "emergencyProcedures": {"fire": "...", "medical": "...", "evacuation": "..."},
+  "reportingRequirements": ["...", "..."],
+  "contactNumbers": ["...", "..."],
+  "inductionDeclaration": "...",
+  "quizQuestions": [{"question": "...", "correctAnswer": "..."}]
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 3000,
+    });
+    usageStats.openaiCalls++;
+    const induction = JSON.parse(aiRes.choices[0].message.content);
+    const inductionRef = `IND-${Date.now().toString(36).toUpperCase()}`;
+    res.json({ inductionRef, projectId, projectName: sanitisedProject, trade: sanitisedTrade, state: sanitisedState, induction });
+  } catch (err) {
+    console.error("ai-site-induction error:", err.message);
+    res.json({
+      inductionRef: "IND-FALLBACK", projectId, projectName: sanitisedProject, trade: sanitisedTrade, state: sanitisedState,
+      induction: {
+        inductionTitle: `Site Safety Induction — ${sanitisedProject}`,
+        welcome: `Welcome to ${sanitisedProject}. Please read this induction carefully before commencing work.`,
+        projectOverview: `${sanitisedProject} is a ${sanitisedTrade} project.`,
+        yourResponsibilities: ["Follow all site safety rules", "Wear mandatory PPE at all times", "Report all hazards and incidents immediately"],
+        siteHazardsAndControls: siteHazards.map(h => ({ hazard: sanitiseInput(h), controls: ["Assess before commencing work", "Consult supervisor"] })),
+        mandatoryPPE: ppeMandatory.length ? ppeMandatory : ["Hard hat", "Safety boots", "Hi-vis vest", "Safety glasses"],
+        siteRules: siteRules.length ? siteRules : ["No alcohol or drugs on site", "Sign in and out daily", "Follow all supervisor instructions"],
+        workingHours: sanitiseInput(workingHours || "7am–4pm Monday–Friday"),
+        emergencyProcedures: { fire: "Raise alarm, evacuate to muster point, call 000", medical: "Call 000, do not move injured person unless in danger", evacuation: "Follow emergency warden instructions to muster point" },
+        reportingRequirements: ["Report all near-misses and incidents to supervisor immediately", "Complete incident report within 24 hours"],
+        contactNumbers: [`Site Supervisor: ${sanitiseInput(supervisorName || "As notified")}`, "Emergency: 000"],
+        inductionDeclaration: "I confirm that I have read and understood the site safety induction requirements.",
+        quizQuestions: [{ question: "What is the emergency number in Australia?", correctAnswer: "000" }],
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
