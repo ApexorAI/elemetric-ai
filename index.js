@@ -39371,6 +39371,213 @@ Return JSON with:
   }
 });
 
+// POST /gas-appliance-register — Register a gas appliance
+app.post("/gas-appliance-register", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, applianceName, applianceType, make, model,
+    serialNumber, gasFittingRef, installationDate, lastServiceDate,
+    nextServiceDue, lastSafetyCheckDate, nextSafetyCheckDue,
+    inputRatingMJ, gasType = "NATURAL_GAS", location,
+    serviceResult = "PASS", decommissioned = false, notes,
+  } = req.body;
+  if (!propertyAddress || !applianceName || !applianceType) {
+    return res.status(400).json({ error: "propertyAddress, applianceName, and applianceType are required." });
+  }
+  const validGasTypes = ["NATURAL_GAS", "LPG", "TOWN_GAS"];
+  const validApplianceTypes = ["HEATER", "HOT_WATER_SYSTEM", "COOKTOP", "OVEN", "BOILER", "COMMERCIAL_CATERING", "BBQ", "DRYER", "FIREPLACE"];
+  if (!validGasTypes.includes(gasType)) return res.status(400).json({ error: `gasType must be one of: ${validGasTypes.join(", ")}` });
+  if (!validApplianceTypes.includes(applianceType)) return res.status(400).json({ error: `applianceType must be one of: ${validApplianceTypes.join(", ")}` });
+  const applianceRef = `GAS-${Date.now().toString(36).toUpperCase()}`;
+  const daysUntilService = nextServiceDue
+    ? Math.ceil((new Date(nextServiceDue) - new Date()) / (1000 * 60 * 60 * 24))
+    : null;
+  const serviceStatus = daysUntilService === null ? "UNKNOWN"
+    : daysUntilService < 0 ? "OVERDUE"
+    : daysUntilService <= 30 ? "DUE_SOON"
+    : "CURRENT";
+  const record = {
+    appliance_ref: applianceRef,
+    property_address: sanitiseInput(propertyAddress),
+    appliance_name: sanitiseInput(applianceName),
+    appliance_type: applianceType,
+    make: sanitiseInput(make || ""),
+    model: sanitiseInput(model || ""),
+    serial_number: sanitiseInput(serialNumber || ""),
+    gas_fitting_ref: sanitiseInput(gasFittingRef || ""),
+    installation_date: installationDate || null,
+    last_service_date: lastServiceDate || null,
+    next_service_due: nextServiceDue || null,
+    last_safety_check_date: lastSafetyCheckDate || null,
+    next_safety_check_due: nextSafetyCheckDue || null,
+    input_rating_mj: Number(inputRatingMJ) || null,
+    gas_type: gasType,
+    location: sanitiseInput(location || ""),
+    service_result: serviceResult,
+    service_status: serviceStatus,
+    days_until_service: daysUntilService,
+    decommissioned: Boolean(decommissioned),
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("gas_appliances").insert(record);
+    if (error) console.error("gas-appliance-register DB error:", error.message);
+  }
+  res.json({ applianceRef, applianceName, applianceType, gasType, serviceStatus, daysUntilService, saved: !!supabaseAdmin });
+});
+
+// GET /gas-appliance-register — List gas appliances for a property
+app.get("/gas-appliance-register", apiKeyAuth, async (req, res) => {
+  const { propertyAddress, serviceStatus } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("gas_appliances").select("*").order("next_service_due", { ascending: true });
+  if (propertyAddress) query = query.ilike("property_address", `%${propertyAddress}%`);
+  if (serviceStatus) query = query.eq("service_status", serviceStatus);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({
+    count: data.length,
+    overdueService: data.filter(a => a.service_status === "OVERDUE").length,
+    decommissioned: data.filter(a => a.decommissioned).length,
+    appliances: data,
+  });
+});
+
+// POST /pressure-test-record — Record a pressure test for gas or plumbing
+app.post("/pressure-test-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, propertyAddress, systemType = "GAS", testDate,
+    testPressureKpa, holdTimeMinutes, finalPressureKpa,
+    acceptablePressureDropKpa = 0.5, testMedium = "AIR",
+    testResult, testedBy, licenceNumber, testStandard,
+    pipelineDiameter, pipelineLengthM, notes,
+  } = req.body;
+  if (!systemType || !testDate || !testPressureKpa || !testedBy) {
+    return res.status(400).json({ error: "systemType, testDate, testPressureKpa, and testedBy are required." });
+  }
+  const validSystemTypes = ["GAS", "WATER", "DRAINAGE", "FIRE_SUPPRESSION", "STEAM"];
+  if (!validSystemTypes.includes(systemType)) {
+    return res.status(400).json({ error: `systemType must be one of: ${validSystemTypes.join(", ")}` });
+  }
+  const pressureDrop = Number(testPressureKpa) - Number(finalPressureKpa || testPressureKpa);
+  const autoResult = testResult || (pressureDrop <= Number(acceptablePressureDropKpa) ? "PASS" : "FAIL");
+  const testRef = `PT-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    test_ref: testRef,
+    project_id: projectId || null,
+    property_address: sanitiseInput(propertyAddress || ""),
+    system_type: systemType,
+    test_date: testDate,
+    test_pressure_kpa: Number(testPressureKpa),
+    hold_time_minutes: Number(holdTimeMinutes) || null,
+    final_pressure_kpa: Number(finalPressureKpa) || null,
+    pressure_drop_kpa: +pressureDrop.toFixed(3),
+    acceptable_pressure_drop_kpa: Number(acceptablePressureDropKpa),
+    test_medium: sanitiseInput(testMedium),
+    test_result: autoResult,
+    tested_by: sanitiseInput(testedBy),
+    licence_number: sanitiseInput(licenceNumber || ""),
+    test_standard: sanitiseInput(testStandard || ""),
+    pipeline_diameter: sanitiseInput(pipelineDiameter || ""),
+    pipeline_length_m: Number(pipelineLengthM) || null,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("pressure_test_records").insert(record);
+    if (error) console.error("pressure-test-record DB error:", error.message);
+  }
+  res.json({
+    testRef, systemType, testDate, testPressureKpa: Number(testPressureKpa),
+    pressureDrop: +pressureDrop.toFixed(3), testResult: autoResult,
+    passed: autoResult === "PASS", saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-gas-compliance-summary — AI summarises gas compliance for a premises
+app.post("/ai-gas-compliance-summary", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, propertyType = "commercial", state = "VIC",
+    applianceCount = 0, lastGasAuditDate, gasType = "NATURAL_GAS",
+    knownLeaks = [], appliancesServiced = false,
+    pressureTestCurrent = false, gasMeterAge_years,
+    safetyShutoffValves = false, certifications = [],
+  } = req.body;
+  if (!propertyAddress) {
+    return res.status(400).json({ error: "propertyAddress is required." });
+  }
+  const sanitisedAddress = sanitiseInput(propertyAddress);
+  const sanitisedType = sanitiseInput(propertyType);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian gas compliance and safety specialist. Assess gas installation compliance for commercial and residential premises.`;
+  const userPrompt = `Assess gas compliance for:
+Address: ${sanitisedAddress}
+Property type: ${sanitisedType}
+State: ${sanitisedState}
+Gas type: ${gasType}
+Appliance count: ${applianceCount}
+Last audit: ${sanitiseInput(lastGasAuditDate || "Unknown")}
+All appliances serviced: ${appliancesServiced}
+Pressure test current: ${pressureTestCurrent}
+Gas meter age: ${gasMeterAge_years ? `${gasMeterAge_years} years` : "Unknown"}
+Safety shutoff valves: ${safetyShutoffValves}
+Known leaks: ${knownLeaks.map(l => sanitiseInput(l)).join("; ") || "None"}
+Certifications: ${certifications.map(c => sanitiseInput(c)).join("; ") || "None"}
+
+Return JSON with:
+{
+  "overallComplianceStatus": "COMPLIANT|PARTIALLY_COMPLIANT|NON_COMPLIANT|UNKNOWN",
+  "complianceScore": 70,
+  "safetyRisks": ["...", "..."],
+  "immediateActions": ["...", "..."],
+  "scheduledActions": [{"action": "...", "timeframe": "...", "priority": "HIGH"}],
+  "regulatoryChecklist": [{"requirement": "...", "status": "MET|NOT_MET|UNKNOWN"}],
+  "applicableStandards": ["AS/NZS ...", "..."],
+  "applianceServiceStatus": "...",
+  "installationIntegrity": "...",
+  "recommendedTests": ["...", "..."],
+  "estimatedRectificationCost": "...",
+  "nextAuditRecommended": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const summary = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ propertyAddress: sanitisedAddress, propertyType: sanitisedType, state: sanitisedState, gasType, summary });
+  } catch (err) {
+    console.error("ai-gas-compliance-summary error:", err.message);
+    res.json({
+      propertyAddress: sanitisedAddress, propertyType: sanitisedType, state: sanitisedState, gasType,
+      summary: {
+        overallComplianceStatus: knownLeaks.length > 0 ? "NON_COMPLIANT" : "UNKNOWN",
+        complianceScore: 0,
+        safetyRisks: knownLeaks.length > 0 ? ["Known gas leaks — immediate action required"] : ["Cannot assess without audit"],
+        immediateActions: knownLeaks.length > 0 ? ["Isolate gas supply and repair leaks immediately"] : ["Commission gas compliance audit"],
+        scheduledActions: [{ action: "Full gas compliance inspection", timeframe: "Within 3 months", priority: "HIGH" }],
+        regulatoryChecklist: [
+          { requirement: "Gas compliance certificate current", status: certifications.length > 0 ? "UNKNOWN" : "NOT_MET" },
+          { requirement: "All appliances serviced to manufacturer schedule", status: appliancesServiced ? "MET" : "NOT_MET" },
+          { requirement: "Pressure test current", status: pressureTestCurrent ? "MET" : "NOT_MET" },
+        ],
+        applicableStandards: ["AS/NZS 5601.1 (Gas Installations)", "AS 4645 (Gas Distribution Networks)", `${sanitisedState} Gas Safety Act`],
+        applianceServiceStatus: appliancesServiced ? "All appliances serviced." : "Appliance service status unknown — schedule service immediately.",
+        installationIntegrity: pressureTestCurrent ? "Pressure test current." : "Pressure test overdue — schedule test.",
+        recommendedTests: ["Gas leak survey", "Pressure test", "Appliance flue gas analysis"],
+        estimatedRectificationCost: "TBD — requires gas audit",
+        nextAuditRecommended: "Within 12 months or immediately if leaks suspected",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
