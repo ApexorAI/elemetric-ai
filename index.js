@@ -34025,6 +34025,209 @@ app.post("/geo-fence-check", apiKeyAuth, async (req, res) => {
   res.status(503).json({ error: "Database not configured." });
 });
 
+// ── Round 127: Client portal, job sharing, AI progress narrative ──────────────
+
+// POST /client-job-share — Generate a shareable job progress link/token for a client
+app.post("/client-job-share", apiKeyAuth, async (req, res) => {
+  const {
+    jobId, contractorId, clientEmail, clientName,
+    expiryDays = 30, includePhotos = true, includeCompliance = true,
+    includeFinancials = false, customMessage,
+  } = req.body;
+
+  if (!jobId || !clientEmail) return res.status(400).json({ error: "jobId and clientEmail required." });
+  if (!isValidEmail(clientEmail)) return res.status(400).json({ error: "Invalid client email." });
+
+  const shareToken = `SHR-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+  const expiry = new Date();
+  expiry.setDate(expiry.getDate() + Number(expiryDays));
+
+  const record = {
+    job_id: sanitiseInput(jobId),
+    contractor_id: sanitiseInput(contractorId || ""),
+    client_email: sanitiseInput(clientEmail),
+    client_name: sanitiseInput(clientName || ""),
+    share_token: shareToken,
+    expiry_date: expiry.toISOString(),
+    include_photos: Boolean(includePhotos),
+    include_compliance: Boolean(includeCompliance),
+    include_financials: Boolean(includeFinancials),
+    custom_message: sanitiseInput(customMessage || ""),
+    views: 0,
+    status: "ACTIVE",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("client_job_shares")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, shareId: data.id, shareToken, expiryDate: expiry.toISOString(), ...record });
+  }
+
+  res.json({ success: true, shareId: null, shareToken, expiryDate: expiry.toISOString(), ...record, saved: false });
+});
+
+// GET /client-job-share/:shareToken — Retrieve shared job data by token (public endpoint — no API key)
+app.get("/client-job-share/:shareToken", async (req, res) => {
+  const { shareToken } = req.params;
+
+  if (!shareToken || !/^SHR-[A-Z0-9]+-[A-Z0-9]+$/.test(shareToken))
+    return res.status(400).json({ error: "Invalid share token." });
+
+  if (!supabaseAdmin) return res.status(503).json({ error: "Service unavailable." });
+
+  const { data: share, error } = await supabaseAdmin
+    .from("client_job_shares")
+    .select("*")
+    .eq("share_token", shareToken)
+    .eq("status", "ACTIVE")
+    .single();
+
+  if (error || !share) return res.status(404).json({ error: "Share link not found or expired." });
+
+  if (new Date(share.expiry_date) < new Date()) {
+    await supabaseAdmin.from("client_job_shares").update({ status: "EXPIRED" }).eq("share_token", shareToken);
+    return res.status(410).json({ error: "This share link has expired." });
+  }
+
+  // Increment view count
+  await supabaseAdmin.from("client_job_shares").update({ views: (share.views || 0) + 1 }).eq("share_token", shareToken);
+
+  // Fetch job data
+  const { data: jobData } = await supabaseAdmin
+    .from("jobs")
+    .select("id, job_type, label, created_at, status")
+    .eq("id", share.job_id)
+    .single();
+
+  return res.json({
+    jobId: share.job_id,
+    clientName: share.client_name,
+    customMessage: share.custom_message,
+    includePhotos: share.include_photos,
+    includeCompliance: share.include_compliance,
+    includeFinancials: share.include_financials,
+    expiryDate: share.expiry_date,
+    job: jobData || null,
+    accessedAt: new Date().toISOString(),
+  });
+});
+
+// POST /client-feedback-request — Send a client satisfaction survey request
+app.post("/client-feedback-request", apiKeyAuth, async (req, res) => {
+  const {
+    jobId, contractorId, clientEmail, clientName,
+    jobType, completionDate, surveyQuestions = [],
+  } = req.body;
+
+  if (!jobId || !clientEmail) return res.status(400).json({ error: "jobId and clientEmail required." });
+  if (!isValidEmail(clientEmail)) return res.status(400).json({ error: "Invalid email." });
+
+  const defaultQuestions = [
+    "How satisfied were you with the quality of work?",
+    "Was the work completed on time?",
+    "How would you rate the communication throughout the job?",
+    "Was the site left clean and tidy?",
+    "Would you recommend this contractor to others?",
+  ];
+
+  const questions = surveyQuestions.length > 0 ? surveyQuestions.map(q => sanitiseInput(q)) : defaultQuestions;
+  const surveyToken = `SRV-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+
+  const record = {
+    job_id: sanitiseInput(jobId),
+    contractor_id: sanitiseInput(contractorId || ""),
+    client_email: sanitiseInput(clientEmail),
+    client_name: sanitiseInput(clientName || ""),
+    job_type: sanitiseInput(jobType || ""),
+    completion_date: completionDate || null,
+    survey_token: surveyToken,
+    questions,
+    status: "SENT",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("client_feedback_requests")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, requestId: data.id, surveyToken, questions, ...record });
+  }
+
+  res.json({ success: true, requestId: null, surveyToken, questions, ...record, saved: false });
+});
+
+// POST /ai-progress-narrative — AI generates a client-friendly job progress narrative
+app.post("/ai-progress-narrative", apiKeyAuth, async (req, res) => {
+  const {
+    jobId, jobType, jobAddress, contractorName,
+    percentComplete, milestonesAchieved = [], currentActivities = [],
+    upcomingActivities = [], issuesOrDelays = [],
+    estimatedCompletionDate, clientName,
+  } = req.body;
+
+  if (!jobType || percentComplete === undefined)
+    return res.status(400).json({ error: "jobType and percentComplete required." });
+
+  const prompt = `You are a professional construction project manager writing a clear, client-friendly progress update.
+
+Job type: ${sanitiseInput(jobType)}
+Address: ${sanitiseInput(jobAddress || "Not specified")}
+Contractor: ${sanitiseInput(contractorName || "Your contractor")}
+Progress: ${percentComplete}% complete
+Milestones achieved: ${milestonesAchieved.map(m => sanitiseInput(m)).join("; ") || "None recorded"}
+Current activities: ${currentActivities.map(a => sanitiseInput(a)).join("; ") || "Ongoing works"}
+Upcoming activities: ${upcomingActivities.map(a => sanitiseInput(a)).join("; ") || "To be confirmed"}
+Issues or delays: ${issuesOrDelays.map(i => sanitiseInput(i)).join("; ") || "None to report"}
+Estimated completion: ${sanitiseInput(estimatedCompletionDate || "To be confirmed")}
+Client name: ${sanitiseInput(clientName || "Valued Client")}
+
+Write a friendly, professional progress update suitable for emailing to a homeowner or client. Return a JSON object with:
+- "subject": email subject line
+- "greeting": personalised greeting
+- "progressSummary": 2-3 sentence overview of progress
+- "milestonesSection": string describing milestones (positive tone)
+- "currentWorkSection": what's happening right now
+- "upcomingWorkSection": what's coming next
+- "issuesSection": honest but solution-focused issue description (omit if no issues)
+- "timelineSection": completion timeline update
+- "closingSection": professional closing
+- "tone": "PROFESSIONAL"|"FRIENDLY"|"FORMAL"`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1200,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, jobId, jobType, percentComplete, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      subject: `Job Progress Update — ${percentComplete}% Complete`,
+      greeting: `Dear ${sanitiseInput(clientName || "Valued Client")},`,
+      progressSummary: `Your ${jobType} works are now ${percentComplete}% complete. Work is progressing as planned.`,
+      milestonesSection: milestonesAchieved.length > 0 ? `Completed: ${milestonesAchieved.join(", ")}.` : "Works are progressing.",
+      currentWorkSection: currentActivities.length > 0 ? currentActivities.join(", ") : "Ongoing construction activities.",
+      upcomingWorkSection: upcomingActivities.length > 0 ? upcomingActivities.join(", ") : "Further works to follow.",
+      issuesSection: issuesOrDelays.length > 0 ? `Some minor items to note: ${issuesOrDelays.join(", ")}.` : "",
+      timelineSection: `Estimated completion: ${sanitiseInput(estimatedCompletionDate || "To be confirmed")}.`,
+      closingSection: "Please don't hesitate to contact us with any questions. We look forward to delivering a great result for you.",
+      tone: "PROFESSIONAL",
+      jobId, jobType, percentComplete, generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
