@@ -25787,6 +25787,195 @@ app.post("/ventilation-check", apiKeyAuth, (req, res) => {
   });
 });
 
+// POST /concrete-mix-check  — Validate a concrete mix design specification
+app.post("/concrete-mix-check", apiKeyAuth, (req, res) => {
+  const { jobId, application, specifiedGrade, wcRatio, slumpMm, cementKgM3, aggregateMm, airContent, addmixtures, exposureClass } = req.body || {};
+  if (!application) return res.status(400).json({ error: "application required." });
+
+  const safeJobId = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeApp   = sanitiseInput(String(application)).slice(0, 80);
+
+  // AS 3600 exposure class minimum requirements
+  const EXPOSURE_REQS = {
+    "A1": { minGrade: 20, maxWC: 0.65, minCement: 270 }, "A2": { minGrade: 25, maxWC: 0.60, minCement: 300 },
+    "B1": { minGrade: 32, maxWC: 0.55, minCement: 320 }, "B2": { minGrade: 40, maxWC: 0.50, minCement: 340 },
+    "C1": { minGrade: 50, maxWC: 0.45, minCement: 380 }, "C2": { minGrade: 65, maxWC: 0.40, minCement: 400 },
+  };
+
+  const safeExposure = exposureClass ? sanitiseInput(String(exposureClass)).toUpperCase().slice(0, 3) : null;
+  const reqs         = safeExposure && EXPOSURE_REQS[safeExposure] ? EXPOSURE_REQS[safeExposure] : null;
+
+  const grade    = specifiedGrade ? parseInt(specifiedGrade) : null;
+  const wc       = wcRatio ? parseFloat(wcRatio) : null;
+  const slump    = slumpMm ? parseInt(slumpMm) : null;
+  const cement   = cementKgM3 ? parseFloat(cementKgM3) : null;
+  const agg      = aggregateMm ? parseInt(aggregateMm) : null;
+
+  const checks = [];
+  if (reqs && grade !== null) checks.push({ check: `Minimum grade (${reqs.minGrade} MPa)`, value: `${grade} MPa`, passed: grade >= reqs.minGrade });
+  if (reqs && wc !== null)    checks.push({ check: `Maximum W/C ratio (${reqs.maxWC})`,    value: wc,           passed: wc <= reqs.maxWC });
+  if (reqs && cement !== null) checks.push({ check: `Minimum cement (${reqs.minCement} kg/m³)`, value: `${cement} kg/m³`, passed: cement >= reqs.minCement });
+  if (slump !== null) checks.push({ check: "Slump 50-120mm (standard)", value: `${slump} mm`, passed: slump >= 50 && slump <= 120 });
+  if (agg !== null)   checks.push({ check: "Aggregate size ≤20mm (standard)", value: `${agg} mm`, passed: agg <= 20 });
+
+  const allPassed = checks.length > 0 && checks.every(c => c.passed);
+
+  return res.json({
+    jobId: safeJobId, application: safeApp, exposureClass: safeExposure,
+    specifiedGrade: grade, wcRatio: wc, slumpMm: slump, cementKgM3: cement, aggregateMm: agg,
+    checks, compliant: allPassed,
+    recommendations: checks.filter(c => !c.passed).map(c => `${c.check}: provided ${c.value} does not meet requirement`),
+    standard: "AS 3600:2018 — Concrete structures",
+    calculatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /stormwater-runoff  — Calculate stormwater runoff using Rational Method
+app.post("/stormwater-runoff", apiKeyAuth, (req, res) => {
+  const { jobId, catchmentAreaM2, rainfallIntensityMmHr, runoffCoefficient, notes } = req.body || {};
+  if (!catchmentAreaM2 || !rainfallIntensityMmHr) return res.status(400).json({ error: "catchmentAreaM2 and rainfallIntensityMmHr required." });
+
+  const safeJobId = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const area      = Math.max(0, parseFloat(catchmentAreaM2) || 0);
+  const intensity = Math.max(0, parseFloat(rainfallIntensityMmHr) || 0);
+  const safeNotes = notes ? sanitiseInput(String(notes)).slice(0, 200) : null;
+
+  // Runoff coefficients for common surfaces
+  const RUNOFF_COEFFICIENTS = {
+    roof: 0.95, concrete: 0.90, asphalt: 0.85, gravel: 0.35,
+    lawn: 0.30, garden: 0.25, mixed: 0.60,
+  };
+
+  let C = runoffCoefficient ? Math.min(1.0, Math.max(0, parseFloat(runoffCoefficient) || 0.7)) : null;
+  let surfaceNote = null;
+  if (!C) {
+    // Try to infer from notes
+    C = 0.70;
+    surfaceNote = "Default coefficient 0.7 used (mixed surface). Specify runoffCoefficient for accuracy.";
+  }
+
+  // Q = C × I × A / 360 (L/s, where A in m², I in mm/hr)
+  const flowLps  = parseFloat((C * intensity * area / 360).toFixed(2));
+  const flowM3Hr = parseFloat((flowLps * 3.6).toFixed(2));
+
+  // Pipe sizing for runoff
+  const PIPE_GUIDE = flowLps <= 5 ? "100mm pipe" : flowLps <= 15 ? "150mm pipe" : flowLps <= 40 ? "225mm pipe" : flowLps <= 80 ? "300mm pipe" : "375mm+ or engineer design required";
+
+  return res.json({
+    jobId: safeJobId, catchmentAreaM2: area, rainfallIntensityMmHr: intensity,
+    runoffCoefficient: C, surfaceNote,
+    peakFlowLps: flowLps, peakFlowM3PerHour: flowM3Hr,
+    recommendedPipeSize: PIPE_GUIDE,
+    notes: safeNotes,
+    standard: "AS/NZS 3500.3 — Stormwater drainage / Rational Method Q=CiA",
+    calculatedAt: new Date().toISOString(),
+  });
+});
+
+// GET /standards-library/:trade  — Get key Australian standards for a trade
+app.get("/standards-library/:trade", apiKeyAuth, (req, res) => {
+  const trade = sanitiseInput(String(req.params.trade || "")).toLowerCase();
+
+  const STANDARDS = {
+    plumbing: [
+      { code: "AS/NZS 3500.1", title: "Plumbing and drainage — Water services" },
+      { code: "AS/NZS 3500.2", title: "Plumbing and drainage — Sanitary plumbing and drainage" },
+      { code: "AS/NZS 3500.3", title: "Plumbing and drainage — Stormwater drainage" },
+      { code: "AS/NZS 3500.4", title: "Plumbing and drainage — Heated water services" },
+      { code: "AS/NZS 3500.5", title: "Plumbing and drainage — Domestic installations" },
+      { code: "AS 3688", title: "Water supply — Metallic fittings and end connectors" },
+    ],
+    gas: [
+      { code: "AS/NZS 5601.1", title: "Gas installations — General installations" },
+      { code: "AS/NZS 5601.2", title: "Gas installations — LP gas installations in caravan parks" },
+      { code: "AS 4565", title: "LPG — Portable containers for domestic use" },
+      { code: "AS 2939", title: "Domestic biogas handling and appliance systems" },
+    ],
+    electrical: [
+      { code: "AS/NZS 3000", title: "Wiring rules" },
+      { code: "AS/NZS 3008.1", title: "Electrical installations — Selection of cables" },
+      { code: "AS/NZS 3012", title: "Electrical installations — Construction and demolition sites" },
+      { code: "AS/NZS 61008", title: "Residual current operated circuit breakers" },
+      { code: "AS/NZS 3017", title: "Electrical installations — Verification guidelines" },
+    ],
+    drainage: [
+      { code: "AS/NZS 3500.2", title: "Sanitary plumbing and drainage" },
+      { code: "AS/NZS 3500.3", title: "Stormwater drainage" },
+      { code: "AS 1726", title: "Geotechnical site investigations" },
+      { code: "AS 1646", title: "Elastomeric seals for waterworks purposes" },
+    ],
+    carpentry: [
+      { code: "AS 1684", title: "Residential timber-framed construction" },
+      { code: "AS 1720", title: "Timber structures" },
+      { code: "AS 4440", title: "Installation of nailplated timber roof trusses" },
+      { code: "AS/NZS 2269", title: "Plywood — Structural" },
+      { code: "NCC Volume 1", title: "National Construction Code — Commercial" },
+      { code: "NCC Volume 2", title: "National Construction Code — Residential" },
+    ],
+    hvac: [
+      { code: "AS/NZS 1668.1", title: "The use of ventilation and air conditioning in buildings — Fire and smoke control" },
+      { code: "AS/NZS 1668.2", title: "The use of ventilation and air conditioning in buildings — Mechanical ventilation" },
+      { code: "AS 3666.1", title: "Air-handling and water systems of buildings — Microbial control" },
+      { code: "AS/NZS 5149", title: "Refrigerating systems and heat pumps" },
+      { code: "AS 1735", title: "Lifts, escalators and moving walks" },
+    ],
+  };
+
+  const standards = STANDARDS[trade] || null;
+  if (!standards) {
+    return res.json({ trade, standards: [], message: `No standards library entry for '${trade}'. Available: ${Object.keys(STANDARDS).join(", ")}` });
+  }
+
+  return res.json({ trade, count: standards.length, standards, note: "Standards listed are current as of 2025. Always verify latest version.", generatedAt: new Date().toISOString() });
+});
+
+// POST /energy-efficiency-check  — Check NCC energy efficiency requirements for a building
+app.post("/energy-efficiency-check", apiKeyAuth, (req, res) => {
+  const { jobId, buildingClass, climate, wallRValue, ceilingRValue, floorRValue, glazingUValue, glazingArea, floorArea, heatingSystem, coolingSystem, hotWaterSystem, notes } = req.body || {};
+  if (!buildingClass) return res.status(400).json({ error: "buildingClass required." });
+
+  const safeJobId = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeClass = sanitiseInput(String(buildingClass)).slice(0, 20);
+  const safeClimate = climate ? sanitiseInput(String(climate)).slice(0, 50) : "Melbourne";
+
+  // NCC 2022 Climate Zone 6 (Melbourne) minimum R-values
+  const CLIMATE_REQUIREMENTS = {
+    "melbourne": { wall: 2.0, ceiling: 4.1, floor: 1.0, glazingU: 3.5 },
+    "sydney":    { wall: 1.5, ceiling: 3.7, floor: 1.0, glazingU: 4.0 },
+    "brisbane":  { wall: 1.0, ceiling: 3.2, floor: 0.5, glazingU: 4.5 },
+    "perth":     { wall: 2.0, ceiling: 3.7, floor: 1.0, glazingU: 3.5 },
+    "adelaide":  { wall: 2.5, ceiling: 4.1, floor: 1.5, glazingU: 3.0 },
+  };
+
+  const climate_key = Object.keys(CLIMATE_REQUIREMENTS).find(k => safeClimate.toLowerCase().includes(k)) || "melbourne";
+  const reqs = CLIMATE_REQUIREMENTS[climate_key];
+
+  const wallR    = wallRValue ? parseFloat(wallRValue) : null;
+  const ceilingR = ceilingRValue ? parseFloat(ceilingRValue) : null;
+  const floorR   = floorRValue ? parseFloat(floorRValue) : null;
+  const glazU    = glazingUValue ? parseFloat(glazingUValue) : null;
+
+  const checks = [];
+  if (wallR !== null)    checks.push({ item: "Wall R-value",     required: `≥${reqs.wall}`,     provided: wallR,    passed: wallR >= reqs.wall });
+  if (ceilingR !== null) checks.push({ item: "Ceiling R-value",  required: `≥${reqs.ceiling}`,  provided: ceilingR, passed: ceilingR >= reqs.ceiling });
+  if (floorR !== null)   checks.push({ item: "Floor R-value",    required: `≥${reqs.floor}`,    provided: floorR,   passed: floorR >= reqs.floor });
+  if (glazU !== null)    checks.push({ item: "Glazing U-value",  required: `≤${reqs.glazingU}`, provided: glazU,    passed: glazU <= reqs.glazingU });
+
+  const passed  = checks.length > 0 && checks.every(c => c.passed);
+  const safeNotes = notes ? sanitiseInput(String(notes)).slice(0, 200) : null;
+
+  return res.json({
+    jobId: safeJobId, buildingClass: safeClass, climate: safeClimate,
+    climateZone: climate_key,
+    checks, compliant: passed,
+    failures: checks.filter(c => !c.passed).map(c => `${c.item}: provided ${c.provided} — required ${c.required}`),
+    notes: safeNotes,
+    standard: "NCC 2022 Section J — Energy Efficiency",
+    disclaimer: "Indicative check only. Full NatHERS or JV3 assessment may be required.",
+    calculatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
