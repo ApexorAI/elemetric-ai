@@ -49505,6 +49505,282 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /hot-work-permit — Create a hot work permit (welding, cutting, grinding near flammables)
+app.post("/hot-work-permit", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, location, level, area,
+    workDate, startTime, endTime, fireWatchDurationMins,
+    workerName, workerLicence, supervisorName,
+    hotWorkType, equipmentUsed,
+    // Pre-work checks
+    combustiblesRemoved, combustiblesProtected, clearanceRadiusM,
+    fireExtinguisherPresent, fireExtinguisherType, fireExtinguisherPressureOk,
+    fireSuppressedOrIsolated, hotWorkSurfacesCool, ventilationAdequate,
+    sprinkerCoverageConsidered, sprinkerIsolated, alarmIsolated, alarmIsolationApproved,
+    floorOpeningsSealedBelow, drainsCovered,
+    fireWatchPersonName, postWorkFireWatchRequired, postWorkFireWatchMins,
+    issuedBy, issuedDate, expiryDate, notes,
+  } = req.body;
+
+  if (!projectId || !location || !workDate || !hotWorkType || !workerName) {
+    return res.status(400).json({ error: "projectId, location, workDate, hotWorkType, and workerName are required." });
+  }
+
+  const sanitisedLocation = sanitiseInput(location, 200);
+  const sanitisedWorker = sanitiseInput(workerName, 120);
+  const sanitisedHotWorkType = sanitiseInput(hotWorkType, 80);
+
+  // Risk assessment
+  const riskFactors = [];
+  if (!combustiblesRemoved && !combustiblesProtected) riskFactors.push("Combustibles not removed or protected — HIGH fire risk.");
+  if ((clearanceRadiusM || 0) < 10) riskFactors.push(`Clearance radius ${clearanceRadiusM || 0}m is less than the recommended 10m minimum.`);
+  if (!fireExtinguisherPresent) riskFactors.push("No fire extinguisher present at work location — required for all hot work.");
+  if (!ventilationAdequate) riskFactors.push("Ventilation inadequate — risk of fume accumulation.");
+  if (alarmIsolated && !alarmIsolationApproved) riskFactors.push("Fire alarm isolated without formal approval — restore alarm or obtain written approval.");
+  if (!fireWatchPersonName) riskFactors.push("No fire watch person nominated — required for all hot work.");
+  if (!drainsCovered) riskFactors.push("Floor drains not covered — spark/molten metal could fall through.");
+
+  const riskLevel = riskFactors.length >= 3 ? "HIGH" : riskFactors.length >= 1 ? "MEDIUM" : "LOW";
+  const canProceed = !riskFactors.some(r => r.includes("HIGH fire risk")) && fireExtinguisherPresent !== false;
+
+  const ref = `HWP-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectName: sanitiseInput(projectName || "", 200),
+    work: {
+      location: sanitisedLocation,
+      level: sanitiseInput(level || "", 20),
+      area: sanitiseInput(area || "", 100),
+      workDate,
+      startTime: startTime || null,
+      endTime: endTime || null,
+    },
+    personnel: {
+      workerName: sanitisedWorker,
+      workerLicence: sanitiseInput(workerLicence || "", 60),
+      supervisorName: sanitiseInput(supervisorName || "", 120),
+      fireWatchPersonName: sanitiseInput(fireWatchPersonName || "", 120),
+    },
+    hotWork: {
+      type: sanitisedHotWorkType,
+      equipmentUsed: sanitiseInput(equipmentUsed || "", 200),
+    },
+    preWorkChecks: {
+      combustiblesRemoved: !!combustiblesRemoved,
+      combustiblesProtected: !!combustiblesProtected,
+      clearanceRadiusM: clearanceRadiusM || null,
+      fireExtinguisherPresent: !!fireExtinguisherPresent,
+      fireExtinguisherType: sanitiseInput(fireExtinguisherType || "", 40),
+      fireExtinguisherPressureOk: fireExtinguisherPressureOk ?? null,
+      fireSuppressedOrIsolated: fireSuppressedOrIsolated ?? null,
+      hotWorkSurfacesCool: hotWorkSurfacesCool ?? null,
+      ventilationAdequate: !!ventilationAdequate,
+      sprinkerCoverageConsidered: sprinkerCoverageConsidered ?? null,
+      sprinkerIsolated: sprinkerIsolated ?? null,
+      alarmIsolated: !!alarmIsolated,
+      alarmIsolationApproved: alarmIsolationApproved ?? null,
+      floorOpeningsSealedBelow: floorOpeningsSealedBelow ?? null,
+      drainsCovered: !!drainsCovered,
+    },
+    fireWatch: {
+      fireWatchDurationMins: fireWatchDurationMins || postWorkFireWatchMins || 60,
+      postWorkFireWatchRequired: postWorkFireWatchRequired !== false,
+      postWorkFireWatchMins: postWorkFireWatchMins || 60,
+    },
+    riskLevel,
+    riskFactors,
+    canProceed,
+    issuedBy: sanitiseInput(issuedBy || "", 120),
+    issuedDate: issuedDate || workDate,
+    expiryDate: expiryDate || workDate,
+    status: "OPEN",
+    closeOutBy: null,
+    closeOutAt: null,
+    fireWatchCompleted: null,
+    closeOutNotes: null,
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("hot_work_permits").insert(record);
+      if (error) console.error("Hot work permit insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Hot work permit DB error:", e.message);
+    }
+  }
+
+  return res.status(canProceed ? 201 : 422).json({
+    success: canProceed,
+    ref,
+    riskLevel,
+    riskFactors,
+    canProceed,
+    postWorkFireWatchMins: postWorkFireWatchMins || 60,
+    message: !canProceed
+      ? `HOLD: Hot work NOT PERMITTED until risk factors are resolved. ${riskFactors[0] || ""}`
+      : riskLevel === "HIGH"
+        ? `Hot work permit issued (HIGH risk) — extra vigilance required. Fire watch ${postWorkFireWatchMins || 60} min post-completion.`
+        : `Hot work permit ${ref} issued. Conduct ${postWorkFireWatchMins || 60}-minute post-work fire watch.`,
+    saved,
+    record,
+  });
+});
+
+// PATCH /hot-work-permit/:permitRef/close — Close hot work permit with fire watch confirmation
+app.patch("/hot-work-permit/:permitRef/close", apiKeyAuth, async (req, res) => {
+  const { permitRef } = req.params;
+  const { closeOutBy, fireWatchCompleted, fireWatchDurationMins, noIncidents, closeOutNotes } = req.body;
+
+  if (!closeOutBy) return res.status(400).json({ error: "closeOutBy is required." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  try {
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from("hot_work_permits")
+      .select("status, fireWatch")
+      .eq("ref", sanitiseInput(permitRef, 60))
+      .single();
+
+    if (fetchErr || !existing) return res.status(404).json({ error: "Hot work permit not found." });
+    if (existing.status === "CLOSED") return res.status(409).json({ error: "Permit already closed." });
+
+    const requiredWatchMins = existing.fireWatch?.postWorkFireWatchMins || 60;
+    const watchWarning = fireWatchCompleted && (fireWatchDurationMins || 0) < requiredWatchMins
+      ? `Fire watch duration ${fireWatchDurationMins} min is less than required ${requiredWatchMins} min.`
+      : null;
+
+    const { error: updateErr } = await supabaseAdmin
+      .from("hot_work_permits")
+      .update({
+        status: "CLOSED",
+        closeOutBy: sanitiseInput(closeOutBy, 120),
+        closeOutAt: new Date().toISOString(),
+        fireWatchCompleted: !!fireWatchCompleted,
+        fireWatchDurationMins: fireWatchDurationMins || null,
+        closeOutNotes: sanitiseInput(closeOutNotes || "", 300),
+      })
+      .eq("ref", sanitiseInput(permitRef, 60));
+
+    if (updateErr) throw updateErr;
+
+    return res.json({
+      success: true,
+      permitRef,
+      status: "CLOSED",
+      fireWatchCompleted: !!fireWatchCompleted,
+      watchWarning,
+      message: watchWarning
+        ? `Permit closed with warning: ${watchWarning}`
+        : `Hot work permit ${permitRef} closed by ${sanitiseInput(closeOutBy, 60)}. ${fireWatchCompleted ? "Fire watch completed." : "NOTE: Fire watch not confirmed — monitor area for at least 60 minutes."}`,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to close hot work permit.", detail: e.message });
+  }
+});
+
+// POST /ai-hot-work-risk-assessment — AI assesses fire risk for hot work in a specific location
+app.post("/ai-hot-work-risk-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    hotWorkType, location, buildingType, constructionType,
+    nearbyMaterials, enclosedSpace, sprinkerProtection,
+    flammableGasPresent, dustPresent, previousIncidents, notes,
+  } = req.body;
+
+  if (!hotWorkType || !location) {
+    return res.status(400).json({ error: "hotWorkType and location are required." });
+  }
+
+  const sanitisedType = sanitiseInput(hotWorkType, 80);
+  const sanitisedLocation = sanitiseInput(location, 200);
+  const sanitisedMaterials = Array.isArray(nearbyMaterials)
+    ? nearbyMaterials.map(m => sanitiseInput(String(m), 80)).slice(0, 10)
+    : [];
+
+  const prompt = `You are a fire safety and hot work risk specialist for Victorian construction sites.
+
+Assess the fire risk for the following hot work:
+- Hot work type: ${sanitisedType}
+- Location: ${sanitisedLocation}
+- Building/structure type: ${sanitiseInput(buildingType || "Under construction", 60)}
+- Construction type: ${sanitiseInput(constructionType || "Not specified", 60)}
+- Nearby combustible materials: ${sanitisedMaterials.join(", ") || "Unknown"}
+- Enclosed space: ${enclosedSpace ? "Yes" : "No"}
+- Sprinkler protection: ${sprinkerProtection ? "Yes" : "No"}
+- Flammable gas present: ${flammableGasPresent ? "Yes" : "No"}
+- Combustible dust present: ${dustPresent ? "Yes" : "No"}
+- Previous incidents: ${sanitiseInput(previousIncidents || "None", 100)}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Reference: AS 1841, AS 2080, WorkSafe Victoria Hot Work Code of Practice.
+
+Respond ONLY with a JSON object:
+{
+  "riskLevel": "LOW|MEDIUM|HIGH|EXTREME",
+  "permitRequired": boolean,
+  "minimumClearanceM": number,
+  "fireWatchDurationMins": number,
+  "preWorkChecklist": [string],
+  "requiredFireProtection": [string],
+  "fumesAndVentilation": [string],
+  "alarmsAndSuppression": [string],
+  "postWorkActions": [string],
+  "prohibitedConditions": [string],
+  "summary": string (2 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      hotWorkType: sanitisedType,
+      riskLevel: parsed.riskLevel || "MEDIUM",
+      permitRequired: parsed.permitRequired ?? true,
+      minimumClearanceM: parsed.minimumClearanceM || 10,
+      fireWatchDurationMins: parsed.fireWatchDurationMins || 60,
+      preWorkChecklist: parsed.preWorkChecklist || [],
+      requiredFireProtection: parsed.requiredFireProtection || [],
+      fumesAndVentilation: parsed.fumesAndVentilation || [],
+      alarmsAndSuppression: parsed.alarmsAndSuppression || [],
+      postWorkActions: parsed.postWorkActions || [],
+      prohibitedConditions: parsed.prohibitedConditions || [],
+      summary: parsed.summary || "Hot work risk assessment complete.",
+    });
+  } catch (e) {
+    console.error("AI hot work risk error:", e.message);
+    return res.json({
+      success: true,
+      hotWorkType: sanitisedType,
+      riskLevel: flammableGasPresent || dustPresent ? "EXTREME" : enclosedSpace ? "HIGH" : "MEDIUM",
+      permitRequired: true,
+      minimumClearanceM: 10,
+      fireWatchDurationMins: 60,
+      preWorkChecklist: ["Remove or protect all combustibles within 10m", "Ensure fire extinguisher is at hand (min. 9L water or 4.5kg ABE)", "Confirm fire watch person is present", "Check hot work equipment is in good condition", "Notify building warden if in occupied building"],
+      requiredFireProtection: ["ABE dry chemical or CO2 extinguisher", "Fire blanket", "Water source nearby"],
+      fumesAndVentilation: ["Ensure adequate ventilation", "Use fume extraction where welding in enclosed spaces", "Consider respiratory protection if ventilation inadequate"],
+      alarmsAndSuppression: [sprinkerProtection ? "Confirm sprinkler head protection from sparks" : "No sprinkler protection — heightened monitoring required", "Do not isolate fire alarm without written approval and continuous fire watch replacement"],
+      postWorkActions: [`Conduct ${60}-minute fire watch after completion`, "Check concealed spaces for smouldering", "Confirm all equipment is isolated and cool before leaving"],
+      prohibitedConditions: ["Do not perform hot work if flammable vapours are present — test atmosphere first", "Do not perform hot work in contact with or adjacent to fuel lines"],
+      summary: "Hot work requires a formal permit and fire watch. Ensure all controls are in place before commencing.",
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
