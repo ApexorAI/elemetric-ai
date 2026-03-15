@@ -14910,6 +14910,335 @@ app.get("/glossary/:term", apiKeyAuth, (req, res) => {
   return res.json(entry);
 });
 
+// ── Round 30 ──────────────────────────────────────────────────────────────────
+
+// POST /priority-queue  — Prioritise a list of compliance jobs by urgency
+app.post("/priority-queue", apiKeyAuth, (req, res) => {
+  const { jobs } = req.body;
+
+  if (!jobs || !Array.isArray(jobs) || jobs.length === 0) {
+    return res.status(400).json({ error: "jobs array is required and must not be empty." });
+  }
+
+  const scored = jobs.slice(0, 50).map((j, idx) => {
+    const safeJobType  = sanitiseInput(String(j.jobType || "general")).toLowerCase();
+    const score        = parseFloat(j.complianceScore) || 100;
+    const missing      = parseInt(j.missingItemCount)  || 0;
+    const daysSince    = parseInt(j.daysSinceCompletion) || 0;
+    const hasCert      = !!j.certificateFiled;
+    const hasSig       = !!j.signatureObtained;
+
+    // Urgency score — higher = more urgent
+    let urgency = 0;
+    if (score < 60)             urgency += 40;
+    else if (score < 75)        urgency += 20;
+    else if (score < 85)        urgency += 10;
+
+    if (missing > 5)            urgency += 25;
+    else if (missing > 2)       urgency += 15;
+    else if (missing > 0)       urgency += 5;
+
+    if (!hasCert)               urgency += 20;
+    if (!hasSig)                urgency += 10;
+
+    if (daysSince > 30)         urgency += 15;
+    else if (daysSince > 14)    urgency += 10;
+    else if (daysSince > 7)     urgency += 5;
+
+    const HIGH_RISK_TRADES = ["gas", "electrical"];
+    if (HIGH_RISK_TRADES.includes(safeJobType)) urgency += 10;
+
+    let urgencyLabel;
+    if (urgency >= 60)      urgencyLabel = "CRITICAL";
+    else if (urgency >= 40) urgencyLabel = "HIGH";
+    else if (urgency >= 20) urgencyLabel = "MEDIUM";
+    else                    urgencyLabel = "LOW";
+
+    return {
+      originalIndex:   idx,
+      jobId:           j.jobId ? sanitiseInput(String(j.jobId)) : null,
+      jobType:         safeJobType,
+      address:         j.address ? sanitiseInput(String(j.address)) : null,
+      complianceScore: score,
+      missingItemCount: missing,
+      certificateFiled: hasCert,
+      urgencyScore:    urgency,
+      urgencyLabel,
+      topReasons: [
+        score < 60     ? `Low compliance score (${score}/100)` : null,
+        missing > 0    ? `${missing} missing item${missing !== 1 ? "s" : ""}` : null,
+        !hasCert       ? "Certificate not yet filed" : null,
+        daysSince > 14 ? `${daysSince} days since completion` : null,
+      ].filter(Boolean).slice(0, 3),
+    };
+  });
+
+  scored.sort((a, b) => b.urgencyScore - a.urgencyScore);
+
+  const critical = scored.filter(j => j.urgencyLabel === "CRITICAL");
+  const high     = scored.filter(j => j.urgencyLabel === "HIGH");
+
+  return res.json({
+    totalJobs: scored.length,
+    criticalCount: critical.length,
+    highCount:     high.length,
+    queue: scored,
+    recommendation: critical.length > 0
+      ? `Address ${critical.length} critical job${critical.length !== 1 ? "s" : ""} immediately.`
+      : high.length > 0
+        ? `${high.length} high-priority job${high.length !== 1 ? "s" : ""} require attention this week.`
+        : "All jobs are low to medium priority. Continue routine monitoring.",
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /licence-expiry-check  — Check if a contractor's licence is approaching expiry
+app.post("/licence-expiry-check", apiKeyAuth, (req, res) => {
+  const { licences } = req.body;
+
+  if (!licences || !Array.isArray(licences) || licences.length === 0) {
+    return res.status(400).json({ error: "licences array is required." });
+  }
+
+  const now = new Date();
+  const results = licences.slice(0, 20).map(l => {
+    const holder       = sanitiseInput(String(l.holderName   || "Unknown"));
+    const licenceNo    = sanitiseInput(String(l.licenceNumber || "Unknown"));
+    const licenceType  = sanitiseInput(String(l.licenceType  || "General"));
+    const tradeType    = sanitiseInput(String(l.tradeType    || "general")).toLowerCase();
+    const expiryDate   = l.expiryDate ? new Date(l.expiryDate) : null;
+
+    if (!expiryDate || isNaN(expiryDate.getTime())) {
+      return { holderName: holder, licenceNumber: licenceNo, licenceType, tradeType, status: "UNKNOWN", note: "Invalid or missing expiry date" };
+    }
+
+    const daysUntilExpiry = Math.round((expiryDate - now) / (1000 * 60 * 60 * 24));
+
+    let status, action;
+    if (daysUntilExpiry < 0) {
+      status = "EXPIRED";
+      action = "Stop work immediately — licence has expired. Renew via vba.vic.gov.au before resuming.";
+    } else if (daysUntilExpiry <= 30) {
+      status = "EXPIRING_SOON";
+      action = `Renew within ${daysUntilExpiry} days to avoid a lapse. Renew at vba.vic.gov.au.`;
+    } else if (daysUntilExpiry <= 90) {
+      status = "RENEWAL_RECOMMENDED";
+      action = "Licence renewal recommended within 3 months.";
+    } else {
+      status = "CURRENT";
+      action = null;
+    }
+
+    return {
+      holderName:       holder,
+      licenceNumber:    licenceNo,
+      licenceType,
+      tradeType,
+      expiryDate:       expiryDate.toISOString().slice(0, 10),
+      daysUntilExpiry,
+      status,
+      action,
+    };
+  });
+
+  const expired       = results.filter(r => r.status === "EXPIRED");
+  const expiringSoon  = results.filter(r => r.status === "EXPIRING_SOON");
+
+  return res.json({
+    totalChecked:   results.length,
+    expiredCount:   expired.length,
+    expiringSoon:   expiringSoon.length,
+    results,
+    alertSummary:   expired.length > 0
+      ? `ALERT: ${expired.length} licence(s) have expired. Work must stop immediately.`
+      : expiringSoon.length > 0
+        ? `WARNING: ${expiringSoon.length} licence(s) expiring within 30 days.`
+        : "All licences are current.",
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+// POST /evidence-package  — Assemble a compliance evidence package summary for a job
+app.post("/evidence-package", apiKeyAuth, (req, res) => {
+  const { jobId, jobType, contractorName, address, completionDate,
+          photos, certificateFiled, testResultsRetained, permitNumber,
+          gpsCoords, signatureObtained, notes } = req.body;
+
+  if (!jobType || !contractorName) {
+    return res.status(400).json({ error: "jobType and contractorName are required." });
+  }
+
+  const safeJobType    = sanitiseInput(String(jobType)).toLowerCase();
+  const safeContractor = sanitiseInput(String(contractorName));
+  const safeAddress    = sanitiseInput(String(address || "Not specified"));
+  const safeDate       = sanitiseInput(String(completionDate || new Date().toISOString().slice(0, 10)));
+  const safeNotes      = sanitiseInput(String(notes || ""));
+
+  const photoCount = Array.isArray(photos) ? photos.length : parseInt(photos) || 0;
+
+  const REQUIRED_EVIDENCE = {
+    plumbing:   ["Certificate of Compliance", "Hydraulic test record", "Photos of concealed work", "Tempering valve test record"],
+    gas:        ["Gas compliance certificate", "Pressure test record", "Combustion analysis report", "Photos of installation"],
+    electrical: ["Electrical Safety Certificate", "RCD test record", "Circuit schedule", "Photos of switchboard and installation"],
+    drainage:   ["Certificate of Compliance", "Water test record", "CCTV inspection report (if applicable)", "Photos of pipe installation"],
+    carpentry:  ["Building permit (if applicable)", "Engineer's certificate (if applicable)", "Photos of structural members", "Inspection report"],
+    hvac:       ["ARCtick refrigerant handling record", "Commissioning report", "Electrical compliance", "Photos of installation"],
+  };
+
+  const requiredItems  = REQUIRED_EVIDENCE[safeJobType] || REQUIRED_EVIDENCE.plumbing;
+
+  const evidenceItems = [
+    { item: "Certificate of Compliance / Safety Certificate", status: certificateFiled ? "PRESENT" : "MISSING", required: true },
+    { item: `Photos of work (${photoCount} provided)`, status: photoCount >= 4 ? "PRESENT" : photoCount > 0 ? "PARTIAL" : "MISSING", required: true },
+    { item: "Test results retained", status: testResultsRetained ? "PRESENT" : "MISSING", required: true },
+    { item: "Permit / approval number", status: permitNumber ? "PRESENT" : "NOT_REQUIRED", required: false, value: permitNumber || null },
+    { item: "GPS location recorded", status: gpsCoords ? "PRESENT" : "MISSING", required: false, value: gpsCoords || null },
+    { item: "Client signature obtained", status: signatureObtained ? "PRESENT" : "MISSING", required: false },
+  ];
+
+  const missingRequired  = evidenceItems.filter(e => e.required && e.status === "MISSING");
+  const partial          = evidenceItems.filter(e => e.status === "PARTIAL");
+  const complete         = missingRequired.length === 0 && partial.length === 0;
+
+  return res.json({
+    packageId:    `EP-${Date.now().toString(36).toUpperCase()}`,
+    jobId:        jobId || null,
+    jobType:      safeJobType,
+    contractor:   safeContractor,
+    address:      safeAddress,
+    completionDate: safeDate,
+    packageStatus: complete ? "COMPLETE" : missingRequired.length > 0 ? "INCOMPLETE" : "PARTIAL",
+    evidenceItems,
+    missingRequired: missingRequired.map(e => e.item),
+    tradeRequiredDocuments: requiredItems,
+    notes: safeNotes,
+    retentionAdvice: `Keep all evidence for a minimum of ${safeJobType === "carpentry" ? "10" : "7"} years in compliance with Victorian statutory requirements.`,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// GET /compliance-tips/random  — Return a random compliance tip for daily digest use
+app.get("/compliance-tips/random", apiKeyAuth, (req, res) => {
+  const { trade } = req.query;
+  const TIPS = {
+    plumbing: [
+      "Always photograph hot water unit nameplates before and after installation — model and serial number must be visible.",
+      "A tempering valve must be installed on all new hot water systems serving baths and showers. Test it before leaving site.",
+      "The TPR valve discharge pipe must terminate no more than 150 mm above a drain tundish — not directly into the drain.",
+      "Isolation valves are required at every appliance and at each floor level in multi-storey buildings.",
+      "Mark the location of concealed pipes on the as-installed plan before plastering.",
+    ],
+    gas: [
+      "Every gas appliance installation requires a pressure test to 1.5 times working pressure — record it before connecting.",
+      "Flexible gas hoses deteriorate over time. Replace any hose older than 5 years regardless of visible condition.",
+      "Photograph the gas meter, regulator, and all new isolation valves in the same shot where possible.",
+      "Combustion analysis must be performed on all newly installed Type A gas appliances.",
+      "Ventilation openings must never be blocked or reduced after installation — photograph them before handover.",
+    ],
+    electrical: [
+      "All new circuits must be tested and each test result recorded on the circuit schedule before issuing the ESCC.",
+      "Take a photo of the complete switchboard with all circuit breakers labelled before closing the cover.",
+      "RCDs must be tested using the push-button test after every installation — don't assume they work.",
+      "Label all new cables at both ends — at the switchboard and at the outlet. This saves hours during future fault finding.",
+      "Never use aluminium cables for branch circuits in domestic installations — copper only under AS/NZS 3000.",
+    ],
+    drainage: [
+      "Minimum fall for drainage pipes is 1:40 for DN100 and 1:60 for DN150 per AS/NZS 3500.2.",
+      "All inspection openings must be accessible after installation — do not bury them below finished floor level.",
+      "Photograph the pipe in the trench before backfilling — it is impossible to prove gradient after the fact.",
+      "The maximum unsupported length for horizontal DN100 PVC drain pipe is 1.2 m under AS/NZS 3500.2.",
+      "Connect stormwater and sanitary drainage to separate systems — cross-connections are a serious code violation.",
+    ],
+    carpentry: [
+      "Always check NCC wind classification before specifying frame connections — connection failure is not covered by insurance.",
+      "Photograph all structural connections before lining — show fixing type, size, and frequency.",
+      "Obtain a written termite management report before working in sub-floor spaces. Do not disturb existing barriers.",
+      "Any timber in contact with or near the ground must be H3 or H4 treated in Victoria.",
+      "Bearer and joist sizes must match the span tables in AS 1684 — do not estimate from memory.",
+    ],
+    hvac: [
+      "Always confirm the system is 'dead' with a refrigerant leak detector before breaking into the refrigerant circuit.",
+      "Photograph the outdoor unit nameplate — model, serial, and refrigerant type must be recorded on the ARCtick form.",
+      "Condensate drain lines must have a continuous fall to a point of safe disposal — never drain onto a roof.",
+      "Record the actual measured refrigerant weight added in the ARCtick handling form at the time of commissioning.",
+      "Duct insulation must meet minimum R-values per NCC climate zone — R1.5 minimum for most Victorian zones.",
+    ],
+  };
+
+  const allTips = trade
+    ? (TIPS[sanitiseInput(String(trade)).toLowerCase()] || [])
+    : Object.values(TIPS).flat();
+
+  if (allTips.length === 0) {
+    return res.status(404).json({ error: "No tips found for the specified trade." });
+  }
+
+  const tip = allTips[Math.floor(Math.random() * allTips.length)];
+  const tradeKey = trade ? sanitiseInput(String(trade)).toLowerCase() : "all";
+
+  return res.json({
+    tip,
+    trade: tradeKey,
+    totalTipsForTrade: allTips.length,
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
+// POST /job-archive  — Archive a completed job record to Supabase long-term storage
+app.post("/job-archive", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, contractorId, contractorName, address, completionDate,
+          complianceScore, grade, certificateFiled, analysisId, metadata } = req.body;
+
+  if (!jobId || !jobType) {
+    return res.status(400).json({ error: "jobId and jobType are required." });
+  }
+
+  const safeJobId      = sanitiseInput(String(jobId));
+  const safeJobType    = sanitiseInput(String(jobType)).toLowerCase();
+  const safeContractor = sanitiseInput(String(contractorName || "Unknown"));
+  const safeAddress    = sanitiseInput(String(address || "Unknown"));
+  const archiveId      = `ARC-${Date.now().toString(36).toUpperCase()}`;
+
+  const archiveRecord = {
+    archiveId,
+    jobId:           safeJobId,
+    jobType:         safeJobType,
+    contractorId:    contractorId || null,
+    contractorName:  safeContractor,
+    address:         safeAddress,
+    completionDate:  completionDate || null,
+    complianceScore: parseFloat(complianceScore) || null,
+    grade:           grade || null,
+    certificateFiled: !!certificateFiled,
+    analysisId:      analysisId || null,
+    metadata:        typeof metadata === "object" && metadata !== null ? metadata : {},
+    archivedAt:      new Date().toISOString(),
+    status:          "ARCHIVED",
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("job_archive").insert({
+      archive_id:        archiveId,
+      job_id:            safeJobId,
+      job_type:          safeJobType,
+      contractor_id:     contractorId || null,
+      contractor_name:   safeContractor,
+      address:           safeAddress,
+      completion_date:   completionDate || null,
+      compliance_score:  parseFloat(complianceScore) || null,
+      grade:             grade || null,
+      certificate_filed: !!certificateFiled,
+      analysis_id:       analysisId || null,
+      metadata:          archiveRecord.metadata,
+      created_at:        new Date().toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...archiveRecord, saved });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
