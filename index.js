@@ -11645,6 +11645,332 @@ NOTE: This agreement is a template only. Consult a construction lawyer for compl
   });
 });
 
+// ── POST /score-breakdown ─────────────────────────────────────────────────────
+// Provides a detailed decomposition of how a compliance score was calculated
+// using the same 4-dimension formula as calculateComplianceScore().
+app.post("/score-breakdown", (req, res) => {
+  const {
+    itemsDetected   = [],
+    itemsMissing    = [],
+    itemsUnclear    = [],
+    photoCount,
+    requiredPhotos,
+    gpsRecorded,
+    signatureObtained,
+    complexityScore = 5,
+    jobType,
+  } = req.body || {};
+
+  const REQUIRED_PHOTOS_DEFAULT = { plumbing: 8, gas: 8, electrical: 8, drainage: 6, carpentry: 6, hvac: 6 };
+  const reqPhotos = requiredPhotos || REQUIRED_PHOTOS_DEFAULT[jobType?.toLowerCase()] || 6;
+  const photos    = photoCount !== undefined ? Number(photoCount) : 0;
+
+  // Dimension 1: Item coverage (40 pts)
+  const totalItems = itemsDetected.length + itemsMissing.length + itemsUnclear.length;
+  const coverageRaw = totalItems > 0 ? itemsDetected.length / totalItems : 0;
+  const itemCoverageScore = Math.round(coverageRaw * 40);
+
+  // Dimension 2: Photo evidence (25 pts)
+  const photoRatio = reqPhotos > 0 ? Math.min(photos / reqPhotos, 1) : 0;
+  const photoScore = Math.round(photoRatio * 25);
+
+  // Dimension 3: Regulatory markings (20 pts)
+  const REGULATORY_KEYWORDS = ["as/nzs", "aga", "rcd", "ptr", "watermark", "coc", "coes", "certificate", "backflow", "earth continuity", "arc licence", "esv", "vba"];
+  const allDetectedText = itemsDetected.join(" ").toLowerCase();
+  const matchedKeywords = REGULATORY_KEYWORDS.filter(k => allDetectedText.includes(k));
+  const regulatoryScore = Math.round(Math.min(matchedKeywords.length / 3, 1) * 20);
+
+  // Dimension 4: Documentation (15 pts)
+  let docScore = 15;
+  if (!gpsRecorded)        docScore -= 5;
+  if (!signatureObtained)  docScore -= 5;
+  const complexityPenalty = Math.max(0, complexityScore - 7) * 0.5;
+  docScore = Math.max(0, Math.round(docScore - complexityPenalty));
+
+  const totalScore = itemCoverageScore + photoScore + regulatoryScore + docScore;
+
+  const GRADE = totalScore >= 90 ? "A" : totalScore >= 80 ? "B" : totalScore >= 70 ? "C" : totalScore >= 60 ? "D" : "F";
+
+  return res.json({
+    jobType:      jobType || null,
+    totalScore,
+    grade:        GRADE,
+    passOrFail:   totalScore >= 70 ? "PASS" : "FAIL",
+
+    dimensions: [
+      {
+        name:        "Item Coverage",
+        weight:      "40 pts",
+        score:       itemCoverageScore,
+        maxScore:    40,
+        calculation: `${itemsDetected.length} detected / (${itemsDetected.length} + ${itemsMissing.length} + ${itemsUnclear.length}) × 40 = ${itemCoverageScore} pts`,
+      },
+      {
+        name:        "Photo Evidence",
+        weight:      "25 pts",
+        score:       photoScore,
+        maxScore:    25,
+        calculation: `min(${photos} photos / ${reqPhotos} required, 1) × 25 = ${photoScore} pts`,
+      },
+      {
+        name:        "Regulatory Markings",
+        weight:      "20 pts",
+        score:       regulatoryScore,
+        maxScore:    20,
+        calculation: `${matchedKeywords.length} regulatory keywords matched → ${regulatoryScore} pts`,
+        matchedKeywords,
+      },
+      {
+        name:        "Documentation",
+        weight:      "15 pts",
+        score:       docScore,
+        maxScore:    15,
+        calculation: `15 pts base${!gpsRecorded ? " −5 (no GPS)" : ""}${!signatureObtained ? " −5 (no signature)" : ""}${complexityPenalty > 0 ? ` −${complexityPenalty.toFixed(1)} (complexity penalty)` : ""} = ${docScore} pts`,
+      },
+    ],
+
+    improvementTips: [
+      itemCoverageScore < 30 ? "Photograph all checklist items to improve item coverage score" : null,
+      photoScore < 20        ? `Submit all ${reqPhotos} required photos for maximum photo evidence score` : null,
+      regulatoryScore < 15   ? "Ensure photos show certification marks, test gauges, and labels with regulatory markings" : null,
+      docScore < 10          ? "Enable GPS on your device and obtain customer signature to improve documentation score" : null,
+    ].filter(Boolean),
+
+    calculatedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /liability-calculator ────────────────────────────────────────────────
+// Calculates potential financial liability exposure for a non-compliant job.
+// Based on Victorian building law, negligence claims, and remediation costs.
+app.post("/liability-calculator", (req, res) => {
+  const {
+    jobType,
+    jobValue,
+    complianceScore,
+    missingItems    = [],
+    daysSinceCompletion = 0,
+    incidentOccurred = false,
+    propertyDamage  = false,
+    injuryOccurred  = false,
+  } = req.body || {};
+
+  if (!jobType || complianceScore === undefined) {
+    return res.status(400).json({ error: "jobType and complianceScore are required." });
+  }
+
+  const LIABILITY = LIABILITY_PERIODS[jobType?.toLowerCase()] || { defects: 7, structuralDefects: 10, statute: "Domestic Building Contracts Act 1995 (Vic)" };
+  const value     = Number(jobValue) || 5000; // default $5,000
+  const score     = Number(complianceScore);
+  const days      = Number(daysSinceCompletion) || 0;
+
+  // Still within liability window?
+  const liabilityWindowDays  = LIABILITY.defects * 365;
+  const withinLiabilityWindow = days < liabilityWindowDays;
+
+  // Remediation cost factor based on score gap
+  const scoreGap           = Math.max(0, 70 - score);
+  const remediationFactor  = scoreGap > 20 ? 0.4 : scoreGap > 10 ? 0.2 : 0.1;
+  const estimatedRemediation = Math.round(value * remediationFactor);
+
+  // Critical missing items add fixed liability premiums
+  const CRITICAL_COSTS = {
+    "certificate":     2000,
+    "rcd":             3000,
+    "ptr valve":       1500,
+    "backflow":        2500,
+    "earth":           2000,
+    "gas compliance":  5000,
+    "permit":          10000,
+  };
+  let regulatoryPenaltyEstimate = 0;
+  for (const item of missingItems) {
+    const lower = item.toLowerCase();
+    for (const [keyword, cost] of Object.entries(CRITICAL_COSTS)) {
+      if (lower.includes(keyword)) {
+        regulatoryPenaltyEstimate += cost;
+        break;
+      }
+    }
+  }
+
+  // Incident multiplier
+  const incidentMultiplier = incidentOccurred ? 2.5 : 1;
+  const injuryMultiplier   = injuryOccurred   ? 5.0 : 1;
+  const propertyMultiplier = propertyDamage   ? 1.8 : 1;
+
+  const baseLiability  = estimatedRemediation + regulatoryPenaltyEstimate;
+  const adjustedLiability = Math.round(baseLiability * incidentMultiplier * injuryMultiplier * propertyMultiplier);
+
+  const liabilityTier = adjustedLiability < 5000 ? "low" : adjustedLiability < 25000 ? "moderate" : adjustedLiability < 100000 ? "high" : "critical";
+
+  return res.json({
+    jobType,
+    jobValue:    value,
+    complianceScore: score,
+    withinLiabilityWindow,
+    liabilityWindowExpiresIn: withinLiabilityWindow ? `${Math.round((liabilityWindowDays - days) / 365 * 10) / 10} years` : "Expired",
+    liabilityStatute: LIABILITY.statute,
+
+    estimatedExposure: {
+      remediationCost:          `$${estimatedRemediation.toLocaleString()}`,
+      regulatoryPenaltyEstimate: `$${regulatoryPenaltyEstimate.toLocaleString()}`,
+      incidentAdjustedTotal:    `$${adjustedLiability.toLocaleString()}`,
+      tier:                     liabilityTier,
+    },
+
+    multipliers: {
+      incident: incidentOccurred ? "2.5×" : null,
+      injury:   injuryOccurred   ? "5.0×" : null,
+      property: propertyDamage   ? "1.8×" : null,
+    },
+
+    recommendation: liabilityTier === "critical"
+      ? "Critical liability exposure — engage legal counsel and notify your public liability insurer immediately."
+      : liabilityTier === "high"
+      ? "High exposure — resolve all missing items, notify insurer, and retain all documentation."
+      : liabilityTier === "moderate"
+      ? "Moderate exposure — address missing items to reduce risk profile."
+      : "Low exposure — maintain good documentation practices.",
+
+    disclaimer: "This is an estimate only and not legal or financial advice. Actual liability depends on specific facts. Consult a construction lawyer.",
+    calculatedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /certificate-reminder ────────────────────────────────────────────────
+// Queues a certificate filing reminder notification for a job. The notification
+// fires N hours before the certificate lodgement deadline.
+app.post("/certificate-reminder", (req, res) => {
+  const {
+    jobType,
+    userId,
+    jobId,
+    completedAt,
+    recipientEmail,
+    recipientName,
+  } = req.body || {};
+
+  if (!jobType || !userId) {
+    return res.status(400).json({ error: "jobType and userId are required." });
+  }
+
+  const DEADLINES = {
+    plumbing:   { label: "VBA Certificate of Compliance",     hoursFromCompletion: 48,  businessDays: 2,  authority: "VBA" },
+    gas:        { label: "ESV Gas Compliance Certificate",    hoursFromCompletion: 48,  businessDays: null, authority: "Energy Safe Victoria" },
+    electrical: { label: "ESV Certificate of Electrical Safety", hoursFromCompletion: 120, businessDays: 5, authority: "Energy Safe Victoria" },
+    drainage:   { label: "VBA Certificate of Compliance",     hoursFromCompletion: 48,  businessDays: 2,  authority: "VBA" },
+    carpentry:  { label: "Building Permit Inspection Sign-off", hoursFromCompletion: 24, businessDays: null, authority: "Registered Building Surveyor" },
+    hvac:       { label: "ARC Service Record Update",          hoursFromCompletion: 24,  businessDays: null, authority: "ARC" },
+  };
+
+  const deadline = DEADLINES[jobType?.toLowerCase()];
+  if (!deadline) {
+    return res.status(400).json({ error: `Unsupported jobType for reminders. Use: ${Object.keys(DEADLINES).join(", ")}` });
+  }
+
+  const baseTime  = completedAt ? new Date(completedAt).getTime() : Date.now();
+  const sendAfter = baseTime + (deadline.hoursFromCompletion - 4) * 3_600_000; // 4 hours before deadline
+
+  const notification = {
+    id:             `CERT-${Date.now().toString(36).toUpperCase()}`,
+    type:           "certificate_reminder",
+    userId,
+    jobId:          jobId || null,
+    jobType,
+    title:          `Certificate Filing Due — ${deadline.label}`,
+    message:        `Your ${deadline.label} must be lodged with ${deadline.authority} within ${deadline.businessDays ? `${deadline.businessDays} business days` : `${deadline.hoursFromCompletion} hours`} of job completion.`,
+    recipientEmail: recipientEmail || null,
+    recipientName:  recipientName  || null,
+    deadlineHours:  deadline.hoursFromCompletion,
+    authority:      deadline.authority,
+    sendAfter:      new Date(sendAfter).toISOString(),
+    scheduledAt:    new Date().toISOString(),
+    sent:           false,
+  };
+
+  notificationQueue.push({ ...notification, sendAfter });
+
+  return res.status(201).json({
+    scheduled:      true,
+    notificationId: notification.id,
+    jobType,
+    certificateType: deadline.label,
+    authority:       deadline.authority,
+    reminderSendAt:  notification.sendAfter,
+    message:         `Reminder scheduled for ${new Date(sendAfter).toLocaleString("en-AU")} (4 hours before deadline).`,
+    scheduledAt:     notification.scheduledAt,
+  });
+});
+
+// ── POST /batch-score ─────────────────────────────────────────────────────────
+// Runs the compliance score formula across multiple pre-existing analysis objects
+// and returns enriched objects with calculated scores. Does NOT call AI.
+app.post("/batch-score", (req, res) => {
+  const { analyses = [] } = req.body || {};
+
+  if (!Array.isArray(analyses) || analyses.length === 0) {
+    return res.status(400).json({ error: "analyses array is required." });
+  }
+  if (analyses.length > 50) {
+    return res.status(400).json({ error: "Maximum 50 analyses per batch." });
+  }
+
+  const REQUIRED_PHOTOS = { plumbing: 8, gas: 8, electrical: 8, drainage: 6, carpentry: 6, hvac: 6 };
+  const REGULATORY_KEYWORDS = ["as/nzs", "aga", "rcd", "ptr", "watermark", "coc", "coes", "certificate", "backflow", "earth continuity", "arc", "esv", "vba"];
+
+  const results = analyses.map((a, idx) => {
+    const jobType    = (a.jobType || a.job_type || "plumbing").toLowerCase();
+    const detected   = Array.isArray(a.itemsDetected) ? a.itemsDetected : [];
+    const missing    = Array.isArray(a.itemsMissing)  ? a.itemsMissing  : [];
+    const unclear    = Array.isArray(a.itemsUnclear)  ? a.itemsUnclear  : [];
+    const photos     = typeof a.photoCount === "number" ? a.photoCount : 0;
+    const reqPhotos  = REQUIRED_PHOTOS[jobType] || 6;
+    const gps        = a.gpsRecorded ?? false;
+    const sig        = a.signatureObtained ?? false;
+    const complexity = typeof a.complexityScore === "number" ? a.complexityScore : 5;
+
+    const totalItems       = detected.length + missing.length + unclear.length;
+    const coverageRaw      = totalItems > 0 ? detected.length / totalItems : 0;
+    const itemScore        = Math.round(coverageRaw * 40);
+    const photoScore       = Math.round(Math.min(photos / reqPhotos, 1) * 25);
+    const allText          = detected.join(" ").toLowerCase();
+    const matched          = REGULATORY_KEYWORDS.filter(k => allText.includes(k)).length;
+    const regulatoryScore  = Math.round(Math.min(matched / 3, 1) * 20);
+    let   docScore         = 15;
+    if (!gps) docScore -= 5;
+    if (!sig) docScore -= 5;
+    docScore = Math.max(0, Math.round(docScore - Math.max(0, complexity - 7) * 0.5));
+
+    const total = itemScore + photoScore + regulatoryScore + docScore;
+    const grade = total >= 90 ? "A" : total >= 80 ? "B" : total >= 70 ? "C" : total >= 60 ? "D" : "F";
+
+    return {
+      index:          idx,
+      id:             a.id || a.analysisId || null,
+      jobType,
+      calculatedScore: total,
+      grade,
+      passOrFail:     total >= 70 ? "PASS" : "FAIL",
+      breakdown:      { itemCoverage: itemScore, photoEvidence: photoScore, regulatoryMarkings: regulatoryScore, documentation: docScore },
+    };
+  });
+
+  const scores  = results.map(r => r.calculatedScore);
+  const avgScore = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length * 10) / 10;
+  const passCount = results.filter(r => r.passOrFail === "PASS").length;
+
+  return res.json({
+    processedCount: results.length,
+    avgScore,
+    passCount,
+    failCount:      results.length - passCount,
+    passRate:       `${Math.round((passCount / results.length) * 100)}%`,
+    results,
+    scoredAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
