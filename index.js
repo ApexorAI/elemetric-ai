@@ -44651,6 +44651,238 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /cladding-register — Register a cladding product (Victorian Cladding Taskforce compliance)
+app.post("/cladding-register", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, buildingName, buildingAddress, buildingClass,
+    numberOfStoreys, productName, manufacturer, productType,
+    coreMaterial, facingMaterial, frrRating, bca_compliance,
+    fireTestStandard, testCertificate, installedAreaM2, installedLocation,
+    installedBy, installedDate, inspectedBy, inspectionDate,
+    remediationRequired, remediationStatus, notes,
+  } = req.body;
+
+  if (!projectId || !productName || !productType) {
+    return res.status(400).json({ error: "projectId, productName, and productType are required." });
+  }
+
+  const sanitisedProduct = sanitiseInput(productName, 200);
+  const sanitisedType = sanitiseInput(productType, 80);
+
+  // Determine fire risk per Victorian Cladding Taskforce / NCC 2022 guidelines
+  // ACM = Aluminium Composite Panel, EPS = Expanded Polystyrene, HPL = High-Pressure Laminate
+  const highRiskTypes = ["ACM", "ACP", "EPS", "HPL", "ALUMINIUM_COMPOSITE"];
+  const isHighRiskType = highRiskTypes.some(t => sanitisedType.toUpperCase().includes(t));
+
+  // NCC 2022 Table 5.1 — non-combustible requirement for Class 2–9 buildings > 2 storeys
+  const storeyCount = numberOfStoreys || 0;
+  const nccNonCombustibleRequired = storeyCount > 2 && ["2", "3", "4", "5", "6", "7", "8", "9"].includes(String(buildingClass || ""));
+
+  const complianceFlags = [];
+  if (isHighRiskType && nccNonCombustibleRequired) {
+    complianceFlags.push("POTENTIAL_NCC_NON_COMPLIANCE — ACM/EPS/HPL on multi-storey building may not meet NCC 2022 C1.9 non-combustible requirement");
+  }
+  if (isHighRiskType) {
+    complianceFlags.push("HIGH RISK PRODUCT TYPE — Register with Victorian Cladding Taskforce if installed on Class 2–9 building");
+  }
+  if (!fireTestStandard && !bca_compliance) {
+    complianceFlags.push("No fire test standard or BCA compliance evidence provided — obtain AS 5113 or AS 1530.1 test certificate");
+  }
+  if (remediationRequired && remediationStatus === "NOT_STARTED") {
+    complianceFlags.push("REMEDIATION REQUIRED — building owner must engage engineer and submit remediation plan");
+  }
+
+  const riskLevel = complianceFlags.length >= 2 ? "HIGH" : complianceFlags.length === 1 ? "MEDIUM" : "LOW";
+
+  const ref = `CLAD-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    buildingName: sanitiseInput(buildingName || "", 200),
+    buildingAddress: sanitiseInput(buildingAddress || "", 300),
+    buildingClass: sanitiseInput(String(buildingClass || ""), 10),
+    numberOfStoreys: storeyCount,
+    product: {
+      name: sanitisedProduct,
+      manufacturer: sanitiseInput(manufacturer || "", 150),
+      type: sanitisedType,
+      coreMaterial: sanitiseInput(coreMaterial || "", 100),
+      facingMaterial: sanitiseInput(facingMaterial || "", 100),
+      frrRating: sanitiseInput(frrRating || "", 30),
+      bcaCompliance: sanitiseInput(bca_compliance || "", 100),
+      fireTestStandard: sanitiseInput(fireTestStandard || "", 80),
+      testCertificate: sanitiseInput(testCertificate || "", 100),
+    },
+    installation: {
+      areaM2: installedAreaM2 || null,
+      location: sanitiseInput(installedLocation || "", 200),
+      installedBy: sanitiseInput(installedBy || "", 120),
+      installedDate: installedDate || null,
+    },
+    inspection: {
+      inspectedBy: sanitiseInput(inspectedBy || "", 120),
+      inspectionDate: inspectionDate || null,
+    },
+    riskLevel,
+    complianceFlags,
+    remediationRequired: !!remediationRequired,
+    remediationStatus: sanitiseInput(remediationStatus || "NOT_APPLICABLE", 40),
+    notes: sanitiseInput(notes || "", 500),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("cladding_register").insert(record);
+      if (error) console.error("Cladding register insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Cladding register DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    riskLevel,
+    complianceFlags,
+    message: riskLevel === "HIGH"
+      ? "HIGH RISK — Engage fire engineer and register with Victorian Cladding Taskforce. Contact: claddingsafety.vic.gov.au"
+      : complianceFlags.length > 0
+        ? "Review compliance flags and obtain required certifications."
+        : "Cladding product registered. No immediate compliance flags.",
+    saved,
+    record,
+  });
+});
+
+// GET /cladding-register/:projectId — List cladding register entries for a project
+app.get("/cladding-register/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("cladding_register")
+      .select("*")
+      .eq("projectId", sanitiseInput(String(projectId), 80))
+      .order("createdAt", { ascending: false });
+
+    if (error) throw error;
+
+    const highRiskCount = (data || []).filter(r => r.riskLevel === "HIGH").length;
+    const remediationCount = (data || []).filter(r => r.remediationRequired).length;
+
+    return res.json({
+      projectId,
+      total: (data || []).length,
+      highRiskCount,
+      remediationCount,
+      entries: data || [],
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to retrieve cladding register.", detail: e.message });
+  }
+});
+
+// POST /ai-cladding-risk-assessment — AI assesses fire risk from installed cladding
+app.post("/ai-cladding-risk-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    buildingClass, numberOfStoreys, claddingType, coreMaterial,
+    fireSpreadPotential, sprinklerInstalled, fireAlarmType,
+    occupancyType, buildingAge, evacuationDifficulty, notes,
+  } = req.body;
+
+  if (!buildingClass || !claddingType) {
+    return res.status(400).json({ error: "buildingClass and claddingType are required." });
+  }
+
+  const sanitisedClass = sanitiseInput(String(buildingClass), 20);
+  const sanitisedCladding = sanitiseInput(claddingType, 120);
+
+  const prompt = `You are a fire safety engineer specialising in Victorian building regulations, NCC 2022, and the Victorian Cladding Taskforce assessment methodology.
+
+Assess the fire risk of the following building cladding situation:
+- Building class: ${sanitisedClass}
+- Number of storeys: ${numberOfStoreys || "Unknown"}
+- Cladding type: ${sanitisedCladding}
+- Core material: ${sanitiseInput(coreMaterial || "Unknown", 80)}
+- Fire spread potential: ${sanitiseInput(fireSpreadPotential || "Unknown", 60)}
+- Sprinklers installed: ${sprinklerInstalled ? "Yes" : "No"}
+- Fire alarm type: ${sanitiseInput(fireAlarmType || "Unknown", 60)}
+- Occupancy type: ${sanitiseInput(occupancyType || "Residential", 60)}
+- Building age (years): ${buildingAge || "Unknown"}
+- Evacuation difficulty: ${sanitiseInput(evacuationDifficulty || "Standard", 60)}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Reference the Victorian Cladding Taskforce risk matrix and NCC 2022 Section C fire resistance provisions.
+
+Respond ONLY with a JSON object:
+{
+  "overallRisk": "LOW|MEDIUM|HIGH|CRITICAL",
+  "riskScore": number (1-10),
+  "nccCompliance": "LIKELY_COMPLIANT|REVIEW_REQUIRED|LIKELY_NON_COMPLIANT",
+  "claddingTaskforceRegistrationRequired": boolean,
+  "immediateActions": [string],
+  "engineeringAssessmentRequired": boolean,
+  "remediationOptions": [{"option": string, "description": string, "costIndicator": "LOW|MEDIUM|HIGH"}],
+  "fireProtectionEnhancements": [string],
+  "regulatoryObligation": string,
+  "lifeExpectancyImpact": string,
+  "summary": string (2-3 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1000,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      overallRisk: parsed.overallRisk || "MEDIUM",
+      riskScore: parsed.riskScore ?? null,
+      nccCompliance: parsed.nccCompliance || "REVIEW_REQUIRED",
+      claddingTaskforceRegistrationRequired: parsed.claddingTaskforceRegistrationRequired ?? false,
+      immediateActions: parsed.immediateActions || [],
+      engineeringAssessmentRequired: parsed.engineeringAssessmentRequired ?? false,
+      remediationOptions: parsed.remediationOptions || [],
+      fireProtectionEnhancements: parsed.fireProtectionEnhancements || [],
+      regulatoryObligation: parsed.regulatoryObligation || "",
+      lifeExpectancyImpact: parsed.lifeExpectancyImpact || "",
+      summary: parsed.summary || "Assessment complete. Engage a fire engineer for detailed review.",
+    });
+  } catch (e) {
+    console.error("AI cladding risk error:", e.message);
+    return res.json({
+      success: true,
+      overallRisk: "MEDIUM",
+      riskScore: 5,
+      nccCompliance: "REVIEW_REQUIRED",
+      claddingTaskforceRegistrationRequired: true,
+      immediateActions: ["Engage a fire safety engineer for assessment", "Check if building is listed on Victorian Cladding Taskforce register at claddingsafety.vic.gov.au"],
+      engineeringAssessmentRequired: true,
+      remediationOptions: [
+        { option: "Replace cladding", description: "Full replacement with NCC-compliant non-combustible cladding", costIndicator: "HIGH" },
+        { option: "Retrofit fire protection", description: "Install cavity fire barriers and enhanced sprinkler coverage", costIndicator: "MEDIUM" },
+      ],
+      fireProtectionEnhancements: ["Ensure sprinkler coverage meets AS 2118.1", "Install smoke detection per AS 1670.1"],
+      regulatoryObligation: "Building owner must register with Victorian Cladding Taskforce and develop a rectification plan if high-risk cladding is confirmed.",
+      lifeExpectancyImpact: "Unremmediated high-risk cladding may affect building insurance and property valuation.",
+      summary: "Manual fire engineering assessment required. Register with the Victorian Cladding Taskforce and engage a fire safety engineer.",
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
