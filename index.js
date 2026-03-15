@@ -68164,6 +68164,418 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /solar-panel-inspection — Solar PV system inspection per AS/NZS 5033 / CEC guidelines
+app.post("/solar-panel-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    propertyAddress,
+    inspectionDate,
+    inspector,
+    inspectorAccreditation, // CEC accreditation number
+    systemSize_kW,
+    panelCount,
+    panelMake,
+    panelModel,
+    inverterMake,
+    inverterModel,
+    inverterCount,
+    installationYear,
+    installerCECAccreditation,
+    mountingType,          // rooftop | ground-mount | carport | tracking
+    roofType,              // tile | metal | flat | EPDM
+    inspectionType,        // commissioning | routine | fault-investigation | pre-purchase
+    // Physical inspection
+    panelCondition,        // good | dirty | cracked | delaminated | PID | shading
+    crackedPanels,         // count
+    delaminatedPanels,
+    hotSpots,              // detected via thermal imaging
+    hotSpotLocations,      // array of { panel, temp_C }
+    mountingCondition,     // good | corroded | loose | damaged
+    looseConnections,
+    dcCablingCondition,    // good | damaged | exposed | rodent-damaged
+    earthingConnected,
+    stringFusesPresent,
+    arcFaultProtection,
+    // Performance
+    inverterStatus,        // normal | fault | offline | error-code
+    inverterErrorCode,
+    expectedGeneration_kWh_day,
+    actualGeneration_kWh_day,
+    performanceRatio_pct,  // actual/expected × 100
+    specificYield_kWh_kWp,
+    // Safety
+    antiIslandingTested,
+    shutdownProcedurePosted,
+    dcIsolatorPresent,
+    dcIsolatorWorking,
+    acIsolatorPresent,
+    acIsolatorWorking,
+    fireLabellingPresent,
+    photos,
+    notes,
+  } = req.body;
+
+  const issues = [];
+
+  // Cracked panels
+  const crackedCount = parseInt(crackedPanels, 10) || 0;
+  if (crackedCount > 0) {
+    issues.push(`${crackedCount} cracked panel(s) — replace immediately; arc fault and fire risk`);
+  }
+
+  // Hot spots
+  if (hotSpots === true || hotSpots === "true") {
+    const maxHotSpot = Array.isArray(hotSpotLocations)
+      ? Math.max(...hotSpotLocations.map((h) => parseFloat(h.temp_C) || 0))
+      : 0;
+    if (maxHotSpot > 80) {
+      issues.push(`Hot spot detected at ${maxHotSpot}°C — fire risk; replace affected cell/bypass diode`);
+    } else if (maxHotSpot > 20) {
+      issues.push(`Thermal anomaly at ${maxHotSpot}°C above ambient — monitor and investigate`);
+    }
+  }
+
+  // DC cabling
+  if (dcCablingCondition === "damaged" || dcCablingCondition === "exposed") {
+    issues.push(`DC cabling ${dcCablingCondition} — electric shock and fire risk under AS/NZS 5033`);
+  }
+
+  // Earthing
+  if (!earthingConnected) {
+    issues.push("Earthing not connected — shock risk in fault condition");
+  }
+
+  // DC isolator
+  if (!dcIsolatorWorking) {
+    issues.push("DC isolator not working — required for emergency shutdown per AS/NZS 5033");
+  }
+
+  // Inverter fault
+  if (inverterStatus === "fault" || inverterStatus === "offline") {
+    issues.push(`Inverter status: ${inverterStatus} — system not generating, investigate fault code`);
+  }
+
+  // Performance ratio check
+  const pr = parseFloat(performanceRatio_pct) || 0;
+  if (pr > 0 && pr < 70) {
+    issues.push(`Performance ratio ${pr}% is below 70% threshold — investigate shading, soiling, or degradation`);
+  }
+
+  // Fire labelling
+  if (!fireLabellingPresent) {
+    issues.push("Fire labelling not present — required per AS/NZS 5033 for emergency services");
+  }
+
+  const passed = issues.length === 0;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    property_address: sanitiseInput(propertyAddress),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    inspector_accreditation: sanitiseInput(inspectorAccreditation),
+    system_size_kw: systemSize_kW,
+    panel_count: panelCount,
+    panel_make: sanitiseInput(panelMake),
+    panel_model: sanitiseInput(panelModel),
+    inverter_make: sanitiseInput(inverterMake),
+    inverter_model: sanitiseInput(inverterModel),
+    mounting_type: sanitiseInput(mountingType),
+    inspection_type: sanitiseInput(inspectionType),
+    panel_condition: sanitiseInput(panelCondition),
+    cracked_panels: crackedCount,
+    delaminated_panels: delaminatedPanels || 0,
+    hot_spots: hotSpots,
+    hot_spot_locations: hotSpotLocations || [],
+    mounting_condition: sanitiseInput(mountingCondition),
+    loose_connections: looseConnections,
+    dc_cabling_condition: sanitiseInput(dcCablingCondition),
+    earthing_connected: earthingConnected,
+    inverter_status: sanitiseInput(inverterStatus),
+    inverter_error_code: sanitiseInput(inverterErrorCode),
+    expected_generation_kwh_day: expectedGeneration_kWh_day,
+    actual_generation_kwh_day: actualGeneration_kWh_day,
+    performance_ratio_pct: performanceRatio_pct,
+    specific_yield_kwh_kwp: specificYield_kWh_kWp,
+    anti_islanding_tested: antiIslandingTested,
+    shutdown_procedure_posted: shutdownProcedurePosted,
+    dc_isolator_present: dcIsolatorPresent,
+    dc_isolator_working: dcIsolatorWorking,
+    ac_isolator_present: acIsolatorPresent,
+    fire_labelling_present: fireLabellingPresent,
+    issues,
+    overall_result: passed ? "COMPLIANT" : "ISSUES-IDENTIFIED",
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("solar_panel_inspections")
+      .insert(record);
+    if (dbErr) console.error("DB error /solar-panel-inspection:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Solar PV inspection recorded",
+    overallResult: passed ? "COMPLIANT" : "ISSUES-IDENTIFIED",
+    issuesCount: issues.length,
+    issues,
+    performanceRatio_pct: pr || null,
+    crackedPanels: crackedCount,
+    applicableStandards: [
+      "AS/NZS 5033",
+      "AS/NZS 4777.1",
+      "CEC Design and Installation Guidelines",
+      "AS/NZS 3000",
+    ],
+    saved,
+  });
+});
+
+// POST /bolted-joint-inspection — Structural bolted joint inspection per AS 4100 / AS/NZS 1296
+app.post("/bolted-joint-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    jointId,
+    location,
+    memberDescription,   // beam-column | splice | base-plate | purlin | connection-plate
+    inspectionDate,
+    inspector,
+    boltGrade,           // 4.6 | 8.8 | 10.9 | A4-70 (stainless)
+    boltDiameter_mm,
+    boltCount,
+    torqueRequired_Nm,   // design torque
+    snugTight,           // pre-installation snug tight done
+    tighteningMethod,    // turn-of-nut | torque-wrench | direct-tension-indicator | calibrated-wrench
+    boltsTorqueChecked,  // number torque checked
+    boltsPassedTorque,   // number that passed
+    failedBolts,         // array of { id, measured_Nm, pass }
+    washerPresent,        // AS 4100: hardened washers required for 8.8 and above
+    threadEngagement,    // adequate | inadequate
+    boltProtrusion_mm,   // minimum 1 complete thread visible per AS 4100
+    corrosionProtection, // paint | galvanised | stainless | unprotected
+    corrosionPresent,
+    slipResistanceClass, // 8.8/TF | 8.8/TB | 8.8/S (AS 4100 bolt categories)
+    contactArea,         // good | gap | plate-bow | surface-treatment-issue
+    photos,
+    notes,
+  } = req.body;
+
+  const failures = [];
+
+  // Torque pass rate
+  const checked = parseInt(boltsTorqueChecked, 10) || 0;
+  const passed_count = parseInt(boltsPassedTorque, 10) || 0;
+  const failedCount = Array.isArray(failedBolts) ? failedBolts.length : (checked - passed_count);
+
+  if (checked > 0) {
+    const passRate = passed_count / checked;
+    if (passRate < 0.9) {
+      failures.push(`Bolt torque pass rate ${Math.round(passRate * 100)}% — less than 90% passed. Re-torque all bolts`);
+    }
+  }
+
+  // Thread engagement
+  if (threadEngagement === "inadequate") {
+    failures.push("Inadequate thread engagement — bolt may strip under load");
+  }
+
+  // Washer requirement for 8.8 and above
+  if ((boltGrade === "8.8" || boltGrade === "10.9") && !washerPresent) {
+    failures.push(`Grade ${boltGrade} bolts require hardened washers under head and nut per AS 4100`);
+  }
+
+  // Contact area
+  if (contactArea === "gap") {
+    failures.push("Gap present at joint contact area — check plate flatness and surface preparation");
+  }
+
+  // Corrosion on structural bolts
+  if (corrosionPresent && corrosionProtection === "unprotected") {
+    failures.push("Corrosion on unprotected structural bolts — loss of clamping force");
+  }
+
+  const result = failures.length === 0 ? "COMPLIANT" : "NON-COMPLIANT";
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    joint_id: sanitiseInput(jointId),
+    location: sanitiseInput(location),
+    member_description: sanitiseInput(memberDescription),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    bolt_grade: sanitiseInput(boltGrade),
+    bolt_diameter_mm: boltDiameter_mm,
+    bolt_count: boltCount,
+    torque_required_nm: torqueRequired_Nm,
+    snug_tight: snugTight,
+    tightening_method: sanitiseInput(tighteningMethod),
+    bolts_torque_checked: boltsTorqueChecked,
+    bolts_passed_torque: boltsPassedTorque,
+    failed_bolts: failedBolts || [],
+    washer_present: washerPresent,
+    thread_engagement: sanitiseInput(threadEngagement),
+    bolt_protrusion_mm: boltProtrusion_mm,
+    corrosion_protection: sanitiseInput(corrosionProtection),
+    corrosion_present: corrosionPresent,
+    slip_resistance_class: sanitiseInput(slipResistanceClass),
+    contact_area: sanitiseInput(contactArea),
+    failures,
+    result,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("bolted_joint_inspections")
+      .insert(record);
+    if (dbErr) console.error("DB error /bolted-joint-inspection:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Bolted joint inspection recorded",
+    jointId: sanitiseInput(jointId),
+    result,
+    boltsTorqueChecked: checked,
+    boltsFailed: failedCount,
+    failuresCount: failures.length,
+    failures,
+    applicableStandards: ["AS 4100", "AS/NZS 1296", "AS 4291"],
+    saved,
+  });
+});
+
+// POST /ai-solar-system-assessment — AI assesses solar PV performance, defects, and safety compliance
+app.post("/ai-solar-system-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    systemSize_kW,
+    performanceRatio_pct,
+    specificYield_kWh_kWp,
+    installationYear,
+    panelCondition,
+    hotSpots,
+    inverterStatus,
+    shadingIssues,
+    soiling,
+    roofType,
+    orientation,          // north | NW | NE | E | W
+    tiltAngle_deg,
+    location_postcode,
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are a solar PV engineer and CEC-accredited designer with 15 years experience assessing residential and commercial solar systems in Australia. Assess solar PV performance, defects, and safety compliance per AS/NZS 5033, AS/NZS 4777.1, and Clean Energy Council Design and Installation Guidelines.
+
+Assess:
+1. Performance ratio and specific yield benchmarks for Australian climate
+2. Degradation rate — typical 0.5%/year for modern panels
+3. Common defect identification — hot spots, delamination, PID, bypass diode failure
+4. Inverter performance and MPPT efficiency
+5. Shading and soiling loss quantification
+6. System sizing and orientation adequacy
+7. Fire safety compliance — AS/NZS 5033, labelling, isolation
+
+Respond with JSON: { "performanceRating": "excellent|good|average|poor|critical", "estimatedAnnualGeneration_kWh": number, "benchmarkPerformanceRatio_pct": number, "degradationEstimate_pct_year": number, "identifiedDefects": [], "safetyFindings": [], "shadingLoss_pct": number, "soilingLoss_pct": number, "inverterEfficiencyRating": "string", "remediationPriority": "none|low|medium|high|urgent", "remediationActions": [], "expectedRemainingLife_years": number, "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const userContent = [
+    {
+      type: "text",
+      text: `System size: ${systemSize_kW || "not specified"} kW
+Performance ratio: ${performanceRatio_pct || "not measured"}%
+Specific yield: ${specificYield_kWh_kWp || "not measured"} kWh/kWp
+Installation year: ${installationYear || "not specified"}
+Panel condition: ${panelCondition || "not specified"}
+Hot spots detected: ${hotSpots || "no"}
+Inverter status: ${inverterStatus || "normal"}
+Shading issues: ${shadingIssues || "no"}
+Soiling: ${soiling || "no"}
+Roof type: ${roofType || "not specified"}
+Orientation: ${orientation || "north"}
+Tilt angle: ${tiltAngle_deg || "not specified"}°
+Location postcode: ${location_postcode || "not specified"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-solar-system-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        performanceRating: "average",
+        estimatedAnnualGeneration_kWh: (parseFloat(systemSize_kW) || 6.6) * 1400,
+        benchmarkPerformanceRatio_pct: 80,
+        degradationEstimate_pct_year: 0.5,
+        identifiedDefects: [
+          "Potential soiling reducing output by 5–10%",
+          "Age-related mild degradation from UV and thermal cycling",
+        ],
+        safetyFindings: [
+          "Verify fire labelling is present and legible",
+          "Check DC isolator operation annually",
+          "Inspect roof penetrations for water ingress annually",
+        ],
+        shadingLoss_pct: 0,
+        soilingLoss_pct: 7,
+        inverterEfficiencyRating: "97% typical for string inverter",
+        remediationPriority: "low",
+        remediationActions: [
+          "Clean panels to restore 5–7% soiling loss",
+          "Verify anti-islanding protection per AS/NZS 4777.1",
+          "Check all cable connections for thermal cycling loosening",
+        ],
+        expectedRemainingLife_years: 20,
+        applicableStandards: [
+          "AS/NZS 5033",
+          "AS/NZS 4777.1",
+          "CEC Design and Installation Guidelines",
+          "AS/NZS 3000",
+        ],
+        recommendation:
+          "Clean panels to remove soiling losses. Annual health check including visual inspection, thermal scan, and inverter data review recommended to maximise ROI.",
+        summary:
+          "Solar system is performing at average level for its age. Soiling is the most cost-effective improvement. Annual inspection and panel cleaning will improve generation by 5–10%.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
