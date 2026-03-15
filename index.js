@@ -35521,6 +35521,189 @@ app.post("/invoice-generator", apiKeyAuth, async (req, res) => {
   res.json({ success: true, invoiceId: null, invoiceNumber: invNum, totalAmount, dueDate: due, ...record, saved: false });
 });
 
+// ── Round 135: AI photo caption batch, comparison analysis, site photo diary ──
+
+// POST /batch-photo-caption — AI generates captions for multiple construction photos at once
+app.post("/batch-photo-caption", apiKeyAuth, async (req, res) => {
+  const { photos = [], jobType, jobAddress, style = "professional" } = req.body;
+
+  if (!photos.length) return res.status(400).json({ error: "photos array required." });
+  if (photos.length > 10) return res.status(400).json({ error: "Maximum 10 photos per batch." });
+
+  const validStyles = ["professional", "brief", "detailed", "client-friendly"];
+  const captionStyle = validStyles.includes(style) ? style : "professional";
+
+  const photoDescriptions = photos.map((p, i) =>
+    `Photo ${i + 1}: ${sanitiseInput(p.description || "")} (stage: ${sanitiseInput(p.stage || "")}, location: ${sanitiseInput(p.location || "")})`
+  ).join("\n");
+
+  const prompt = `You are a construction documentation specialist. Generate ${captionStyle} captions for the following construction photos for a ${sanitiseInput(jobType || "general")} job at ${sanitiseInput(jobAddress || "site")}.
+
+${photoDescriptions}
+
+Return a JSON object with:
+- "captions": array of { "photoNumber": number, "caption": string, "timestamp": null, "tags": string[] }
+- "jobSummary": brief overall summary of what the photos document
+- "recommendedAlbumTitle": suggested album/folder name`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1200,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, photoCount: photos.length, style: captionStyle, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      captions: photos.map((p, i) => ({
+        photoNumber: i + 1,
+        caption: `${sanitiseInput(jobType || "Construction")} work — ${sanitiseInput(p.stage || "progress")} at ${sanitiseInput(p.location || "site")}.`,
+        timestamp: null,
+        tags: [jobType, p.stage, p.location].filter(Boolean).map(t => sanitiseInput(t)),
+      })),
+      jobSummary: `Photo documentation of ${sanitiseInput(jobType || "construction")} works.`,
+      recommendedAlbumTitle: `${sanitiseInput(jobType || "Job")} Photos — ${new Date().toISOString().split("T")[0]}`,
+      photoCount: photos.length, style: captionStyle, generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /site-photo-diary — Create a chronological site photo diary entry
+app.post("/site-photo-diary", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, siteId, entryDate, entryBy,
+    photos = [], weatherConditions, personnelOnSite = 0,
+    activitiesDescription, progressPercent, notes,
+  } = req.body;
+
+  if (!projectId || !entryDate) return res.status(400).json({ error: "projectId and entryDate required." });
+
+  const diaryRef = `SPD-${sanitiseInput(projectId).slice(-4).toUpperCase()}-${entryDate.replace(/-/g, "")}`;
+
+  const processedPhotos = photos.map((p, idx) => ({
+    photoNumber: idx + 1,
+    caption: sanitiseInput(p.caption || ""),
+    stage: sanitiseInput(p.stage || ""),
+    location: sanitiseInput(p.location || ""),
+    url: p.url && isSafeUrl(p.url) ? p.url : null,
+    timestamp: p.timestamp || entryDate,
+  }));
+
+  const record = {
+    diary_ref: diaryRef,
+    project_id: sanitiseInput(projectId),
+    site_id: sanitiseInput(siteId || ""),
+    entry_date: entryDate,
+    entry_by: sanitiseInput(entryBy || ""),
+    photos: processedPhotos,
+    photo_count: processedPhotos.length,
+    weather_conditions: sanitiseInput(weatherConditions || ""),
+    personnel_on_site: Number(personnelOnSite),
+    activities_description: sanitiseInput(activitiesDescription || ""),
+    progress_percent: Number(progressPercent) || null,
+    notes: sanitiseInput(notes || ""),
+    status: "RECORDED",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("site_photo_diary")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, diaryId: data.id, diaryRef, photoCount: processedPhotos.length, ...record });
+  }
+
+  res.json({ success: true, diaryId: null, diaryRef, photoCount: processedPhotos.length, ...record, saved: false });
+});
+
+// GET /site-photo-diary/:projectId — List photo diary entries for a project
+app.get("/site-photo-diary/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { startDate, endDate } = req.query;
+
+  if (supabaseAdmin) {
+    let query = supabaseAdmin
+      .from("site_photo_diary")
+      .select("diary_ref, entry_date, photo_count, weather_conditions, progress_percent, entry_by, created_at")
+      .eq("project_id", projectId)
+      .order("entry_date", { ascending: false });
+
+    if (startDate) query = query.gte("entry_date", startDate);
+    if (endDate) query = query.lte("entry_date", endDate);
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "DB error." });
+
+    const totalPhotos = (data || []).reduce((s, e) => s + (e.photo_count || 0), 0);
+    return res.json({ projectId, entries: data || [], entryCount: (data || []).length, totalPhotos });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /ai-photo-comparison — AI compares two construction photo descriptions and identifies changes
+app.post("/ai-photo-comparison", apiKeyAuth, async (req, res) => {
+  const {
+    beforeDescription, afterDescription, trade,
+    comparisonType = "before-after", locationDescription,
+  } = req.body;
+
+  if (!beforeDescription || !afterDescription)
+    return res.status(400).json({ error: "beforeDescription and afterDescription required." });
+
+  const prompt = `You are a construction quality inspector comparing ${sanitiseInput(comparisonType)} photos. Identify changes, progress, and any quality concerns.
+
+Location: ${sanitiseInput(locationDescription || "Not specified")}
+Trade: ${sanitiseInput(trade || "General construction")}
+Comparison type: ${sanitiseInput(comparisonType)}
+
+BEFORE/FIRST PHOTO:
+${sanitiseInput(beforeDescription)}
+
+AFTER/SECOND PHOTO:
+${sanitiseInput(afterDescription)}
+
+Return a JSON object with:
+- "changesIdentified": array of specific changes observed
+- "progressAssessment": "SIGNIFICANT_PROGRESS"|"MODERATE_PROGRESS"|"MINOR_PROGRESS"|"NO_VISIBLE_CHANGE"|"REGRESSION"
+- "progressPercent": estimated progress made between photos (0-100)
+- "qualityObservations": array of quality observations
+- "concerns": array of any concerns noted
+- "complianceFlags": array of potential compliance issues visible
+- "narrativeSummary": 2-3 sentence comparison narrative
+- "recommendation": what should happen next`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1000,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, trade, comparisonType, comparedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      changesIdentified: [],
+      progressAssessment: "MODERATE_PROGRESS",
+      progressPercent: null,
+      qualityObservations: [],
+      concerns: [],
+      complianceFlags: [],
+      narrativeSummary: "Automated photo comparison temporarily unavailable. Manual review recommended.",
+      recommendation: "Have a qualified inspector review the photos directly.",
+      trade, comparisonType, comparedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
