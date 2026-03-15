@@ -69357,6 +69357,387 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /fall-arrest-equipment-inspection — Personal fall arrest equipment inspection per AS/NZS 1891.4
+app.post("/fall-arrest-equipment-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    inspectionDate,
+    inspector,
+    workerName,
+    equipmentItems,       // array of { type, serialNo, manufacturer, manufactureDateYear, condition, lastInspectionDate }
+    harnessId,
+    harnessMfgYear,
+    harnessCondition,     // good | stitching-damaged | webbing-cut | webbing-heat | deformed-hardware | retire
+    harnessFallIndicator, // has the harness been in a fall — if yes, retire
+    harnessLastInspected,
+    lanyardId,
+    lanyardType,          // fixed-length | energy-absorber | self-retracting
+    lanyardLength_m,
+    lanyardCondition,     // good | kinked | cut | heat-damage | retire
+    energyAbsorberDeployed, // true — if PFAS pack has deployed, retire
+    srlId,                // self-retracting lifeline
+    srlCondition,
+    anchorType,           // rated-anchor | structural-beam | dedicated-hardware | improvised
+    anchorCapacity_kN,    // must be ≥15 kN per AS 1891.4
+    anchorCondition,
+    equipmentAge_years,   // AS/NZS 1891.4: retire synthetic webbing at 10 years from manufacture
+    totalFallsProtected,  // how many falls has equipment arrested — retire after any fall
+    criticalDefects,      // array of strings
+    overallResult,        // FIT-FOR-USE | RETIRE | REQUIRES-INSPECTION
+    photos,
+    notes,
+  } = req.body;
+
+  const retireReasons = [];
+
+  // Harness fall indicator
+  if (harnessFallIndicator === true || harnessFallIndicator === "true") {
+    retireReasons.push("Harness has been in a fall — RETIRE IMMEDIATELY per AS/NZS 1891.4");
+  }
+
+  // Energy absorber deployed
+  if (energyAbsorberDeployed === true || energyAbsorberDeployed === "true") {
+    retireReasons.push("Energy absorber (shock pack) has deployed — RETIRE IMMEDIATELY");
+  }
+
+  // Harness condition
+  if (harnessCondition === "retire") retireReasons.push("Harness condition warrants retirement");
+  if (harnessCondition === "stitching-damaged") retireReasons.push("Harness stitching damaged — retire");
+  if (harnessCondition === "webbing-cut") retireReasons.push("Harness webbing cut — retire");
+  if (harnessCondition === "webbing-heat") retireReasons.push("Harness heat damage — retire");
+
+  // Lanyard condition
+  if (lanyardCondition === "retire") retireReasons.push("Lanyard condition warrants retirement");
+  if (lanyardCondition === "cut") retireReasons.push("Lanyard webbing cut — retire");
+
+  // Age retirement — 10 years from manufacture per AS/NZS 1891.4
+  const age = parseFloat(equipmentAge_years) || 0;
+  if (age > 10) {
+    retireReasons.push(`Equipment is ${Math.round(age)} years old — exceeds 10-year synthetic retirement limit per AS/NZS 1891.4`);
+  }
+
+  // Anchor capacity
+  const anchorCap = parseFloat(anchorCapacity_kN) || 0;
+  if (anchorCap > 0 && anchorCap < 15) {
+    retireReasons.push(`Anchor capacity ${anchorCap} kN is below minimum 15 kN per AS 1891.4`);
+  }
+
+  // Improvised anchor
+  if (anchorType === "improvised") {
+    retireReasons.push("Improvised anchor point not acceptable — use rated anchor minimum 15 kN");
+  }
+
+  // Total falls
+  if (parseInt(totalFallsProtected, 10) >= 1) {
+    retireReasons.push("Equipment has arrested at least one fall — RETIRE per AS/NZS 1891.4");
+  }
+
+  // Custom critical defects
+  if (Array.isArray(criticalDefects)) criticalDefects.forEach((d) => retireReasons.push(d));
+
+  const mustRetire = retireReasons.length > 0;
+  const result = mustRetire ? "RETIRE" : (overallResult || "FIT-FOR-USE");
+
+  if (mustRetire) {
+    return res.status(422).json({
+      error: "Fall arrest equipment must be RETIRED — do not use",
+      retireReasons,
+      immediateActions: [
+        "Remove equipment from service immediately",
+        "Mark clearly as CONDEMNED/DO NOT USE",
+        "Destroy or dispose to prevent re-use",
+        "Replace with compliant equipment before accessing height",
+      ],
+      applicableStandards: [
+        "AS/NZS 1891.1",
+        "AS/NZS 1891.4",
+        "OHS Regulations 2017 (Vic) Part 3.4",
+        "WorkSafe Victoria Fall Prevention Code of Practice",
+      ],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    worker_name: sanitiseInput(workerName),
+    equipment_items: equipmentItems || [],
+    harness_id: sanitiseInput(harnessId),
+    harness_mfg_year: harnessMfgYear,
+    harness_condition: sanitiseInput(harnessCondition),
+    harness_fall_indicator: harnessFallIndicator,
+    lanyard_id: sanitiseInput(lanyardId),
+    lanyard_type: sanitiseInput(lanyardType),
+    lanyard_length_m: lanyardLength_m,
+    lanyard_condition: sanitiseInput(lanyardCondition),
+    energy_absorber_deployed: energyAbsorberDeployed,
+    srl_id: sanitiseInput(srlId),
+    srl_condition: sanitiseInput(srlCondition),
+    anchor_type: sanitiseInput(anchorType),
+    anchor_capacity_kn: anchorCapacity_kN,
+    anchor_condition: sanitiseInput(anchorCondition),
+    equipment_age_years: equipmentAge_years,
+    overall_result: result,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("fall_arrest_equipment_inspections")
+      .insert(record);
+    if (dbErr) console.error("DB error /fall-arrest-equipment-inspection:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Fall arrest equipment inspection completed — fit for use",
+    overallResult: result,
+    equipmentAge_years: age,
+    anchorCapacity_kN: anchorCap,
+    applicableStandards: ["AS/NZS 1891.1", "AS/NZS 1891.4", "OHS Regulations 2017 (Vic)"],
+    saved,
+  });
+});
+
+// POST /heritage-asset-assessment — Heritage asset condition documentation per Heritage Act 2017 (Vic)
+app.post("/heritage-asset-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    assetId,
+    assetName,
+    propertyAddress,
+    heritageListing,      // VHR | local-planning-overlay | Commonwealth | unlisted
+    vhrNumber,
+    localOverlayNumber,
+    assessmentDate,
+    assessor,
+    assetType,            // building | structure | tree | archaeological | garden | cultural-landscape
+    constructionPeriod,   // era of construction
+    architecturalStyle,
+    significanceLevel,    // exceptional | high | moderate | low
+    integrityRating,      // high | medium | low — how much original fabric remains
+    conditionRating,      // good | fair | poor | dangerous
+    elements,             // array of { element, condition, significance, action }
+    structuralDefects,    // array of strings
+    maintenanceDeficiencies, // array of strings
+    proposedWorks,        // array of { description, impact: no-impact|minor|substantial|adverse }
+    heritagePermitRequired,
+    heritagePlanRequired,
+    conservationWorkRequired,
+    urgentWorksRequired,   // structurally dangerous heritage buildings
+    photos,
+    notes,
+  } = req.body;
+
+  // Check proposed works for adverse heritage impact
+  const adverseImpact = Array.isArray(proposedWorks)
+    ? proposedWorks.filter((w) => w.impact === "adverse" || w.impact === "substantial")
+    : [];
+
+  const alerts = [];
+
+  if (adverseImpact.length > 0) {
+    alerts.push(
+      `${adverseImpact.length} proposed work(s) may have substantial/adverse heritage impact — Heritage permit required`
+    );
+  }
+
+  if (conditionRating === "dangerous") {
+    alerts.push("Heritage asset assessed as DANGEROUS — urgent structural stabilisation required");
+  }
+
+  if (heritagePermitRequired && !alerts.some((a) => a.includes("permit"))) {
+    alerts.push("Heritage permit required before commencing any works — apply to Heritage Victoria");
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    asset_id: sanitiseInput(assetId),
+    asset_name: sanitiseInput(assetName),
+    property_address: sanitiseInput(propertyAddress),
+    heritage_listing: sanitiseInput(heritageListing),
+    vhr_number: sanitiseInput(vhrNumber),
+    local_overlay_number: sanitiseInput(localOverlayNumber),
+    assessment_date: assessmentDate,
+    assessor: sanitiseInput(assessor),
+    asset_type: sanitiseInput(assetType),
+    construction_period: sanitiseInput(constructionPeriod),
+    architectural_style: sanitiseInput(architecturalStyle),
+    significance_level: sanitiseInput(significanceLevel),
+    integrity_rating: sanitiseInput(integrityRating),
+    condition_rating: sanitiseInput(conditionRating),
+    elements: elements || [],
+    structural_defects: structuralDefects || [],
+    maintenance_deficiencies: maintenanceDeficiencies || [],
+    proposed_works: proposedWorks || [],
+    adverse_impact_works: adverseImpact,
+    heritage_permit_required: heritagePermitRequired,
+    heritage_plan_required: heritagePlanRequired,
+    conservation_work_required: conservationWorkRequired,
+    urgent_works_required: urgentWorksRequired,
+    alerts,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("heritage_asset_assessments")
+      .insert(record);
+    if (dbErr) console.error("DB error /heritage-asset-assessment:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Heritage asset assessment recorded",
+    assetId: sanitiseInput(assetId),
+    conditionRating: sanitiseInput(conditionRating),
+    significanceLevel: sanitiseInput(significanceLevel),
+    alertsCount: alerts.length,
+    alerts,
+    adverseImpactWorksCount: adverseImpact.length,
+    applicableLegislation: [
+      "Heritage Act 2017 (Vic)",
+      "Planning and Environment Act 1987 (Vic)",
+      "Australia ICOMOS Burra Charter",
+      "Commonwealth Heritage Management Principles",
+    ],
+    saved,
+  });
+});
+
+// POST /ai-fall-protection-assessment — AI assesses fall protection adequacy, anchor requirements, and rescue plan
+app.post("/ai-fall-protection-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    workAtHeight_m,
+    workType,             // roofing | maintenance | construction | window-cleaning | inspection
+    fallHazards,          // array of surfaces/edges at risk
+    existingProtection,   // guardrails | safety-net | PFAS | edge-protection | none
+    anchorPoints,         // available anchor types
+    numberOfWorkers,
+    workDuration_hours,
+    rescuePlan,
+    accessEgress,
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are a fall prevention specialist and safety engineer with 20 years experience on Australian construction and building maintenance projects. Assess fall protection adequacy per AS/NZS 1891 series, OHS Regulations 2017 (Vic) Part 3.4, and WorkSafe Victoria Fall Prevention Code of Practice.
+
+Assess:
+1. Fall prevention hierarchy — eliminate > passive protection (guardrails, barriers) > active protection (nets) > PFAS
+2. Free-fall distance calculation — total arresting distance includes lanyard length + anchor height + energy absorber deployment + body suspension + safety factor
+3. Swing fall hazard when working off-side of anchor point
+4. Suspended worker rescue — plan before entry, not after incident
+5. Travel restraint vs fall arrest — restraint preferred to prevent reaching fall hazard
+6. Collective vs personal protection priorities
+7. Required anchor capacity calculations
+
+Respond with JSON: { "fallRisk": "low|medium|high|critical", "minimumProtectionRequired": "string", "recommendedProtectionSystem": "string", "freeFallDistance_m": number, "clearanceRequired_m": number, "clearanceAvailable": boolean, "swingFallHazard": boolean, "rescuePlanAdequate": boolean, "rescuePlanRecommendations": [], "anchorRequirements": "string", "additionalControls": [], "hierachyOfControls": [], "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Work height: ${workAtHeight_m || "not specified"} m
+Work type: ${workType || "not specified"}
+Fall hazards: ${Array.isArray(fallHazards) ? fallHazards.join(", ") : (fallHazards || "not specified")}
+Existing protection: ${existingProtection || "none"}
+Available anchors: ${Array.isArray(anchorPoints) ? anchorPoints.join(", ") : (anchorPoints || "none")}
+Number of workers: ${numberOfWorkers || "not specified"}
+Work duration: ${workDuration_hours || "not specified"} hours
+Rescue plan: ${rescuePlan || "not established"}
+Access/egress: ${accessEgress || "not specified"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-fall-protection-assessment error:", err.message);
+    const height = parseFloat(workAtHeight_m) || 3;
+    res.json({
+      source: "fallback",
+      assessment: {
+        fallRisk: height > 6 ? "high" : "medium",
+        minimumProtectionRequired:
+          height > 2 ? "Fall arrest system or passive protection (guardrails)" : "Monitor for changes",
+        recommendedProtectionSystem:
+          height > 6
+            ? "Permanently fixed guardrails or safety netting as primary; PFAS as secondary"
+            : "Temporary edge protection or travel restraint",
+        freeFallDistance_m: 1.75 + 0.175 + height * 0.15,
+        clearanceRequired_m: 6.3,
+        clearanceAvailable: height > 6.3,
+        swingFallHazard: true,
+        rescuePlanAdequate: false,
+        rescuePlanRecommendations: [
+          "Establish rescue plan before workers access height",
+          "Designate rescue person with training to lower/assist suspended worker",
+          "Suspension trauma is life-threatening within 15–30 minutes — rapid rescue essential",
+          "Pre-rig rescue equipment before entry",
+        ],
+        anchorRequirements:
+          "Minimum 15 kN rated anchor per AS 1891.4. Engineer-certified horizontal lifeline for fall arrest.",
+        additionalControls: [
+          "Work area supervision by safety observer",
+          "Buddy system — two workers minimum for PFAS use",
+          "Morning rescue drill before work commences",
+        ],
+        hierachyOfControls: [
+          "Eliminate: Can work be done from ground with EWP or long-reach tools?",
+          "Passive protection: Fixed guardrails are preferred over PFAS",
+          "Active protection: Safety nets for large open areas",
+          "PFAS: Last resort when passive measures impractical",
+        ],
+        applicableStandards: [
+          "AS/NZS 1891.1",
+          "AS/NZS 1891.4",
+          "OHS Regulations 2017 (Vic) Part 3.4",
+          "WorkSafe Victoria Fall Prevention Code of Practice",
+        ],
+        recommendation:
+          "Install passive fall protection (guardrails or edge protection) as primary control. Establish rescue plan before commencing work at height. Ensure all PFAS equipment is inspected and within service life.",
+        summary:
+          "Work at height presents significant fall risk. The rescue plan is as important as the fall prevention system — suspension trauma can be fatal within 30 minutes. Establish rescue capability before anyone accesses height.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
