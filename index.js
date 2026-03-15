@@ -79046,6 +79046,395 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 280 ─────────────────────────────────────────────────────────────────
+
+// POST /hvac-maintenance-record — Record HVAC system maintenance per AS 1851 / AS 1668
+app.post("/hvac-maintenance-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, systemId, location, maintenanceDate, technicianName,
+      licenceNumber, systemType, maintenanceType,
+      filterCondition, filterReplaced, filterMERV,
+      coilCleaned, coilCondition, beltsInspected, beltsReplaced,
+      refrigerantChargeOk, refrigerantLeakCheck, refrigerantLoss,
+      compressorAmpsDraw, specifiedAmps, electricalTestPassed,
+      airflowMeasuredLs, airflowSpecifiedLs,
+      coolingOutputKw, heatingOutputKw,
+      fanBearingCondition, drainPanCleaned, condensateDrainClear,
+      outdoorUnitCondition, controlsCalibrated,
+      nextMaintenanceDue, notes
+    } = req.body;
+
+    if (!systemId || !location || !maintenanceDate || !technicianName) {
+      return res.status(400).json({ error: "systemId, location, maintenanceDate, technicianName are required." });
+    }
+
+    const safeSystem = sanitiseInput(String(systemId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeTech = sanitiseInput(String(technicianName));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+
+    const compressorAmps = parseFloat(compressorAmpsDraw) || null;
+    const specAmps = parseFloat(specifiedAmps) || null;
+    const measAirflow = parseFloat(airflowMeasuredLs) || null;
+    const specAirflow = parseFloat(airflowSpecifiedLs) || null;
+    const refrigLoss = parseFloat(refrigerantLoss) || 0;
+
+    const criticalIssues = [];
+    const warnings = [];
+
+    // AS 1851 — Maintenance of fire protection systems (if HVAC includes fire modes)
+    // AS 1668.2 — Mechanical ventilation and air conditioning
+    // Ozone Protection and Synthetic Greenhouse Gas Management Act 1989 (Cth) — refrigerant
+
+    if (compressorAmps !== null && specAmps !== null) {
+      if (compressorAmps > specAmps * 1.1) {
+        warnings.push(`Compressor amps ${compressorAmps}A above rated ${specAmps}A — possible low charge, dirty condenser, or mechanical issue.`);
+      }
+    }
+
+    if (measAirflow !== null && specAirflow !== null) {
+      const deviation = Math.abs(measAirflow - specAirflow) / specAirflow * 100;
+      if (deviation > 15) {
+        criticalIssues.push(`Airflow ${measAirflow}L/s deviates ${deviation.toFixed(1)}% from specified ${specAirflow}L/s — exceeds AIRAH 15% tolerance. Rebalance required (AS 1668.2).`);
+      }
+    }
+
+    if (refrigerantLeakCheck === true || refrigerantLeakCheck === "true") {
+      if (refrigLoss > 0) {
+        criticalIssues.push(`Refrigerant loss ${refrigLoss}kg detected — refrigerant leak requires repair and recharge. Licensed refrigerant handling required (ARCS licence, Ozone Protection Act 1989 Cth).`);
+      }
+    }
+
+    if (!electricalTestPassed) {
+      criticalIssues.push("Electrical test not passed — do not operate HVAC until electrical fault is rectified.");
+    }
+
+    const filterCond = String(filterCondition || "").toUpperCase();
+    if (filterCond === "BLOCKED" || filterCond === "FAILED") {
+      warnings.push(`Filter condition ${filterCondition} — replace filter immediately to restore airflow and air quality.`);
+    }
+
+    if (!drainPanCleaned) {
+      warnings.push("Drain pan not cleaned — blocked condensate drains cause water damage and mould growth (AS 3666.2 Legionella risk).");
+    }
+    if (!condensateDrainClear) {
+      warnings.push("Condensate drain not cleared — overflow will cause water damage.");
+    }
+
+    const outdoorCond = String(outdoorUnitCondition || "").toUpperCase();
+    if (outdoorCond === "OBSTRUCTED" || outdoorCond === "DAMAGED") {
+      warnings.push(`Outdoor unit condition ${outdoorUnitCondition} — address to prevent heat rejection issues and compressor damage.`);
+    }
+
+    const maint = String(maintenanceType || "").toUpperCase();
+    if (maint === "ANNUAL" && !controlsCalibrated) {
+      warnings.push("Annual maintenance — controls calibration not confirmed. Calibrate BMS/thermostats per AS 1668.2.");
+    }
+
+    const maintenanceStatus = criticalIssues.length > 0 ? "DEFECTS_FOUND" : warnings.length > 0 ? "ATTENTION_REQUIRED" : "SERVICEABLE";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("hvac_maintenance_records")
+        .insert({
+          project_id: safeProject,
+          system_id: safeSystem,
+          location: safeLocation,
+          maintenance_date: maintenanceDate,
+          technician_name: safeTech,
+          licence_number: licenceNumber ? sanitiseInput(String(licenceNumber)) : null,
+          system_type: systemType ? sanitiseInput(String(systemType)) : null,
+          maintenance_type: maintenanceType ? sanitiseInput(String(maintenanceType)) : null,
+          filter_condition: filterCondition || null,
+          filter_replaced: filterReplaced || false,
+          coil_cleaned: coilCleaned || false,
+          belts_replaced: beltsReplaced || false,
+          refrigerant_charge_ok: refrigerantChargeOk !== false && refrigerantChargeOk !== "false",
+          refrigerant_loss_kg: refrigLoss || null,
+          compressor_amps_draw: compressorAmps,
+          specified_amps: specAmps,
+          electrical_test_passed: electricalTestPassed !== false && electricalTestPassed !== "false",
+          airflow_measured_ls: measAirflow,
+          airflow_specified_ls: specAirflow,
+          drain_pan_cleaned: drainPanCleaned || false,
+          condensate_drain_clear: condensateDrainClear !== false && condensateDrainClear !== "false",
+          controls_calibrated: controlsCalibrated || false,
+          next_maintenance_due: nextMaintenanceDue || null,
+          maintenance_status: maintenanceStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        maintenanceStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "HVAC critical defects found — do not operate until rectified.",
+        standards: ["AS 1668.2", "AS 3666.2", "Ozone Protection Act 1989 (Cth)"],
+      });
+    }
+
+    res.json({
+      maintenanceStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      systemId: safeSystem,
+      nextMaintenanceDue: nextMaintenanceDue || null,
+      standards: ["AS 1668.2", "AS 3666.2"],
+    });
+  } catch (err) {
+    console.error("POST /hvac-maintenance-record error:", err.message);
+    res.status(500).json({ error: "Failed to record HVAC maintenance." });
+  }
+});
+
+// POST /lift-maintenance-record — Record lift/elevator maintenance per AS 1418.1 and ESM obligations
+app.post("/lift-maintenance-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, liftId, location, maintenanceDate, technicianName,
+      licenceNumber, liftType, maintenanceType,
+      doorsOperatingOk, doorForceN, doorReverseOk,
+      levelingAccuracyMm, toleranceMm,
+      safetyGearTest, bufferTest, governorTest,
+      lightCurtainOk, overspeedGovernorOk,
+      cabinLightingOk, emergencyLightingOk, emergencyPhoneOk,
+      machineRoomCondition, brakeTest, hydraulicFluidLevel,
+      annualMaintenanceCert, certRef, notes
+    } = req.body;
+
+    if (!liftId || !location || !maintenanceDate || !technicianName) {
+      return res.status(400).json({ error: "liftId, location, maintenanceDate, technicianName are required." });
+    }
+
+    const safeLiftId = sanitiseInput(String(liftId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeTech = sanitiseInput(String(technicianName));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+
+    const criticalIssues = [];
+    const warnings = [];
+
+    const levelingMm = parseFloat(levelingAccuracyMm) || null;
+    const toleranceMmVal = parseFloat(toleranceMm) || 10; // AS 1418.1 — 10mm landing tolerance
+    const doorForce = parseFloat(doorForceN) || null;
+    const maxDoorForce = 135; // AS 1418.1 maximum door reopening force
+
+    // AS 1418.1 — Lifts, escalators and moving walks
+    // Building Regulations 2018 (Vic) — ESM obligation
+    if (!emergencyPhoneOk) {
+      criticalIssues.push("Emergency phone non-operational — mandatory life safety device. Do not operate lift (AS 1418.1 cl.14.2.3).");
+    }
+
+    if (!emergencyLightingOk) {
+      criticalIssues.push("Emergency lighting non-operational — safety issue. Do not operate lift (AS 1418.1).");
+    }
+
+    if (safetyGearTest === false || safetyGearTest === "false") {
+      criticalIssues.push("Safety gear test failed — overspeed/overload protection non-functional. Take lift out of service immediately (AS 1418.1).");
+    }
+
+    if (brakeTest === false || brakeTest === "false") {
+      criticalIssues.push("Brake test failed — lift must not operate until brake is repaired and re-tested (AS 1418.1).");
+    }
+
+    if (!doorReverseOk) {
+      criticalIssues.push("Door reversal device not operating — crush/entrapment risk. Do not operate lift (AS 1418.1 cl.7.3.7).");
+    }
+
+    if (doorForce !== null && doorForce > maxDoorForce) {
+      warnings.push(`Door reopening force ${doorForce}N exceeds maximum ${maxDoorForce}N — reduce door force adjustment.`);
+    }
+
+    if (levelingMm !== null && levelingMm > toleranceMmVal) {
+      warnings.push(`Landing leveling accuracy ${levelingMm}mm exceeds tolerance ${toleranceMmVal}mm — trip hazard. Adjust (AS 1418.1 cl.5.11).`);
+    }
+
+    if (overspeedGovernorOk === false || overspeedGovernorOk === "false") {
+      criticalIssues.push("Overspeed governor non-functional — take lift out of service (AS 1418.1).");
+    }
+
+    const maint = String(maintenanceType || "").toUpperCase();
+    if ((maint === "ANNUAL" || maint === "MAJOR") && !annualMaintenanceCert) {
+      warnings.push("Annual maintenance certificate not issued — required for ESM compliance (Building Regulations 2018 Vic) and owner's insurance.");
+    }
+
+    const maintenanceStatus = criticalIssues.length > 0 ? "TAKE_OUT_OF_SERVICE" : warnings.length > 0 ? "ATTENTION_REQUIRED" : "SERVICEABLE";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("lift_maintenance_records")
+        .insert({
+          project_id: safeProject,
+          lift_id: safeLiftId,
+          location: safeLocation,
+          maintenance_date: maintenanceDate,
+          technician_name: safeTech,
+          licence_number: licenceNumber ? sanitiseInput(String(licenceNumber)) : null,
+          lift_type: liftType ? sanitiseInput(String(liftType)) : null,
+          maintenance_type: maintenanceType ? sanitiseInput(String(maintenanceType)) : null,
+          doors_operating_ok: doorsOperatingOk !== false && doorsOperatingOk !== "false",
+          door_force_n: doorForce,
+          door_reverse_ok: doorReverseOk !== false && doorReverseOk !== "false",
+          leveling_accuracy_mm: levelingMm,
+          safety_gear_test: safetyGearTest !== false && safetyGearTest !== "false",
+          brake_test: brakeTest !== false && brakeTest !== "false",
+          overspeed_governor_ok: overspeedGovernorOk !== false && overspeedGovernorOk !== "false",
+          emergency_lighting_ok: emergencyLightingOk !== false && emergencyLightingOk !== "false",
+          emergency_phone_ok: emergencyPhoneOk !== false && emergencyPhoneOk !== "false",
+          annual_maintenance_cert: annualMaintenanceCert || false,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          maintenance_status: maintenanceStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        maintenanceStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Lift safety defects — take out of service immediately.",
+        standards: ["AS 1418.1", "Building Regulations 2018 (Vic)", "AS 1851"],
+      });
+    }
+
+    res.json({
+      maintenanceStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      liftId: safeLiftId,
+      standards: ["AS 1418.1", "Building Regulations 2018 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /lift-maintenance-record error:", err.message);
+    res.status(500).json({ error: "Failed to record lift maintenance." });
+  }
+});
+
+// POST /ai-mechanical-services-assessment — AI assesses mechanical building services compliance and performance
+app.post("/ai-mechanical-services-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      buildingType, buildingClass, grossFloorAreaM2,
+      hvacSystemType, ventilationMethod, coolingCapacityKw,
+      heatingCapacityKw, freshAirRateLsPerPerson,
+      filterGrade, airChangesPerHour,
+      maintenanceHistory, deficienciesObserved,
+      energyPerformanceData, ageYears, siteContext
+    } = req.body;
+
+    if (!buildingType) {
+      return res.status(400).json({ error: "buildingType is required." });
+    }
+
+    const safeBuildingType = sanitiseInput(String(buildingType));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const deficiencies = Array.isArray(deficienciesObserved) ? deficienciesObserved.map(d => sanitiseInput(String(d))) : [];
+
+    const prompt = `You are a mechanical building services engineer assessing HVAC system compliance and performance for a Victorian building.
+
+Building type: ${safeBuildingType}
+Building class: ${buildingClass || "Unknown"}
+Gross floor area: ${grossFloorAreaM2 ? grossFloorAreaM2 + " m²" : "Unknown"}
+HVAC system type: ${hvacSystemType || "Unknown"}
+Ventilation method: ${ventilationMethod || "Unknown"}
+Cooling capacity: ${coolingCapacityKw ? coolingCapacityKw + " kW" : "Unknown"}
+Heating capacity: ${heatingCapacityKw ? heatingCapacityKw + " kW" : "Unknown"}
+Fresh air rate: ${freshAirRateLsPerPerson ? freshAirRateLsPerPerson + " L/s/person" : "Unknown"}
+Filter grade: ${filterGrade || "Unknown"}
+Air changes per hour: ${airChangesPerHour || "Unknown"}
+System age: ${ageYears ? ageYears + " years" : "Unknown"}
+Maintenance history: ${maintenanceHistory || "Unknown"}
+Deficiencies observed: ${deficiencies.join("; ") || "None"}
+Energy performance: ${energyPerformanceData || "Not measured"}
+Location: ${safeSite}
+
+Assess under:
+- AS 1668.1 (fire and smoke control)
+- AS 1668.2 (mechanical ventilation and air conditioning)
+- AS 3666.1/2 (air handling and water systems — Legionella)
+- NCC 2022 Section J (energy efficiency)
+- Health (Legionella) Regulations 2016 (Vic)
+
+Provide:
+1. Compliance risk rating
+2. NCC Section J energy performance assessment
+3. Indoor air quality compliance (CO2, fresh air rates)
+4. Legionella risk assessment
+5. Maintenance obligations
+6. Recommended upgrades
+
+Respond ONLY in JSON:
+{
+  "complianceRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "nccSectionJCompliance": "COMPLIANT|NON_COMPLIANT|UNKNOWN",
+  "freshAirCompliance": "COMPLIANT|NON_COMPLIANT|UNKNOWN",
+  "legionellaRisk": "LOW|MODERATE|HIGH",
+  "maintenanceObligations": ["string"],
+  "complianceGaps": ["string"],
+  "energyEfficiencyIssues": ["string"],
+  "upgradeRecommendations": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        complianceRisk: "MODERATE",
+        nccSectionJCompliance: "UNKNOWN",
+        freshAirCompliance: "UNKNOWN",
+        legionellaRisk: "MODERATE",
+        maintenanceObligations: ["Annual AS 1851 maintenance", "Legionella risk assessment per Health Regulations 2016 (Vic)"],
+        complianceGaps: ["AI assessment unavailable — engage mechanical services engineer"],
+        energyEfficiencyIssues: ["Measure and benchmark NABERS energy rating"],
+        upgradeRecommendations: ["Consider BMS upgrade for improved control and monitoring"],
+        applicableStandards: ["AS 1668.1", "AS 1668.2", "AS 3666.1", "NCC 2022 Section J"],
+        summary: "AI mechanical services assessment unavailable. Engage mechanical engineer for formal compliance review.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      buildingType: safeBuildingType,
+      standards: ["AS 1668.1", "AS 1668.2", "AS 3666.1", "NCC 2022 Section J"],
+    });
+  } catch (err) {
+    console.error("POST /ai-mechanical-services-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess mechanical services." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
