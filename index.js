@@ -45178,6 +45178,251 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /waste-management-record — Log a construction waste disposal event
+app.post("/waste-management-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, recordDate, wasteType, wasteCategory,
+    volumeM3, weightKg, containerType, containerCount,
+    disposalFacility, facilityLicenceNumber,
+    disposalMethod, recycled, reused, landfill, recoveryRate,
+    transportContractor, docketNumber, manifested, notes,
+  } = req.body;
+
+  if (!projectId || !wasteType || !recordDate) {
+    return res.status(400).json({ error: "projectId, wasteType, and recordDate are required." });
+  }
+
+  const validWasteTypes = ["TIMBER", "CONCRETE", "STEEL", "PLASTERBOARD", "MASONRY", "PLASTIC", "CARDBOARD", "MIXED_GENERAL", "HAZARDOUS", "FILL", "GREEN_WASTE", "METAL", "GLASS", "ASPHALT", "OTHER"];
+  const validCategories = ["INERT", "GENERAL", "HAZARDOUS", "LIQUID", "EWASTE"];
+  const validMethods = ["RECYCLING", "REUSE", "ENERGY_RECOVERY", "LANDFILL", "COMPOSTING", "TREATMENT"];
+
+  const resolvedType = validWasteTypes.includes((wasteType || "").toUpperCase()) ? wasteType.toUpperCase() : "OTHER";
+  const resolvedCategory = validCategories.includes((wasteCategory || "").toUpperCase()) ? wasteCategory.toUpperCase() : "GENERAL";
+  const resolvedMethod = validMethods.includes((disposalMethod || "").toUpperCase()) ? disposalMethod.toUpperCase() : "LANDFILL";
+
+  // Hazardous waste checks — must have manifested transport
+  const warnings = [];
+  if (resolvedCategory === "HAZARDOUS" && !manifested) {
+    warnings.push("Hazardous waste must be transported under a waste transport certificate (EPA Victoria) — manifested transport required.");
+  }
+  if (resolvedCategory === "HAZARDOUS" && !facilityLicenceNumber) {
+    warnings.push("Hazardous waste disposal facility licence number required by EPA Victoria.");
+  }
+
+  // Diversion calculation
+  const totalDisposed = (volumeM3 || 0) + (weightKg ? weightKg / 1000 : 0);
+  const diversionRate = recycled || reused || recoveryRate
+    ? (recoveryRate || ((Number(recycled || 0) + Number(reused || 0)) / Math.max(totalDisposed, 0.001) * 100))
+    : (resolvedMethod !== "LANDFILL" ? 100 : 0);
+  const diversionPercent = Math.min(Math.round(diversionRate), 100);
+
+  // Victorian EPA waste levy applies to scheduled premises receiving waste
+  const epaLevyApplicable = resolvedCategory !== "INERT" || resolvedType === "ASPHALT";
+
+  const ref = `WMR-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectName: sanitiseInput(projectName || "", 200),
+    recordDate,
+    wasteType: resolvedType,
+    wasteCategory: resolvedCategory,
+    volumeM3: volumeM3 || null,
+    weightKg: weightKg || null,
+    containerType: sanitiseInput(containerType || "", 60),
+    containerCount: containerCount || null,
+    disposal: {
+      facility: sanitiseInput(disposalFacility || "", 200),
+      facilityLicenceNumber: sanitiseInput(facilityLicenceNumber || "", 60),
+      method: resolvedMethod,
+      docketNumber: sanitiseInput(docketNumber || "", 60),
+      manifested: !!manifested,
+    },
+    diversion: {
+      recycledM3: recycled || null,
+      reusedM3: reused || null,
+      landfillM3: landfill || null,
+      diversionPercent,
+    },
+    transport: {
+      contractor: sanitiseInput(transportContractor || "", 120),
+    },
+    epaLevyApplicable,
+    warnings,
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("waste_management_records").insert(record);
+      if (error) console.error("Waste record insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Waste record DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    wasteType: resolvedType,
+    wasteCategory: resolvedCategory,
+    disposalMethod: resolvedMethod,
+    diversionPercent,
+    epaLevyApplicable,
+    warnings,
+    message: warnings.length > 0 ? warnings[0] : `Waste record logged. Diversion rate: ${diversionPercent}%.`,
+    saved,
+    record,
+  });
+});
+
+// GET /waste-management-record/:projectId — Summary of waste records for a project
+app.get("/waste-management-record/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { from, to } = req.query;
+
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  try {
+    let query = supabaseAdmin
+      .from("waste_management_records")
+      .select("*")
+      .eq("projectId", sanitiseInput(String(projectId), 80))
+      .order("recordDate", { ascending: false });
+
+    if (from) query = query.gte("recordDate", from);
+    if (to) query = query.lte("recordDate", to);
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const records = data || [];
+    const totalVolumeM3 = records.reduce((s, r) => s + (r.volumeM3 || 0), 0);
+    const totalWeightKg = records.reduce((s, r) => s + (r.weightKg || 0), 0);
+    const landfillCount = records.filter(r => r.disposal?.method === "LANDFILL").length;
+    const hazardousCount = records.filter(r => r.wasteCategory === "HAZARDOUS").length;
+    const avgDiversion = records.length > 0
+      ? Math.round(records.reduce((s, r) => s + (r.diversion?.diversionPercent || 0), 0) / records.length)
+      : 0;
+
+    const byType = records.reduce((acc, r) => {
+      acc[r.wasteType] = (acc[r.wasteType] || 0) + (r.volumeM3 || 0);
+      return acc;
+    }, {});
+
+    return res.json({
+      projectId,
+      total: records.length,
+      totalVolumeM3: Math.round(totalVolumeM3 * 100) / 100,
+      totalWeightKg: Math.round(totalWeightKg),
+      landfillCount,
+      hazardousCount,
+      averageDiversionPercent: avgDiversion,
+      wasteByType: byType,
+      records,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to retrieve waste records.", detail: e.message });
+  }
+});
+
+// POST /ai-waste-diversion-plan — AI generates a construction waste diversion plan
+app.post("/ai-waste-diversion-plan", apiKeyAuth, async (req, res) => {
+  const {
+    projectType, projectSize, mainTrades, demolitionScope,
+    currentDiversionTarget, localRecyclers, councilRequirements, notes,
+  } = req.body;
+
+  if (!projectType) {
+    return res.status(400).json({ error: "projectType is required." });
+  }
+
+  const sanitisedType = sanitiseInput(projectType, 100);
+  const sanitisedTrades = Array.isArray(mainTrades)
+    ? mainTrades.map(t => sanitiseInput(String(t), 60)).slice(0, 10)
+    : [];
+
+  const prompt = `You are a sustainability consultant specialising in Victorian construction waste management.
+
+Generate a construction waste diversion plan for:
+- Project type: ${sanitisedType}
+- Project size: ${sanitiseInput(projectSize || "Medium", 60)}
+- Main trades: ${sanitisedTrades.join(", ") || "General construction"}
+- Demolition scope: ${sanitiseInput(demolitionScope || "None", 150)}
+- Diversion target: ${currentDiversionTarget ? `${currentDiversionTarget}%` : "Not specified"}
+- Local recyclers available: ${sanitiseInput(localRecyclers || "Standard Melbourne providers", 200)}
+- Council requirements: ${sanitiseInput(councilRequirements || "Standard Victorian requirements", 200)}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Reference: Victorian EPA Waste and Resource Recovery policy, National Waste Policy 2018, Sustainability Victoria guidelines.
+
+Respond ONLY with a JSON object:
+{
+  "diversionTarget": number (percentage),
+  "wasteStreams": [{"type": string, "estimatedVolumeM3": number, "disposalMethod": string, "recycler": string, "notes": string}],
+  "onSiteSeparation": [string],
+  "recyclingFacilities": [{"name": string, "wasteTypes": [string], "distanceKm": number}],
+  "wasteReductionStrategies": [string],
+  "demolitionWastePriorities": [string],
+  "reportingRequirements": [string],
+  "epaObligations": [string],
+  "estimatedCostSaving": string,
+  "summary": string (2-3 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1200,
+      temperature: 0.3,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      diversionTarget: parsed.diversionTarget || (currentDiversionTarget || 80),
+      wasteStreams: parsed.wasteStreams || [],
+      onSiteSeparation: parsed.onSiteSeparation || [],
+      recyclingFacilities: parsed.recyclingFacilities || [],
+      wasteReductionStrategies: parsed.wasteReductionStrategies || [],
+      demolitionWastePriorities: parsed.demolitionWastePriorities || [],
+      reportingRequirements: parsed.reportingRequirements || [],
+      epaObligations: parsed.epaObligations || [],
+      estimatedCostSaving: parsed.estimatedCostSaving || "",
+      summary: parsed.summary || "Waste diversion plan generated.",
+    });
+  } catch (e) {
+    console.error("AI waste diversion error:", e.message);
+    return res.json({
+      success: true,
+      diversionTarget: currentDiversionTarget || 80,
+      wasteStreams: [
+        { type: "TIMBER", estimatedVolumeM3: null, disposalMethod: "RECYCLING", recycler: "Local timber recycler", notes: "Separate clean timber from treated timber" },
+        { type: "CONCRETE", estimatedVolumeM3: null, disposalMethod: "RECYCLING", recycler: "Concrete recycler", notes: "Crushed for road base" },
+        { type: "STEEL", estimatedVolumeM3: null, disposalMethod: "RECYCLING", recycler: "Metal recycler", notes: "High recovery value" },
+        { type: "PLASTERBOARD", estimatedVolumeM3: null, disposalMethod: "RECYCLING", recycler: "Plasterboard recycler", notes: "Must be clean and dry" },
+        { type: "MIXED_GENERAL", estimatedVolumeM3: null, disposalMethod: "LANDFILL", recycler: "Landfill facility", notes: "Minimise mixed waste" },
+      ],
+      onSiteSeparation: ["Provide labelled skips for each waste stream", "Conduct weekly audits of bin contamination", "Tool-box talk on waste segregation at start of each trade"],
+      recyclingFacilities: [],
+      wasteReductionStrategies: ["Order materials to length where possible", "Use prefabricated components to reduce offcut waste", "Track waste weekly and review with site team"],
+      demolitionWastePriorities: ["Salvage timber, bricks, and metals before demolition begins", "Decontaminate before any crushing or mixing"],
+      reportingRequirements: ["Record waste type, volume, disposal facility, and docket number for each disposal event", "Submit waste management report at practical completion"],
+      epaObligations: ["Do not dispose of hazardous waste at unlicensed facilities", "Obtain EPA waste transport certificate for hazardous materials"],
+      estimatedCostSaving: "Recycling and diversion can reduce overall waste disposal costs by 20–40%.",
+      summary: "AI generation unavailable — generic Victorian construction waste diversion plan provided. Customise with local recycler details and project-specific waste estimates.",
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
