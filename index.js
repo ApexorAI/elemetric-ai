@@ -24618,6 +24618,173 @@ Respond with JSON:
   }
 });
 
+// POST /meeting-minutes  — Log meeting minutes for a project or job
+app.post("/meeting-minutes", apiKeyAuth, async (req, res) => {
+  const { projectId, jobId, meetingDate, meetingType, attendees = [], agenda, discussion, decisions = [], actionItems = [], nextMeetingDate, notes } = req.body || {};
+  if (!projectId && !jobId) return res.status(400).json({ error: "projectId or jobId required." });
+
+  const VALID_TYPES = ["site-meeting", "project-review", "safety-meeting", "client-meeting", "kick-off", "handover", "progress", "defects", "other"];
+  const safeProjId  = projectId ? sanitiseInput(String(projectId)).slice(0, 80) : null;
+  const safeJobId   = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeDate    = meetingDate ? sanitiseInput(String(meetingDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeType    = VALID_TYPES.includes(String(meetingType || "").toLowerCase().replace(/ /g, "-")) ? String(meetingType).toLowerCase().replace(/ /g, "-") : "other";
+  const safeAttendees = Array.isArray(attendees) ? attendees.slice(0, 30).map(a => sanitiseInput(String(a)).slice(0, 100)) : [];
+  const safeAgenda  = agenda ? sanitiseInput(String(agenda)).slice(0, 1000) : null;
+  const safeDisc    = discussion ? sanitiseInput(String(discussion)).slice(0, 2000) : null;
+  const safeDecisions = Array.isArray(decisions) ? decisions.slice(0, 20).map(d => sanitiseInput(String(d)).slice(0, 200)) : [];
+  const safeActions = Array.isArray(actionItems) ? actionItems.slice(0, 30).map(a => ({
+    action: sanitiseInput(String(a.action || a)).slice(0, 200),
+    assignedTo: a.assignedTo ? sanitiseInput(String(a.assignedTo)).slice(0, 100) : null,
+    dueDate: a.dueDate ? sanitiseInput(String(a.dueDate)).slice(0, 20) : null,
+    status: "OPEN",
+  })) : [];
+
+  const record = {
+    minutesId: `MTG-${(safeProjId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    projectId: safeProjId, jobId: safeJobId, meetingDate: safeDate, meetingType: safeType,
+    attendeeCount: safeAttendees.length, attendees: safeAttendees,
+    agenda: safeAgenda, discussion: safeDisc,
+    decisionCount: safeDecisions.length, decisions: safeDecisions,
+    actionItemCount: safeActions.length, actionItems: safeActions,
+    nextMeetingDate: nextMeetingDate ? sanitiseInput(String(nextMeetingDate)).slice(0, 20) : null,
+    notes: notes ? sanitiseInput(String(notes)).slice(0, 300) : null,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("meeting_minutes").insert({
+        minutes_id: record.minutesId, project_id: safeProjId, job_id: safeJobId,
+        meeting_date: safeDate, meeting_type: safeType, attendees: safeAttendees,
+        agenda: safeAgenda, discussion: safeDisc, decisions: safeDecisions,
+        action_items: safeActions, next_meeting_date: record.nextMeetingDate,
+        notes: record.notes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// GET /meeting-minutes/:projectId  — Get meeting minutes for a project
+app.get("/meeting-minutes/:projectId", apiKeyAuth, async (req, res) => {
+  const projectId = sanitiseInput(String(req.params.projectId || "")).slice(0, 80);
+  const type      = req.query.type ? sanitiseInput(String(req.query.type)).toLowerCase() : null;
+  if (!projectId) return res.status(400).json({ error: "projectId required." });
+
+  let minutes = [];
+  if (supabaseAdmin) {
+    try {
+      let q = supabaseAdmin.from("meeting_minutes").select("*").eq("project_id", projectId).order("meeting_date", { ascending: false }).limit(50);
+      if (type) q = q.eq("meeting_type", type);
+      const { data } = await q;
+      minutes = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const totalActions  = minutes.reduce((s, m) => s + (m.action_items?.length || 0), 0);
+  const totalDecisions = minutes.reduce((s, m) => s + (m.decisions?.length || 0), 0);
+
+  return res.json({ projectId, meetingCount: minutes.length, totalActionItems: totalActions, totalDecisions, minutes, generatedAt: new Date().toISOString() });
+});
+
+// POST /ai-lessons-learned  — AI generates a lessons learned summary at job completion
+app.post("/ai-lessons-learned", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, outcome, issues, successes, teamFeedback, complianceScore, delayDays, budgetVariance } = req.body || {};
+  if (!jobId || !jobType) return res.status(400).json({ error: "jobId and jobType required." });
+
+  const safeJobId   = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeType    = sanitiseInput(String(jobType)).slice(0, 40);
+  const safeOutcome = outcome ? sanitiseInput(String(outcome)).slice(0, 500) : null;
+  const safeIssues  = issues ? sanitiseInput(String(issues)).slice(0, 500) : null;
+  const safeSuccess = successes ? sanitiseInput(String(successes)).slice(0, 500) : null;
+  const safeFeedback = teamFeedback ? sanitiseInput(String(teamFeedback)).slice(0, 300) : null;
+  const safeScore   = typeof complianceScore === "number" ? Math.min(100, Math.max(0, complianceScore)) : null;
+  const safeDelay   = typeof delayDays === "number" ? delayDays : null;
+  const safeBudget  = typeof budgetVariance === "number" ? budgetVariance : null;
+
+  const prompt = `You are a project debrief facilitator for ${safeType} construction work.
+
+Generate a lessons learned summary for job ${safeJobId}:
+${safeOutcome ? `Outcome: ${safeOutcome}` : ""}
+${safeIssues ? `Issues encountered: ${safeIssues}` : ""}
+${safeSuccess ? `Successes: ${safeSuccess}` : ""}
+${safeFeedback ? `Team feedback: ${safeFeedback}` : ""}
+${safeScore !== null ? `Compliance score: ${safeScore}/100` : ""}
+${safeDelay !== null ? `Delay days: ${safeDelay}` : ""}
+${safeBudget !== null ? `Budget variance: $${safeBudget}` : ""}
+
+Respond with JSON:
+{
+  "overallOutcome": "SUCCESSFUL|PARTIALLY_SUCCESSFUL|UNSUCCESSFUL",
+  "keyLessons": ["lesson 1", ...],
+  "processImprovements": ["improvement 1", ...],
+  "bestPractices": ["practice to retain", ...],
+  "riskMitigation": ["future risk to address", ...],
+  "summary": "2-sentence executive summary"
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 600 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      jobId: safeJobId, jobType: safeType,
+      overallOutcome:      parsed.overallOutcome || "PARTIALLY_SUCCESSFUL",
+      keyLessons:          Array.isArray(parsed.keyLessons) ? parsed.keyLessons : [],
+      processImprovements: Array.isArray(parsed.processImprovements) ? parsed.processImprovements : [],
+      bestPractices:       Array.isArray(parsed.bestPractices) ? parsed.bestPractices : [],
+      riskMitigation:      Array.isArray(parsed.riskMitigation) ? parsed.riskMitigation : [],
+      summary:             parsed.summary || "",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      jobId: safeJobId, jobType: safeType, overallOutcome: "PARTIALLY_SUCCESSFUL",
+      keyLessons: ["Lessons learned analysis temporarily unavailable"],
+      processImprovements: [], bestPractices: [], riskMitigation: [], summary: "",
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// GET /job-summary/:jobId  — Consolidated summary of all key data for a job
+app.get("/job-summary/:jobId", apiKeyAuth, async (req, res) => {
+  const jobId = sanitiseInput(String(req.params.jobId || "")).slice(0, 80);
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  const summary = { jobId, fetchedAt: new Date().toISOString(), components: {} };
+
+  if (supabaseAdmin) {
+    try {
+      const results = await Promise.allSettled([
+        supabaseAdmin.from("jobs").select("*").eq("id", jobId).single(),
+        supabaseAdmin.from("job_notes").select("count").eq("job_id", jobId),
+        supabaseAdmin.from("job_photos").select("count").eq("job_id", jobId),
+        supabaseAdmin.from("punch_list").select("count").eq("job_id", jobId).eq("status", "OPEN"),
+        supabaseAdmin.from("quality_inspections").select("result").eq("job_id", jobId),
+        supabaseAdmin.from("job_delay_log").select("days_delayed").eq("job_id", jobId),
+        supabaseAdmin.from("corrective_actions").select("count").eq("job_id", jobId).eq("status", "OPEN"),
+        supabaseAdmin.from("job_score_history").select("compliance_score,grade").eq("job_id", jobId).order("created_at", { ascending: false }).limit(1).single(),
+      ]);
+
+      summary.components.job               = results[0].status === "fulfilled" ? results[0].value.data : null;
+      summary.components.noteCount         = results[1].status === "fulfilled" ? (results[1].value.data?.length || 0) : 0;
+      summary.components.photoCount        = results[2].status === "fulfilled" ? (results[2].value.data?.length || 0) : 0;
+      summary.components.openPunchItems    = results[3].status === "fulfilled" ? (results[3].value.data?.length || 0) : 0;
+      summary.components.inspections       = results[4].status === "fulfilled" ? results[4].value.data || [] : [];
+      summary.components.totalDelayDays    = results[5].status === "fulfilled" ? (results[5].value.data || []).reduce((s, d) => s + (d.days_delayed || 0), 0) : 0;
+      summary.components.openCorrectiveActions = results[6].status === "fulfilled" ? (results[6].value.data?.length || 0) : 0;
+      summary.components.latestScore       = results[7].status === "fulfilled" ? results[7].value.data : null;
+    } catch (_) { /* ignore */ }
+  }
+
+  const inspResults = summary.components.inspections || [];
+  summary.components.inspectionSummary = { total: inspResults.length, passed: inspResults.filter(i => i.result === "PASS").length, failed: inspResults.filter(i => i.result === "FAIL").length };
+
+  return res.json(summary);
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
