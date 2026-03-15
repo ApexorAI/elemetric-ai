@@ -66428,6 +66428,433 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /lockout-tagout-record — Electrical/mechanical isolation per AS 4024.1603 / OHS Regs 2017 (Vic)
+app.post("/lockout-tagout-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    permitNumber,
+    isolationDate,
+    authorisedIsolator,
+    isolatorLicence,
+    equipmentId,
+    equipmentDescription,
+    isolationType,        // electrical | mechanical | pneumatic | hydraulic | gravitational | thermal | chemical
+    energySources,        // array of { type, location, isolationDevice, lockApplied, tagApplied }
+    verificationMethod,   // test-voltage | test-for-motion | pressure-gauge | check-valve
+    verifiedBy,
+    isolationVerified,    // true | false
+    workersProtected,     // array of { name, personalLock }
+    personalLocksCount,
+    masterLockApplied,
+    tagMessage,           // e.g. "DANGER — DO NOT OPERATE"
+    workToBeDone,
+    startDateTime,
+    estimatedEndDateTime,
+    returnToServiceDate,
+    returnAuthorisedBy,
+    allLocksRemoved,
+    allWorkersAway,
+    interlocksTested,
+    guardsReinstalled,
+    notes,
+    photos,
+  } = req.body;
+
+  const safetyGaps = [];
+
+  // Isolation not verified
+  if (!isolationVerified) {
+    safetyGaps.push("Isolation has not been verified — test for dead-voltage/motion/pressure before work commences");
+  }
+
+  // No personal locks
+  const lockCount = parseInt(personalLocksCount, 10) || 0;
+  if (lockCount === 0 || !workersProtected || workersProtected.length === 0) {
+    safetyGaps.push("No personal locks applied — each worker must apply their own lock per AS 4024.1603");
+  }
+
+  // Master lock not applied
+  if (!masterLockApplied) {
+    safetyGaps.push("Master isolation lock not applied");
+  }
+
+  // Unverified energy sources
+  const unverified = Array.isArray(energySources)
+    ? energySources.filter((e) => !e.lockApplied && !e.tagApplied)
+    : [];
+  if (unverified.length > 0) {
+    safetyGaps.push(`${unverified.length} energy source(s) have neither lock nor tag applied`);
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    permit_number: sanitiseInput(permitNumber),
+    isolation_date: isolationDate,
+    authorised_isolator: sanitiseInput(authorisedIsolator),
+    isolator_licence: sanitiseInput(isolatorLicence),
+    equipment_id: sanitiseInput(equipmentId),
+    equipment_description: sanitiseInput(equipmentDescription),
+    isolation_type: sanitiseInput(isolationType),
+    energy_sources: energySources || [],
+    verification_method: sanitiseInput(verificationMethod),
+    verified_by: sanitiseInput(verifiedBy),
+    isolation_verified: isolationVerified,
+    workers_protected: workersProtected || [],
+    personal_locks_count: personalLocksCount,
+    master_lock_applied: masterLockApplied,
+    tag_message: sanitiseInput(tagMessage),
+    work_to_be_done: sanitiseInput(workToBeDone),
+    start_date_time: startDateTime,
+    estimated_end_date_time: estimatedEndDateTime,
+    return_to_service_date: returnToServiceDate,
+    return_authorised_by: sanitiseInput(returnAuthorisedBy),
+    all_locks_removed: allLocksRemoved,
+    all_workers_away: allWorkersAway,
+    interlocks_tested: interlocksTested,
+    guards_reinstalled: guardsReinstalled,
+    safety_gaps: safetyGaps,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("lockout_tagout_records")
+      .insert(record);
+    if (dbErr) console.error("DB error /lockout-tagout-record:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  if (safetyGaps.length > 0) {
+    return res.status(422).json({
+      error: "Lockout-Tagout record has safety gaps — do not commence work",
+      safetyGaps,
+      immediateActions: [
+        "Verify isolation using approved test method before any work",
+        "Ensure every worker applies personal lock before starting work",
+        "Do not commence work until all energy sources are locked and tagged",
+      ],
+      applicableStandards: [
+        "AS 4024.1603",
+        "OHS Regulations 2017 (Vic)",
+        "WorkSafe Victoria Electrical Safety Guidance",
+      ],
+      saved,
+    });
+  }
+
+  res.json({
+    message: "Lockout-Tagout record issued — isolation complete",
+    permitNumber: sanitiseInput(permitNumber),
+    isolationVerified,
+    personalLocksCount: lockCount,
+    safetyGapsCount: 0,
+    applicableStandards: ["AS 4024.1603", "OHS Regulations 2017 (Vic)"],
+    saved,
+  });
+});
+
+// POST /tank-inspection-record — Above/below ground storage tank inspection per AS 1692 / AS 1698 / AS 3570
+app.post("/tank-inspection-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    facilityName,
+    facilityAddress,
+    tankId,
+    tankType,             // AST | UST | atmospheric | pressure | water | chemical | fuel
+    contents,             // fuel | water | chemical | waste-oil | LPG | compressed-gas
+    capacity_L,
+    constructionMaterial, // steel | fibreglass | polyethylene | concrete | stainless
+    installationYear,
+    lastInspectionDate,
+    inspectionDate,
+    inspector,
+    inspectorAccreditation,
+    externalCondition,    // good | fair | poor | damaged
+    internalCondition,    // good | fair | corrosion | pitting | holes | not-inspected
+    cathodicProtection,   // active | passive | none | not-applicable
+    cpReadingMV,          // cathodic protection reading in mV — typically -850 mV or more negative
+    corrosionRate_mm_year,
+    ullage_pct,           // % full
+    overfillProtectionPresent,
+    overfillProtectionWorking,
+    leakDetectionSystem,
+    leakDetectionWorking,
+    ventilationAdequate,
+    pressureReliefValvePresent,
+    pressureReliefValveWorking,
+    waterInTank,          // bottom water layer
+    sedimentPresent,
+    bunding_present,
+    bunding_capacity_L,
+    bunding_intact,
+    spillwareManagedCompliant,
+    epaCriteria,          // true | false — EPA Vic UST notification requirements
+    photos,
+    notes,
+  } = req.body;
+
+  const issues = [];
+
+  // Cathodic protection check for UST/steel tanks
+  if (tankType === "UST" && cathodicProtection === "none") {
+    issues.push("No cathodic protection on UST — soil corrosion will cause leaks; EPA Victoria notification required for USTs");
+  }
+  const cpReading = parseFloat(cpReadingMV) || 0;
+  if (cathodicProtection === "active" && cpReading > -850) {
+    issues.push(`Cathodic protection reading ${cpReading} mV is less negative than required -850 mV — CP system may be inadequate`);
+  }
+
+  // Leak detection
+  if (!leakDetectionSystem) {
+    issues.push("No leak detection system — required for fuel USTs per EPA Victoria guidelines");
+  }
+  if (leakDetectionSystem && !leakDetectionWorking) {
+    issues.push("Leak detection system not working — repair immediately");
+  }
+
+  // Overfill protection
+  if (!overfillProtectionPresent) {
+    issues.push("Overfill protection absent — required for petroleum storage per AS 4897");
+  }
+  if (overfillProtectionPresent && !overfillProtectionWorking) {
+    issues.push("Overfill protection not working — risk of environmental spill");
+  }
+
+  // Bunding
+  if (!bunding_present) {
+    issues.push("Bunding absent — required for above-ground petroleum/chemical storage");
+  }
+  if (bunding_present && !bunding_intact) {
+    issues.push("Bunding damaged — spill containment compromised");
+  }
+
+  // Internal condition
+  if (internalCondition === "holes") {
+    issues.push("Holes found in tank — immediate decommissioning and cleanup required");
+  } else if (internalCondition === "corrosion" || internalCondition === "pitting") {
+    issues.push(`Internal ${internalCondition} detected — remaining wall thickness assessment required`);
+  }
+
+  const passed = issues.length === 0;
+  const overallResult = passed ? "FIT-FOR-SERVICE" : "REQUIRES-ACTION";
+
+  if (!passed && issues.some((i) => i.includes("Holes") || i.includes("leak"))) {
+    return res.status(422).json({
+      error: "Tank inspection — critical defects requiring immediate action",
+      issues,
+      overallResult: "TAKE-OUT-OF-SERVICE",
+      immediateActions: [
+        "Cease filling immediately",
+        "Decommission tank if holes or active leak detected",
+        "Notify EPA Victoria if contamination suspected",
+        "Commission site assessment for USTs",
+      ],
+      applicableStandards: [
+        "AS 1692",
+        "AS 4897",
+        "Environment Protection Act 2017 (Vic)",
+        "EPA Victoria UST Regulations",
+      ],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    facility_name: sanitiseInput(facilityName),
+    facility_address: sanitiseInput(facilityAddress),
+    tank_id: sanitiseInput(tankId),
+    tank_type: sanitiseInput(tankType),
+    contents: sanitiseInput(contents),
+    capacity_l: capacity_L,
+    construction_material: sanitiseInput(constructionMaterial),
+    installation_year: installationYear,
+    last_inspection_date: lastInspectionDate,
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    inspector_accreditation: sanitiseInput(inspectorAccreditation),
+    external_condition: sanitiseInput(externalCondition),
+    internal_condition: sanitiseInput(internalCondition),
+    cathodic_protection: sanitiseInput(cathodicProtection),
+    cp_reading_mv: cpReadingMV,
+    corrosion_rate_mm_year: corrosionRate_mm_year,
+    ullage_pct,
+    overfill_protection_present: overfillProtectionPresent,
+    overfill_protection_working: overfillProtectionWorking,
+    leak_detection_system: leakDetectionSystem,
+    leak_detection_working: leakDetectionWorking,
+    ventilation_adequate: ventilationAdequate,
+    pressure_relief_valve_present: pressureReliefValvePresent,
+    pressure_relief_valve_working: pressureReliefValveWorking,
+    water_in_tank: waterInTank,
+    sediment_present: sedimentPresent,
+    bunding_present,
+    bunding_capacity_l: bunding_capacity_L,
+    bunding_intact,
+    issues,
+    overall_result: overallResult,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("tank_inspection_records")
+      .insert(record);
+    if (dbErr) console.error("DB error /tank-inspection-record:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Tank inspection record saved",
+    tankId: sanitiseInput(tankId),
+    overallResult,
+    issuesCount: issues.length,
+    issues,
+    applicableStandards: [
+      "AS 1692",
+      "AS 4897",
+      "Environment Protection Act 2017 (Vic)",
+      "EPA Victoria UST Regulations",
+    ],
+    saved,
+  });
+});
+
+// POST /ai-isolation-safety-assessment — AI assesses isolation adequacy and return-to-service safety
+app.post("/ai-isolation-safety-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    isolationType,
+    equipmentType,
+    energySources,
+    workToBeDone,
+    workersCount,
+    workDuration_hours,
+    confinedSpace,
+    residualEnergyRisk,
+    verificationPerformed,
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are an electrical and mechanical safety engineer specialising in isolation and lockout-tagout systems with 20 years experience on Australian industrial and construction sites. Assess isolation adequacy per AS 4024.1603, OHS Regulations 2017 (Vic), and WorkSafe Victoria guidance.
+
+Assess:
+1. Completeness of energy isolation — all energy sources accounted for?
+2. Stored energy risks — capacitors, springs, pressurised vessels, gravity (suspended loads, hydraulic)
+3. Multiple isolation points — complex systems may require multiple lock points
+4. Verification method adequacy — voltage testing, try-to-start, pressure gauge
+5. Group isolation complexity — multiple workers each need personal lock
+6. Return-to-service sequence — pre-start checks, guard reinstatement, worker clearance
+7. Confined space additional requirements if applicable
+
+Respond with JSON: { "isolationAdequacy": "adequate|marginal|inadequate", "storedEnergyRisks": [], "missingIsolationPoints": [], "verificationRequired": [], "groupIsolationComplexity": "simple|moderate|complex", "returnToServiceChecklist": [], "confinedSpaceAdditional": [], "residualRiskLevel": "low|medium|high|critical", "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const energySummary = Array.isArray(energySources)
+    ? energySources.map((e) => `${e.type} at ${e.location}`).join(", ")
+    : "Not specified";
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Isolation type: ${isolationType || "electrical"}
+Equipment type: ${equipmentType || "not specified"}
+Energy sources: ${energySummary}
+Work to be done: ${workToBeDone || "not specified"}
+Number of workers: ${workersCount || "not specified"}
+Work duration: ${workDuration_hours || "not specified"} hours
+Confined space: ${confinedSpace || "no"}
+Residual energy risk identified: ${residualEnergyRisk || "not assessed"}
+Verification performed: ${verificationPerformed || "not confirmed"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-isolation-safety-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        isolationAdequacy: "marginal",
+        storedEnergyRisks: [
+          "Capacitor banks may retain charge after isolation — test before touching",
+          "Pneumatic systems retain stored pressure in accumulators",
+          "Hydraulic systems: suspended loads remain gravitationally energised",
+          "Springs/counterweights in mechanical drives",
+        ],
+        missingIsolationPoints: [
+          "Verify all control circuit supplies are isolated, not just power circuits",
+          "Check for UPS or backup power supplies",
+          "Identify and isolate any inter-tie feeds from adjacent equipment",
+        ],
+        verificationRequired: [
+          "Test for dead voltage using calibrated test equipment on all phases",
+          "Try-to-start test for mechanical equipment",
+          "Pressure gauge confirmation for pneumatic/hydraulic systems",
+        ],
+        groupIsolationComplexity: "moderate",
+        returnToServiceChecklist: [
+          "All workers accounted for and clear of equipment",
+          "All tools, rags, and materials removed from equipment",
+          "Guards, covers, and safety devices reinstalled",
+          "All personal locks removed (each worker removes own lock)",
+          "Master lock removed by authorised isolator",
+          "Post-energisation test run before returning to normal service",
+        ],
+        confinedSpaceAdditional: confinedSpace
+          ? [
+              "Atmospheric test required before and during entry",
+              "Standby person and rescue equipment required",
+              "Confined space entry permit required",
+            ]
+          : [],
+        residualRiskLevel: "medium",
+        applicableStandards: [
+          "AS 4024.1603",
+          "OHS Regulations 2017 (Vic)",
+          "AS/NZS 3000",
+          "WorkSafe Victoria Electrical Safety Guidance",
+        ],
+        recommendation:
+          "Verify complete isolation using approved test method before commencing work. Ensure every worker applies personal lock. Pre-start return-to-service check required before energising.",
+        summary:
+          "Isolation presents medium residual risk primarily from stored energy in capacitors, pneumatics, and suspended loads. Complete all verification steps and personal lock application before commencing work.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
