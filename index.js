@@ -58719,6 +58719,298 @@ Return a JSON object with:
   }
 });
 
+// POST /passive-fire-protection-inspection — Inspect passive fire protection elements (fire stopping, dampers, collars)
+app.post("/passive-fire-protection-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      inspectionRef,
+      date,
+      inspector,
+      location,
+      buildingClass,
+      fireCompartment,
+      firewallRef,
+      penetrationsInspected,
+      penetrationCount,
+      sealantBrand,
+      sealantSystemRef,
+      collarBrand,
+      collarRef,
+      fireDamperCount,
+      fireDampersOperational,
+      smokeDamperCount,
+      smokeDampersOperational,
+      intumescentStripsDoorSets,
+      fireDoorSelfClosingOk,
+      fireDoorGapsOk,
+      fireDoorClearanceOk,
+      firestopSealingComplete,
+      unsealed,
+      unsealedLocations,
+      productApprovalRefs,
+      frlAchieved,
+      frlRequired,
+      overallResult,
+      defects,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !inspector || !location || !overallResult) {
+      return res.status(400).json({ error: "projectId, date, inspector, location, and overallResult are required" });
+    }
+
+    const failures = [];
+    if (unsealed || !firestopSealingComplete) {
+      failures.push(`Unsealed penetrations present${unsealedLocations ? ` at: ${sanitiseInput(unsealedLocations)}` : ""} — all penetrations through fire-rated elements must be fire-stopped per NCC 2022 and AS 1530.4`);
+    }
+    if (fireDamperCount && !fireDampersOperational) failures.push("Fire dampers not operational — must be tested and operational before occupation per AS 1682");
+    if (smokeDamperCount && !smokeDampersOperational) failures.push("Smoke dampers not operational — required for air-handling systems in smoke zones per AS 1668.1");
+    if (frlAchieved && frlRequired && String(frlAchieved) !== String(frlRequired)) failures.push(`FRL achieved (${frlAchieved}) does not match required FRL (${frlRequired}) — re-inspect after rectification`);
+    if (!fireDoorSelfClosingOk && intumescentStripsDoorSets) failures.push("Fire door self-closing mechanism non-functional — AS 1905.1 requires fire doors to self-close and latch");
+    if (overallResult === "FAIL") failures.push("Passive fire protection inspection FAILED — building must not be occupied until rectified");
+
+    if (failures.length > 0) console.warn(`[PASSIVE FIRE] ${location} at ${projectId} — ${failures.join("; ")}`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      inspection_ref: sanitiseInput(inspectionRef || `PFP-${Date.now()}`),
+      date,
+      inspector: sanitiseInput(inspector),
+      location: sanitiseInput(location),
+      building_class: sanitiseInput(buildingClass || ""),
+      fire_compartment: sanitiseInput(fireCompartment || ""),
+      firewall_ref: sanitiseInput(firewallRef || ""),
+      penetrations_inspected: !!penetrationsInspected,
+      penetration_count: penetrationCount || null,
+      sealant_brand: sanitiseInput(sealantBrand || ""),
+      sealant_system_ref: sanitiseInput(sealantSystemRef || ""),
+      collar_brand: sanitiseInput(collarBrand || ""),
+      collar_ref: sanitiseInput(collarRef || ""),
+      fire_damper_count: fireDamperCount || null,
+      fire_dampers_operational: fireDamperCount ? !!fireDampersOperational : null,
+      smoke_damper_count: smokeDamperCount || null,
+      smoke_dampers_operational: smokeDamperCount ? !!smokeDampersOperational : null,
+      intumescent_strips_door_sets: !!intumescentStripsDoorSets,
+      fire_door_self_closing_ok: !!fireDoorSelfClosingOk,
+      fire_door_gaps_ok: !!fireDoorGapsOk,
+      fire_door_clearance_ok: !!fireDoorClearanceOk,
+      firestop_sealing_complete: !!firestopSealingComplete,
+      unsealed: !!unsealed,
+      unsealed_locations: sanitiseInput(unsealedLocations || ""),
+      product_approval_refs: Array.isArray(productApprovalRefs) ? productApprovalRefs.map(r => sanitiseInput(r)) : [],
+      frl_achieved: sanitiseInput(frlAchieved || ""),
+      frl_required: sanitiseInput(frlRequired || ""),
+      overall_result: sanitiseInput(overallResult),
+      defects: Array.isArray(defects) ? defects.map(d => sanitiseInput(d)) : [],
+      failures,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("passive_fire_protection_inspections").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (failures.length > 0) {
+      return res.status(422).json({ passed: false, failures, message: "Passive fire protection inspection failed. Rectify all unsealed penetrations and non-functional dampers before occupation.", record, saved });
+    }
+
+    res.json({
+      passed: true,
+      inspectionRef: record.inspection_ref,
+      failures: [],
+      applicableStandards: ["NCC 2022 Section C (fire resistance)", "AS 1530.4 Fire resistance tests", "AS 1682 Fire dampers", "AS 1905.1 Components for the protection of openings in fire-resistant walls"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/passive-fire-protection-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record passive fire protection inspection" });
+  }
+});
+
+// POST /plumbing-compliance-certificate — Track plumbing compliance certificates per Plumbing Regulations 2018 (Vic)
+app.post("/plumbing-compliance-certificate", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      certificateRef,
+      issueDate,
+      plumberName,
+      plumberLicenceNumber,
+      licenceClass,
+      businessName,
+      businessLicenceNumber,
+      propertyAddress,
+      workDescription,
+      permitNumber,
+      buildingClass,
+      scope,
+      appliancesInstalled,
+      testsConducted,
+      testResults,
+      gasWorkIncluded,
+      gasSafetyCertificateRef,
+      gasPressureTestPassed,
+      drainageTestPassed,
+      hotWaterSystemInstalled,
+      hotWaterCompliant,
+      backflowPreventionInstalled,
+      backflowTestPassed,
+      certifiedByPlumberSignature,
+      inspectionRequired,
+      inspectionDate,
+      inspectionResult,
+      notes,
+    } = req.body;
+
+    if (!projectId || !plumberName || !plumberLicenceNumber || !issueDate || !propertyAddress) {
+      return res.status(400).json({ error: "projectId, plumberName, plumberLicenceNumber, issueDate, and propertyAddress are required" });
+    }
+
+    const flags = [];
+    if (!certifiedByPlumberSignature) flags.push("Certificate not yet signed by licensed plumber — signature required before submitting to VBA");
+    if (gasWorkIncluded && !gasSafetyCertificateRef) flags.push("Gas work included but no gas safety certificate referenced — Gas Safety Certificate required for all Type A gas appliance installations");
+    if (gasWorkIncluded && !gasPressureTestPassed) flags.push("Gas pressure test not passed — gas installation must not be used until pressure test passed");
+    if (!drainageTestPassed) flags.push("Drainage test not passed — hydraulic pressure or air test required per AS 3500");
+    if (backflowPreventionInstalled && !backflowTestPassed) flags.push("Backflow prevention device test not passed — must be tested by a licensed tester before connection");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      certificate_ref: sanitiseInput(certificateRef || `PCC-${Date.now()}`),
+      issue_date: issueDate,
+      plumber_name: sanitiseInput(plumberName),
+      plumber_licence_number: sanitiseInput(plumberLicenceNumber),
+      licence_class: sanitiseInput(licenceClass || ""),
+      business_name: sanitiseInput(businessName || ""),
+      business_licence_number: sanitiseInput(businessLicenceNumber || ""),
+      property_address: sanitiseInput(propertyAddress),
+      work_description: sanitiseInput(workDescription || ""),
+      permit_number: sanitiseInput(permitNumber || ""),
+      building_class: sanitiseInput(buildingClass || ""),
+      scope: sanitiseInput(scope || ""),
+      appliances_installed: sanitiseInput(appliancesInstalled || ""),
+      tests_conducted: sanitiseInput(testsConducted || ""),
+      test_results: sanitiseInput(testResults || ""),
+      gas_work_included: !!gasWorkIncluded,
+      gas_safety_certificate_ref: sanitiseInput(gasSafetyCertificateRef || ""),
+      gas_pressure_test_passed: gasWorkIncluded ? !!gasPressureTestPassed : null,
+      drainage_test_passed: !!drainageTestPassed,
+      hot_water_system_installed: !!hotWaterSystemInstalled,
+      hot_water_compliant: hotWaterSystemInstalled ? !!hotWaterCompliant : null,
+      backflow_prevention_installed: !!backflowPreventionInstalled,
+      backflow_test_passed: backflowPreventionInstalled ? !!backflowTestPassed : null,
+      certified_by_plumber_signature: !!certifiedByPlumberSignature,
+      inspection_required: !!inspectionRequired,
+      inspection_date: inspectionDate || null,
+      inspection_result: sanitiseInput(inspectionResult || ""),
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("plumbing_compliance_certificates").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      certificateRef: record.certificate_ref,
+      flags,
+      vbaSubmissionRequired: true,
+      applicableRegulations: ["Plumbing Regulations 2018 (Vic)", "Plumbing and Drainage Act 2016 (Vic)", "AS 3500 Plumbing and drainage", "AS 5601 Gas installations"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/plumbing-compliance-certificate error:", err.message);
+    res.status(500).json({ error: "Failed to record plumbing compliance certificate" });
+  }
+});
+
+// POST /ai-passive-fire-assessment — AI assesses passive fire protection compliance for a building
+app.post("/ai-passive-fire-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      buildingClass,
+      constructionType,
+      riseInStoreys,
+      fireCompartmentation,
+      penetrationTypes,
+      fireDoorCount,
+      observedIssues,
+      lastInspectionDate,
+    } = req.body;
+
+    if (!buildingClass || !constructionType) {
+      return res.status(400).json({ error: "buildingClass and constructionType are required" });
+    }
+
+    const prompt = `You are a fire safety engineer and NCC compliance specialist with expertise in passive fire protection under NCC 2022, AS 1530, and Victorian building regulations.
+
+Assess passive fire protection compliance for:
+- Building class: ${sanitiseInput(buildingClass)}
+- Construction type: ${sanitiseInput(constructionType)}
+- Rise in storeys: ${sanitiseInput(String(riseInStoreys || "not specified"))}
+- Fire compartmentation: ${sanitiseInput(fireCompartmentation || "not specified")}
+- Penetration types present: ${sanitiseInput(penetrationTypes || "pipes, cables, ducts")}
+- Fire door count: ${sanitiseInput(String(fireDoorCount || "not specified"))}
+- Observed issues: ${sanitiseInput(observedIssues || "none")}
+- Last inspection: ${sanitiseInput(lastInspectionDate || "unknown")}
+
+Return a JSON object with:
+{
+  "complianceRating": "COMPLIANT|MINOR_ISSUES|MAJOR_ISSUES|NON_COMPLIANT",
+  "frlRequirements": string,
+  "criticalIssues": [string],
+  "penetrationFirestopRequirements": string,
+  "fireDoorRequirements": string,
+  "fireDamperRequirements": string,
+  "inspectionSchedule": string,
+  "maintenanceRequirements": [string],
+  "occupancyPermitRisk": boolean,
+  "applicableStandards": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ buildingClass, constructionType, assessment });
+  } catch (err) {
+    console.error("/ai-passive-fire-assessment error:", err.message);
+    res.json({
+      buildingClass: req.body.buildingClass || "",
+      constructionType: req.body.constructionType || "",
+      assessment: {
+        complianceRating: "MINOR_ISSUES",
+        frlRequirements: "FRL requirements depend on building class, rise in storeys, and construction type per NCC 2022 Specification A2.3. Confirm with structural engineer and fire engineer.",
+        criticalIssues: [],
+        penetrationFirestopRequirements: "All penetrations through fire-rated walls and floors must be fire-stopped with a system achieving the required FRL per AS 1530.4. Use only CodeMark-certified or Codemark-equivalent products.",
+        fireDoorRequirements: "Fire doors must be self-closing, self-latching, and maintain their FRL. Annual inspection required per AS 1905.1. Check seals, intumescent strips, and door hardware.",
+        fireDamperRequirements: "Fire dampers required where air ducts penetrate fire-rated elements per AS 1668.1. Test all fire dampers before occupation and annually in service per AS 1851.",
+        inspectionSchedule: "Annual passive fire protection inspection recommended; 6-monthly for high-risk buildings or complex fire compartmentation. Log and track all inspections.",
+        maintenanceRequirements: ["Annual fire door inspection and adjustment per AS 1905.1", "Annual fire damper operational test per AS 1851", "Visual inspection of fire-stop seals after any refurbishment or maintenance work", "Update fire compartmentation drawings if any penetrations are added or modified"],
+        occupancyPermitRisk: true,
+        applicableStandards: ["NCC 2022 Section C — fire resistance", "AS 1530.4 Fire resistance tests for elements of construction", "AS 1905.1 Components for protection of openings in fire-resistant walls", "AS 1851 Maintenance of fire protection systems and equipment"],
+        recommendation: "Commission a fire safety engineer to review passive fire protection compliance against the NCC 2022 fire compartmentation drawings. All unsealed penetrations and non-functional dampers must be rectified before occupation.",
+        summary: "Passive fire protection compliance requires all penetrations to be fire-stopped, fire doors to be self-closing and self-latching, and fire/smoke dampers to be tested and operational. Annual maintenance and inspection are mandatory.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
