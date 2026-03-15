@@ -5614,6 +5614,181 @@ app.post("/photo-tips", (req, res) => {
   });
 });
 
+// ── Round 3: POST /liability-estimate — Liability period calculator ───────────
+// Returns how long a plumber is liable for a completed job under Victorian law.
+
+const LIABILITY_PERIODS = {
+  plumbing:  { defects: 7, structuralDefects: 10, statute: "Domestic Building Contracts Act 1995 (Vic)", note: "Plumbing defects: 7 years. Structural defects (major structural elements): 10 years." },
+  gas:       { defects: 7, structuralDefects: 10, statute: "Domestic Building Contracts Act 1995 (Vic)", note: "Gas fitting defects: 7 years. Serious injury or death: no limitation." },
+  electrical:{ defects: 7, structuralDefects: 10, statute: "Electricity Safety Act 1998 (Vic)", note: "Electrical defects: 7 years. Serious injury or death: no limitation." },
+  drainage:  { defects: 7, structuralDefects: 10, statute: "Domestic Building Contracts Act 1995 (Vic)", note: "Drainage defects: 7 years." },
+  carpentry: { defects: 7, structuralDefects: 10, statute: "Domestic Building Contracts Act 1995 (Vic)", note: "Structural carpentry defects: 10 years. Non-structural: 7 years." },
+  hvac:      { defects: 7, structuralDefects: 10, statute: "Domestic Building Contracts Act 1995 (Vic)", note: "HVAC defects: 7 years. Refrigerant systems: additional ARCtick obligations." },
+};
+
+app.post("/liability-estimate", (req, res) => {
+  const { jobType, completedDate, isStructural = false } = req.body || {};
+
+  if (!jobType || typeof jobType !== "string") {
+    return res.status(400).json({ error: "jobType is required." });
+  }
+
+  const liability = LIABILITY_PERIODS[jobType];
+  if (!liability) {
+    return res.status(400).json({ error: `Unknown jobType: ${jobType}` });
+  }
+
+  const years      = isStructural ? liability.structuralDefects : liability.defects;
+  const baseDate   = completedDate ? new Date(completedDate) : new Date();
+  const expiryDate = new Date(baseDate);
+  expiryDate.setFullYear(expiryDate.getFullYear() + years);
+
+  const daysRemaining = Math.ceil((expiryDate - new Date()) / (1000 * 60 * 60 * 24));
+  const yearsRemaining = parseFloat((daysRemaining / 365).toFixed(1));
+
+  return res.json({
+    jobType,
+    isStructural,
+    liabilityYears:    years,
+    completedDate:     baseDate.toISOString().split("T")[0],
+    liabilityExpiry:   expiryDate.toISOString().split("T")[0],
+    daysRemaining:     Math.max(0, daysRemaining),
+    yearsRemaining:    Math.max(0, yearsRemaining),
+    status:            daysRemaining > 0 ? "within_liability_period" : "expired",
+    statute:           liability.statute,
+    note:              liability.note,
+    recommendation:    daysRemaining > 0 && daysRemaining <= 365
+      ? "Liability period expires within 12 months. Ensure all documentation is securely archived."
+      : daysRemaining > 0
+      ? "Retain all job documentation, photos, and certificates until the liability period expires."
+      : "Liability period has expired. Standard record-keeping requirements still apply.",
+  });
+});
+
+// ── Round 3: POST /estimate-time — Job time estimator ─────────────────────────
+// Estimates documentation and on-site time for a job.
+
+const TIME_ESTIMATES = {
+  plumbing: {
+    simple:   { onSiteHours: 2, documentationMins: 15, photoCount: 8 },
+    moderate: { onSiteHours: 4, documentationMins: 25, photoCount: 12 },
+    complex:  { onSiteHours: 8, documentationMins: 40, photoCount: 18 },
+  },
+  gas: {
+    simple:   { onSiteHours: 1.5, documentationMins: 20, photoCount: 10 },
+    moderate: { onSiteHours: 3,   documentationMins: 30, photoCount: 14 },
+    complex:  { onSiteHours: 6,   documentationMins: 45, photoCount: 20 },
+  },
+  electrical: {
+    simple:   { onSiteHours: 2,   documentationMins: 20, photoCount: 10 },
+    moderate: { onSiteHours: 5,   documentationMins: 35, photoCount: 15 },
+    complex:  { onSiteHours: 10,  documentationMins: 50, photoCount: 22 },
+  },
+  drainage: {
+    simple:   { onSiteHours: 3,   documentationMins: 20, photoCount: 8 },
+    moderate: { onSiteHours: 6,   documentationMins: 30, photoCount: 12 },
+    complex:  { onSiteHours: 12,  documentationMins: 45, photoCount: 18 },
+  },
+  carpentry: {
+    simple:   { onSiteHours: 4,   documentationMins: 15, photoCount: 6 },
+    moderate: { onSiteHours: 8,   documentationMins: 25, photoCount: 10 },
+    complex:  { onSiteHours: 20,  documentationMins: 40, photoCount: 16 },
+  },
+  hvac: {
+    simple:   { onSiteHours: 2.5, documentationMins: 20, photoCount: 8 },
+    moderate: { onSiteHours: 5,   documentationMins: 30, photoCount: 12 },
+    complex:  { onSiteHours: 10,  documentationMins: 45, photoCount: 18 },
+  },
+};
+
+app.post("/estimate-time", (req, res) => {
+  const { jobType, complexityBand = "moderate", applianceCount = 1 } = req.body || {};
+
+  if (!jobType || !TIME_ESTIMATES[jobType]) {
+    return res.status(400).json({ error: `jobType required. Valid: ${Object.keys(TIME_ESTIMATES).join(", ")}` });
+  }
+
+  const band     = ["simple", "moderate", "complex"].includes(complexityBand) ? complexityBand : "moderate";
+  const estimate = TIME_ESTIMATES[jobType][band];
+
+  // Scale for multiple appliances/fixtures
+  const scaleFactor = Math.min(2.5, 1 + (applianceCount - 1) * 0.3);
+  const onSiteHours = parseFloat((estimate.onSiteHours * scaleFactor).toFixed(1));
+  const photoCount  = Math.min(30, Math.round(estimate.photoCount * Math.min(1.5, scaleFactor)));
+
+  return res.json({
+    jobType,
+    complexityBand:        band,
+    applianceCount,
+    estimates: {
+      onSiteHours,
+      documentationMinutes: estimate.documentationMins,
+      recommendedPhotoCount: photoCount,
+      totalJobMinutes:       Math.round(onSiteHours * 60 + estimate.documentationMins),
+    },
+    tips: [
+      `Allow ${estimate.documentationMins} minutes at the end of the job for documentation — don't rush it.`,
+      `Take ${photoCount} photos. More photos = higher compliance scores.`,
+      band === "complex" ? "For complex jobs, consider taking a video walkthrough as a backup record." : null,
+    ].filter(Boolean),
+  });
+});
+
+// ── Round 3: POST /address-lookup — Property context lookup ───────────────────
+// Returns property context useful for compliance (zone, property type, build year estimate).
+
+app.post("/address-lookup", async (req, res) => {
+  const { address } = req.body || {};
+
+  if (!address || typeof address !== "string" || address.trim().length < 5) {
+    return res.status(400).json({ error: "A valid Australian address is required." });
+  }
+
+  // No external geocoding API is called — instead we derive context from address components
+  const addr = address.toLowerCase();
+
+  // Detect suburb from known Victorian high-density/heritage areas
+  const isInnerMelbourne  = /fitzroy|richmond|collingwood|hawthorn|malvern|prahran|st kilda|williamstown|northcote|brunswick|carlton|parkville/.test(addr);
+  const isRegionalVIC     = /ballarat|bendigo|geelong|shepparton|wodonga|warrnambool|mildura|horsham|castlemaine|kyneton|daylesford/.test(addr);
+  const isNewDevelopment  = /tarneit|truganina|wyndham|clyde|pakenham|berwick|cranbourne|officer|manor lakes|point cook/.test(addr);
+  const isHighDensity     = /southbank|docklands|melbourne city|cbd|swanston|flinders|elizabeth st|collins st/.test(addr);
+  const isHeritageArea    = /victorian era|heritage overlay|1880|1890|1900|1910|1920|terrace/.test(addr) || isInnerMelbourne;
+
+  const propertyTypeHint = isHighDensity ? "commercial/apartment complex" : isNewDevelopment ? "new residential estate" : isRegionalVIC ? "regional residential" : "metropolitan residential";
+
+  // Estimate likely build era
+  const buildEraHint = isInnerMelbourne ? "Pre-1960 (likely heritage — watch for lead solder, cloth wiring, cast-iron drainage)"
+    : isNewDevelopment    ? "Post-2010 (modern standards — full compliance expected)"
+    : isRegionalVIC       ? "Mixed era — verify existing services condition on arrival"
+    : "1960–2000 (check for dezincification in plumbing, early RCD coverage in electrical)";
+
+  // Planning zone hints
+  const zoningHint = isHighDensity    ? "Commercial Zone — permit may be required for works over $10,000"
+    : isInnerMelbourne  ? "Residential — likely Heritage Overlay, confirm with council before structural work"
+    : isNewDevelopment  ? "Growth Zone — new construction standards apply"
+    : "Residential Zone — standard domestic building permit thresholds apply";
+
+  return res.json({
+    address:      address.trim(),
+    jurisdiction: "Victoria, Australia",
+    hints: {
+      propertyTypeHint,
+      buildEraHint,
+      zoningHint,
+      isHeritageArea,
+      isRegionalVIC,
+      isNewDevelopment,
+    },
+    complianceNotes: [
+      isHeritageArea    ? "Heritage properties: council approval may be required for external changes. Check Heritage Overlay with Council." : null,
+      isInnerMelbourne  ? "Inner Melbourne: existing plumbing may have lead solder (pre-1985). Inspect and advise client before cutting in." : null,
+      isNewDevelopment  ? "New estate: all work must meet current NCC (National Construction Code) 2022 requirements." : null,
+      isRegionalVIC     ? "Regional property: check water pressure — boosting pumps may be needed on low-pressure mains supplies." : null,
+    ].filter(Boolean),
+    note: "Address context is estimated from known suburb patterns — not a formal zoning certificate. Verify with local council.",
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
