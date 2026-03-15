@@ -20953,6 +20953,191 @@ app.get("/version", (req, res) => {
   });
 });
 
+// ── Round 56 ──────────────────────────────────────────────────────────────────
+
+// POST /project-register  — Register a new project in the system
+app.post("/project-register", apiKeyAuth, async (req, res) => {
+  const { projectName, projectType, address, clientName, contractorId, contractorName,
+          estimatedValue, startDate, endDate, tradeTypes, notes } = req.body;
+
+  if (!projectName || !address) {
+    return res.status(400).json({ error: "projectName and address are required." });
+  }
+
+  const safeName       = sanitiseInput(String(projectName));
+  const safeProjType   = sanitiseInput(String(projectType   || "residential"));
+  const safeAddress    = sanitiseInput(String(address));
+  const safeClient     = sanitiseInput(String(clientName    || "Property Owner"));
+  const safeContractor = sanitiseInput(String(contractorName|| "Contractor"));
+  const safeNotes      = sanitiseInput(String(notes || ""));
+  const trades         = Array.isArray(tradeTypes) ? tradeTypes.map(t => sanitiseInput(String(t)).toLowerCase()) : [];
+  const projectId      = `PROJ-${Date.now().toString(36).toUpperCase()}`;
+
+  const project = {
+    projectId,
+    status:          "ACTIVE",
+    projectName:     safeName,
+    projectType:     safeProjType,
+    address:         safeAddress,
+    client:          safeClient,
+    contractor:      safeContractor,
+    contractorId:    contractorId ? sanitiseInput(String(contractorId)) : null,
+    estimatedValue:  estimatedValue ? parseFloat(estimatedValue) : null,
+    startDate:       startDate || null,
+    endDate:         endDate   || null,
+    tradeTypes:      trades,
+    notes:           safeNotes || null,
+    milestoneCount:  0,
+    createdAt:       new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("projects").insert({
+      project_id:      projectId,
+      project_name:    safeName,
+      project_type:    safeProjType,
+      address:         safeAddress,
+      client_name:     safeClient,
+      contractor_id:   project.contractorId,
+      contractor_name: safeContractor,
+      estimated_value: project.estimatedValue,
+      start_date:      startDate || null,
+      end_date:        endDate   || null,
+      status:          "ACTIVE",
+      created_at:      new Date().toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...project, saved });
+});
+
+// GET /project/:projectId  — Retrieve a project record
+app.get("/project/:projectId", apiKeyAuth, async (req, res) => {
+  const projectId = sanitiseInput(String(req.params.projectId || ""));
+  if (!projectId) return res.status(400).json({ error: "projectId is required." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  const [projectResult, milestonesResult] = await Promise.all([
+    supabaseAdmin.from("projects").select("*").eq("project_id", projectId).single(),
+    supabaseAdmin.from("project_milestones").select("milestone_name, status, due_date").eq("project_id", projectId),
+  ]);
+
+  if (projectResult.error || !projectResult.data) {
+    return res.status(404).json({ error: "Project not found." });
+  }
+
+  const milestones = milestonesResult.data || [];
+  const completed  = milestones.filter(m => m.status === "completed").length;
+
+  return res.json({
+    ...projectResult.data,
+    milestoneCount:    milestones.length,
+    completedMilestones: completed,
+    progressRate:      milestones.length > 0 ? `${Math.round((completed / milestones.length) * 100)}%` : "0%",
+    milestones:        milestones.slice(0, 10),
+    retrievedAt:       new Date().toISOString(),
+  });
+});
+
+// POST /scope-change  — Record a change in project scope with audit trail
+app.post("/scope-change", apiKeyAuth, async (req, res) => {
+  const { projectId, changeDescription, requestedBy, costImpact, scheduleImpact,
+          approvalStatus, approvedBy, notes } = req.body;
+
+  if (!projectId || !changeDescription) {
+    return res.status(400).json({ error: "projectId and changeDescription are required." });
+  }
+
+  const safeProjectId  = sanitiseInput(String(projectId));
+  const safeDesc       = sanitiseInput(String(changeDescription)).slice(0, 500);
+  const safeReqBy      = sanitiseInput(String(requestedBy || "Client"));
+  const safeApprBy     = sanitiseInput(String(approvedBy  || ""));
+  const safeStatus     = sanitiseInput(String(approvalStatus || "pending")).toUpperCase();
+  const safeNotes      = sanitiseInput(String(notes || ""));
+
+  const VALID_STATUSES = ["PENDING", "APPROVED", "REJECTED", "DEFERRED"];
+  const resolvedStatus = VALID_STATUSES.includes(safeStatus) ? safeStatus : "PENDING";
+
+  const costImpactVal     = costImpact     ? parseFloat(costImpact)     : 0;
+  const scheduleImpactDays= scheduleImpact ? parseInt(scheduleImpact)   : 0;
+
+  const changeId = `SCH-${Date.now().toString(36).toUpperCase()}`;
+
+  const change = {
+    changeId,
+    projectId:           safeProjectId,
+    changeDescription:   safeDesc,
+    requestedBy:         safeReqBy,
+    costImpact:          costImpactVal,
+    costImpactGst:       Math.round(costImpactVal * 0.1 * 100) / 100,
+    costImpactInclGst:   Math.round(costImpactVal * 1.1 * 100) / 100,
+    scheduleImpactDays,
+    approvalStatus:      resolvedStatus,
+    approvedBy:          safeApprBy || null,
+    notes:               safeNotes  || null,
+    warning:             resolvedStatus === "PENDING" ? "Scope change must be approved in writing before work commences. Document all variations." : null,
+    createdAt:           new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("scope_changes").insert({
+      change_id:         changeId,
+      project_id:        safeProjectId,
+      description:       safeDesc,
+      requested_by:      safeReqBy,
+      cost_impact:       costImpactVal,
+      schedule_impact:   scheduleImpactDays,
+      approval_status:   resolvedStatus,
+      approved_by:       safeApprBy || null,
+      created_at:        new Date().toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...change, saved });
+});
+
+// POST /occupancy-check  — Verify that a building is compliant for occupation
+app.post("/occupancy-check", apiKeyAuth, (req, res) => {
+  const { jobType, certificatesFiled, inspectionPassed, utilityConnected,
+          finalCleanDone, keysHandedOver, documentationProvided,
+          defectsCleared, buildingClass, address, notes } = req.body;
+
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+
+  const safeJobType    = sanitiseInput(String(jobType)).toLowerCase();
+  const safeBldgClass  = sanitiseInput(String(buildingClass || "Class 1"));
+  const safeAddress    = sanitiseInput(String(address || "Not specified"));
+
+  const checks = [
+    { item: "All certificates of compliance filed",     passed: !!certificatesFiled,        critical: true  },
+    { item: "Final inspection passed",                  passed: !!inspectionPassed,          critical: true  },
+    { item: "All utilities connected and operational",  passed: !!utilityConnected,          critical: true  },
+    { item: "Defects liability register cleared",       passed: !!defectsCleared,            critical: true  },
+    { item: "Final site clean completed",               passed: !!finalCleanDone,            critical: false },
+    { item: "Keys handed over to owner",                passed: !!keysHandedOver,            critical: false },
+    { item: "All documentation provided to client",     passed: !!documentationProvided,     critical: true  },
+  ];
+
+  const criticalFail = checks.filter(c => c.critical && !c.passed);
+  const readyToOccupy = criticalFail.length === 0;
+
+  return res.json({
+    address:         safeAddress,
+    buildingClass:   safeBldgClass,
+    jobType:         safeJobType,
+    readyToOccupy,
+    verdict:         readyToOccupy ? "CLEARED FOR OCCUPATION" : `NOT CLEARED — ${criticalFail.length} critical item(s) outstanding`,
+    checks,
+    criticalItems:   criticalFail.map(c => c.item),
+    notes:           sanitiseInput(String(notes || "")),
+    checkedAt:       new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
