@@ -68576,6 +68576,402 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /cathodic-protection-record — Cathodic protection system monitoring per AS 2832
+app.post("/cathodic-protection-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    facilityName,
+    facilityAddress,
+    structureId,
+    structureType,        // pipeline | storage-tank | bridge | jetty | wharf | reinforced-concrete | ship-hull
+    materialType,         // carbon-steel | stainless-steel | cast-iron | reinforced-concrete | aluminium
+    cpSystemType,         // ICCP | SACP | both
+    inspectionDate,
+    inspector,
+    // Impressed current CP (ICCP)
+    rectifierOutputVoltage_V,
+    rectifierOutputCurrent_A,
+    rectifierOutputPower_W,
+    // Structure-to-electrolyte potential readings
+    pipeToSoilReadings,   // array of { testPoint, potential_mV, with_IR_drop: boolean }
+    protectionCriteria_mV, // AS 2832 minimum -850 mV CSE with IR-free, or -1050 mV instant-off
+    instantOffPotential_mV,
+    onPotential_mV,
+    // Sacrificial anode CP (SACP)
+    anodeMaterial,        // zinc | magnesium | aluminium
+    anodeWeight_kg,
+    anodeConsumed_pct,
+    anodeReplacementDue,
+    // Readings
+    referenceElectrodeType, // Cu/CuSO4 | Ag/AgCl | Zn
+    soilResistivity_Ohm_m,
+    strayCurrentPresent,
+    interferenceSources,
+    coatingCondition,     // good | holiday-detected | damaged | absent
+    holidaysDetected,     // number of coating holidays
+    insulatingFlangesWorking,
+    cathodicProtectionAdequate, // true | false
+    photos,
+    notes,
+  } = req.body;
+
+  const issues = [];
+
+  // Potential criteria check — AS 2832 Part 1
+  const instOffMV = parseFloat(instantOffPotential_mV) || 0;
+  const onMV = parseFloat(onPotential_mV) || 0;
+  const criteriaLimit = parseFloat(protectionCriteria_mV) || -850;
+
+  if (instOffMV !== 0 && instOffMV > criteriaLimit) {
+    issues.push(
+      `Instant-off potential ${instOffMV} mV is less negative than criterion ${criteriaLimit} mV — under-protected`
+    );
+  }
+
+  // Anode consumption
+  const anodeUsed = parseFloat(anodeConsumed_pct) || 0;
+  if (anodeUsed > 85) {
+    issues.push(`Sacrificial anode ${anodeUsed}% consumed — replacement required`);
+  }
+
+  // Stray current
+  if (strayCurrentPresent === true || strayCurrentPresent === "true") {
+    issues.push("Stray current interference detected — may cause accelerated corrosion, investigate source");
+  }
+
+  // Coating holidays
+  const holidays = parseInt(holidaysDetected, 10) || 0;
+  if (holidays > 5) {
+    issues.push(`${holidays} coating holidays detected — repair coating to restore barrier protection`);
+  }
+
+  // CP system overall
+  if (cathodicProtectionAdequate === false || cathodicProtectionAdequate === "false") {
+    issues.push("CP system assessed as inadequate — risk of uncontrolled corrosion");
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    facility_name: sanitiseInput(facilityName),
+    facility_address: sanitiseInput(facilityAddress),
+    structure_id: sanitiseInput(structureId),
+    structure_type: sanitiseInput(structureType),
+    material_type: sanitiseInput(materialType),
+    cp_system_type: sanitiseInput(cpSystemType),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    rectifier_output_voltage_v: rectifierOutputVoltage_V,
+    rectifier_output_current_a: rectifierOutputCurrent_A,
+    pipe_to_soil_readings: pipeToSoilReadings || [],
+    protection_criteria_mv: protectionCriteria_mV || -850,
+    instant_off_potential_mv: instantOffPotential_mV,
+    on_potential_mv: onPotential_mV,
+    anode_material: sanitiseInput(anodeMaterial),
+    anode_weight_kg: anodeWeight_kg,
+    anode_consumed_pct: anodeConsumed_pct,
+    anode_replacement_due: anodeReplacementDue,
+    reference_electrode_type: sanitiseInput(referenceElectrodeType),
+    soil_resistivity_ohm_m: soilResistivity_Ohm_m,
+    stray_current_present: strayCurrentPresent,
+    interference_sources: sanitiseInput(interferenceSources),
+    coating_condition: sanitiseInput(coatingCondition),
+    holidays_detected: holidaysDetected,
+    insulating_flanges_working: insulatingFlangesWorking,
+    cathodic_protection_adequate: cathodicProtectionAdequate,
+    issues,
+    overall_result: issues.length === 0 ? "ADEQUATE" : "ACTION-REQUIRED",
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("cathodic_protection_records")
+      .insert(record);
+    if (dbErr) console.error("DB error /cathodic-protection-record:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Cathodic protection record saved",
+    structureId: sanitiseInput(structureId),
+    overallResult: issues.length === 0 ? "ADEQUATE" : "ACTION-REQUIRED",
+    issuesCount: issues.length,
+    issues,
+    instantOffPotential_mV: instOffMV,
+    protectionCriteria_mV: criteriaLimit,
+    applicableStandards: [
+      "AS 2832.1",
+      "AS 2832.2",
+      "AS 2832.5",
+      "AS 3992",
+      "NACE SP0169",
+    ],
+    saved,
+  });
+});
+
+// POST /fire-door-inspection — Fire door inspection per AS 1905.1 / AS 1851 / NCC 2022
+app.post("/fire-door-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    buildingName,
+    inspectionDate,
+    inspector,
+    inspectorAccreditation,
+    inspectionType,       // annual-as1851 | routine | commissioning | post-incident
+    doorsInspected,       // array of { id, location, frLevel, frlIntegrity, frlInsulation, ... }
+    // Per-door fields (or aggregate)
+    doorId,
+    doorLocation,
+    frlRequired,          // FRL (fire resistance level) e.g. -/120/30
+    leafCondition,        // good | warped | damaged | repainted
+    frameCondition,       // good | damaged | cracked | corroded
+    intumescentStrip,     // present | missing | damaged
+    smokeSeals,           // present | missing | damaged
+    hingesCount,
+    hingesCondition,
+    selfClosingDevice,    // present | absent
+    selfClosingFunctional,
+    holdOpenDevice,       // electromagnetic | none
+    holdOpenFunctional,
+    latchWorking,
+    gapCompliant,         // max 3 mm at edges per AS 1905.1
+    maxGap_mm,
+    underDoorGap_mm,      // max 10 mm per AS 1905.1
+    glazingPresent,
+    glazingFrlLabelled,
+    doorSwingClear,       // nothing blocking swing
+    overallResult,        // PASS | FAIL | DEFECTS-NOTED
+    defects,              // array of { doorId, description, severity }
+    photos,
+    notes,
+  } = req.body;
+
+  const failures = [];
+
+  // Self-closing device
+  if (!selfClosingDevice || selfClosingFunctional === false || selfClosingFunctional === "false") {
+    failures.push("Self-closing device absent or not functional — required per AS 1905.1");
+  }
+
+  // Gap compliance
+  const gap = parseFloat(maxGap_mm) || 0;
+  if (gap > 3) failures.push(`Edge gap ${gap} mm exceeds AS 1905.1 maximum 3 mm`);
+
+  const underGap = parseFloat(underDoorGap_mm) || 0;
+  if (underGap > 10) failures.push(`Under-door gap ${underGap} mm exceeds AS 1905.1 maximum 10 mm`);
+
+  // Intumescent strip
+  if (intumescentStrip === "missing") failures.push("Intumescent strip missing — required for smoke/fire seal integrity");
+  if (intumescentStrip === "damaged") failures.push("Intumescent strip damaged — replace before fire event");
+
+  // Frame condition
+  if (frameCondition === "damaged" || frameCondition === "cracked") {
+    failures.push(`Door frame ${frameCondition} — FRL integrity compromised`);
+  }
+
+  // Leaf warped
+  if (leafCondition === "warped") failures.push("Door leaf warped — may not seal in fire event");
+
+  // Latch
+  if (!latchWorking) failures.push("Latch not working — door will not retain in frame during fire");
+
+  // Custom defects (critical only)
+  if (Array.isArray(defects)) {
+    defects.filter((d) => d.severity === "critical" || d.severity === "major")
+      .forEach((d) => failures.push(`${d.doorId || "Door"}: ${d.description}`));
+  }
+
+  const result = failures.length === 0 ? "PASS" : "FAIL";
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    building_name: sanitiseInput(buildingName),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    inspector_accreditation: sanitiseInput(inspectorAccreditation),
+    inspection_type: sanitiseInput(inspectionType),
+    doors_inspected: doorsInspected || [],
+    door_id: sanitiseInput(doorId),
+    door_location: sanitiseInput(doorLocation),
+    frl_required: sanitiseInput(frlRequired),
+    leaf_condition: sanitiseInput(leafCondition),
+    frame_condition: sanitiseInput(frameCondition),
+    intumescent_strip: sanitiseInput(intumescentStrip),
+    smoke_seals: sanitiseInput(smokeSeals),
+    hinges_count: hingesCount,
+    hinges_condition: sanitiseInput(hingesCondition),
+    self_closing_device: selfClosingDevice,
+    self_closing_functional: selfClosingFunctional,
+    hold_open_device: sanitiseInput(holdOpenDevice),
+    hold_open_functional: holdOpenFunctional,
+    latch_working: latchWorking,
+    gap_compliant: gap <= 3,
+    max_gap_mm: maxGap_mm,
+    under_door_gap_mm: underDoorGap_mm,
+    glazing_present: glazingPresent,
+    glazing_frl_labelled: glazingFrlLabelled,
+    door_swing_clear: doorSwingClear,
+    failures,
+    overall_result: result,
+    defects: defects || [],
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("fire_door_inspections")
+      .insert(record);
+    if (dbErr) console.error("DB error /fire-door-inspection:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  if (result === "FAIL") {
+    return res.status(422).json({
+      error: "Fire door inspection FAILED — fire compartmentation compromised",
+      failures,
+      overallResult: result,
+      immediateActions: [
+        "Repair or replace defective fire doors immediately",
+        "Until repaired: assign fire watch at affected doors during high-risk periods",
+        "Notify building owner and fire safety officer",
+        "Log defects in building's Essential Safety Measures (ESM) record",
+      ],
+      applicableStandards: [
+        "AS 1905.1",
+        "AS 1851",
+        "NCC 2022 Section C",
+        "Building Act 1993 (Vic) — Essential Safety Measures",
+      ],
+      saved,
+    });
+  }
+
+  res.json({
+    message: "Fire door inspection PASSED",
+    doorId: sanitiseInput(doorId),
+    overallResult: result,
+    applicableStandards: ["AS 1905.1", "AS 1851", "NCC 2022 Section C"],
+    saved,
+  });
+});
+
+// POST /ai-cathodic-protection-assessment — AI assesses CP adequacy, corrosion risk, and remediation
+app.post("/ai-cathodic-protection-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    structureType,
+    materialType,
+    cpSystemType,
+    instantOffPotential_mV,
+    anodeConsumed_pct,
+    soilResistivity_Ohm_m,
+    strayCurrentPresent,
+    coatingCondition,
+    structureAge_years,
+    environment,          // buried | marine | concrete | atmospheric
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are a cathodic protection engineer and corrosion specialist with 20 years experience on Australian pipelines, tanks, and marine structures. Assess cathodic protection adequacy per AS 2832 series, NACE SP0169, NACE SP0176, and AS 3992.
+
+Assess:
+1. Protection potential compliance — instant-off vs on potential criteria for different environments
+2. Anode consumption rate and replacement timing
+3. Coating-CP interaction — holidays increase CP demand
+4. Stray current interference — DC traction systems, HVDC, other CP systems
+5. CP system design life and adequacy for remaining service
+6. Corrosion rate estimation from potential data
+7. Soil/electrolyte aggressiveness classification
+
+Respond with JSON: { "cpAdequacy": "adequate|marginal|inadequate|failed", "corrosionRisk": "low|medium|high|critical", "estimatedCorrosionRate_mm_year": number, "anodeReplacementUrgency": "immediate|within-6-months|within-2-years|monitor", "strayCurrentRisk": "low|medium|high", "coatingLifeRemaining_years": number, "systemRecommendations": [], "monitoringFrequency": "string", "remediationOptions": [], "designReview": boolean, "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Structure type: ${structureType || "not specified"}
+Material: ${materialType || "carbon-steel"}
+CP system type: ${cpSystemType || "not specified"}
+Instant-off potential: ${instantOffPotential_mV || "not measured"} mV
+Anode consumed: ${anodeConsumed_pct || "not measured"}%
+Soil resistivity: ${soilResistivity_Ohm_m || "not measured"} Ω·m
+Stray current present: ${strayCurrentPresent || "no"}
+Coating condition: ${coatingCondition || "not specified"}
+Structure age: ${structureAge_years || "not specified"} years
+Environment: ${environment || "buried"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-cathodic-protection-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        cpAdequacy: "marginal",
+        corrosionRisk: "medium",
+        estimatedCorrosionRate_mm_year: 0.1,
+        anodeReplacementUrgency: "within-2-years",
+        strayCurrentRisk: "low",
+        coatingLifeRemaining_years: 8,
+        systemRecommendations: [
+          "Increase rectifier output to achieve instant-off potential ≤-850 mV CSE",
+          "Repair coating holidays to reduce CP current demand",
+          "Install close-interval survey reference electrodes for continuous monitoring",
+        ],
+        monitoringFrequency: "Annual full survey; 6-monthly rectifier output check",
+        remediationOptions: [
+          "Increase impressed current output if rectifier at capacity",
+          "Install additional anodes if soil resistivity high",
+          "Apply new coating system if holiday count excessive",
+        ],
+        designReview: false,
+        applicableStandards: [
+          "AS 2832.1",
+          "AS 2832.2",
+          "NACE SP0169",
+          "AS 3992",
+        ],
+        recommendation:
+          "Increase CP current to achieve protection criteria. Repair coating holidays. Annual close-interval survey to verify protection over full structure length.",
+        summary:
+          "CP system is marginal — protection potential is near but not consistently meeting -850 mV criterion. Increase current output and repair coating. Annual survey required to confirm protection.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
