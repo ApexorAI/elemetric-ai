@@ -21508,6 +21508,248 @@ app.post("/estimate-vs-actual", apiKeyAuth, (req, res) => {
   });
 });
 
+// POST /job-photo-checklist  — Validate which required photo types have been captured
+app.post("/job-photo-checklist", apiKeyAuth, (req, res) => {
+  const { jobType, photoLabels = [] } = req.body || {};
+  if (!jobType) return res.status(400).json({ error: "jobType required." });
+
+  const PHOTO_REQUIREMENTS = {
+    plumbing:   ["before work", "pipe connections", "pressure test gauge", "completed fixtures", "meter reading"],
+    gas:        ["appliance nameplate", "gas meter", "flexible connections", "leak test gauge", "completed installation"],
+    electrical: ["switchboard before", "switchboard after", "cable runs", "RCD test", "completed outlets"],
+    drainage:   ["drain entry point", "pipe gradient", "inspection opening", "water flow test", "backfill"],
+    carpentry:  ["site before", "framing progress", "connections/fixings", "completed structure", "site after"],
+    hvac:       ["existing unit", "installation position", "refrigerant connections", "electrical connections", "commissioned unit"],
+  };
+
+  const required = PHOTO_REQUIREMENTS[jobType.toLowerCase()] || PHOTO_REQUIREMENTS.plumbing;
+  const safeLabels = (Array.isArray(photoLabels) ? photoLabels : []).map(l => sanitiseInput(String(l)).toLowerCase());
+
+  const results = required.map(req => {
+    const captured = safeLabels.some(l => l.includes(req.split(" ")[0]) || l.includes(req));
+    return { requirement: req, captured, status: captured ? "CAPTURED" : "MISSING" };
+  });
+
+  const capturedCount = results.filter(r => r.captured).length;
+  const pct = Math.round((capturedCount / required.length) * 100);
+
+  return res.json({
+    jobType,
+    totalRequired: required.length,
+    captured: capturedCount,
+    missing: required.length - capturedCount,
+    completionPercent: pct,
+    status: pct === 100 ? "COMPLETE" : pct >= 60 ? "PARTIAL" : "INSUFFICIENT",
+    results,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /contractor-availability  — Register contractor availability windows
+app.post("/contractor-availability", apiKeyAuth, async (req, res) => {
+  const { contractorId, windows = [], timezone = "Australia/Melbourne" } = req.body || {};
+  if (!contractorId) return res.status(400).json({ error: "contractorId required." });
+  if (!Array.isArray(windows) || windows.length === 0) return res.status(400).json({ error: "windows array required." });
+
+  const safeId = sanitiseInput(String(contractorId));
+  const safeTz = sanitiseInput(String(timezone)).slice(0, 60);
+
+  const validated = windows.slice(0, 30).map(w => ({
+    date:      sanitiseInput(String(w.date || "")).slice(0, 20),
+    startTime: sanitiseInput(String(w.startTime || "")).slice(0, 10),
+    endTime:   sanitiseInput(String(w.endTime || "")).slice(0, 10),
+    available: w.available !== false,
+    note:      w.note ? sanitiseInput(String(w.note)).slice(0, 100) : null,
+  }));
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("contractor_availability").upsert(
+        validated.map(w => ({ contractor_id: safeId, ...w, timezone: safeTz, updated_at: new Date().toISOString() })),
+        { onConflict: "contractor_id,date,start_time" }
+      );
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.json({
+    contractorId: safeId,
+    windowsRegistered: validated.length,
+    timezone: safeTz,
+    windows: validated,
+    savedAt: new Date().toISOString(),
+  });
+});
+
+// GET /compliance-expiry/:contractorId  — List certs/licences/permits expiring within N days
+app.get("/compliance-expiry/:contractorId", apiKeyAuth, async (req, res) => {
+  const contractorId = sanitiseInput(String(req.params.contractorId || "")).slice(0, 80);
+  const daysAhead = Math.min(parseInt(req.query.days) || 90, 365);
+
+  if (!contractorId) return res.status(400).json({ error: "contractorId required." });
+
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() + daysAhead);
+
+  let items = [];
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin
+        .from("compliance_items")
+        .select("*")
+        .eq("contractor_id", contractorId)
+        .lte("expiry_date", cutoff.toISOString())
+        .gte("expiry_date", new Date().toISOString())
+        .order("expiry_date", { ascending: true });
+      items = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const now = Date.now();
+  const enriched = items.map(item => {
+    const expMs = new Date(item.expiry_date).getTime();
+    const daysLeft = Math.round((expMs - now) / 86400000);
+    return {
+      ...item,
+      daysLeft,
+      urgency: daysLeft <= 14 ? "CRITICAL" : daysLeft <= 30 ? "HIGH" : daysLeft <= 60 ? "MEDIUM" : "LOW",
+    };
+  });
+
+  return res.json({
+    contractorId,
+    daysAhead,
+    count: enriched.length,
+    critical: enriched.filter(i => i.urgency === "CRITICAL").length,
+    high:     enriched.filter(i => i.urgency === "HIGH").length,
+    items: enriched,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /material-waste  — Log material waste for a job
+app.post("/material-waste", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, items = [] } = req.body || {};
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "items array required." });
+
+  const safeJobId  = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeType   = sanitiseInput(String(jobType || "general")).slice(0, 40);
+
+  const WASTE_BENCHMARKS = {
+    plumbing:   0.08,
+    gas:        0.05,
+    electrical: 0.07,
+    drainage:   0.10,
+    carpentry:  0.12,
+    hvac:       0.06,
+    general:    0.10,
+  };
+  const benchmark = WASTE_BENCHMARKS[safeType.toLowerCase()] || 0.10;
+
+  const logged = items.slice(0, 50).map(i => ({
+    material:   sanitiseInput(String(i.material || "unknown")).slice(0, 80),
+    unit:       sanitiseInput(String(i.unit || "unit")).slice(0, 20),
+    ordered:    Math.max(0, parseFloat(i.ordered) || 0),
+    used:       Math.max(0, parseFloat(i.used) || 0),
+    waste:      Math.max(0, parseFloat(i.waste) || Math.max(0, (parseFloat(i.ordered) || 0) - (parseFloat(i.used) || 0))),
+    unitCost:   Math.max(0, parseFloat(i.unitCost) || 0),
+  })).map(i => ({
+    ...i,
+    wastePct: i.ordered > 0 ? parseFloat(((i.waste / i.ordered) * 100).toFixed(1)) : 0,
+    wasteCost: parseFloat((i.waste * i.unitCost).toFixed(2)),
+    status: i.ordered > 0 && (i.waste / i.ordered) > benchmark ? "EXCESSIVE" : "ACCEPTABLE",
+  }));
+
+  const totalWasteCost = parseFloat(logged.reduce((s, i) => s + i.wasteCost, 0).toFixed(2));
+  const excessive      = logged.filter(i => i.status === "EXCESSIVE").length;
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("material_waste").insert({
+        job_id: safeJobId, job_type: safeType, items: logged,
+        total_waste_cost: totalWasteCost, excessive_items: excessive,
+        created_at: new Date().toISOString(),
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.json({
+    jobId: safeJobId,
+    jobType: safeType,
+    benchmarkWastePct: (benchmark * 100).toFixed(0) + "%",
+    totalWasteCost,
+    excessiveItems: excessive,
+    recommendation: excessive > 0
+      ? `${excessive} material(s) exceed the ${(benchmark * 100).toFixed(0)}% waste benchmark — review ordering and cutting practices`
+      : "Waste within acceptable benchmarks",
+    items: logged,
+    loggedAt: new Date().toISOString(),
+  });
+});
+
+// POST /ai-scope-review  — AI reviews a scope of works for completeness and compliance gaps
+app.post("/ai-scope-review", apiKeyAuth, async (req, res) => {
+  const { jobType, scope, address } = req.body || {};
+  if (!jobType || !scope) return res.status(400).json({ error: "jobType and scope required." });
+
+  const safeType    = sanitiseInput(String(jobType)).slice(0, 40);
+  const safeScope   = sanitiseInput(String(scope)).slice(0, 3000);
+  const safeAddress = address ? sanitiseInput(String(address)).slice(0, 200) : null;
+
+  const prompt = `You are an expert ${safeType} compliance reviewer in Victoria, Australia.
+
+Review the following scope of works and identify:
+1. Missing compliance steps (permits, certificates, testing requirements)
+2. Safety gaps
+3. Regulatory requirements not addressed
+4. Suggested additions
+
+Scope of works:
+${safeScope}
+${safeAddress ? `\nProperty address: ${safeAddress}` : ""}
+
+Respond with JSON:
+{
+  "overallRating": "COMPLETE|MOSTLY_COMPLETE|NEEDS_WORK|INCOMPLETE",
+  "score": 0-100,
+  "complianceGaps": ["gap1", ...],
+  "safetyGaps": ["gap1", ...],
+  "suggestedAdditions": ["addition1", ...],
+  "strengths": ["strength1", ...],
+  "summary": "2-sentence summary"
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 700 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      jobType: safeType,
+      scope:   safeScope.slice(0, 200) + (safeScope.length > 200 ? "..." : ""),
+      overallRating:      parsed.overallRating || "NEEDS_WORK",
+      score:              typeof parsed.score === "number" ? parsed.score : 50,
+      complianceGaps:     Array.isArray(parsed.complianceGaps) ? parsed.complianceGaps : [],
+      safetyGaps:         Array.isArray(parsed.safetyGaps) ? parsed.safetyGaps : [],
+      suggestedAdditions: Array.isArray(parsed.suggestedAdditions) ? parsed.suggestedAdditions : [],
+      strengths:          Array.isArray(parsed.strengths) ? parsed.strengths : [],
+      summary:            parsed.summary || "",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      jobType: safeType,
+      overallRating: "NEEDS_WORK",
+      score: 50,
+      complianceGaps: ["Unable to analyse scope at this time"],
+      safetyGaps: [],
+      suggestedAdditions: [],
+      strengths: [],
+      summary: "Scope review temporarily unavailable.",
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
