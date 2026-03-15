@@ -1,15 +1,19 @@
 require("dotenv").config();
 
 const express = require("express");
-const cors = require("cors");
-const OpenAI = require("openai");
+const cors    = require("cors");
+const helmet  = require("helmet");
+const OpenAI  = require("openai");
 const Replicate = require("replicate");
 const rateLimit = require("express-rate-limit");
-const Stripe = require("stripe");
+const Stripe  = require("stripe");
 const { createClient } = require("@supabase/supabase-js");
-const sharp = require("sharp");
+const sharp   = require("sharp");
 
 const app = express();
+
+// Trust Railway's reverse proxy so rate-limiter and IP logging see the real IP
+app.set("trust proxy", 1);
 
 // ── Stripe webhook — raw body MUST come before express.json() ─────────────────
 
@@ -135,8 +139,50 @@ app.post(
   }
 );
 
-app.use(cors());
-app.use(express.json({ limit: "50mb" }));
+// ── Security headers (helmet) ─────────────────────────────────────────────────
+app.use(helmet());
+
+// ── CORS restriction ──────────────────────────────────────────────────────────
+// Allowed origins are set via ALLOWED_ORIGINS env var (comma-separated).
+// Requests with no Origin header (mobile apps, server-to-server) are passed
+// through without restriction — CORS only applies to browser cross-origin calls.
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // No Origin = mobile app or same-origin curl — allow
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.length === 0) {
+      // ALLOWED_ORIGINS not configured — open in dev, warn loudly
+      if (process.env.NODE_ENV === "production") {
+        return callback(new Error("CORS: ALLOWED_ORIGINS not configured in production."));
+      }
+      return callback(null, true);
+    }
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error(`CORS: origin '${origin}' not permitted.`));
+  },
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type", "x-elemetric-key", "Authorization"],
+}));
+
+// ── Request body size limit (10 MB) ──────────────────────────────────────────
+app.use(express.json({ limit: "10mb" }));
+
+// ── Request logger ────────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    const ms = Date.now() - start;
+    console.log(
+      `[${new Date().toISOString()}] ${req.method} ${req.path} → ${res.statusCode} (${ms}ms)`
+    );
+  });
+  next();
+});
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 
@@ -164,7 +210,7 @@ app.use(globalLimiter);
 
 app.use((req, res, next) => {
   // Allow unauthenticated health check and Stripe webhook
-  if (req.path === "/" || req.path === "/webhook") return next();
+  if (req.path === "/" || req.path === "/webhook" || req.path === "/health") return next();
 
   const key = req.headers["x-elemetric-key"];
   const expected = process.env.ELEMETRIC_API_KEY;
@@ -242,10 +288,11 @@ apiKey: process.env.OPENAI_API_KEY,
 });
 
 app.get("/", (_req, res) => {
-res.json({
-ok: true,
-service: "Elemetric AI server",
+  res.json({ ok: true, service: "Elemetric AI server" });
 });
+
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", uptime: process.uptime() });
 });
 
 app.get("/timestamp", (_req, res) => {
@@ -754,9 +801,9 @@ let parsed;
 try {
 parsed = JSON.parse(raw);
 } catch {
+console.error("AI returned invalid JSON:", raw);
 return res.status(500).json({
-error: "AI returned invalid JSON",
-raw,
+  error: "AI returned an unreadable response. Please try again.",
 });
 }
 
@@ -830,8 +877,7 @@ return res.json({
 console.error("AI review error:", error);
 
 return res.status(500).json({
-error: "AI analysis failed",
-details: error.message || "Unknown server error",
+  error: "AI analysis failed. Please try again.",
 });
 }
 });
@@ -1065,8 +1111,7 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
     console.error("  message:", error.message);
     console.error("  stack:", error.stack);
     return res.status(500).json({
-      error: "Visualisation failed",
-      details: error.message || "Unknown server error",
+      error: "Visualisation failed. Please try again.",
     });
   }
 });
@@ -1122,8 +1167,7 @@ app.post("/stamp-photo", async (req, res) => {
   } catch (error) {
     console.error("Stamp photo error:", error);
     return res.status(500).json({
-      error: "Photo stamping failed",
-      details: error.message || "Unknown error",
+      error: "Photo stamping failed. Please try again.",
     });
   }
 });
@@ -1202,14 +1246,28 @@ app.get("/property-passport", async (req, res) => {
   } catch (error) {
     console.error("Property passport error:", error);
     return res.status(500).json({
-      error: "Property passport failed",
-      details: error.message || "Unknown error",
+      error: "Property passport lookup failed. Please try again.",
     });
   }
+});
+
+// ── 404 handler ───────────────────────────────────────────────────────────────
+app.use((_req, res) => {
+  res.status(404).json({ error: "Not found." });
+});
+
+// ── Global error handler ──────────────────────────────────────────────────────
+// Catches anything thrown outside a route-level try/catch (e.g. CORS errors,
+// body-parser rejections). Logs full detail server-side, returns generic message.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, _next) => {
+  console.error(`[${new Date().toISOString()}] Unhandled error on ${req.method} ${req.path}:`, err);
+  const status = typeof err.status === "number" ? err.status : 500;
+  res.status(status).json({ error: err.message || "An unexpected error occurred." });
 });
 
 const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, "0.0.0.0", () => {
-console.log(`Elemetric AI server running on http://0.0.0.0:${PORT}`);
+  console.log(`Elemetric AI server running on http://0.0.0.0:${PORT}`);
 });
