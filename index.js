@@ -29232,6 +29232,198 @@ Identify gaps, overlaps, and ambiguities. Return a JSON object with:
   }
 });
 
+// ── Round 102: Site access log, induction register, visitor management ────────
+
+// POST /site-access-log — Log entry and exit of personnel on site
+app.post("/site-access-log", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, personName, personType, company, inductionId,
+    action, vehicleRego, visitorHost, temperature,
+  } = req.body;
+
+  if (!siteId || !personName || !action)
+    return res.status(400).json({ error: "siteId, personName, action required." });
+
+  const validTypes = ["WORKER", "CONTRACTOR", "VISITOR", "DELIVERY", "INSPECTOR", "CLIENT", "OTHER"];
+  const validActions = ["SIGN_IN", "SIGN_OUT"];
+  const act = (action || "").toUpperCase();
+  const type = (personType || "WORKER").toUpperCase();
+
+  if (!validActions.includes(act)) return res.status(400).json({ error: "action must be SIGN_IN or SIGN_OUT" });
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    person_name: sanitiseInput(personName),
+    person_type: validTypes.includes(type) ? type : "OTHER",
+    company: sanitiseInput(company || ""),
+    induction_id: sanitiseInput(inductionId || ""),
+    action: act,
+    vehicle_rego: sanitiseInput(vehicleRego || ""),
+    visitor_host: sanitiseInput(visitorHost || ""),
+    temperature: temperature !== undefined ? Number(temperature) : null,
+    timestamp: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("site_access_log")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, logId: data.id, ...record });
+  }
+
+  res.json({ success: true, logId: null, ...record, saved: false });
+});
+
+// GET /site-access-log/:siteId — Get today's access log for a site
+app.get("/site-access-log/:siteId", apiKeyAuth, async (req, res) => {
+  const { siteId } = req.params;
+  const { date } = req.query;
+  const queryDate = date || new Date().toISOString().split("T")[0];
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("site_access_log")
+      .select("*")
+      .eq("site_id", siteId)
+      .gte("timestamp", `${queryDate}T00:00:00.000Z`)
+      .lte("timestamp", `${queryDate}T23:59:59.999Z`)
+      .order("timestamp", { ascending: true });
+
+    if (error) return res.status(500).json({ error: "DB error." });
+
+    const signedIn = (data || []).filter(e => e.action === "SIGN_IN").map(e => e.person_name);
+    const signedOut = (data || []).filter(e => e.action === "SIGN_OUT").map(e => e.person_name);
+    const currentlyOnSite = signedIn.filter(n => !signedOut.includes(n));
+
+    return res.json({ siteId, date: queryDate, entries: data || [], currentlyOnSite, onSiteCount: currentlyOnSite.length });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /induction-register — Register a completed site induction
+app.post("/induction-register", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, inducteeName, company, inductedBy,
+    inductionType, trade, emergencyContactName, emergencyContactPhone,
+    medicalConditions = false, medicalDetails, expiryDate,
+  } = req.body;
+
+  if (!siteId || !inducteeName) return res.status(400).json({ error: "siteId and inducteeName required." });
+
+  const validTypes = ["SITE_SPECIFIC", "COMPANY", "WHITE_CARD", "ONLINE", "TOOLBOX"];
+  const type = (inductionType || "SITE_SPECIFIC").toUpperCase();
+
+  const inductionId = `IND-${siteId.slice(-4).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    induction_id: inductionId,
+    site_id: sanitiseInput(siteId),
+    inductee_name: sanitiseInput(inducteeName),
+    company: sanitiseInput(company || ""),
+    inducted_by: sanitiseInput(inductedBy || ""),
+    induction_type: validTypes.includes(type) ? type : "SITE_SPECIFIC",
+    trade: sanitiseInput(trade || ""),
+    emergency_contact_name: sanitiseInput(emergencyContactName || ""),
+    emergency_contact_phone: sanitiseInput(emergencyContactPhone || ""),
+    medical_conditions: Boolean(medicalConditions),
+    medical_details: medicalConditions ? sanitiseInput(medicalDetails || "") : "",
+    expiry_date: expiryDate || null,
+    status: "ACTIVE",
+    inducted_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("induction_register")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, inductionId, dbId: data.id, ...record });
+  }
+
+  res.json({ success: true, inductionId, dbId: null, ...record, saved: false });
+});
+
+// GET /induction-check/:siteId/:personName — Check if a person has a valid induction
+app.get("/induction-check/:siteId/:personName", apiKeyAuth, async (req, res) => {
+  const { siteId, personName } = req.params;
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("induction_register")
+      .select("*")
+      .eq("site_id", siteId)
+      .ilike("inductee_name", personName)
+      .eq("status", "ACTIVE")
+      .order("inducted_at", { ascending: false })
+      .limit(1);
+
+    if (error) return res.status(500).json({ error: "DB error." });
+
+    if (!data || !data.length) {
+      return res.json({ siteId, personName, inducted: false, inductionId: null, message: "No active induction found." });
+    }
+
+    const ind = data[0];
+    const expired = ind.expiry_date && new Date(ind.expiry_date) < new Date();
+    return res.json({
+      siteId, personName, inducted: !expired,
+      inductionId: ind.induction_id, inductedAt: ind.inducted_at,
+      expiryDate: ind.expiry_date, expired,
+      message: expired ? "Induction has expired — re-induction required." : "Valid induction on record.",
+    });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /visitor-management — Pre-register a visitor for site access
+app.post("/visitor-management", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, visitorName, visitorCompany, visitPurpose,
+    hostName, visitDate, expectedArrival, vehicleRego,
+    requiresPPE = true, hasSiteInduction = false,
+  } = req.body;
+
+  if (!siteId || !visitorName || !visitDate)
+    return res.status(400).json({ error: "siteId, visitorName, visitDate required." });
+
+  const accessCode = `V${Date.now().toString(36).toUpperCase().slice(-6)}`;
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    visitor_name: sanitiseInput(visitorName),
+    visitor_company: sanitiseInput(visitorCompany || ""),
+    visit_purpose: sanitiseInput(visitPurpose || ""),
+    host_name: sanitiseInput(hostName || ""),
+    visit_date: visitDate,
+    expected_arrival: sanitiseInput(expectedArrival || ""),
+    vehicle_rego: sanitiseInput(vehicleRego || ""),
+    requires_ppe: Boolean(requiresPPE),
+    has_site_induction: Boolean(hasSiteInduction),
+    access_code: accessCode,
+    status: "PRE_REGISTERED",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("visitor_management")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, visitorId: data.id, accessCode, ...record });
+  }
+
+  res.json({ success: true, visitorId: null, accessCode, ...record, saved: false });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
