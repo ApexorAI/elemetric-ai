@@ -36491,6 +36491,261 @@ Return JSON with this structure:
   }
 });
 
+// POST /ai-quote-writer — AI drafts a professional trade quote/proposal
+app.post("/ai-quote-writer", apiKeyAuth, async (req, res) => {
+  const {
+    trade, jobDescription, scopeItems = [], labourHours, labourRateAud,
+    materialItems = [], overheadPercentage = 15, marginPercentage = 20,
+    clientName, siteAddress, validDays = 30, includeTerms = true,
+  } = req.body;
+  if (!trade || !jobDescription) {
+    return res.status(400).json({ error: "trade and jobDescription are required." });
+  }
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedDesc = sanitiseInput(jobDescription);
+  const sanitisedClient = sanitiseInput(clientName || "");
+  const sanitisedAddress = sanitiseInput(siteAddress || "");
+  const labourCost = (Number(labourHours) || 0) * (Number(labourRateAud) || 0);
+  const materialCost = Array.isArray(materialItems)
+    ? materialItems.reduce((s, m) => s + (Number(m.qty) || 0) * (Number(m.unitPrice) || 0), 0)
+    : 0;
+  const subtotal = labourCost + materialCost;
+  const overhead = subtotal * (Number(overheadPercentage) / 100);
+  const costBase = subtotal + overhead;
+  const margin = costBase * (Number(marginPercentage) / 100);
+  const totalExGst = costBase + margin;
+  const gst = totalExGst * 0.1;
+  const totalIncGst = totalExGst + gst;
+  const systemPrompt = `You are a professional trade business quoting assistant. Write clear, professional Australian trade quotes.`;
+  const userPrompt = `Write a professional quote document for:
+Trade: ${sanitisedTrade}
+Client: ${sanitisedClient || "The Client"}
+Site: ${sanitisedAddress || "As specified"}
+Job description: ${sanitisedDesc}
+Scope items: ${scopeItems.map(s => sanitiseInput(s)).join("; ")}
+Total (inc GST): $${totalIncGst.toFixed(2)} AUD
+Valid for: ${validDays} days
+
+Return JSON with:
+{
+  "quoteIntroduction": "...",
+  "scopeOfWorks": ["...", "..."],
+  "exclusions": ["...", "..."],
+  "assumptions": ["...", "..."],
+  "paymentTerms": "...",
+  "warrantyStatement": "...",
+  "terms": "...",
+  "professionalClosing": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const content = JSON.parse(aiRes.choices[0].message.content);
+    res.json({
+      trade: sanitisedTrade, clientName: sanitisedClient, siteAddress: sanitisedAddress,
+      validDays,
+      pricing: {
+        labourCost: +labourCost.toFixed(2),
+        materialCost: +materialCost.toFixed(2),
+        subtotal: +subtotal.toFixed(2),
+        overhead: +overhead.toFixed(2),
+        margin: +margin.toFixed(2),
+        totalExGst: +totalExGst.toFixed(2),
+        gst: +gst.toFixed(2),
+        totalIncGst: +totalIncGst.toFixed(2),
+      },
+      content,
+    });
+  } catch (err) {
+    console.error("ai-quote-writer error:", err.message);
+    res.json({
+      trade: sanitisedTrade, clientName: sanitisedClient, siteAddress: sanitisedAddress,
+      validDays,
+      pricing: {
+        labourCost: +labourCost.toFixed(2), materialCost: +materialCost.toFixed(2),
+        subtotal: +subtotal.toFixed(2), overhead: +overhead.toFixed(2), margin: +margin.toFixed(2),
+        totalExGst: +totalExGst.toFixed(2), gst: +gst.toFixed(2), totalIncGst: +totalIncGst.toFixed(2),
+      },
+      content: {
+        quoteIntroduction: `We are pleased to submit our quote for the ${sanitisedTrade} works as described below.`,
+        scopeOfWorks: scopeItems.length ? scopeItems : ["As per job description"],
+        exclusions: ["Works not specified in scope", "Permit fees unless stated", "Builder's work unless stated"],
+        assumptions: ["Site access will be available as required", "Existing services have been located"],
+        paymentTerms: "50% deposit required. Balance due within 7 days of completion.",
+        warrantyStatement: "All workmanship is warranted for 12 months from the date of completion.",
+        terms: `This quote is valid for ${validDays} days. Acceptance constitutes agreement to our standard terms and conditions.`,
+        professionalClosing: "Thank you for the opportunity. We look forward to working with you.",
+      },
+    });
+  }
+});
+
+// POST /job-profitability — Analyse actual vs budgeted job profitability
+app.post("/job-profitability", apiKeyAuth, async (req, res) => {
+  const {
+    jobId, jobName, trade,
+    quotedRevenue, actualRevenue,
+    budgetedLabourHours, actualLabourHours, labourRateAud,
+    budgetedMaterials, actualMaterials,
+    budgetedOverhead, actualOverhead,
+    invoicesPaid = 0, invoicesOutstanding = 0,
+  } = req.body;
+  if (!quotedRevenue || !actualRevenue) {
+    return res.status(400).json({ error: "quotedRevenue and actualRevenue are required." });
+  }
+  const qRev = Number(quotedRevenue);
+  const aRev = Number(actualRevenue);
+  const rate = Number(labourRateAud) || 0;
+  const bLabourCost = (Number(budgetedLabourHours) || 0) * rate;
+  const aLabourCost = (Number(actualLabourHours) || 0) * rate;
+  const bMat = Number(budgetedMaterials) || 0;
+  const aMat = Number(actualMaterials) || 0;
+  const bOh = Number(budgetedOverhead) || 0;
+  const aOh = Number(actualOverhead) || 0;
+  const budgetedCost = bLabourCost + bMat + bOh;
+  const actualCost = aLabourCost + aMat + aOh;
+  const budgetedGrossProfit = qRev - budgetedCost;
+  const actualGrossProfit = aRev - actualCost;
+  const budgetedGPM = qRev > 0 ? (budgetedGrossProfit / qRev) * 100 : 0;
+  const actualGPM = aRev > 0 ? (actualGrossProfit / aRev) * 100 : 0;
+  const revenueVariance = aRev - qRev;
+  const costVariance = budgetedCost - actualCost;
+  const profitVariance = actualGrossProfit - budgetedGrossProfit;
+  const labourEfficiency = Number(budgetedLabourHours) > 0 ? (Number(budgetedLabourHours) / Number(actualLabourHours || 1)) * 100 : 100;
+  let performanceRating = "GOOD";
+  if (actualGPM < 10) performanceRating = "POOR";
+  else if (actualGPM < 20) performanceRating = "FAIR";
+  else if (actualGPM >= 30) performanceRating = "EXCELLENT";
+  const flags = [];
+  if (revenueVariance < -0.05 * qRev) flags.push("Revenue underperformance — possible scope creep or pricing issue");
+  if (aMat > bMat * 1.1) flags.push("Material cost overrun — review supplier pricing or wastage");
+  if (aLabourCost > bLabourCost * 1.15) flags.push("Labour overrun — review hours and productivity");
+  if (actualGPM < 15) flags.push("Gross margin below 15% — job may not be worth repeating at this price");
+  const record = {
+    job_id: jobId || null,
+    job_name: sanitiseInput(jobName || ""),
+    trade: sanitiseInput(trade || ""),
+    quoted_revenue: qRev, actual_revenue: aRev,
+    budgeted_cost: +budgetedCost.toFixed(2), actual_cost: +actualCost.toFixed(2),
+    budgeted_gross_profit: +budgetedGrossProfit.toFixed(2),
+    actual_gross_profit: +actualGrossProfit.toFixed(2),
+    budgeted_gpm: +budgetedGPM.toFixed(2), actual_gpm: +actualGPM.toFixed(2),
+    performance_rating: performanceRating,
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("job_profitability").insert(record);
+    if (error) console.error("job-profitability DB error:", error.message);
+  }
+  res.json({
+    jobId, jobName, trade,
+    revenue: { quoted: qRev, actual: aRev, variance: +revenueVariance.toFixed(2) },
+    costs: {
+      labour: { budgeted: +bLabourCost.toFixed(2), actual: +aLabourCost.toFixed(2) },
+      materials: { budgeted: +bMat.toFixed(2), actual: +aMat.toFixed(2) },
+      overhead: { budgeted: +bOh.toFixed(2), actual: +aOh.toFixed(2) },
+      total: { budgeted: +budgetedCost.toFixed(2), actual: +actualCost.toFixed(2), variance: +costVariance.toFixed(2) },
+    },
+    grossProfit: {
+      budgeted: +budgetedGrossProfit.toFixed(2), actual: +actualGrossProfit.toFixed(2),
+      variance: +profitVariance.toFixed(2), budgetedGPM: +budgetedGPM.toFixed(1),
+      actualGPM: +actualGPM.toFixed(1),
+    },
+    labourEfficiency: +labourEfficiency.toFixed(1),
+    cashPosition: { invoicesPaid: Number(invoicesPaid), invoicesOutstanding: Number(invoicesOutstanding) },
+    performanceRating, flags, saved: !!supabaseAdmin,
+  });
+});
+
+// POST /client-survey — Record a client satisfaction survey response
+app.post("/client-survey", apiKeyAuth, async (req, res) => {
+  const {
+    jobId, clientName, clientEmail, trade,
+    overallRating, qualityRating, communicationRating, timelinessRating, valueRating,
+    wouldRecommend, likelyToRebook, comments, followUpRequested = false,
+  } = req.body;
+  if (!jobId || !overallRating) {
+    return res.status(400).json({ error: "jobId and overallRating are required." });
+  }
+  const ratings = [overallRating, qualityRating, communicationRating, timelinessRating, valueRating].map(Number).filter(r => r > 0);
+  const avgRating = ratings.length > 0 ? ratings.reduce((s, r) => s + r, 0) / ratings.length : Number(overallRating);
+  const surveyRef = `SRV-${Date.now().toString(36).toUpperCase()}`;
+  let sentiment = "NEUTRAL";
+  if (avgRating >= 4.5) sentiment = "VERY_POSITIVE";
+  else if (avgRating >= 3.5) sentiment = "POSITIVE";
+  else if (avgRating < 2.5) sentiment = "NEGATIVE";
+  else if (avgRating < 3.5) sentiment = "MIXED";
+  const requiresFollowUp = followUpRequested || avgRating < 3 || wouldRecommend === false;
+  const record = {
+    survey_ref: surveyRef,
+    job_id: jobId,
+    client_name: sanitiseInput(clientName || ""),
+    client_email: clientEmail && isValidEmail(clientEmail) ? clientEmail : null,
+    trade: sanitiseInput(trade || ""),
+    overall_rating: Number(overallRating),
+    quality_rating: Number(qualityRating) || null,
+    communication_rating: Number(communicationRating) || null,
+    timeliness_rating: Number(timelinessRating) || null,
+    value_rating: Number(valueRating) || null,
+    avg_rating: +avgRating.toFixed(2),
+    would_recommend: wouldRecommend !== undefined ? Boolean(wouldRecommend) : null,
+    likely_to_rebook: likelyToRebook !== undefined ? Boolean(likelyToRebook) : null,
+    comments: sanitiseInput(comments || ""),
+    sentiment,
+    requires_follow_up: requiresFollowUp,
+    follow_up_requested: followUpRequested,
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("client_surveys").insert(record);
+    if (error) console.error("client-survey DB error:", error.message);
+  }
+  res.json({
+    surveyRef, jobId, avgRating: +avgRating.toFixed(2), sentiment,
+    requiresFollowUp, wouldRecommend, saved: !!supabaseAdmin,
+  });
+});
+
+// GET /client-survey — Summarise survey results for a trade or job
+app.get("/client-survey", apiKeyAuth, async (req, res) => {
+  const { jobId, trade, from, to } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("client_surveys").select("*").order("created_at", { ascending: false });
+  if (jobId) query = query.eq("job_id", jobId);
+  if (trade) query = query.eq("trade", trade);
+  if (from) query = query.gte("created_at", from);
+  if (to) query = query.lte("created_at", to);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data.length) return res.json({ count: 0, surveys: [] });
+  const avgOverall = data.reduce((s, r) => s + (r.avg_rating || 0), 0) / data.length;
+  const npsPositive = data.filter(r => r.would_recommend === true).length;
+  const npsNegative = data.filter(r => r.would_recommend === false).length;
+  const nps = data.length > 0 ? Math.round(((npsPositive - npsNegative) / data.length) * 100) : 0;
+  res.json({
+    count: data.length,
+    avgRating: +avgOverall.toFixed(2),
+    nps,
+    requiresFollowUp: data.filter(r => r.requires_follow_up).length,
+    sentimentBreakdown: {
+      veryPositive: data.filter(r => r.sentiment === "VERY_POSITIVE").length,
+      positive: data.filter(r => r.sentiment === "POSITIVE").length,
+      neutral: data.filter(r => r.sentiment === "NEUTRAL").length,
+      mixed: data.filter(r => r.sentiment === "MIXED").length,
+      negative: data.filter(r => r.sentiment === "NEGATIVE").length,
+    },
+    surveys: data,
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
