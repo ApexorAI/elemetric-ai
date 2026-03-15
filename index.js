@@ -64763,6 +64763,438 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /electrical-safety-audit — Electrical safety audit per AS/NZS 3000 / AS/NZS 3760 / OHS Regs 2017 (Vic)
+app.post("/electrical-safety-audit", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    siteAddress,
+    auditDate,
+    auditor,
+    auditorLicenceNumber,
+    auditScope,           // construction-site | commercial | industrial | residential | temporary-supply
+    supplyVoltage,        // 230V | 415V | 11kV | other
+    mainSwitchboardAge,
+    lastTestTagDate,
+    testTagProgram,       // compliant | non-compliant | partial
+    rcdProtection,        // all-circuits | selected-circuits | none
+    rcdTestedDate,
+    earthingSystemType,   // TN-C-S | TN-S | TT | IT
+    earthingCondition,    // good | degraded | absent | not-inspected
+    loopImpedanceTest,    // pass | fail | not-tested
+    insulationResistance, // pass | fail | not-tested
+    switchboardCondition, // good | fair | poor | hazardous
+    overloadProtection,   // adequate | undersized | absent
+    arcFaultProtection,
+    wiring_condition,     // good | fair | damaged | exposed
+    exposedConductors,
+    temporaryWiringCompliant,
+    extensionLeadsCompliant,
+    flexibleCordsCondition, // good | damaged | taped
+    socketOutletsCondition,
+    earthContinuityMet,
+    defects,              // array of { location, description, severity: critical|major|minor }
+    photos,
+    notes,
+  } = req.body;
+
+  const criticalDefects = [];
+
+  // Exposed conductors
+  if (exposedConductors === true || exposedConductors === "true") {
+    criticalDefects.push("Exposed live conductors identified — electric shock risk");
+  }
+
+  // RCD protection
+  if (rcdProtection === "none") {
+    criticalDefects.push("No RCD protection installed — required for socket-outlet circuits per AS/NZS 3000");
+  }
+
+  // Earthing absent
+  if (earthingCondition === "absent") {
+    criticalDefects.push("Earthing system absent — risk of electric shock in fault conditions");
+  }
+
+  // Loop impedance failure
+  if (loopImpedanceTest === "fail") {
+    criticalDefects.push("Earth loop impedance test FAILED — protective device may not operate in fault");
+  }
+
+  // Hazardous switchboard
+  if (switchboardCondition === "hazardous") {
+    criticalDefects.push("Switchboard in hazardous condition — immediate de-energisation may be required");
+  }
+
+  // Damaged wiring
+  if (wiring_condition === "damaged" || wiring_condition === "exposed") {
+    criticalDefects.push(`Wiring condition ${wiring_condition} — replacement required`);
+  }
+
+  // Damaged flexible cords
+  if (flexibleCordsCondition === "damaged") {
+    criticalDefects.push("Damaged flexible cords identified — fire and shock risk");
+  }
+
+  // Defects from inspector
+  if (Array.isArray(defects)) {
+    defects.filter((d) => d.severity === "critical").forEach((d) =>
+      criticalDefects.push(`${d.location}: ${d.description}`)
+    );
+  }
+
+  const passed = criticalDefects.length === 0;
+
+  if (!passed) {
+    return res.status(422).json({
+      error: "Electrical safety audit — critical defects require immediate action",
+      criticalDefects,
+      immediateActions: [
+        "De-energise affected circuits immediately if shock risk present",
+        "Engage licensed electrician to rectify all critical defects",
+        "Do not reconnect power until defects rectified and re-tested",
+        "Notify WorkSafe Victoria if serious incident has occurred",
+      ],
+      applicableStandards: [
+        "AS/NZS 3000",
+        "AS/NZS 3760",
+        "OHS Regulations 2017 (Vic) Part 4.2",
+        "Electricity Safety Act 1998 (Vic)",
+      ],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    site_address: sanitiseInput(siteAddress),
+    audit_date: auditDate,
+    auditor: sanitiseInput(auditor),
+    auditor_licence_number: sanitiseInput(auditorLicenceNumber),
+    audit_scope: sanitiseInput(auditScope),
+    supply_voltage: sanitiseInput(supplyVoltage),
+    main_switchboard_age: mainSwitchboardAge,
+    last_test_tag_date: lastTestTagDate,
+    test_tag_program: sanitiseInput(testTagProgram),
+    rcd_protection: sanitiseInput(rcdProtection),
+    rcd_tested_date: rcdTestedDate,
+    earthing_system_type: sanitiseInput(earthingSystemType),
+    earthing_condition: sanitiseInput(earthingCondition),
+    loop_impedance_test: sanitiseInput(loopImpedanceTest),
+    insulation_resistance: sanitiseInput(insulationResistance),
+    switchboard_condition: sanitiseInput(switchboardCondition),
+    overload_protection: sanitiseInput(overloadProtection),
+    wiring_condition: sanitiseInput(wiring_condition),
+    exposed_conductors: exposedConductors,
+    temporary_wiring_compliant: temporaryWiringCompliant,
+    extension_leads_compliant: extensionLeadsCompliant,
+    flexible_cords_condition: sanitiseInput(flexibleCordsCondition),
+    socket_outlets_condition: sanitiseInput(socketOutletsCondition),
+    earth_continuity_met: earthContinuityMet,
+    defects: defects || [],
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    overall_result: "PASSED",
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("electrical_safety_audits")
+      .insert(record);
+    if (dbErr) console.error("DB error /electrical-safety-audit:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  const minorDefects = Array.isArray(defects) ? defects.filter((d) => d.severity !== "critical") : [];
+
+  res.json({
+    message: "Electrical safety audit completed — no critical defects",
+    overallResult: "PASSED",
+    criticalDefectsCount: 0,
+    minorDefectsCount: minorDefects.length,
+    rcdProtection: sanitiseInput(rcdProtection),
+    testTagProgram: sanitiseInput(testTagProgram),
+    applicableStandards: [
+      "AS/NZS 3000",
+      "AS/NZS 3760",
+      "OHS Regulations 2017 (Vic)",
+      "Electricity Safety Act 1998 (Vic)",
+    ],
+    saved,
+  });
+});
+
+// POST /drinking-water-quality-test — Drinking water test record per ADWG / Safe Drinking Water Act 2003 (Vic)
+app.post("/drinking-water-quality-test", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    facilityName,
+    facilityAddress,
+    sampleDate,
+    sampleLocation,       // tap | storage-tank | bore | treatment-outlet
+    sampledBy,
+    labName,
+    labAccreditation,
+    waterSource,          // mains | rainwater | bore | dam | recycled
+    // Physical parameters
+    pH,                   // ADWG: 6.5–8.5
+    turbidity_NTU,        // ADWG: <1 NTU aesthetic; <0.1 NTU health for treated
+    temperature_C,
+    conductivity_uS_cm,
+    // Chemical parameters
+    chlorine_residual_mg_L, // ADWG: 0.2–5 mg/L free chlorine for treated water
+    fluoride_mg_L,        // ADWG: 1.5 mg/L health guideline
+    nitrate_mg_L,         // ADWG: 50 mg/L health guideline
+    nitrite_mg_L,         // ADWG: 3 mg/L health guideline
+    arsenic_ug_L,         // ADWG: 10 µg/L
+    lead_ug_L,            // ADWG: 10 µg/L
+    // Microbiological parameters
+    eColi_per100mL,       // ADWG: 0/100 mL — health guideline
+    totalColiforms_per100mL, // ADWG: 0/100 mL — health guideline
+    thermoColiforms_per100mL,
+    // Results
+    overallResult,        // PASS | FAIL | CONDITIONAL
+    photos,
+    notes,
+  } = req.body;
+
+  const exceedances = [];
+
+  // Microbiological — most critical
+  if (parseFloat(eColi_per100mL) > 0) {
+    exceedances.push(`E. coli detected ${eColi_per100mL}/100 mL — immediate boil water advisory`);
+  }
+  if (parseFloat(totalColiforms_per100mL) > 0) {
+    exceedances.push(`Total coliforms ${totalColiforms_per100mL}/100 mL — investigate contamination source`);
+  }
+
+  // Chemical parameters
+  if (parseFloat(pH) < 6.5 || parseFloat(pH) > 8.5) {
+    exceedances.push(`pH ${pH} outside ADWG range 6.5–8.5`);
+  }
+  if (parseFloat(turbidity_NTU) > 1) {
+    exceedances.push(`Turbidity ${turbidity_NTU} NTU exceeds ADWG aesthetic guideline 1 NTU`);
+  }
+  if (parseFloat(fluoride_mg_L) > 1.5) {
+    exceedances.push(`Fluoride ${fluoride_mg_L} mg/L exceeds ADWG health guideline 1.5 mg/L`);
+  }
+  if (parseFloat(nitrate_mg_L) > 50) {
+    exceedances.push(`Nitrate ${nitrate_mg_L} mg/L exceeds ADWG health guideline 50 mg/L`);
+  }
+  if (parseFloat(arsenic_ug_L) > 10) {
+    exceedances.push(`Arsenic ${arsenic_ug_L} µg/L exceeds ADWG health guideline 10 µg/L`);
+  }
+  if (parseFloat(lead_ug_L) > 10) {
+    exceedances.push(`Lead ${lead_ug_L} µg/L exceeds ADWG health guideline 10 µg/L`);
+  }
+
+  // Chlorine residual (treated water)
+  const cl = parseFloat(chlorine_residual_mg_L) || 0;
+  if (waterSource === "mains" && cl < 0.2) {
+    exceedances.push(`Free chlorine ${cl} mg/L below minimum 0.2 mg/L for treated water`);
+  }
+
+  const hasMicrobial = exceedances.some((e) => e.includes("E. coli") || e.includes("coliforms"));
+  const testResult = exceedances.length === 0 ? "PASS" : hasMicrobial ? "FAIL" : "CONDITIONAL";
+
+  if (hasMicrobial) {
+    return res.status(422).json({
+      error: "Microbiological contamination detected — boil water advisory required",
+      exceedances,
+      immediateActions: [
+        "Issue boil water advisory immediately",
+        "Stop use of affected water supply for drinking/cooking",
+        "Investigate contamination source",
+        "Notify Department of Health and Safe Drinking Water Authority if licensed supplier",
+        "Re-sample and test immediately after remediation",
+      ],
+      applicableStandards: [
+        "Australian Drinking Water Guidelines (ADWG)",
+        "Safe Drinking Water Act 2003 (Vic)",
+        "Department of Health Victoria",
+      ],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    facility_name: sanitiseInput(facilityName),
+    facility_address: sanitiseInput(facilityAddress),
+    sample_date: sampleDate,
+    sample_location: sanitiseInput(sampleLocation),
+    sampled_by: sanitiseInput(sampledBy),
+    lab_name: sanitiseInput(labName),
+    lab_accreditation: sanitiseInput(labAccreditation),
+    water_source: sanitiseInput(waterSource),
+    ph,
+    turbidity_ntu: turbidity_NTU,
+    temperature_c: temperature_C,
+    conductivity_us_cm: conductivity_uS_cm,
+    chlorine_residual_mg_l: chlorine_residual_mg_L,
+    fluoride_mg_l: fluoride_mg_L,
+    nitrate_mg_l: nitrate_mg_L,
+    nitrite_mg_l: nitrite_mg_L,
+    arsenic_ug_l: arsenic_ug_L,
+    lead_ug_l: lead_ug_L,
+    e_coli_per_100ml: eColi_per100mL,
+    total_coliforms_per_100ml: totalColiforms_per100mL,
+    thermo_coliforms_per_100ml: thermoColiforms_per100mL,
+    exceedances,
+    overall_result: testResult,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("drinking_water_quality_tests")
+      .insert(record);
+    if (dbErr) console.error("DB error /drinking-water-quality-test:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Drinking water quality test recorded",
+    overallResult: testResult,
+    exceedancesCount: exceedances.length,
+    exceedances,
+    microbiologicallySafe: !hasMicrobial,
+    adwgGuidelines: {
+      ph: "6.5–8.5",
+      turbidity_NTU: "<1 NTU aesthetic",
+      eColi_per100mL: "0/100 mL",
+      totalColiforms_per100mL: "0/100 mL",
+      nitrate_mg_L: "<50 mg/L",
+    },
+    applicableStandards: [
+      "Australian Drinking Water Guidelines (ADWG)",
+      "Safe Drinking Water Act 2003 (Vic)",
+      "AS/NZS 4020",
+    ],
+    saved,
+  });
+});
+
+// POST /ai-electrical-safety-report — AI assesses electrical safety compliance, risk, and priority rectification
+app.post("/ai-electrical-safety-report", apiKeyAuth, async (req, res) => {
+  const {
+    auditScope,
+    defects,
+    rcdProtection,
+    earthingCondition,
+    switchboardCondition,
+    wiringCondition,
+    testTagStatus,
+    buildingAge_years,
+    occupancyType,        // office | industrial | construction | school | healthcare
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are a licensed electrical engineer and safety auditor with 20 years experience on Australian commercial, industrial, and construction sites. Assess electrical safety compliance per AS/NZS 3000, AS/NZS 3760, Electricity Safety Act 1998 (Vic), and OHS Regulations 2017 (Vic).
+
+Assess:
+1. Shock and fire risk from identified defects
+2. RCD protection coverage adequacy — AS/NZS 3000 requirements for socket-outlets and portable equipment
+3. Test and tag programme compliance — 3-monthly for construction, 12-monthly for commercial
+4. Earthing system integrity and protective device discrimination
+5. Switchboard obsolescence — fuse boards vs circuit breakers, RCBO requirements
+6. Priority rectification order based on risk
+7. Upgrade requirements for older electrical installations
+
+Respond with JSON: { "overallRisk": "low|medium|high|critical", "shockRisk": "low|medium|high|critical", "fireRisk": "low|medium|high|critical", "priorityRectifications": [], "rcdComplianceGap": "string", "testTagCompliance": "string", "switchboardUpgradeRequired": boolean, "upgradeJustification": "string", "maintenanceProgramme": [], "licencedElectricianRequired": boolean, "worksafeNotificationRequired": boolean, "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const defectSummary = Array.isArray(defects)
+    ? defects.map((d) => `${d.severity?.toUpperCase()}: ${d.location} — ${d.description}`).join("\n")
+    : "Not specified";
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Audit scope: ${auditScope || "not specified"}
+Defects identified:\n${defectSummary}
+RCD protection: ${rcdProtection || "not specified"}
+Earthing condition: ${earthingCondition || "not specified"}
+Switchboard condition: ${switchboardCondition || "not specified"}
+Wiring condition: ${wiringCondition || "not specified"}
+Test and tag status: ${testTagStatus || "not specified"}
+Building age: ${buildingAge_years || "not specified"} years
+Occupancy type: ${occupancyType || "not specified"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", report: parsed });
+  } catch (err) {
+    console.error("/ai-electrical-safety-report error:", err.message);
+    res.json({
+      source: "fallback",
+      report: {
+        overallRisk: "medium",
+        shockRisk: "medium",
+        fireRisk: "low",
+        priorityRectifications: [
+          "P1: Install RCDs on all socket-outlet circuits immediately",
+          "P2: Replace any damaged flexible cords and extension leads",
+          "P3: Implement test and tag programme for all portable equipment",
+          "P4: Replace deteriorated wiring at identified locations",
+        ],
+        rcdComplianceGap:
+          "RCDs required on all socket-outlet circuits per AS/NZS 3000 cl.2.6.3. Construction sites: all portable equipment must have RCD protection.",
+        testTagCompliance:
+          "Construction sites require 3-monthly test and tag of all portable equipment per AS/NZS 3760. Commercial: 12-monthly.",
+        switchboardUpgradeRequired: false,
+        upgradeJustification:
+          "Assess switchboard age — if >25 years or fuse-based, consider upgrade to circuit breaker/RCBO panel",
+        maintenanceProgramme: [
+          "3-monthly test and tag on construction sites",
+          "Annual RCD trip-time testing",
+          "5-yearly electrical installation inspection by licensed electrician",
+        ],
+        licencedElectricianRequired: true,
+        worksafeNotificationRequired: false,
+        applicableStandards: [
+          "AS/NZS 3000",
+          "AS/NZS 3760",
+          "Electricity Safety Act 1998 (Vic)",
+          "OHS Regulations 2017 (Vic) Part 4.2",
+        ],
+        recommendation:
+          "Install RCDs on all socket-outlet circuits. Implement 3-monthly test and tag on construction site. Engage licensed electrician to rectify all identified defects within 30 days.",
+        summary:
+          "Electrical installation presents medium risk manageable through RCD installation, test and tag programme, and rectification of identified defects. Annual inspection by licensed electrician recommended.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
