@@ -29816,6 +29816,220 @@ app.post("/quality-audit", apiKeyAuth, async (req, res) => {
   res.json({ success: true, auditId: null, ...record, saved: false });
 });
 
+// ── Round 105: Handover manual, O&M register, AI asset lifecycle analysis ─────
+
+// POST /handover-manual — Generate and store a project handover manual record
+app.post("/handover-manual", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, clientName, handoverDate,
+    systems = [], warranties = [], maintenanceSchedules = [],
+    emergencyContacts = [], asBuiltsLocation, operationalManualLocation,
+    defectsLiabilityEnd, notes,
+  } = req.body;
+
+  if (!projectId || !projectName) return res.status(400).json({ error: "projectId and projectName required." });
+
+  const processedSystems = systems.map(s => ({
+    systemName: sanitiseInput(s.systemName || ""),
+    trade: sanitiseInput(s.trade || ""),
+    manufacturer: sanitiseInput(s.manufacturer || ""),
+    model: sanitiseInput(s.model || ""),
+    serialNumber: sanitiseInput(s.serialNumber || ""),
+    installDate: s.installDate || null,
+    warrantyExpiry: s.warrantyExpiry || null,
+    maintenanceFrequency: sanitiseInput(s.maintenanceFrequency || ""),
+    serviceContact: sanitiseInput(s.serviceContact || ""),
+  }));
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    client_name: sanitiseInput(clientName || ""),
+    handover_date: handoverDate || new Date().toISOString().split("T")[0],
+    systems: processedSystems,
+    system_count: processedSystems.length,
+    warranties: warranties.map(w => ({
+      item: sanitiseInput(w.item || ""),
+      provider: sanitiseInput(w.provider || ""),
+      expiry: w.expiry || null,
+      coverage: sanitiseInput(w.coverage || ""),
+    })),
+    maintenance_schedules: maintenanceSchedules.map(m => ({
+      system: sanitiseInput(m.system || ""),
+      frequency: sanitiseInput(m.frequency || ""),
+      contractor: sanitiseInput(m.contractor || ""),
+      nextDue: m.nextDue || null,
+    })),
+    emergency_contacts: emergencyContacts.map(ec => ({
+      role: sanitiseInput(ec.role || ""),
+      name: sanitiseInput(ec.name || ""),
+      phone: sanitiseInput(ec.phone || ""),
+    })),
+    as_builts_location: sanitiseInput(asBuiltsLocation || ""),
+    operational_manual_location: sanitiseInput(operationalManualLocation || ""),
+    defects_liability_end: defectsLiabilityEnd || null,
+    notes: sanitiseInput(notes || ""),
+    status: "ISSUED",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("handover_manuals")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, manualId: data.id, ...record });
+  }
+
+  res.json({ success: true, manualId: null, ...record, saved: false });
+});
+
+// POST /om-register — Operations & Maintenance register entry
+app.post("/om-register", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, assetName, assetCategory, manufacturer, model,
+    serialNumber, installDate, warrantyExpiry, location,
+    maintenanceFrequency, lastServiced, nextServiceDue,
+    serviceContractor, serviceContactPhone, criticalAsset = false, notes,
+  } = req.body;
+
+  if (!siteId || !assetName) return res.status(400).json({ error: "siteId and assetName required." });
+
+  const validCategories = ["HVAC", "ELECTRICAL", "PLUMBING", "FIRE", "HYDRAULIC", "STRUCTURAL", "LIFT", "SECURITY", "IT", "OTHER"];
+  const cat = (assetCategory || "OTHER").toUpperCase();
+
+  const warrantyExpired = warrantyExpiry ? new Date(warrantyExpiry) < new Date() : false;
+  const serviceOverdue = nextServiceDue ? new Date(nextServiceDue) < new Date() : false;
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    asset_name: sanitiseInput(assetName),
+    asset_category: validCategories.includes(cat) ? cat : "OTHER",
+    manufacturer: sanitiseInput(manufacturer || ""),
+    model: sanitiseInput(model || ""),
+    serial_number: sanitiseInput(serialNumber || ""),
+    install_date: installDate || null,
+    warranty_expiry: warrantyExpiry || null,
+    warranty_expired: warrantyExpired,
+    location: sanitiseInput(location || ""),
+    maintenance_frequency: sanitiseInput(maintenanceFrequency || ""),
+    last_serviced: lastServiced || null,
+    next_service_due: nextServiceDue || null,
+    service_overdue: serviceOverdue,
+    service_contractor: sanitiseInput(serviceContractor || ""),
+    service_contact_phone: sanitiseInput(serviceContactPhone || ""),
+    critical_asset: Boolean(criticalAsset),
+    notes: sanitiseInput(notes || ""),
+    status: serviceOverdue ? "SERVICE_OVERDUE" : "ACTIVE",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("om_register")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, assetId: data.id, ...record });
+  }
+
+  res.json({ success: true, assetId: null, ...record, saved: false });
+});
+
+// GET /om-register/:siteId — List O&M assets for a site
+app.get("/om-register/:siteId", apiKeyAuth, async (req, res) => {
+  const { siteId } = req.params;
+  const { category, serviceOverdue } = req.query;
+
+  if (supabaseAdmin) {
+    let query = supabaseAdmin
+      .from("om_register")
+      .select("*")
+      .eq("site_id", siteId)
+      .order("asset_name", { ascending: true });
+
+    if (category) query = query.eq("asset_category", category.toUpperCase());
+    if (serviceOverdue === "true") query = query.eq("service_overdue", true);
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "DB error." });
+
+    const overdueCount = (data || []).filter(a => a.service_overdue).length;
+    const criticalCount = (data || []).filter(a => a.critical_asset).length;
+
+    return res.json({ siteId, assets: data || [], assetCount: (data || []).length, overdueServiceCount: overdueCount, criticalAssetCount: criticalCount });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /ai-asset-lifecycle — AI analyses an asset and recommends lifecycle management strategy
+app.post("/ai-asset-lifecycle", apiKeyAuth, async (req, res) => {
+  const {
+    assetName, assetCategory, installYear, expectedLifespan,
+    currentCondition, maintenanceHistory = [], replacementCost,
+    annualMaintenanceCost, criticalAsset = false,
+  } = req.body;
+
+  if (!assetName || !assetCategory) return res.status(400).json({ error: "assetName and assetCategory required." });
+
+  const assetAge = installYear ? new Date().getFullYear() - Number(installYear) : null;
+  const lifePercent = assetAge && expectedLifespan ? Math.round((assetAge / Number(expectedLifespan)) * 100) : null;
+
+  const prompt = `You are an expert Australian facilities and asset management consultant. Analyse the following asset and provide lifecycle management recommendations.
+
+Asset: ${sanitiseInput(assetName)}
+Category: ${sanitiseInput(assetCategory)}
+Asset age: ${assetAge !== null ? `${assetAge} years` : "Unknown"}
+Expected lifespan: ${expectedLifespan ? `${expectedLifespan} years` : "Unknown"}
+Life consumed: ${lifePercent !== null ? `${lifePercent}%` : "Unknown"}
+Current condition: ${sanitiseInput(currentCondition || "Not assessed")}
+Critical asset: ${criticalAsset}
+Replacement cost: ${replacementCost ? `AUD $${replacementCost}` : "Unknown"}
+Annual maintenance cost: ${annualMaintenanceCost ? `AUD $${annualMaintenanceCost}` : "Unknown"}
+Maintenance history: ${maintenanceHistory.length > 0 ? maintenanceHistory.map(h => sanitiseInput(h)).join("; ") : "None recorded"}
+
+Return a JSON object with:
+- "lifecycleStage": "NEW"|"OPERATIONAL"|"MATURING"|"END_OF_LIFE"|"CRITICAL"
+- "recommendation": "CONTINUE_MAINTENANCE"|"INCREASE_MAINTENANCE"|"PLAN_REPLACEMENT"|"IMMEDIATE_REPLACEMENT"|"UPGRADE"
+- "remainingUsefulLife": estimated years remaining
+- "replacementYear": recommended replacement year
+- "maintenanceStrategy": "RUN_TO_FAILURE"|"PREVENTIVE"|"PREDICTIVE"|"CONDITION_BASED"
+- "maintenanceActions": array of { "action": string, "frequency": string, "priority": "LOW"|"MEDIUM"|"HIGH" }
+- "capitalPlanningNote": string for budget planning
+- "riskIfNotReplaced": string
+- "npvAnalysis": brief cost analysis string
+- "summary": string`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, assetName, assetCategory, assetAge, lifePercent, analysedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      lifecycleStage: "OPERATIONAL",
+      recommendation: "CONTINUE_MAINTENANCE",
+      remainingUsefulLife: null, replacementYear: null,
+      maintenanceStrategy: "PREVENTIVE",
+      maintenanceActions: [{ action: "Carry out scheduled preventive maintenance", frequency: "As per manufacturer recommendations", priority: "HIGH" }],
+      capitalPlanningNote: "Asset lifecycle analysis temporarily unavailable. Engage a facilities manager.",
+      riskIfNotReplaced: "Unable to assess.",
+      npvAnalysis: "Unable to calculate.",
+      summary: "Automated lifecycle analysis temporarily unavailable. Manual assessment recommended.",
+      assetName, assetCategory, assetAge, lifePercent, analysedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
