@@ -47395,6 +47395,319 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /emergency-management-plan — Create an emergency management plan for a site or building
+app.post("/emergency-management-plan", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, siteName, siteAddress, siteType,
+    workerCount, shiftPattern,
+    wardenName, wardenRole, wardenPhone,
+    deputyWardenName, deputyWardenPhone,
+    firstAidOfficerName, firstAidOfficerLicence,
+    nearestHospital, nearestHospitalAddress, nearestHospitalPhone,
+    mustersPoints, evacuationRoutes, disabledPersonProcedures,
+    fireExtinguisherLocations, firstAidKitLocations,
+    emergencyPhoneLocations, defibrillatorPresent, defibrillatorLocation,
+    emergencyServices, hazardsOnSite, notificationProcedure,
+    reviewDate, notes,
+  } = req.body;
+
+  if (!projectId || !siteName || !wardenName) {
+    return res.status(400).json({ error: "projectId, siteName, and wardenName are required." });
+  }
+
+  const sanitisedSite = sanitiseInput(siteName, 200);
+  const sanitisedWarden = sanitiseInput(wardenName, 120);
+
+  // Default emergency services contacts (Victorian)
+  const defaultEmergencyServices = [
+    { service: "Emergency (Police/Fire/Ambulance)", number: "000" },
+    { service: "WorkSafe Victoria", number: "13 23 60" },
+    { service: "EPA Victoria Pollution Hotline", number: "1800 210 010" },
+    { service: "Poisons Information Centre", number: "13 11 26" },
+    { service: "VicEmergency Hotline", number: "1800 226 226" },
+  ];
+
+  const resolvedEmergencyServices = Array.isArray(emergencyServices) && emergencyServices.length > 0
+    ? [...defaultEmergencyServices, ...emergencyServices.slice(0, 10).map(s => ({
+        service: sanitiseInput(String(s.service || ""), 100),
+        number: sanitiseInput(String(s.number || ""), 20),
+      }))]
+    : defaultEmergencyServices;
+
+  const processedMusterPoints = (mustersPoints || []).map(m => sanitiseInput(String(m), 200)).slice(0, 5);
+  const processedRoutes = (evacuationRoutes || []).map(r => sanitiseInput(String(r), 200)).slice(0, 10);
+  const processedHazards = (hazardsOnSite || []).map(h => sanitiseInput(String(h), 100)).slice(0, 20);
+
+  // Validation warnings
+  const warnings = [];
+  if (!defibrillatorPresent && (workerCount || 0) > 25) warnings.push("Buildings/sites with > 25 workers — consider installing a defibrillator (AED).");
+  if (processedMusterPoints.length === 0) warnings.push("No muster points defined — at least one muster point is required.");
+  if (!firstAidOfficerName) warnings.push("No First Aid Officer nominated — required per WHS Regulations 2017 r.42.");
+
+  const empRef = `EMP-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    empRef,
+    projectId: sanitiseInput(String(projectId), 80),
+    siteName: sanitisedSite,
+    siteAddress: sanitiseInput(siteAddress || "", 300),
+    siteType: sanitiseInput(siteType || "", 60),
+    workerCount: workerCount || null,
+    shiftPattern: sanitiseInput(shiftPattern || "", 60),
+    wardens: {
+      chiefWarden: { name: sanitisedWarden, role: sanitiseInput(wardenRole || "Site Manager", 80), phone: sanitiseInput(wardenPhone || "", 20) },
+      deputyWarden: { name: sanitiseInput(deputyWardenName || "", 120), phone: sanitiseInput(deputyWardenPhone || "", 20) },
+      firstAidOfficer: { name: sanitiseInput(firstAidOfficerName || "", 120), licence: sanitiseInput(firstAidOfficerLicence || "", 40) },
+    },
+    medicalFacilities: {
+      nearestHospital: sanitiseInput(nearestHospital || "", 150),
+      nearestHospitalAddress: sanitiseInput(nearestHospitalAddress || "", 300),
+      nearestHospitalPhone: sanitiseInput(nearestHospitalPhone || "", 20),
+    },
+    emergency: {
+      musterPoints: processedMusterPoints,
+      evacuationRoutes: processedRoutes,
+      disabledPersonProcedures: sanitiseInput(disabledPersonProcedures || "", 300),
+      fireExtinguisherLocations: (fireExtinguisherLocations || []).map(l => sanitiseInput(String(l), 100)).slice(0, 20),
+      firstAidKitLocations: (firstAidKitLocations || []).map(l => sanitiseInput(String(l), 100)).slice(0, 10),
+      emergencyPhoneLocations: (emergencyPhoneLocations || []).map(l => sanitiseInput(String(l), 100)).slice(0, 10),
+      defibrillatorPresent: !!defibrillatorPresent,
+      defibrillatorLocation: sanitiseInput(defibrillatorLocation || "", 100),
+    },
+    emergencyServices: resolvedEmergencyServices,
+    hazardsOnSite: processedHazards,
+    notificationProcedure: sanitiseInput(notificationProcedure || "Call 000, then notify site warden immediately.", 400),
+    reviewDate: reviewDate || null,
+    warnings,
+    notes: sanitiseInput(notes || "", 400),
+    status: "ACTIVE",
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin
+        .from("emergency_management_plans")
+        .upsert(record, { onConflict: "projectId" });
+      if (error) console.error("EMP upsert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("EMP DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    empRef,
+    warnings,
+    message: warnings.length > 0
+      ? `Emergency Management Plan created with ${warnings.length} recommendation(s) — review before posting on site.`
+      : "Emergency Management Plan created. Post in visible location and brief all workers.",
+    saved,
+    record,
+  });
+});
+
+// POST /emergency-evacuation-drill — Log an emergency evacuation drill
+app.post("/emergency-evacuation-drill", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, drillDate, drillType, startTime, allClearTime,
+    personsEvacuated, personsAccounted, refugeesOrMobility,
+    wardensParticipated, chiefWardenName,
+    issuesIdentified, correctiveActions,
+    evacuationTimeSecs, evacuationTargetSecs,
+    notifyWorksafe, notes,
+  } = req.body;
+
+  if (!projectId || !drillDate || !drillType) {
+    return res.status(400).json({ error: "projectId, drillDate, and drillType are required." });
+  }
+
+  const evacuated = Number(personsEvacuated || 0);
+  const accounted = Number(personsAccounted || 0);
+  const allAccountedFor = accounted >= evacuated;
+
+  const evacuationTime = evacuationTimeSecs ? Number(evacuationTimeSecs) : null;
+  const targetTime = evacuationTargetSecs || 300; // 5-minute default target
+  const timeTarget = evacuationTime !== null ? (evacuationTime <= targetTime ? "MET" : "EXCEEDED") : "NOT_MEASURED";
+
+  const issues = (issuesIdentified || []).map(i => sanitiseInput(String(i), 200)).slice(0, 10);
+  const actions = (correctiveActions || []).map(a => sanitiseInput(String(a), 200)).slice(0, 10);
+
+  const drillResult = !allAccountedFor || issues.filter(i => i.toLowerCase().includes("critical")).length > 0 ? "UNSATISFACTORY" : "SATISFACTORY";
+
+  const ref = `EED-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    drillDate,
+    drillType: sanitiseInput(drillType, 60),
+    startTime: startTime || null,
+    allClearTime: allClearTime || null,
+    evacuation: {
+      personsEvacuated: evacuated,
+      personsAccounted: accounted,
+      allAccountedFor,
+      refugeesOrMobility: refugeesOrMobility || null,
+      evacuationTimeSecs: evacuationTime,
+      evacuationTargetSecs: targetTime,
+      timeTarget,
+    },
+    wardens: {
+      chiefWardenName: sanitiseInput(chiefWardenName || "", 120),
+      wardensParticipated: wardensParticipated || null,
+    },
+    drillResult,
+    issuesIdentified: issues,
+    correctiveActions: actions,
+    notifyWorksafe: !!notifyWorksafe,
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("emergency_evacuation_drills").insert(record);
+      if (error) console.error("Evacuation drill insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Evacuation drill DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    drillResult,
+    allAccountedFor,
+    evacuationTimeSecs: evacuationTime,
+    timeTarget,
+    issueCount: issues.length,
+    message: drillResult === "SATISFACTORY"
+      ? `Evacuation drill SATISFACTORY. ${accounted}/${evacuated} persons accounted for${evacuationTime ? ` in ${evacuationTime}s` : ""}.`
+      : `Evacuation drill UNSATISFACTORY — ${issues.length} issue(s) identified. Implement corrective actions before next drill.`,
+    saved,
+    record,
+  });
+});
+
+// POST /ai-emergency-response-plan — AI generates emergency response procedures for specific hazards
+app.post("/ai-emergency-response-plan", apiKeyAuth, async (req, res) => {
+  const {
+    siteType, hazards, workerCount, hasGas, hasDangerousGoods,
+    nearbyPopulation, existingEquipment, notes,
+  } = req.body;
+
+  if (!siteType) {
+    return res.status(400).json({ error: "siteType is required." });
+  }
+
+  const resolvedSiteType = sanitiseInput(siteType, 100);
+  const resolvedHazards = Array.isArray(hazards)
+    ? hazards.map(hz => sanitiseInput(String(hz), 100)).slice(0, 20)
+    : [];
+
+  const prompt = `You are an emergency management consultant preparing emergency response procedures for a Victorian construction site.
+
+SITE DETAILS:
+- Site type: ${resolvedSiteType}
+- Worker count: ${workerCount || "Unknown"}
+- Hazards identified: ${resolvedHazards.join(", ") || "Standard construction hazards"}
+- Gas on site: ${hasGas ?? "Unknown"}
+- Dangerous goods on site: ${hasDangerousGoods ?? "Unknown"}
+- Nearby population/sensitive receivers: ${sanitiseInput(nearbyPopulation || "Unknown", 100)}
+- Equipment available: ${sanitiseInput(existingEquipment || "Standard fire extinguishers, first aid kit", 200)}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Reference: WHS Act 2011, WHS Regulations 2017 reg.43 (emergency plans), AS 3745 (Planning for emergencies in facilities).
+
+Generate emergency response procedures for each hazard type. Respond ONLY with a JSON object:
+{
+  "emergencyTypes": [
+    {
+      "type": string,
+      "immediateActions": [string],
+      "notificationSequence": [string],
+      "evacuationRequired": boolean,
+      "containmentProcedures": [string],
+      "recoveryActions": [string],
+      "regulatoryNotifications": [string]
+    }
+  ],
+  "siteSpecificConsiderations": [string],
+  "trainingRequirements": [string],
+  "equipmentRequirements": [string],
+  "reviewFrequency": string
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1400,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      siteType: resolvedSiteType,
+      emergencyTypes: parsed.emergencyTypes || [],
+      siteSpecificConsiderations: parsed.siteSpecificConsiderations || [],
+      trainingRequirements: parsed.trainingRequirements || [],
+      equipmentRequirements: parsed.equipmentRequirements || [],
+      reviewFrequency: parsed.reviewFrequency || "Annually or after any emergency event",
+      note: "Review these procedures with a qualified emergency management consultant before implementing.",
+    });
+  } catch (e) {
+    console.error("AI emergency response plan error:", e.message);
+    return res.json({
+      success: true,
+      siteType: resolvedSiteType,
+      emergencyTypes: [
+        {
+          type: "Fire",
+          immediateActions: ["Sound alarm", "Call 000", "Evacuate all personnel to muster point", "Account for all persons"],
+          notificationSequence: ["000 — Fire brigade", "WorkSafe Victoria: 13 23 60 (if injury)", "Site manager/project director"],
+          evacuationRequired: true,
+          containmentProcedures: ["Use fire extinguisher if trained and safe to do so — only for small, contained fires"],
+          recoveryActions: ["Do not re-enter until fire brigade gives all-clear", "Preserve site for WorkSafe investigation if injury occurred"],
+          regulatoryNotifications: ["WorkSafe Victoria if injury or dangerous incident (s.38 WHS Act)"],
+        },
+        {
+          type: "Medical emergency",
+          immediateActions: ["Call 000 immediately", "Send someone to meet ambulance at site entrance", "First Aid Officer to attend", "Do not move injured person unless in immediate danger"],
+          notificationSequence: ["000 — Ambulance", "First Aid Officer", "Site manager", "WorkSafe Victoria if serious injury (s.38 WHS Act)"],
+          evacuationRequired: false,
+          containmentProcedures: ["Secure area around injured person", "Preserve evidence for investigation"],
+          recoveryActions: ["Complete incident report within 24 hours", "Review risk assessment for activity"],
+          regulatoryNotifications: ["WorkSafe: 13 23 60 — notify immediately for serious injuries/deaths"],
+        },
+        {
+          type: "Chemical spill",
+          immediateActions: ["Evacuate immediate area", "Prevent spill entering stormwater", "Refer to SDS for specific response"],
+          notificationSequence: ["000 if fire risk", "EPA Victoria: 1800 210 010", "Poisons line: 13 11 26 if exposure"],
+          evacuationRequired: false,
+          containmentProcedures: ["Deploy spill kit", "Contain with absorbent material", "Do not wash into drains"],
+          recoveryActions: ["Dispose of contaminated material as hazardous waste", "Document and report"],
+          regulatoryNotifications: ["EPA Victoria Pollution Hotline: 1800 210 010"],
+        },
+      ],
+      siteSpecificConsiderations: ["Ensure all workers are briefed on emergency procedures at site induction", "Post emergency contacts and muster points visibly on site"],
+      trainingRequirements: ["Chief Warden and Deputy Warden training", "First Aid Officer certification (HLTAID003)", "Annual evacuation drill"],
+      equipmentRequirements: ["Fire extinguishers per AS 2444", "Fully stocked first aid kit", "Spill kit for chemicals on site"],
+      reviewFrequency: "Annually or after any emergency event or change in site conditions",
+      note: "Review these procedures with a qualified emergency management consultant before implementing.",
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
