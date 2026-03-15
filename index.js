@@ -588,6 +588,93 @@ function calculateComplexity(type, photoCount, totalItems, missingCount) {
   return { score, band };
 }
 
+// ── Task 8: Photo Quality Pre-screener ───────────────────────────────────────
+/**
+ * prescreenPhotos — quickly assesses each photo for quality before compliance
+ * analysis. Uses GPT-4.1-mini vision to flag: blur, lighting, distance, angle,
+ * subject visibility. Returns { passed, failed } arrays.
+ *
+ * @param {Array}  images  - array of { label, mime, data }
+ * @returns {{ passed: Array, failed: Array<{ label, issue }> }}
+ */
+async function prescreenPhotos(images) {
+  if (!images || images.length === 0) return { passed: [], failed: [] };
+
+  const qualityPrompt = `You are a photo quality screener for trade compliance documentation.
+For each photo, assess whether it is suitable for compliance analysis.
+
+A photo PASSES quality screening if:
+- The main subject can be identified (even if some blur exists)
+- Lighting is adequate (not pitch black, not severely overexposed)
+- The photo shows something related to trade work
+- The subject is close enough for at least basic assessment
+
+A photo FAILS quality screening ONLY if it clearly:
+- Is completely or severely blurry — nothing can be identified
+- Is pitch black or completely overexposed — no detail visible
+- Shows nothing related to trade work (e.g. blank wall, floor, sky only)
+- Subject is impossibly distant — cannot see any detail at all
+
+When in doubt: PASS the photo through. Only reject clearly unusable photos.
+
+For failed photos, use one of these exact issue strings:
+- "Too blurry — move closer and retake in better lighting"
+- "Too dark — use flash or retake in better lighting"
+- "Overexposed — adjust camera exposure and retake"
+- "Subject not visible — retake from a closer angle"
+- "No trade work visible — retake showing the required item"
+- "Too far away — move much closer to the subject and retake"
+
+Return STRICT JSON only:
+{ "assessments": [ { "label": "...", "pass": true, "issue": null }, ... ] }`;
+
+  const inputContent = [
+    { type: "text", text: qualityPrompt },
+    ...images.flatMap((img) => [
+      { type: "text", text: `Photo label: "${img.label}"` },
+      { type: "image_url", image_url: { url: `data:${img.mime};base64,${img.data}` } },
+    ]),
+  ];
+
+  try {
+    usageStats.openaiCalls++;
+    const response = await client.chat.completions.create({
+      model: "gpt-4.1-mini",
+      response_format: { type: "json_object" },
+      messages: [{ role: "user", content: inputContent }],
+      max_tokens: 600,
+      temperature: 0.1,
+    });
+    const raw = response.choices?.[0]?.message?.content || "{}";
+    const parsed = JSON.parse(raw);
+    const assessments = Array.isArray(parsed.assessments) ? parsed.assessments : [];
+
+    const passed = [];
+    const failed = [];
+    const labelMap = new Map(images.map(img => [img.label, img]));
+    const assessedLabels = new Set();
+
+    for (const a of assessments) {
+      assessedLabels.add(a.label);
+      const img = labelMap.get(a.label);
+      if (!img) continue;
+      if (a.pass === false && a.issue) {
+        failed.push({ label: a.label, issue: a.issue });
+      } else {
+        passed.push(img);
+      }
+    }
+    // Any images not returned in assessments default to passed
+    for (const img of images) {
+      if (!assessedLabels.has(img.label)) passed.push(img);
+    }
+    return { passed, failed };
+  } catch (err) {
+    console.warn("[prescreen] Quality screen failed, passing all photos:", err.message);
+    return { passed: images, failed: [] };
+  }
+}
+
 // ── Task 7: Compliance Scoring Algorithm ─────────────────────────────────────
 /**
  * calculateComplianceScore — multi-dimensional compliance score 0-100.
@@ -716,6 +803,19 @@ if (pendingAnalyses.has(cacheKey)) {
 }
 const dedupPromise = new Promise((res, rej) => { resolveDedup = res; rejectDedup = rej; });
 pendingAnalyses.set(cacheKey, dedupPromise);
+
+// Task 8: Pre-screen photos for quality before compliance analysis
+const { passed: qualityPassedImages, failed: qualityFailedImages } = await prescreenPhotos(images);
+if (qualityPassedImages.length === 0) {
+  if (typeof rejectDedup === "function") rejectDedup(new Error("all_photos_failed_quality"));
+  pendingAnalyses.delete(cacheKey);
+  return res.status(422).json({
+    error: "All submitted photos failed quality screening. Please retake photos closer to the subject in better lighting.",
+    photo_quality_flags: qualityFailedImages,
+  });
+}
+// Use only quality-passed images for the compliance analysis
+const analysisImages = qualityPassedImages;
 
 const isGas = type === "gas";
 const isElectrical = type === "electrical";
@@ -1306,7 +1406,7 @@ const inputContent = [
 type: "text",
 text: buildRegulationsNote(type) + promptText,
 },
-...images.flatMap((img) => [
+...analysisImages.flatMap((img) => [
 {
 type: "text",
 text: `Photo label: "${img.label}"`,
@@ -1409,7 +1509,7 @@ const complianceScore = calculateComplianceScore({
   itemsDetected,
   itemsMissing,
   itemsUnclear,
-  photoCount: images.length,
+  photoCount: analysisImages.length,
   gpsRecorded: !!(req.body?.gpsRecorded),
   complexityScore,
 });
@@ -1428,6 +1528,9 @@ const finalResult = {
   recommended_actions: recommendedActions,
   liability_summary: liabilitySummary,
   analysis,
+  photos_analysed:     analysisImages.length,
+  photos_submitted:    images.length,
+  photo_quality_flags: qualityFailedImages.length > 0 ? qualityFailedImages : undefined,
 };
 
 // Cache result and resolve any waiting dedup requests
