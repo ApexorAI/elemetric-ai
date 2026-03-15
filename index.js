@@ -514,8 +514,8 @@ const replicate = new Replicate({
  * Image is assumed 1024px wide (mobile resizes before sending).
  */
 function generateMaskPNG(width = 1024, height = 768) {
-  const rectX1 = Math.floor(width * 0.25);
-  const rectX2 = Math.floor(width * 0.75);
+  const rectX1 = Math.floor(width * 0.35);
+  const rectX2 = Math.floor(width * 0.65);
   const rectY1 = Math.floor(height * 0.25);
   const rectY2 = Math.floor(height * 0.65);
 
@@ -634,8 +634,8 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
     // Step 3: Run Stable Diffusion inpainting via Replicate
     // Only the masked (white) region is edited; everything else is preserved exactly.
     const prompt =
-      `A ${modelNumber} air conditioning unit mounted on the wall, professional installation photo, ` +
-      `photorealistic, 8k quality, same room lighting, natural shadows, seamlessly blended, ${roomDescription}`;
+      `A ${modelNumber} air conditioning unit approximately 80cm wide mounted on the wall, correct scale and ` +
+      `proportion relative to the room, professional installation photo, photorealistic, natural shadows, ${roomDescription}`;
 
     console.log("[visualise] Step 3 - Calling Replicate with prompt:", prompt, "| image size:", correctedWallImage.length);
 
@@ -648,7 +648,7 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
             image:            `data:${correctedMime};base64,${correctedWallImage}`,
             mask:             `data:image/png;base64,${maskBase64}`,
             prompt,
-            negative_prompt:  "ceiling, roof, floor, distorted, blurry, cartoon, painting, unrealistic, floating",
+            negative_prompt:  "ceiling, roof, floor, distorted, blurry, cartoon, painting, unrealistic, floating, oversized, too large, giant, distorted proportions, wrong scale",
             strength:         0.95,
             guidance_scale:   9,
             num_inference_steps: 50,
