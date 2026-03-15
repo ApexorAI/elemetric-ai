@@ -80241,6 +80241,471 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 283 ─────────────────────────────────────────────────────────────────
+
+// POST /roof-anchor-inspection — Record roof anchor/fall arrest anchor inspection per AS/NZS 1891.4
+app.post("/roof-anchor-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, anchorId, location, inspectionDate, inspectedBy,
+      competentPersonLicence, anchorType, installationYear,
+      anchorMake, anchorModel, loadRatingKn,
+      substrateMaterial, substrateCondition,
+      visualInspectionPassed, corrosionPresent, corrosionSeverity,
+      loadTestConducted, loadTestKn, loadTestPassed,
+      connectorOk, lifeline, lifelineCondition,
+      labelPresent, labelLegible, certExpiry,
+      signageDisplayed, rescuePlanAvailable,
+      defectsFound, defectDetails, nextInspectionDue, certRef, notes
+    } = req.body;
+
+    if (!anchorId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "anchorId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeAnchorId = sanitiseInput(String(anchorId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const defects = Array.isArray(defectDetails) ? defectDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const loadTestForce = parseFloat(loadTestKn) || null;
+    const ratedLoad = parseFloat(loadRatingKn) || null;
+
+    // AS/NZS 1891.4 — Fall arrest / fall restraint anchor systems
+    if (!visualInspectionPassed) {
+      criticalIssues.push("Visual inspection failed — anchor must be taken out of service immediately. Tag out and do not use until professionally assessed (AS/NZS 1891.4 cl.6.2).");
+    }
+
+    if (corrosionPresent === true || corrosionPresent === "true") {
+      const severity = String(corrosionSeverity || "").toUpperCase();
+      if (severity === "SEVERE" || severity === "HEAVY") {
+        criticalIssues.push(`Severe corrosion detected on anchor — structural integrity compromised. Remove from service immediately (AS/NZS 1891.4 cl.6.2.3).`);
+      } else {
+        warnings.push(`Corrosion detected (${corrosionSeverity || "level not specified"}) — monitor closely and schedule professional assessment.`);
+      }
+    }
+
+    if (loadTestConducted === true || loadTestConducted === "true") {
+      if (!loadTestPassed) {
+        criticalIssues.push("Anchor load test FAILED — remove from service immediately. Do not use until replaced or engineering sign-off obtained (AS/NZS 1891.4 cl.6.5).");
+      }
+      if (ratedLoad !== null && loadTestForce !== null && loadTestForce < ratedLoad) {
+        warnings.push(`Load test applied ${loadTestForce} kN which is below rated capacity ${ratedLoad} kN — confirm test load was appropriate.`);
+      }
+    }
+
+    const substrate = String(substrateCondition || "").toUpperCase();
+    if (substrate === "FAILED" || substrate === "CRACKED" || substrate === "DELAMINATED") {
+      criticalIssues.push(`Substrate condition ${substrateCondition} — anchor base material compromised. Remove from service until substrate is repaired and anchor re-certified.`);
+    }
+
+    if (!labelPresent) {
+      criticalIssues.push("Identification label not present — cannot confirm anchor is compliant or within service life. Remove from service per AS/NZS 1891.4.");
+    } else if (!labelLegible) {
+      warnings.push("Label present but not fully legible — replace label to maintain traceability.");
+    }
+
+    if (certExpiry) {
+      const expiry = new Date(certExpiry);
+      const today = new Date();
+      if (expiry < today) {
+        criticalIssues.push(`Anchor certification expired ${certExpiry} — remove from service until recertification obtained (AS/NZS 1891.4 requires periodic competent person inspection).`);
+      } else {
+        const daysToExpiry = Math.ceil((expiry - today) / 86400000);
+        if (daysToExpiry <= 30) {
+          warnings.push(`Anchor certification expires in ${daysToExpiry} days — schedule recertification before expiry.`);
+        }
+      }
+    }
+
+    if (!signageDisplayed) {
+      warnings.push("No signage indicating fall arrest anchor location — WorkSafe Victoria compliance risk.");
+    }
+
+    if (!rescuePlanAvailable) {
+      warnings.push("No rescue plan available — AS/NZS 1891.4 and OHS Regulations 2017 (Vic) require a rescue procedure for all fall arrest work.");
+    }
+
+    const inspYear = parseInt(installationYear) || null;
+    if (inspYear && (new Date().getFullYear() - inspYear) > 15) {
+      warnings.push(`Anchor installed ${inspYear} — exceeds 15-year advisory service life. Engage structural engineer for extended service assessment.`);
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "OUT_OF_SERVICE" : warnings.length > 0 ? "CONDITIONAL" : "SERVICEABLE";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("roof_anchor_inspections")
+        .insert({
+          project_id: safeProject,
+          anchor_id: safeAnchorId,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          competent_person_licence: competentPersonLicence ? sanitiseInput(String(competentPersonLicence)) : null,
+          anchor_type: anchorType ? sanitiseInput(String(anchorType)) : null,
+          installation_year: inspYear,
+          anchor_make: anchorMake ? sanitiseInput(String(anchorMake)) : null,
+          anchor_model: anchorModel ? sanitiseInput(String(anchorModel)) : null,
+          load_rating_kn: ratedLoad,
+          substrate_material: substrateMaterial ? sanitiseInput(String(substrateMaterial)) : null,
+          substrate_condition: substrateCondition ? sanitiseInput(String(substrateCondition)) : null,
+          visual_inspection_passed: visualInspectionPassed !== false && visualInspectionPassed !== "false",
+          corrosion_present: corrosionPresent || false,
+          corrosion_severity: corrosionSeverity ? sanitiseInput(String(corrosionSeverity)) : null,
+          load_test_conducted: loadTestConducted || false,
+          load_test_kn: loadTestForce,
+          load_test_passed: loadTestPassed !== false && loadTestPassed !== "false",
+          label_present: labelPresent !== false && labelPresent !== "false",
+          label_legible: labelLegible !== false && labelLegible !== "false",
+          cert_expiry: certExpiry || null,
+          signage_displayed: signageDisplayed !== false && signageDisplayed !== "false",
+          rescue_plan_available: rescuePlanAvailable !== false && rescuePlanAvailable !== "false",
+          defects_found: defectsFound || false,
+          defect_details: defects,
+          next_inspection_due: nextInspectionDue || null,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Fall arrest anchor removed from service — do not use until defects are rectified and anchor is recertified.",
+        standards: ["AS/NZS 1891.4", "OHS Regulations 2017 (Vic)", "AS/NZS 1576.1"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      anchorId: safeAnchorId,
+      nextInspectionDue: nextInspectionDue || null,
+      standards: ["AS/NZS 1891.4", "OHS Regulations 2017 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /roof-anchor-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record roof anchor inspection." });
+  }
+});
+
+// POST /pressure-vessel-inspection — Record pressure vessel/boiler inspection per AS 3788 / AS 1210
+app.post("/pressure-vessel-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, vesselId, location, inspectionDate, inspectedBy,
+      inspectorLicenceNumber, vesselType, designPressureKpa, designTemperatureC,
+      workingPressureKpa, workingTemperatureC,
+      yearOfManufacture, wallThicknessMeasured, minimumAllowableThicknessMm,
+      safetyValveTested, safetyValvePassed, safetyValveSetPressureKpa,
+      pressureGaugeOk, pressureGaugeCalibrated,
+      corrosionInspected, corrosionFound, corrosionDepthMm,
+      weldInspectionMethod, weldDefectsFound,
+      hydroTestConducted, hydroTestPressureKpa, hydroTestPassed,
+      registrationNumber, registrationExpiry,
+      defectDetails, nextInspectionDue, certRef, notes
+    } = req.body;
+
+    if (!vesselId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "vesselId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeVesselId = sanitiseInput(String(vesselId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const defects = Array.isArray(defectDetails) ? defectDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const designPressure = parseFloat(designPressureKpa) || null;
+    const workingPressure = parseFloat(workingPressureKpa) || null;
+    const wallThickness = parseFloat(wallThicknessMeasured) || null;
+    const minThickness = parseFloat(minimumAllowableThicknessMm) || null;
+    const corrosionDepth = parseFloat(corrosionDepthMm) || null;
+    const hydroPressure = parseFloat(hydroTestPressureKpa) || null;
+    const safetyValvePressure = parseFloat(safetyValveSetPressureKpa) || null;
+
+    // AS 3788 — Pressure equipment in-service inspection
+    // AS 1210 — Pressure vessels
+    if (!registrationNumber) {
+      criticalIssues.push("No registration number recorded — all pressure vessels above threshold must be registered with WorkSafe Victoria (OHS Regulations 2017 (Vic) reg 4.4.8).");
+    }
+
+    if (registrationExpiry) {
+      const expiry = new Date(registrationExpiry);
+      if (expiry < new Date()) {
+        criticalIssues.push(`Pressure vessel registration expired ${registrationExpiry} — vessel must not operate until registration renewed (OHS Regulations 2017 (Vic)).`);
+      }
+    }
+
+    if (!safetyValveTested) {
+      criticalIssues.push("Safety relief valve not tested — vessel must not operate without a tested and certified SRV (AS 3788 cl.4.4).");
+    } else if (safetyValvePassed === false || safetyValvePassed === "false") {
+      criticalIssues.push("Safety relief valve FAILED test — vessel must not operate. Replace SRV immediately (AS 3788 cl.4.4).");
+    }
+
+    if (designPressure !== null && workingPressure !== null && workingPressure > designPressure) {
+      criticalIssues.push(`Working pressure ${workingPressure} kPa exceeds design pressure ${designPressure} kPa — vessel operating beyond design limits. Stop immediately (AS 1210).`);
+    }
+
+    if (safetyValvePressure !== null && designPressure !== null && safetyValvePressure > designPressure) {
+      criticalIssues.push(`Safety valve set pressure ${safetyValvePressure} kPa exceeds vessel design pressure ${designPressure} kPa — incorrect SRV installed. Replace immediately.`);
+    }
+
+    if (wallThickness !== null && minThickness !== null && wallThickness < minThickness) {
+      criticalIssues.push(`Measured wall thickness ${wallThickness} mm below minimum allowable ${minThickness} mm — structural integrity compromised. Remove from service (AS 3788 cl.5.3).`);
+    }
+
+    if (corrosionFound === true || corrosionFound === "true") {
+      if (corrosionDepth !== null && minThickness !== null && corrosionDepth > minThickness * 0.2) {
+        criticalIssues.push(`Corrosion depth ${corrosionDepth} mm exceeds 20% of minimum wall thickness — engineering assessment required before further operation (AS 3788 cl.5.3).`);
+      } else {
+        warnings.push(`Corrosion found (depth ${corrosionDepth !== null ? corrosionDepth + " mm" : "not measured"}) — monitor and re-measure at next inspection.`);
+      }
+    }
+
+    if (weldDefectsFound === true || weldDefectsFound === "true") {
+      criticalIssues.push(`Weld defects detected (inspection method: ${weldInspectionMethod || "not specified"}) — take vessel out of service for engineering assessment and repair (AS 1210 cl.6).`);
+    }
+
+    if (hydroTestConducted === true || hydroTestConducted === "true") {
+      if (hydroTestPassed === false || hydroTestPassed === "false") {
+        criticalIssues.push(`Hydrostatic test FAILED at ${hydroPressure || "unknown"} kPa — vessel must not be returned to service until repaired and re-tested (AS 1210 cl.9).`);
+      }
+    }
+
+    if (!pressureGaugeOk) {
+      warnings.push("Pressure gauge defective — operator cannot monitor working pressure. Replace before operation.");
+    } else if (!pressureGaugeCalibrated) {
+      warnings.push("Pressure gauge not calibrated — accuracy cannot be confirmed. Calibrate or replace gauge.");
+    }
+
+    if (!inspectorLicenceNumber) {
+      warnings.push("Inspector licence number not recorded — pressure vessel inspection must be performed by a licensed inspection body (OHS Regulations 2017 (Vic)).");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "OUT_OF_SERVICE" : warnings.length > 0 ? "CONDITIONAL" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("pressure_vessel_inspections")
+        .insert({
+          project_id: safeProject,
+          vessel_id: safeVesselId,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          inspector_licence: inspectorLicenceNumber ? sanitiseInput(String(inspectorLicenceNumber)) : null,
+          vessel_type: vesselType ? sanitiseInput(String(vesselType)) : null,
+          design_pressure_kpa: designPressure,
+          design_temperature_c: parseFloat(designTemperatureC) || null,
+          working_pressure_kpa: workingPressure,
+          working_temperature_c: parseFloat(workingTemperatureC) || null,
+          year_of_manufacture: parseInt(yearOfManufacture) || null,
+          wall_thickness_measured_mm: wallThickness,
+          minimum_allowable_thickness_mm: minThickness,
+          safety_valve_tested: safetyValveTested !== false && safetyValveTested !== "false",
+          safety_valve_passed: safetyValvePassed !== false && safetyValvePassed !== "false",
+          safety_valve_set_pressure_kpa: safetyValvePressure,
+          pressure_gauge_ok: pressureGaugeOk !== false && pressureGaugeOk !== "false",
+          pressure_gauge_calibrated: pressureGaugeCalibrated !== false && pressureGaugeCalibrated !== "false",
+          corrosion_found: corrosionFound || false,
+          corrosion_depth_mm: corrosionDepth,
+          weld_defects_found: weldDefectsFound || false,
+          weld_inspection_method: weldInspectionMethod ? sanitiseInput(String(weldInspectionMethod)) : null,
+          hydro_test_conducted: hydroTestConducted || false,
+          hydro_test_pressure_kpa: hydroPressure,
+          hydro_test_passed: hydroTestPassed !== false && hydroTestPassed !== "false",
+          registration_number: registrationNumber ? sanitiseInput(String(registrationNumber)) : null,
+          registration_expiry: registrationExpiry || null,
+          defect_details: defects,
+          next_inspection_due: nextInspectionDue || null,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Pressure vessel removed from service — do not operate until all critical defects are rectified.",
+        standards: ["AS 3788", "AS 1210", "OHS Regulations 2017 (Vic)"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      vesselId: safeVesselId,
+      nextInspectionDue: nextInspectionDue || null,
+      standards: ["AS 3788", "AS 1210"],
+    });
+  } catch (err) {
+    console.error("POST /pressure-vessel-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record pressure vessel inspection." });
+  }
+});
+
+// POST /ai-fall-prevention-assessment — AI assesses site fall prevention and height safety compliance
+app.post("/ai-fall-prevention-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      siteId, siteType, workAtHeightActivities, maxWorkingHeightM,
+      edgeProtectionInstalled, edgeProtectionType, edgeProtectionCondition,
+      roofAnchorCount, roofAnchorsOverdue, lastAnchorInspection,
+      scaffoldingPresent, scaffoldingType, scaffoldingCertified,
+      ladderCount, laddersCompliant,
+      mewpCount, mewpInspectionCurrent,
+      fallIncidents12Months, nearMissEvents12Months,
+      riskAssessmentCurrent, swmsInPlace, workerTrainingCurrent,
+      rescuePlanInPlace, firstAidKitAvailable, deficienciesNoted, notes
+    } = req.body;
+
+    if (!siteId) {
+      return res.status(400).json({ error: "siteId is required." });
+    }
+
+    const safeSite = sanitiseInput(String(siteId));
+    const deficiencies = Array.isArray(deficienciesNoted) ? deficienciesNoted : [];
+    const activities = Array.isArray(workAtHeightActivities) ? workAtHeightActivities : [];
+
+    const prompt = `You are an expert occupational health and safety engineer specialising in height safety and fall prevention. Assess this site's fall prevention compliance under Victorian and Australian regulations.
+
+Site ID: ${safeSite}
+Site type: ${siteType || "Unknown"}
+Work at height activities: ${activities.join(", ") || "Not specified"}
+Maximum working height: ${maxWorkingHeightM ? maxWorkingHeightM + " m" : "Unknown"}
+
+EDGE PROTECTION:
+- Installed: ${edgeProtectionInstalled ? "Yes" : "No"}
+- Type: ${edgeProtectionType || "None"}
+- Condition: ${edgeProtectionCondition || "Unknown"}
+
+ROOF ANCHORS:
+- Count: ${roofAnchorCount || 0}
+- Overdue for inspection: ${roofAnchorsOverdue || 0}
+- Last inspection: ${lastAnchorInspection || "Unknown"}
+
+SCAFFOLDING:
+- Present: ${scaffoldingPresent ? "Yes" : "No"}
+- Type: ${scaffoldingType || "N/A"}
+- Certified: ${scaffoldingCertified ? "Yes" : "No/Unknown"}
+
+LADDERS: ${ladderCount || 0} ladders, compliant: ${laddersCompliant ? "Yes" : "No/Unknown"}
+
+MEWPs / EWPs: ${mewpCount || 0}, inspection current: ${mewpInspectionCurrent ? "Yes" : "No/Unknown"}
+
+INCIDENTS:
+- Falls/incidents (12 months): ${fallIncidents12Months || 0}
+- Near misses (12 months): ${nearMissEvents12Months || 0}
+
+MANAGEMENT SYSTEMS:
+- Risk assessment current: ${riskAssessmentCurrent ? "Yes" : "No"}
+- SWMS in place: ${swmsInPlace ? "Yes" : "No"}
+- Worker training current: ${workerTrainingCurrent ? "Yes" : "No"}
+- Rescue plan in place: ${rescuePlanInPlace ? "Yes" : "No"}
+- First aid available: ${firstAidKitAvailable ? "Yes" : "No"}
+
+Deficiencies noted: ${deficiencies.join("; ") || "None"}
+
+Assess under:
+- OHS Regulations 2017 (Vic) Part 3.3 (falls from height >2m)
+- AS/NZS 1891.4 (industrial fall arrest systems)
+- AS/NZS 4488.1/2 (industrial rope access systems)
+- AS 1576.1/3 (scaffolding)
+- AS 1657 (fixed platforms, walkways, stairways, ladders)
+- AS 2550.1 (cranes, hoists, and winches — EWPs)
+- Safe Work Australia Code of Practice: Managing the risk of falls
+
+Provide:
+1. Overall fall risk rating
+2. Regulatory compliance status
+3. Control hierarchy assessment
+4. Specific high-priority gaps
+5. Training and competency requirements
+6. Action plan
+
+Respond ONLY in JSON:
+{
+  "overallFallRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "regulatoryComplianceStatus": "COMPLIANT|PARTIALLY_COMPLIANT|NON_COMPLIANT",
+  "controlHierarchyAssessment": "string",
+  "highPriorityGaps": ["string"],
+  "trainingRequirements": ["string"],
+  "immediateActions": ["string"],
+  "shortTermActions": ["string"],
+  "applicableStandards": ["string"],
+  "estimatedRiskScore": "number 0-100",
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 900,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallFallRisk: "HIGH",
+        regulatoryComplianceStatus: "PARTIALLY_COMPLIANT",
+        controlHierarchyAssessment: "AI assessment unavailable — conduct manual risk assessment per hierarchy of controls.",
+        highPriorityGaps: ["Verify all roof anchors are inspected annually per AS/NZS 1891.4", "Ensure SWMS in place for all work above 2m (OHS Regulations 2017 (Vic))"],
+        trainingRequirements: ["Working at heights training for all personnel performing work above 2m"],
+        immediateActions: ["Conduct fresh risk assessment with qualified safety professional"],
+        shortTermActions: ["Inspect all fall arrest anchors", "Verify edge protection meets AS 1891.4 and NCC requirements"],
+        applicableStandards: ["OHS Regulations 2017 (Vic)", "AS/NZS 1891.4", "AS 1576.1", "AS 1657"],
+        estimatedRiskScore: "60",
+        summary: "AI fall prevention assessment unavailable. Engage a qualified WHS professional to conduct a formal height safety audit.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      siteId: safeSite,
+      standards: ["OHS Regulations 2017 (Vic)", "AS/NZS 1891.4", "AS 1576.1", "AS 1657", "AS 2550.1"],
+    });
+  } catch (err) {
+    console.error("POST /ai-fall-prevention-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess fall prevention compliance." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
