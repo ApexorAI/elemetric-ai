@@ -14681,6 +14681,235 @@ app.post("/contractor-scorecard", apiKeyAuth, (req, res) => {
   });
 });
 
+// ── Round 29 ──────────────────────────────────────────────────────────────────
+
+// POST /client-report  — Generate a client-facing compliance report (non-technical language)
+app.post("/client-report", apiKeyAuth, async (req, res) => {
+  const { jobType, contractorName, address, completionDate, complianceScore,
+          grade, itemsDetected, itemsMissing, gpsRecorded, signatureObtained,
+          certificateFiled, language, notes } = req.body;
+
+  if (!jobType || !contractorName) {
+    return res.status(400).json({ error: "jobType and contractorName are required." });
+  }
+
+  const safeJobType    = sanitiseInput(String(jobType)).toLowerCase();
+  const safeContractor = sanitiseInput(String(contractorName));
+  const safeAddress    = sanitiseInput(String(address || "your property"));
+  const safeDate       = sanitiseInput(String(completionDate || new Date().toISOString().slice(0, 10)));
+  const safeNotes      = sanitiseInput(String(notes || ""));
+  const lang           = sanitiseInput(String(language || "en")).toLowerCase();
+
+  const tradeLabel = { plumbing: "Plumbing", gas: "Gas Fitting", electrical: "Electrical",
+    drainage: "Drainage", carpentry: "Carpentry", hvac: "Heating & Cooling" }[safeJobType] || safeJobType;
+
+  const scoreNum = parseInt(complianceScore) || 0;
+  let summaryVerdict;
+  if (scoreNum >= 90)      summaryVerdict = lang === "vi" ? "Xuất sắc" : "Excellent";
+  else if (scoreNum >= 75) summaryVerdict = lang === "vi" ? "Tốt" : "Good";
+  else if (scoreNum >= 60) summaryVerdict = lang === "vi" ? "Đạt yêu cầu" : "Satisfactory";
+  else                     summaryVerdict = lang === "vi" ? "Cần cải thiện" : "Needs Attention";
+
+  const detectedItems = (itemsDetected || []).slice(0, 12).map(i => sanitiseInput(String(i)));
+  const missingItems  = (itemsMissing  || []).slice(0, 8).map(i => sanitiseInput(String(i)));
+
+  let intro, scoreSection, certSection, missingSection, closingSection;
+
+  if (lang === "vi") {
+    intro           = `Kính gửi Quý khách,\n\n${safeContractor} đã hoàn thành công việc ${tradeLabel} tại ${safeAddress} vào ngày ${safeDate}.`;
+    scoreSection    = scoreNum ? `Điểm tuân thủ: ${scoreNum}/100 — ${summaryVerdict}` : null;
+    certSection     = `Giấy chứng nhận tuân thủ: ${certificateFiled ? "Đã nộp" : "Sẽ nộp trong 5 ngày làm việc"}`;
+    missingSection  = missingItems.length ? `Các hạng mục cần xử lý:\n${missingItems.map(i => `  • ${i}`).join("\n")}` : null;
+    closingSection  = "Cảm ơn Quý khách đã tin tưởng sử dụng dịch vụ của chúng tôi. Vui lòng liên hệ nếu có bất kỳ câu hỏi nào.";
+  } else {
+    intro           = `Dear Property Owner,\n\n${safeContractor} has completed ${tradeLabel.toLowerCase()} work at ${safeAddress} on ${safeDate}.`;
+    scoreSection    = scoreNum ? `Your compliance score is ${scoreNum} out of 100 — ${summaryVerdict}.` : null;
+    certSection     = `Certificate of Compliance: ${certificateFiled ? "Filed with the regulator" : "Will be filed within 5 business days"}.`;
+    missingSection  = missingItems.length ? `Items requiring attention:\n${missingItems.map(i => `  • ${i}`).join("\n")}` : null;
+    closingSection  = "Thank you for choosing a compliant tradesperson. Please don't hesitate to reach out if you have any questions about this work.";
+  }
+
+  const reportSections = [intro, scoreSection, certSection, missingSection, safeNotes || null, closingSection].filter(Boolean);
+  const reportText     = reportSections.join("\n\n");
+
+  return res.json({
+    jobType: safeJobType,
+    language: lang,
+    tradeLabel,
+    complianceScore: scoreNum || null,
+    summaryVerdict,
+    grade: grade || null,
+    documentationStatus: {
+      certificateFiled:  !!certificateFiled,
+      signatureObtained: !!signatureObtained,
+      gpsRecorded:       !!gpsRecorded,
+    },
+    detectedItems,
+    missingItems,
+    reportText,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// GET /vba-contacts  — Return VBA and trade authority contact information
+app.get("/vba-contacts", apiKeyAuth, (req, res) => {
+  const contacts = [
+    {
+      authority: "Victorian Building Authority (VBA)",
+      trades:    ["plumbing", "gas", "drainage", "carpentry"],
+      phone:     "1300 815 127",
+      web:       "vba.vic.gov.au",
+      address:   "733 Bourke Street, Docklands VIC 3008",
+      services:  ["Licence checks", "Permit enquiries", "Complaint lodgement", "Certificate of compliance"],
+    },
+    {
+      authority: "Energy Safe Victoria (ESV)",
+      trades:    ["electrical", "gas"],
+      phone:     "1800 652 563",
+      web:       "esv.vic.gov.au",
+      address:   "Level 2, 1 Spring Street, Melbourne VIC 3000",
+      services:  ["Electrical licence checks", "Gas safety", "Incident reporting", "Safety certificates"],
+    },
+    {
+      authority: "Australian Refrigeration Council (ARC)",
+      trades:    ["hvac"],
+      phone:     "1300 884 483",
+      web:       "arctick.org",
+      address:   "PO Box 260, Roseville NSW 2069",
+      services:  ["ARCtick licence check", "Refrigerant handling", "Licence renewal"],
+    },
+    {
+      authority: "Consumer Affairs Victoria",
+      trades:    ["plumbing", "electrical", "carpentry", "gas", "drainage", "hvac"],
+      phone:     "1300 558 181",
+      web:       "consumer.vic.gov.au",
+      address:   "GPO Box 123, Melbourne VIC 3001",
+      services:  ["Contractor complaints", "Domestic building disputes", "Home warranty insurance"],
+    },
+    {
+      authority: "WorkSafe Victoria",
+      trades:    ["plumbing", "electrical", "carpentry", "gas", "drainage", "hvac"],
+      phone:     "1800 136 089",
+      web:       "worksafe.vic.gov.au",
+      address:   "1 Malop Street, Geelong VIC 3220",
+      services:  ["Workplace injury reporting", "SWMS guidance", "Confined space permits", "High-risk work licences"],
+    },
+    {
+      authority: "Dial Before You Dig",
+      trades:    ["plumbing", "drainage", "electrical"],
+      phone:     "1100",
+      web:       "1100.com.au",
+      address:   "National service",
+      services:  ["Underground service enquiries before excavation"],
+    },
+  ];
+
+  const { trade } = req.query;
+  if (trade) {
+    const key = sanitiseInput(String(trade)).toLowerCase();
+    const filtered = contacts.filter(c => c.trades.includes(key));
+    return res.json({ trade: key, contacts: filtered, count: filtered.length });
+  }
+
+  return res.json({ contacts, count: contacts.length });
+});
+
+// POST /job-bundle  — Bundle multiple job summaries into a single overview report
+app.post("/job-bundle", apiKeyAuth, (req, res) => {
+  const { jobs, bundleName, contractorName, reportPeriod } = req.body;
+
+  if (!jobs || !Array.isArray(jobs) || jobs.length === 0) {
+    return res.status(400).json({ error: "jobs array is required and must not be empty." });
+  }
+
+  const safeBundleName  = sanitiseInput(String(bundleName  || "Job Bundle"));
+  const safeContractor  = sanitiseInput(String(contractorName || "Contractor"));
+  const safePeriod      = sanitiseInput(String(reportPeriod || "Not specified"));
+
+  const jobCount        = jobs.length;
+  const scores          = jobs.map(j => parseFloat(j.complianceScore) || 0).filter(s => s > 0);
+  const avgScore        = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+  const certCount       = jobs.filter(j => j.certificateFiled).length;
+  const sigCount        = jobs.filter(j => j.signatureObtained).length;
+  const gpsCount        = jobs.filter(j => j.gpsRecorded).length;
+
+  const tradeBreakdown = {};
+  for (const j of jobs) {
+    const t = sanitiseInput(String(j.jobType || "unknown")).toLowerCase();
+    tradeBreakdown[t] = (tradeBreakdown[t] || 0) + 1;
+  }
+
+  const summaries = jobs.slice(0, 50).map((j, idx) => ({
+    index:           idx + 1,
+    jobId:           j.jobId ? sanitiseInput(String(j.jobId)) : null,
+    jobType:         sanitiseInput(String(j.jobType || "unknown")).toLowerCase(),
+    address:         j.address ? sanitiseInput(String(j.address)) : null,
+    completionDate:  j.completionDate || null,
+    complianceScore: parseFloat(j.complianceScore) || null,
+    grade:           j.grade || null,
+    certificateFiled:!!j.certificateFiled,
+    signatureObtained:!!j.signatureObtained,
+    missingCount:    Array.isArray(j.itemsMissing) ? j.itemsMissing.length : 0,
+  }));
+
+  const overallGrade = avgScore !== null
+    ? avgScore >= 90 ? "A" : avgScore >= 80 ? "B" : avgScore >= 70 ? "C" : avgScore >= 60 ? "D" : "F"
+    : null;
+
+  return res.json({
+    bundleId:        `BDL-${Date.now().toString(36).toUpperCase()}`,
+    bundleName:      safeBundleName,
+    contractorName:  safeContractor,
+    reportPeriod:    safePeriod,
+    jobCount,
+    summary: {
+      averageComplianceScore: avgScore,
+      overallGrade,
+      certificatesFiledRate:  `${Math.round((certCount / jobCount) * 100)}%`,
+      signaturesObtainedRate: `${Math.round((sigCount  / jobCount) * 100)}%`,
+      gpsRecordedRate:        `${Math.round((gpsCount  / jobCount) * 100)}%`,
+    },
+    tradeBreakdown,
+    jobs: summaries,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// GET /glossary/:term  — Look up a specific trade compliance term from the tech glossary
+app.get("/glossary/:term", apiKeyAuth, (req, res) => {
+  const GLOSSARY = {
+    "coc": { term: "Certificate of Compliance (CoC)", definition: "A legal document issued by a licenced tradesperson certifying that work meets all applicable codes and standards. Required for plumbing, drainage, gas, and electrical work in Victoria.", authority: "VBA / ESV" },
+    "rcd": { term: "Residual Current Device (RCD)", definition: "A safety switch that trips the circuit if it detects a leakage current, protecting against electric shock. Required in all new domestic installations in Victoria since 2000.", authority: "Energy Safe Victoria" },
+    "escc": { term: "Electrical Safety Certificate of Compliance (ESCC)", definition: "The CoC issued by a licenced electrician after completing electrical installation work in Victoria.", authority: "Energy Safe Victoria" },
+    "tpr": { term: "Temperature and Pressure Relief Valve (TPR valve)", definition: "A safety device on a hot water heater that opens to release excess pressure or temperature, preventing explosions. Must discharge to a safe location.", authority: "AS/NZS 3500" },
+    "swms": { term: "Safe Work Method Statement (SWMS)", definition: "A document that identifies high-risk construction work, the hazards, and the controls to minimise risk. Required for all high-risk work under WorkSafe Vic.", authority: "WorkSafe Victoria" },
+    "vba": { term: "Victorian Building Authority (VBA)", definition: "The state government body that registers building practitioners and plumbers, issues licences, and enforces the Building Act 1993 in Victoria.", authority: "vba.vic.gov.au" },
+    "esv": { term: "Energy Safe Victoria (ESV)", definition: "Victoria's electrical and gas safety regulator. Issues electrician and gasfitter licences, investigates electrical incidents, and enforces safety standards.", authority: "esv.vic.gov.au" },
+    "arc": { term: "Australian Refrigeration Council (ARC) / ARCtick", definition: "The national authority for refrigerant handling. Technicians working with refrigerants must hold an ARCtick licence.", authority: "arctick.org" },
+    "ncc": { term: "National Construction Code (NCC)", definition: "Australia's national framework for the design, construction, and performance of buildings. Includes the Building Code of Australia (BCA). Applies in all states.", authority: "abcb.gov.au" },
+    "bca": { term: "Building Code of Australia (BCA)", definition: "Volumes 1 and 2 of the National Construction Code, covering commercial and residential building requirements respectively.", authority: "abcb.gov.au" },
+    "ips": { term: "Inspection Point / Inspection Opening", definition: "An accessible location in a drainage or plumbing system that allows inspection and cleaning. Required at specific intervals under AS/NZS 3500.2.", authority: "AS/NZS 3500.2" },
+    "gwp": { term: "Global Warming Potential (GWP)", definition: "A measure of how much heat a greenhouse gas traps in the atmosphere. High-GWP refrigerants (R22, R410A) are being phased out under the Montreal Protocol.", authority: "ARC / MEPS" },
+    "dbca": { term: "Domestic Building Contracts Act 1995 (DBCA)", definition: "Victorian legislation governing domestic building contracts, including statutory warranties and dispute resolution processes for home owners.", authority: "Consumer Affairs Victoria" },
+  };
+
+  const rawTerm  = sanitiseInput(String(req.params.term || "")).toLowerCase().replace(/[^a-z0-9]/g, "");
+  const entry    = GLOSSARY[rawTerm];
+
+  if (!entry) {
+    const matches = Object.entries(GLOSSARY)
+      .filter(([k, v]) => v.term.toLowerCase().includes(rawTerm) || v.definition.toLowerCase().includes(rawTerm))
+      .map(([k, v]) => ({ key: k, term: v.term }));
+    return res.status(404).json({
+      error:          `No glossary entry for: ${req.params.term}`,
+      suggestions:    matches.slice(0, 5),
+      availableTerms: Object.keys(GLOSSARY),
+    });
+  }
+
+  return res.json(entry);
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
