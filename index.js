@@ -40172,6 +40172,227 @@ Return JSON with:
   }
 });
 
+// POST /solar-performance-log — Log solar system performance readings
+app.post("/solar-performance-log", apiKeyAuth, async (req, res) => {
+  const {
+    systemId, propertyAddress, readingDate, systemCapacityKw,
+    dailyGenerationKwh, monthlyGenerationKwh, exportToGridKwh,
+    selfConsumptionKwh, gridImportKwh, batteryChargePercent,
+    inverterStatus = "NORMAL", specificYieldKwhPerKwp,
+    performanceRatio, faultCodes = [], notes,
+  } = req.body;
+  if (!systemId || !readingDate) {
+    return res.status(400).json({ error: "systemId and readingDate are required." });
+  }
+  const validStatuses = ["NORMAL", "WARNING", "FAULT", "OFFLINE", "MAINTENANCE"];
+  if (!validStatuses.includes(inverterStatus)) {
+    return res.status(400).json({ error: `inverterStatus must be one of: ${validStatuses.join(", ")}` });
+  }
+  const logRef = `SOL-${Date.now().toString(36).toUpperCase()}`;
+  const calculatedYield = (!specificYieldKwhPerKwp && dailyGenerationKwh && systemCapacityKw)
+    ? +(Number(dailyGenerationKwh) / Number(systemCapacityKw)).toFixed(2)
+    : Number(specificYieldKwhPerKwp) || null;
+  // Typical average peak sun hours in Australia: 4–5 h/day
+  const expectedDailyKwh = systemCapacityKw ? Number(systemCapacityKw) * 4.5 : null;
+  const generationRatio = (dailyGenerationKwh && expectedDailyKwh)
+    ? +(Number(dailyGenerationKwh) / expectedDailyKwh * 100).toFixed(1)
+    : null;
+  const performanceAlert = inverterStatus !== "NORMAL" || faultCodes.length > 0
+    || (generationRatio !== null && generationRatio < 50);
+  const record = {
+    log_ref: logRef,
+    system_id: sanitiseInput(systemId),
+    property_address: sanitiseInput(propertyAddress || ""),
+    reading_date: readingDate,
+    system_capacity_kw: Number(systemCapacityKw) || null,
+    daily_generation_kwh: Number(dailyGenerationKwh) || null,
+    monthly_generation_kwh: Number(monthlyGenerationKwh) || null,
+    export_to_grid_kwh: Number(exportToGridKwh) || null,
+    self_consumption_kwh: Number(selfConsumptionKwh) || null,
+    grid_import_kwh: Number(gridImportKwh) || null,
+    battery_charge_percent: Number(batteryChargePercent) || null,
+    inverter_status: inverterStatus,
+    specific_yield_kwh_per_kwp: calculatedYield,
+    performance_ratio: Number(performanceRatio) || null,
+    generation_ratio_pct: generationRatio,
+    fault_codes: Array.isArray(faultCodes) ? faultCodes.map(f => sanitiseInput(f)) : [],
+    performance_alert: performanceAlert,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("solar_performance_logs").insert(record);
+    if (error) console.error("solar-performance-log DB error:", error.message);
+  }
+  res.json({
+    logRef, systemId, readingDate, inverterStatus, performanceAlert,
+    dailyGenerationKwh: Number(dailyGenerationKwh) || null,
+    generationRatioPct: generationRatio, specificYield: calculatedYield,
+    saved: !!supabaseAdmin,
+  });
+});
+
+// GET /solar-performance-log/:systemId — Get performance history for a solar system
+app.get("/solar-performance-log/:systemId", apiKeyAuth, async (req, res) => {
+  const { systemId } = req.params;
+  const { from, to } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("solar_performance_logs").select("*").eq("system_id", systemId).order("reading_date", { ascending: false });
+  if (from) query = query.gte("reading_date", from);
+  if (to) query = query.lte("reading_date", to);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  const totalGeneration = data.reduce((s, r) => s + (r.daily_generation_kwh || 0), 0);
+  const avgGeneration = data.length > 0 ? totalGeneration / data.length : 0;
+  const alertCount = data.filter(r => r.performance_alert).length;
+  res.json({
+    systemId, readingCount: data.length,
+    totalGenerationKwh: +totalGeneration.toFixed(2),
+    avgDailyGenerationKwh: +avgGeneration.toFixed(2),
+    alertCount, logs: data,
+  });
+});
+
+// POST /ncc-section-j-check — Check NCC Section J energy efficiency compliance
+app.post("/ncc-section-j-check", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, buildingClass, state = "VIC", climateZone,
+    floorAreaM2, proposedWallUValue, requiredWallUValue,
+    proposedRoofUValue, requiredRoofUValue,
+    proposedWindowSHGC, requiredWindowSHGC,
+    proposedLightingPowerDensity, requiredLightingPowerDensity,
+    proposedHvacCop, requiredHvacCop,
+    hotWaterSystemType, solarHwc = false, nccVersion = "2022",
+  } = req.body;
+  if (!buildingClass || !floorAreaM2) {
+    return res.status(400).json({ error: "buildingClass and floorAreaM2 are required." });
+  }
+  const checks = [];
+  const checkItem = (name, proposed, required, lowerIsBetter = true) => {
+    if (proposed === undefined || proposed === null) return { name, status: "NOT_ASSESSED", proposed: null, required, note: "Data not provided" };
+    const passes = lowerIsBetter ? Number(proposed) <= Number(required) : Number(proposed) >= Number(required);
+    return { name, status: passes ? "PASS" : "FAIL", proposed: Number(proposed), required: Number(required), variance: +(Number(proposed) - Number(required)).toFixed(3) };
+  };
+  checks.push(checkItem("Wall U-Value", proposedWallUValue, requiredWallUValue));
+  checks.push(checkItem("Roof U-Value", proposedRoofUValue, requiredRoofUValue));
+  checks.push(checkItem("Window SHGC", proposedWindowSHGC, requiredWindowSHGC));
+  checks.push(checkItem("Lighting Power Density (W/m²)", proposedLightingPowerDensity, requiredLightingPowerDensity));
+  checks.push(checkItem("HVAC COP", proposedHvacCop, requiredHvacCop, false));
+  const failedCount = checks.filter(c => c.status === "FAIL").length;
+  const assessedCount = checks.filter(c => c.status !== "NOT_ASSESSED").length;
+  const overallResult = failedCount === 0 && assessedCount > 0 ? "COMPLIANT"
+    : assessedCount === 0 ? "INSUFFICIENT_DATA"
+    : "NON_COMPLIANT";
+  const jRef = `SECTIONJ-${Date.now().toString(36).toUpperCase()}`;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("ncc_section_j_checks").insert({
+      check_ref: jRef,
+      property_address: sanitiseInput(propertyAddress || ""),
+      building_class: sanitiseInput(buildingClass),
+      state: sanitiseInput(state),
+      climate_zone: Number(climateZone) || null,
+      floor_area_m2: Number(floorAreaM2),
+      ncc_version: sanitiseInput(nccVersion),
+      checks, overall_result: overallResult, failed_count: failedCount,
+      created_at: new Date().toISOString(),
+    });
+    if (error) console.error("ncc-section-j-check DB error:", error.message);
+  }
+  res.json({
+    checkRef: jRef, buildingClass, state, climateZone, floorAreaM2: Number(floorAreaM2),
+    nccVersion, overallResult, failedCount, checks, saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-energy-audit — AI generates an energy audit report for a building
+app.post("/ai-energy-audit", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, propertyType = "commercial", state = "VIC",
+    floorAreaM2, buildYear, currentEnergyUse_kwh_year,
+    energySources = [], currentEnergySpend_aud_year,
+    hvacAge_years, lightingType, solarInstalled = false,
+    solarCapacityKw, knownIssues = [], targetReductionPercent = 20,
+  } = req.body;
+  if (!propertyAddress || !floorAreaM2) {
+    return res.status(400).json({ error: "propertyAddress and floorAreaM2 are required." });
+  }
+  const sanitisedAddress = sanitiseInput(propertyAddress);
+  const sanitisedType = sanitiseInput(propertyType);
+  const sanitisedState = sanitiseInput(state);
+  const eui = currentEnergyUse_kwh_year && floorAreaM2
+    ? +(Number(currentEnergyUse_kwh_year) / Number(floorAreaM2)).toFixed(1)
+    : null;
+  const systemPrompt = `You are an Australian energy auditor with expertise in commercial and residential building energy performance.`;
+  const userPrompt = `Conduct an energy audit assessment for:
+Address: ${sanitisedAddress}
+Property type: ${sanitisedType}
+State: ${sanitisedState}
+Floor area: ${floorAreaM2} m²
+Build year: ${buildYear || "Unknown"}
+Current energy use: ${currentEnergyUse_kwh_year ? `${currentEnergyUse_kwh_year} kWh/year` : "Unknown"}
+Energy Use Intensity: ${eui ? `${eui} kWh/m²/year` : "Unknown"}
+Annual energy spend: ${currentEnergySpend_aud_year ? `$${currentEnergySpend_aud_year}` : "Unknown"}
+Energy sources: ${energySources.map(s => sanitiseInput(s)).join(", ") || "Grid electricity"}
+HVAC age: ${hvacAge_years ? `${hvacAge_years} years` : "Unknown"}
+Lighting type: ${sanitiseInput(lightingType || "Unknown")}
+Solar installed: ${solarInstalled} ${solarCapacityKw ? `(${solarCapacityKw} kW)` : ""}
+Known issues: ${knownIssues.map(i => sanitiseInput(i)).join("; ") || "None"}
+Target reduction: ${targetReductionPercent}%
+
+Return JSON with:
+{
+  "euiBenchmark": {"current": 0, "industry_avg": 0, "best_practice": 0, "rating": "POOR|FAIR|GOOD|EXCELLENT"},
+  "energyWasteIdentified": ["...", "..."],
+  "recommendations": [{"measure": "...", "estimatedSavings_kwh": 0, "estimatedSavings_aud": 0, "paybackYears": 0, "priority": "HIGH"}],
+  "quickWins": ["...", "..."],
+  "capitalWorks": ["...", "..."],
+  "potentialSavingsTotal_aud": 0,
+  "potentialReductionPercent": 0,
+  "renewableOpportunities": ["...", "..."],
+  "nabersBenchmark": "...",
+  "complianceNotes": "...",
+  "nextSteps": ["...", "..."]
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2500,
+    });
+    usageStats.openaiCalls++;
+    const audit = JSON.parse(aiRes.choices[0].message.content);
+    const auditRef = `EA-${Date.now().toString(36).toUpperCase()}`;
+    res.json({ auditRef, propertyAddress: sanitisedAddress, propertyType: sanitisedType, state: sanitisedState, eui, targetReductionPercent, audit });
+  } catch (err) {
+    console.error("ai-energy-audit error:", err.message);
+    const auditRef = `EA-FALLBACK`;
+    res.json({
+      auditRef, propertyAddress: sanitisedAddress, propertyType: sanitisedType, state: sanitisedState, eui, targetReductionPercent,
+      audit: {
+        euiBenchmark: { current: eui, industry_avg: null, best_practice: null, rating: "UNKNOWN" },
+        energyWasteIdentified: knownIssues.length > 0 ? knownIssues : ["Full energy audit required to identify waste"],
+        recommendations: [
+          { measure: "LED lighting upgrade", estimatedSavings_kwh: null, estimatedSavings_aud: null, paybackYears: 2, priority: "HIGH" },
+          { measure: "HVAC optimisation and scheduling", estimatedSavings_kwh: null, estimatedSavings_aud: null, paybackYears: 3, priority: "HIGH" },
+          !solarInstalled ? { measure: "Solar PV installation", estimatedSavings_kwh: null, estimatedSavings_aud: null, paybackYears: 5, priority: "MEDIUM" } : null,
+        ].filter(Boolean),
+        quickWins: ["Turn off equipment when not in use", "Adjust HVAC setpoints", "Install timers on hot water systems"],
+        capitalWorks: ["Building envelope insulation upgrade", "HVAC replacement"],
+        potentialSavingsTotal_aud: null,
+        potentialReductionPercent: targetReductionPercent,
+        renewableOpportunities: !solarInstalled ? ["Solar PV installation"] : ["Battery storage for existing solar"],
+        nabersBenchmark: "NABERS rating assessment recommended for commercial buildings.",
+        complianceNotes: "Section J compliance assessment may be required for tenancy fitouts.",
+        nextSteps: ["Commission formal energy audit by accredited assessor", "Apply for NABERS rating", "Obtain solar feasibility report"],
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
