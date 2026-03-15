@@ -21324,6 +21324,190 @@ app.get("/compliance-resources", apiKeyAuth, (req, res) => {
   });
 });
 
+// ── Round 58 ──────────────────────────────────────────────────────────────────
+
+// POST /job-score-history  — Store a job compliance score to the DB with metadata
+app.post("/job-score-history", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, contractorId, complianceScore, grade, certificateFiled,
+          signatureObtained, gpsRecorded, photoCount, missingItemCount,
+          address, completionDate } = req.body;
+
+  if (!jobId || complianceScore === undefined) {
+    return res.status(400).json({ error: "jobId and complianceScore are required." });
+  }
+
+  const safeJobId   = sanitiseInput(String(jobId));
+  const safeJobType = sanitiseInput(String(jobType || "general")).toLowerCase();
+  const score       = parseFloat(complianceScore);
+
+  if (isNaN(score)) return res.status(400).json({ error: "complianceScore must be a number." });
+
+  const entry = {
+    jobId:           safeJobId,
+    jobType:         safeJobType,
+    contractorId:    contractorId ? sanitiseInput(String(contractorId)) : null,
+    complianceScore: score,
+    grade:           grade || (score >= 90 ? "A" : score >= 80 ? "B" : score >= 70 ? "C" : score >= 60 ? "D" : "F"),
+    certificateFiled:  !!certificateFiled,
+    signatureObtained: !!signatureObtained,
+    gpsRecorded:       !!gpsRecorded,
+    photoCount:        parseInt(photoCount) || 0,
+    missingItemCount:  parseInt(missingItemCount) || 0,
+    address:           address ? sanitiseInput(String(address)) : null,
+    completionDate:    completionDate || new Date().toISOString().slice(0, 10),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("job_score_history").insert({
+      job_id:           safeJobId,
+      job_type:         safeJobType,
+      contractor_id:    entry.contractorId,
+      compliance_score: score,
+      grade:            entry.grade,
+      certificate_filed: entry.certificateFiled,
+      signature_obtained: entry.signatureObtained,
+      gps_recorded:     entry.gpsRecorded,
+      photo_count:      entry.photoCount,
+      missing_count:    entry.missingItemCount,
+      address:          entry.address,
+      completion_date:  entry.completionDate,
+      created_at:       new Date().toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...entry, saved, savedAt: new Date().toISOString() });
+});
+
+// POST /document-store  — Store a compliance document reference in the DB
+app.post("/document-store", apiKeyAuth, async (req, res) => {
+  const { jobId, contractorId, documentType, documentTitle, documentUrl,
+          expiryDate, issueDate, notes } = req.body;
+
+  if (!documentTitle || !documentType) {
+    return res.status(400).json({ error: "documentTitle and documentType are required." });
+  }
+
+  const VALID_DOC_TYPES = ["certificate_of_compliance", "permit", "test_report", "swms", "insurance", "licence", "invoice", "photo_set", "engineer_cert", "other"];
+  const safeDocType  = sanitiseInput(String(documentType)).toLowerCase().replace(/\s/g, "_");
+  const resolvedType = VALID_DOC_TYPES.find(t => t === safeDocType) || "other";
+  const safeTitle    = sanitiseInput(String(documentTitle)).slice(0, 200);
+  const safeUrl      = documentUrl && isSafeUrl(documentUrl) ? documentUrl : null;
+  const safeNotes    = sanitiseInput(String(notes || ""));
+
+  const docId        = `DOC-${Date.now().toString(36).toUpperCase()}`;
+  const now          = new Date();
+  const expDate      = expiryDate ? new Date(expiryDate) : null;
+  const isExpired    = expDate && !isNaN(expDate.getTime()) ? expDate < now : null;
+
+  const doc = {
+    documentId:    docId,
+    documentType:  resolvedType,
+    documentTitle: safeTitle,
+    documentUrl:   safeUrl,
+    jobId:         jobId        ? sanitiseInput(String(jobId))        : null,
+    contractorId:  contractorId ? sanitiseInput(String(contractorId)) : null,
+    issueDate:     issueDate || null,
+    expiryDate:    expDate ? expDate.toISOString().slice(0, 10) : null,
+    isExpired,
+    notes:         safeNotes || null,
+    storedAt:      now.toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("document_store").insert({
+      document_id:   docId,
+      document_type: resolvedType,
+      document_title: safeTitle,
+      document_url:  safeUrl,
+      job_id:        doc.jobId,
+      contractor_id: doc.contractorId,
+      issue_date:    issueDate || null,
+      expiry_date:   expDate ? expDate.toISOString() : null,
+      created_at:    now.toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...doc, saved });
+});
+
+// GET /document-store/:jobId  — Retrieve all documents stored for a job
+app.get("/document-store/:jobId", apiKeyAuth, async (req, res) => {
+  const jobId = sanitiseInput(String(req.params.jobId || ""));
+  if (!jobId) return res.status(400).json({ error: "jobId is required." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  const { data, error } = await supabaseAdmin
+    .from("document_store")
+    .select("*")
+    .eq("job_id", jobId)
+    .order("created_at", { ascending: false });
+
+  if (error) return res.status(500).json({ error: "Failed to retrieve documents." });
+
+  const docs     = data || [];
+  const now      = new Date();
+  const expired  = docs.filter(d => d.expiry_date && new Date(d.expiry_date) < now).length;
+  const byType   = docs.reduce((acc, d) => { acc[d.document_type] = (acc[d.document_type] || 0) + 1; return acc; }, {});
+
+  return res.json({
+    jobId,
+    documentCount: docs.length,
+    expiredCount:  expired,
+    byType,
+    documents: docs,
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
+// POST /estimate-vs-actual  — Compare estimated vs actual costs for a job
+app.post("/estimate-vs-actual", apiKeyAuth, (req, res) => {
+  const { jobId, jobType, estimatedLabour, actualLabour, estimatedMaterials,
+          actualMaterials, estimatedTotal, actualTotal, currency, notes } = req.body;
+
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+
+  const safeJobType = sanitiseInput(String(jobType)).toLowerCase();
+  const safeNotes   = sanitiseInput(String(notes || ""));
+  const curr        = sanitiseInput(String(currency || "AUD"));
+
+  const estLabour   = parseFloat(estimatedLabour)    || 0;
+  const actLabour   = parseFloat(actualLabour)       || 0;
+  const estMats     = parseFloat(estimatedMaterials) || 0;
+  const actMats     = parseFloat(actualMaterials)    || 0;
+  const estTotal    = parseFloat(estimatedTotal)     || (estLabour + estMats);
+  const actTotal    = parseFloat(actualTotal)        || (actLabour + actMats);
+
+  const labourVar   = Math.round((actLabour - estLabour) * 100) / 100;
+  const matsVar     = Math.round((actMats   - estMats)   * 100) / 100;
+  const totalVar    = Math.round((actTotal  - estTotal)  * 100) / 100;
+  const varPct      = estTotal > 0 ? Math.round((totalVar / estTotal) * 100) : null;
+
+  const status      = varPct === null ? "UNKNOWN" : varPct > 15 ? "SIGNIFICANT_OVERRUN" : varPct > 5 ? "OVER_BUDGET" : varPct < -5 ? "UNDER_BUDGET" : "ON_BUDGET";
+
+  return res.json({
+    jobId:     jobId ? sanitiseInput(String(jobId)) : null,
+    jobType:   safeJobType,
+    currency:  curr,
+    labour:    { estimated: estLabour, actual: actLabour, variance: labourVar },
+    materials: { estimated: estMats,   actual: actMats,   variance: matsVar   },
+    total:     { estimated: estTotal,  actual: actTotal,  variance: totalVar, variancePct: varPct !== null ? `${varPct}%` : null },
+    status,
+    recommendation: status === "SIGNIFICANT_OVERRUN"
+      ? "Cost significantly exceeds estimate — review scope, time tracking, and materials ordering process"
+      : status === "OVER_BUDGET"
+        ? "Slightly over budget — review for unapproved variations"
+        : status === "UNDER_BUDGET"
+          ? "Under budget — consider whether all work was completed as scoped"
+          : "Costs within expected range",
+    notes:     safeNotes || null,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
