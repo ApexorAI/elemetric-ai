@@ -274,9 +274,25 @@ error: "No images provided",
 
 const isGas = type === "gas";
 const isElectrical = type === "electrical";
+const isDrainage = type === "drainage";
 const isGeneralDoc = type === "hvac" || type === "carpentry";
 
 const tradeLabel = type === "hvac" ? "HVAC" : type;
+
+// Shared output format instruction appended to every prompt
+const outputFormatInstruction = `
+CONFIDENCE BREAKDOWN — return ALL of the following fields in your JSON response:
+- relevant: true if at least one photo passes and shows genuine trade work, false otherwise
+- overall_confidence: integer 0–100 — round((passing photos / total photos submitted) * 100)
+- items_detected: array of labels that clearly PASS
+- items_missing: array of labels that FAIL — wrong subject, obstructed, or required item not visible
+- items_unclear: array of labels that show something related but cannot be confidently verified
+- risk_rating: "high" if any critical safety item fails, "medium" if non-critical items fail, "low" if all critical items pass
+- recommended_actions: array of short action strings — one per failed or unclear item
+- liability_summary: one plain-English sentence explaining what this result means for the plumber's liability and certification
+- analysis: one sentence summarising how many photos passed and why others failed
+
+Return STRICT JSON only. No markdown. No text outside the JSON object.`;
 
 const promptText = isElectrical ? `
 You are a strict electrical compliance photo validator for Victorian electrical regulations under AS/NZS 3000 Wiring Rules and Energy Safe Victoria requirements.
@@ -293,42 +309,98 @@ VALIDATION RULES — apply without exception:
 - A photo FAILS if it shows electrical work in general but not the specific item named in its label.
 - Never give benefit of the doubt. When in doubt, the photo fails.
 
-REQUIRED ELECTRICAL INSTALLATION ITEMS and what must be visible for a PASS:
-- "RCD protection installed and tested": must show an RCD or safety switch with test button, ideally in a switchboard
-- "Circuit breaker ratings correct": must clearly show circuit breakers with visible amperage ratings or labels
-- "Earth continuity tested": must show earthing conductors, earth terminals, or test equipment confirming earth continuity
-- "Polarity correct": must show wiring connections or test instrument confirming correct active/neutral polarity
-- "Insulation resistance tested": must show an insulation resistance tester (megohmmeter) or clearly readable test result
-- "All connections secure and terminations correct": must show cable terminations at switchboard, outlet, or fitting — no loose wires
-- "Cable support and protection adequate": must show cables properly clipped, conduit, or cable management in place
-- "Switchboard labelling complete": must show switchboard with circuit labels or directory visible
-- "No visible damage to cables or fittings": must show cables or fittings — clean, undamaged, no burns or cuts
-- "Smoke alarm installed and tested where required": must show a smoke alarm installed on ceiling or wall
-- "Safety switch tested and operational": must show a safety switch (RCD) with test button or test result indicated
-- "Test results recorded": must show a completed test results sheet, certificate of electrical safety, or test instrument screen
+REQUIRED ELECTRICAL INSTALLATION ITEMS and what must be CLEARLY VISIBLE for a PASS:
+- "RCD protection installed and tested": must show an RCD or safety switch with BOTH the test button AND the trip indicator (LED or label) clearly visible. A photo showing only a switchboard without a legible RCD test button FAILS.
+- "Circuit breaker ratings correct": must clearly show circuit breakers with visible and legible amperage ratings or circuit labels — blurry or unreadable labels FAIL.
+- "Earth continuity tested": must show earthing conductors or earth terminals — the conductor insulation must be green/yellow striped. Grey, black, or unidentifiable conductors FAIL this item.
+- "Polarity correct": must show wiring connections or a test instrument screen confirming correct active/neutral polarity — the instrument result must be readable.
+- "Insulation resistance tested": must show an insulation resistance tester (megohmmeter) with a visible reading on the display, or a printed test certificate with results.
+- "All connections secure and terminations correct": must show cable terminations at switchboard, outlet, or fitting — no loose wires, no bare conductors outside terminals. Any exposed conductor tips or loose wires FAIL.
+- "Cable support and protection adequate": must show cables properly clipped or in conduit at regular intervals. Unsupported cable runs or cables hanging freely FAIL.
+- "Switchboard labelling complete": must show the switchboard with ALL circuit labels or a circuit directory legible — partially labelled boards where some circuits are blank FAIL.
+- "No visible damage to cables or fittings": must show cables or fittings that are clean and undamaged — any burns, cuts, exposed core, kinks, or crush marks FAIL.
+- "Smoke alarm installed and tested where required": must show a smoke alarm physically mounted on the ceiling or wall — alarm brand, mounting screws, and interconnect wires (if applicable) must be visible.
+- "Safety switch tested and operational": must show a safety switch (RCD) with the test button pressed result OR a test certificate — a photo of an untested switch alone FAILS.
+- "Test results recorded": must show a completed test results sheet, certificate of electrical safety, or a test instrument screen with all required fields filled — blank or partial test sheets FAIL.
+- "No exposed conductors": must show all conductors fully insulated, terminated in appropriate fittings, and no bare copper visible outside of terminals. Any visible bare copper outside a terminal FAILS immediately.
 
-SCORING:
-- confidence = round((passing photos / total photos submitted) * 100)
-- If zero photos pass: confidence = 0, relevant = false
-- relevant = true only if at least one photo passes and shows genuine electrical installation work
+ADDITIONAL REJECTION CRITERIA:
+- Any photo where circuit labels, RCD markings, or earth colour coding are not legible FAILS.
+- Photos taken from excessive distance where individual components cannot be identified FAIL.
+- Photos of closed switchboard doors without showing internal components FAIL.
 
-OUTPUT FIELDS:
-- detected: labels of photos that clearly PASS
-- unclear: labels of photos that show something electrical-related but cannot be confidently verified as the named item
-- missing: labels of photos that FAIL — wrong subject, unrelated object, or required item not visible
-- action: one short sentence on what to retake or fix
-- analysis: one short sentence summarising how many photos passed and why others failed
+RISK RATING CRITERIA:
+- "high": RCD/safety switch, earth continuity, or exposed conductor items fail
+- "medium": switchboard labelling, cable support, or test records fail
+- "low": all safety-critical items pass, minor documentation gaps only
 
-Return STRICT JSON only. No markdown.
+${outputFormatInstruction}
 
+Example response shape:
 {
-"relevant": true,
-"confidence": 75,
-"detected": ["RCD protection installed and tested", "Switchboard labelling complete"],
-"unclear": ["Earth continuity tested"],
-"missing": ["Insulation resistance tested", "Test results recorded"],
-"action": "Retake the insulation resistance and test results photos — current photos do not show test equipment or recorded results.",
-"analysis": "2 of 5 photos pass validation. 1 is unclear. 2 photos do not show the required electrical installation item."
+  "relevant": true,
+  "overall_confidence": 75,
+  "items_detected": ["RCD protection installed and tested", "Switchboard labelling complete"],
+  "items_missing": ["Insulation resistance tested", "Test results recorded"],
+  "items_unclear": ["Earth continuity tested"],
+  "risk_rating": "medium",
+  "recommended_actions": [
+    "Retake the insulation resistance photo — show the megohmmeter display with a readable test value.",
+    "Retake the test results photo — the certificate or test sheet must have all fields completed and legible."
+  ],
+  "liability_summary": "Without documented insulation resistance results and a completed test certificate, the installation cannot be certified safe. The electrician remains liable for any fault that emerges on untested circuits.",
+  "analysis": "2 of 5 photos pass validation. 1 is unclear. 2 photos do not show the required electrical installation item."
+}
+`.trim() : isDrainage ? `
+You are a strict drainage compliance photo validator for Victorian plumbing regulations under AS/NZS 3500.2 (Sanitary Plumbing and Drainage).
+
+Job type: drainage installation
+
+Each photo below has been submitted with a label describing what it is SUPPOSED to show. Validate each photo individually and determine whether it actually contains the required drainage component or evidence.
+
+VALIDATION RULES — apply without exception:
+- Validate each photo against its label independently.
+- A photo PASSES only if it clearly and unambiguously shows the specific drainage item named in its label.
+- A photo FAILS if it shows a person, animal, unrelated object, or anything not related to drainage work.
+- A photo FAILS if it is blurry, too dark, or ambiguous — if you cannot clearly identify the named item, it fails.
+- A photo FAILS if it shows drainage work in general but not the specific item named in its label.
+- Never give benefit of the doubt. When in doubt, the photo fails.
+
+REQUIRED DRAINAGE ITEMS and what must be CLEARLY VISIBLE for a PASS:
+- "Pipe fall / gradient": must show drainage pipework with a clearly visible downward fall direction. Flat or upward-sloping pipe FAILS. A spirit level or visible gradient relative to a datum is ideal — if fall cannot be assessed from the photo it FAILS.
+- "Inspection opening": must show an inspection opening (IO) or access point that is BOTH accessible (no permanent obstruction within 500 mm) AND has a legible label or cover marking identifying it as an inspection opening. An unlabelled or obstructed IO FAILS.
+- "Trap installed correctly": must show a trap (P-trap, bottle trap, or floor trap) with visible water seal, correct connection to the fixture outlet, and no distortion or cracking. A trap with a cracked body, missing water seal, or improper connection FAILS.
+- "No pooling water or moisture staining": must show dry drainage surfaces, pipe bedding, and surrounding substrate. Any visible standing water, watermarks, efflorescence, or moisture staining causes a FAIL for this item.
+- "Pipe bedding adequate": must show pipe bedding material (sand or gravel) around the pipe at the correct depth and compaction — visible void spaces, uneven bedding, or solid unsupported spans FAIL.
+- "Vent stack / air admittance valve": must show the vent stack termination or an air admittance valve (AAV) clearly installed and accessible — the vent opening or AAV body must be visible.
+- "All joints sealed and connected": must show pipe joints that are smooth, fully engaged, and free of visible gaps, mis-alignment, or adhesive voids. Joints with visible gaps or stepped connections FAIL.
+
+ADDITIONAL REJECTION CRITERIA:
+- Any photo of a trench or pipe without clearly showing the specific item named in the label FAILS.
+- Photos taken at angles that prevent assessment of pipe fall or joint quality FAIL.
+- Photos showing only soil or backfill without visible pipe or fittings FAIL.
+
+RISK RATING CRITERIA:
+- "high": pipe fall, trap, or joint items fail — risk of sewer gas entry or drain blockage
+- "medium": bedding, IO labelling, or moisture items fail
+- "low": all critical drainage items pass, minor documentation gaps only
+
+${outputFormatInstruction}
+
+Example response shape:
+{
+  "relevant": true,
+  "overall_confidence": 60,
+  "items_detected": ["Trap installed correctly", "All joints sealed and connected"],
+  "items_missing": ["Pipe fall / gradient", "Inspection opening"],
+  "items_unclear": ["Pipe bedding adequate"],
+  "risk_rating": "high",
+  "recommended_actions": [
+    "Retake the pipe fall photo — show the pipe with a visible gradient or spirit level confirming adequate fall.",
+    "Retake the inspection opening photo — the IO must be accessible and its cover must be labelled."
+  ],
+  "liability_summary": "Without documented evidence of correct pipe fall and an accessible labelled inspection opening, compliance cannot be confirmed. The plumber is liable if blockages or drainage failures occur on an unverified installation.",
+  "analysis": "2 of 5 photos pass validation. 1 is unclear. 2 photos do not show the required drainage item."
 }
 `.trim() : isGeneralDoc ? `
 You are a trade documentation photo validator for Australian construction documentation records.
@@ -344,32 +416,35 @@ VALIDATION RULES — apply without exception:
 - This is a documentation record — not a compliance check. You are not verifying code compliance, only that the photos show genuine ${tradeLabel} trade work.
 
 SCORING:
-- confidence = round((passing photos / total photos submitted) * 100)
-- If zero photos pass: confidence = 0, relevant = false
+- overall_confidence = round((passing photos / total photos submitted) * 100)
+- If zero photos pass: overall_confidence = 0, relevant = false
 - relevant = true only if at least one photo passes and shows genuine ${tradeLabel} work
 
-OUTPUT FIELDS:
-- detected: labels of photos that clearly PASS
-- unclear: labels of photos that show something related but hard to identify
-- missing: labels of photos that FAIL — wrong subject or unrelated to ${tradeLabel} work
-- action: one short sentence on what to retake or fix
-- analysis: one short sentence summarising how many photos passed
+RISK RATING CRITERIA:
+- "high": more than half the photos fail or show unrelated content
+- "medium": some photos fail or are unclear
+- "low": all or nearly all photos show genuine trade work
 
-Return STRICT JSON only. No markdown.
+${outputFormatInstruction}
 
+Example response shape:
 {
-"relevant": true,
-"confidence": 80,
-"detected": ["Site Overview", "Completed Work"],
-"unclear": ["Equipment / Materials"],
-"missing": ["Labels / Documentation"],
-"action": "Retake the labels photo — current photo does not show trade documentation.",
-"analysis": "2 of 4 photos pass validation. 1 is unclear. 1 does not show relevant work."
+  "relevant": true,
+  "overall_confidence": 80,
+  "items_detected": ["Site Overview", "Completed Work"],
+  "items_missing": ["Labels / Documentation"],
+  "items_unclear": ["Equipment / Materials"],
+  "risk_rating": "low",
+  "recommended_actions": [
+    "Retake the labels photo — current photo does not show trade documentation or equipment markings."
+  ],
+  "liability_summary": "Documentation is mostly complete. The missing labels photo is a minor gap — retake before submitting the final job record.",
+  "analysis": "2 of 4 photos pass validation. 1 is unclear. 1 does not show relevant work."
 }
 `.trim() : isGas ? `
 You are a strict gas compliance photo validator for Victorian gas regulations under AS/NZS 5601.1:2013 and AS 4575:2019.
 
-Job type: gas rough-in
+Job type: gas installation
 
 Each photo below has been submitted with a label describing what it is SUPPOSED to show. Validate each photo individually and determine whether it actually contains the required gas installation component or evidence.
 
@@ -379,95 +454,107 @@ VALIDATION RULES — apply without exception:
 - A photo FAILS if it shows a person, animal, unrelated object, room interior, or anything not related to gas fitting work.
 - A photo FAILS if it is blurry, too dark, or ambiguous — if you cannot clearly identify the named item, it fails.
 - A photo FAILS if it shows gas work in general but not the specific item named in its label.
+- Any photo where a gas component is present but cannot be clearly identified (brand, type, connections) FAILS — flag it in items_unclear.
 - Never give benefit of the doubt. When in doubt, the photo fails.
 
-REQUIRED GAS INSTALLATION ITEMS and what must be visible for a PASS:
-- "Gastight AS/NZS 5601.1": must show evidence of gastightness testing — gauge, written test result visible, or marked connections
-- "Accessible for servicing": must show the appliance or component is clearly accessible with no obstructions
-- "Isolation valve present": must clearly show an isolation valve on the gas supply line
-- "Electrically safe": must show electrical connections or earthing that are visibly safe and compliant
-- "Evidence of certification": must show a compliance label, certificate plate, or certification marking on the appliance
-- "Adequately restrained": must show restraints, brackets, or fixings holding the appliance or pipework
-- "Ventilation adequate": must show ventilation openings, grilles, or ducting providing adequate airflow
-- "Clearances OK": must show required clearances around the appliance to combustibles or walls
-- "Cowl and flue terminal OK": must clearly show the cowl or flue terminal at the point of exhaust
-- "Flue supported and sealed": must show the flue pipe with visible supports and sealed joints
-- "Scorching and overheating check": must show no scorching — clean surfaces around the appliance
-- "Heat exchanger OK": must show the heat exchanger surface — clean, undamaged, no cracks or corrosion
-- "Gas fitting line tested and gas tight": must show test equipment or marked connections confirming gas tightness
-- "Appliance cleaned of dust and debris": must show the appliance interior or burner area — visibly clean
-- "Gas supply and appliance operating pressures correct": must show a pressure gauge with a readable value
-- "Burner flames normal": must clearly show the burner with normal blue flames — no yellow tipping or lifting
-- "Appliance operating correctly including all safety devices": must show the appliance running normally with safety devices visible
+REQUIRED GAS INSTALLATION ITEMS and what must be CLEARLY VISIBLE for a PASS:
+- "Gastight AS/NZS 5601.1": must show a pressure gauge with a READABLE numerical value confirming test pressure, or a written test certificate with legible results. A photo of fittings without a gauge or certificate FAILS.
+- "Accessible for servicing": must show the appliance or component with a clear, unobstructed access path — at least 600 mm clear space must be visually apparent. Blocked or cluttered access FAILS.
+- "Isolation valve present": must clearly show an isolation valve on the gas supply line, with the valve handle visible and accessible (not buried, enclosed, or obstructed). A valve that cannot be reached without tools FAILS.
+- "Electrically safe": must show electrical connections or bonding conductors that are visibly insulated, terminated, and comply with AS/NZS 3000. Bare or uninsulated conductors FAIL.
+- "Evidence of certification": must show a compliance label, AGA certification plate, or regulatory marking PHYSICALLY ATTACHED to the appliance body — the label text must be legible enough to confirm it is a compliance marking. Labels hidden, removed, or painted over FAIL.
+- "Adequately restrained": must show brackets, restraint straps, or fixings securing the appliance or gas pipework — the fixing hardware must be visible and appear correctly torqued.
+- "Ventilation adequate": must show ventilation openings, grilles, or louvres providing combustion air — grilles must appear unobstructed. Sealed or covered ventilation openings FAIL.
+- "Clearances OK": must show measured or visually apparent clearances between the appliance and combustible materials or walls — insufficient clearance FAILS.
+- "Cowl and flue terminal OK": must show the cowl or flue terminal AT THE POINT OF EXHAUST — the terminal must be visible, undamaged, and correctly positioned. Photos of the flue pipe mid-run instead of the terminal FAIL.
+- "Flue supported and sealed": must show the flue pipe with visible support brackets at correct intervals AND sealed joints (no visible gaps or separations at joints). Unsupported spans or open joints FAIL.
+- "Scorching and overheating check": must show surfaces surrounding the appliance that are clean and undamaged — any discolouration, burn marks, blistering paint, or heat staining FAIL this item.
+- "Heat exchanger OK": must show the heat exchanger surface clearly — no cracks, corrosion, sooting, or physical damage. If the surface cannot be fully seen, the photo is unclear.
+- "Gas fitting line tested and gas tight": must show a pressure gauge with a readable test pressure value, or a marked and signed test record. A gauge that is out of frame or unreadable FAILS.
+- "Appliance cleaned of dust and debris": must show the burner compartment or appliance interior — visibly free of dust, lint, and debris. Any visible debris or blocked burner ports FAIL.
+- "Gas supply and appliance operating pressures correct": must show a pressure gauge WITH LEGIBLE NUMBERS indicating the operating pressure. A gauge where the needle position or numbers cannot be read FAILS.
+- "Burner flames normal": must clearly show active burner flames that are predominantly BLUE in colour. Yellow-tipped, orange, or lifting flames FAIL this item. A photo of an unlit burner does not pass — the burner must be operating.
+- "Appliance operating correctly including all safety devices": must show the appliance running with at least one visible safety device (flame failure device, overheat cut-out, or pressure relief) clearly present and labelled.
 
-SCORING:
-- confidence = round((passing photos / total photos submitted) * 100)
-- If zero photos pass: confidence = 0, relevant = false
-- relevant = true only if at least one photo passes and shows genuine gas installation work
+ADDITIONAL REJECTION CRITERIA:
+- Any pressure gauge photo where the numeric scale is unreadable or the needle position is ambiguous FAILS.
+- Any burner photo that does not show live flames FAILS — an unlit burner is not evidence of normal operation.
+- Any appliance certification label that is obscured, removed, or illegible FAILS.
+- Any flue terminal photo taken from inside the building that does not show the external termination point FAILS.
 
-OUTPUT FIELDS:
-- detected: labels of photos that clearly PASS
-- unclear: labels of photos that show something gas-related but cannot be confidently verified as the named item
-- missing: labels of photos that FAIL — wrong subject, unrelated object, or required item not visible
-- action: one short sentence on what to retake or fix
-- analysis: one short sentence summarising how many photos passed and why others failed
+RISK RATING CRITERIA:
+- "high": gastightness, burner flames, appliance certification, isolation valve, or flue terminal items fail
+- "medium": ventilation, clearances, scorching check, or support items fail
+- "low": all critical gas safety items pass, minor documentation gaps only
 
-Return STRICT JSON only. No markdown.
+${outputFormatInstruction}
 
+Example response shape:
 {
-"relevant": true,
-"confidence": 65,
-"detected": ["Isolation valve present", "Burner flames normal"],
-"unclear": ["Flue supported and sealed"],
-"missing": ["Gas supply and appliance operating pressures correct", "Scorching and overheating check"],
-"action": "Retake the pressure gauge photo and scorching check — current photos do not show these items.",
-"analysis": "2 of 5 photos pass validation. 1 photo is unclear. 2 photos do not show the required gas installation item."
+  "relevant": true,
+  "overall_confidence": 65,
+  "items_detected": ["Isolation valve present", "Adequately restrained"],
+  "items_missing": ["Burner flames normal", "Gas supply and appliance operating pressures correct"],
+  "items_unclear": ["Flue supported and sealed"],
+  "risk_rating": "high",
+  "recommended_actions": [
+    "Retake the burner flames photo — the appliance must be operating and blue flames must be clearly visible.",
+    "Retake the operating pressure photo — the gauge face must be in frame with legible numbers and a readable needle position."
+  ],
+  "liability_summary": "Critical gas safety items are unverified. Without documented burner flame colour and confirmed operating pressures, the installation cannot be certified compliant. The gas fitter carries full liability for any combustion incident on an unverified installation.",
+  "analysis": "2 of 5 photos pass validation. 1 photo is unclear. 2 photos do not show the required gas installation item."
 }
 `.trim() : `
-You are a strict plumbing compliance photo validator for Victorian plumbing regulations.
+You are a strict plumbing compliance photo validator for Victorian plumbing regulations under AS/NZS 3500 and the Plumbing Regulations 2018.
 
-Job type: ${type}
+Job type: ${type} plumbing installation
 
-Each photo below has been submitted with a label describing what it is SUPPOSED to show. Your job is to validate each photo individually and determine whether it actually contains the required plumbing component.
+Each photo below has been submitted with a label describing what it is SUPPOSED to show. Your job is to validate each photo individually and determine whether it actually contains the required plumbing component with sufficient evidence for compliance documentation.
 
 VALIDATION RULES — apply these without exception:
 - Validate each photo against its label independently.
-- A photo PASSES only if it clearly and unambiguously shows the specific plumbing component named in its label.
+- A photo PASSES only if it clearly and unambiguously shows the specific plumbing component named in its label, WITH the compliance evidence described below.
 - A photo FAILS if it shows a person, animal, pet, room interior, outdoor scene, food, furniture, vehicle, sky, or any object that is not a plumbing component.
 - A photo FAILS if it is blurry, too dark, or ambiguous — if you cannot clearly identify the named component, it fails.
 - A photo FAILS if it shows plumbing in general but not the specific component named in its label.
 - Never give benefit of the doubt. When in doubt, the photo fails.
 
-REQUIRED COMPONENTS for a ${type} installation and what must be visible for a PASS:
-- "Existing system (before)": must show the old hot water unit, tank, or existing pipework before replacement
-- "PTR valve installed": must clearly show a PTR (pressure and temperature relief) valve with discharge pipe
-- "Tempering valve": must clearly show a tempering valve body with markings or connections
-- "Compliance plate / label": must show the compliance plate or regulatory rating label physically attached to the unit
-- "Isolation valve": must clearly show an isolation valve on the supply or return pipework
+REQUIRED PLUMBING COMPONENTS and what must be CLEARLY VISIBLE for a PASS:
+- "PTR valve installed": must show a PTR (pressure and temperature relief) valve body WITH a visible manufacturer compliance label or AS 1357 marking attached to the valve itself. A discharge pipe must also be connected and visible. A PTR valve without a legible compliance label FAILS. A discharge pipe that terminates to an incorrect location (e.g. not to a tundish or safe drain) FAILS.
+- "Tempering valve": must show the tempering valve body WITH a visible AS 3500.4 compliance marking or temperature rating label on the valve body. The hot, cold, and mixed water connections must all be visible. A tempering valve without a legible rating marking FAILS.
+- "Pipe supports": must show pipework with support clips, brackets, or hangers — horizontal copper pipe must have supports at no more than approximately 1.2 m intervals, and vertical pipe at no more than approximately 1.8 m. Any horizontal span that visually appears unsupported over 1.2 m FAILS.
+- "No leaks or moisture": must show dry pipework, fittings, and surrounding materials — all surfaces dry and free of watermarks, efflorescence, corrosion, or staining. Any visible moisture, wet surfaces, or water droplets FAIL this item.
+- "Isolation valve at fixture": must clearly show an isolation valve directly on the supply line to a specific fixture (tap, toilet, dishwasher, etc.) — the valve body, handle orientation, and supply connection must all be visible. A main isolation valve shown instead of a fixture-specific valve FAILS unless the label explicitly refers to the main.
+- "Pressure limiting valve (PLV)": must show a PLV body WITH a visible pressure rating label or AS 1357.2 marking — the pressure rating value (e.g. 500 kPa) must be legible. A valve body without a legible pressure rating FAILS.
+- "Existing system (before)": must show the old hot water unit, tank, or existing pipework in its pre-replacement state — this is a before-state record confirming the original installation.
+- "Compliance plate / label": must show the compliance plate or regulatory rating label physically attached to the water heater or appliance, with the text and markings legible. Labels that are obscured, peeling off, or illegible FAIL.
 
-SCORING:
-- Count how many photos PASS their individual validation.
-- confidence = round((passing photos / total photos submitted) * 100)
-- If zero photos pass: confidence = 0, relevant = false.
-- relevant = true only if at least one photo passes and the passing photos are genuine plumbing components.
+ADDITIONAL REJECTION CRITERIA:
+- Any photo where the compliance label, valve marking, or pressure rating is not legible FAILS — zoom in on labels if necessary.
+- Photos showing only pipework without the specific component named in the label FAIL.
+- Photos of complete installations where the specific component is present but obstructed by insulation, lagging, or other materials FAIL.
 
-OUTPUT FIELDS:
-- detected: labels of photos that clearly PASS
-- unclear: labels of photos that show something plumbing-related but cannot be confidently verified as the named component
-- missing: labels of photos that FAIL — wrong subject, animal, person, unrelated object, or component not visible
-- action: one short sentence on what to retake or fix
-- analysis: one short sentence summarising how many photos passed and why others failed
+RISK RATING CRITERIA:
+- "high": PTR valve, tempering valve, or PLV items are missing or failed — direct hot water scalding or pressure risk
+- "medium": pipe supports, isolation valves, or moisture items fail
+- "low": all critical safety items pass, minor documentation gaps only
 
-Return STRICT JSON only. No markdown. No explanation outside the JSON.
+${outputFormatInstruction}
 
+Example response shape:
 {
-"relevant": true,
-"confidence": 60,
-"detected": ["PTR valve installed", "Isolation valve"],
-"unclear": ["Compliance plate / label"],
-"missing": ["Existing system (before)", "Tempering valve"],
-"action": "Retake the before photo and tempering valve — current photos do not show these components.",
-"analysis": "2 of 5 photos pass validation. 1 photo is unclear. 2 photos do not show the required component."
+  "relevant": true,
+  "overall_confidence": 60,
+  "items_detected": ["PTR valve installed", "Isolation valve at fixture"],
+  "items_missing": ["Tempering valve", "Pressure limiting valve (PLV)"],
+  "items_unclear": ["Compliance plate / label"],
+  "risk_rating": "high",
+  "recommended_actions": [
+    "Retake the tempering valve photo — the AS 3500.4 compliance marking and all three connections must be visible.",
+    "Retake the PLV photo — the pressure rating label must be legible with the kPa value readable."
+  ],
+  "liability_summary": "Critical hot water safety items are unverified. Without documented evidence of a compliant tempering valve and PLV, this installation cannot be certified. The plumber carries full liability for any scalding or pressure-related incident on an unverified hot water system.",
+  "analysis": "2 of 5 photos pass validation. 1 photo is unclear. 2 photos do not show the required plumbing component."
 }
 `.trim();
 
@@ -515,29 +602,45 @@ raw,
 }
 
 const relevant = !!parsed.relevant;
-const confidence =
-typeof parsed.confidence === "number"
-? Math.max(0, Math.min(100, parsed.confidence))
-: 0;
+const overallConfidence =
+  typeof parsed.overall_confidence === "number"
+    ? Math.max(0, Math.min(100, parsed.overall_confidence))
+    : typeof parsed.confidence === "number"
+      ? Math.max(0, Math.min(100, parsed.confidence))
+      : 0;
 
-const detected = Array.isArray(parsed.detected) ? parsed.detected : [];
-const unclear = Array.isArray(parsed.unclear) ? parsed.unclear : [];
-const missing = Array.isArray(parsed.missing) ? parsed.missing : [];
-const action =
-typeof parsed.action === "string" ? parsed.action : "review installation";
-const analysis =
-typeof parsed.analysis === "string"
-? parsed.analysis
-: "AI review completed.";
+const itemsDetected = Array.isArray(parsed.items_detected) ? parsed.items_detected
+  : Array.isArray(parsed.detected) ? parsed.detected : [];
+const itemsMissing = Array.isArray(parsed.items_missing) ? parsed.items_missing
+  : Array.isArray(parsed.missing) ? parsed.missing : [];
+const itemsUnclear = Array.isArray(parsed.items_unclear) ? parsed.items_unclear
+  : Array.isArray(parsed.unclear) ? parsed.unclear : [];
+
+const validRatings = ["low", "medium", "high"];
+const riskRating = validRatings.includes(parsed.risk_rating) ? parsed.risk_rating : "medium";
+
+const recommendedActions = Array.isArray(parsed.recommended_actions)
+  ? parsed.recommended_actions
+  : typeof parsed.action === "string" ? [parsed.action] : [];
+
+const liabilitySummary = typeof parsed.liability_summary === "string"
+  ? parsed.liability_summary
+  : "Review the missing items and retake photos before certifying this installation.";
+
+const analysis = typeof parsed.analysis === "string"
+  ? parsed.analysis
+  : "AI review completed.";
 
 return res.json({
-relevant,
-confidence,
-detected,
-unclear,
-missing,
-action,
-analysis,
+  relevant,
+  overall_confidence: overallConfidence,
+  items_detected: itemsDetected,
+  items_missing: itemsMissing,
+  items_unclear: itemsUnclear,
+  risk_rating: riskRating,
+  recommended_actions: recommendedActions,
+  liability_summary: liabilitySummary,
+  analysis,
 });
 } catch (error) {
 console.error("AI review error:", error);
