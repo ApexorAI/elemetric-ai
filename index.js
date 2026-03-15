@@ -62073,6 +62073,353 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /asbestos-clearance-record — Asbestos clearance inspection per OHS Regulations 2017 (Vic) Part 4.4
+app.post("/asbestos-clearance-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    siteAddress,
+    removalScope,         // description of ACM removed
+    removalClass,         // class-a | class-b | friable | non-friable
+    removalContractor,
+    removalLicence,       // licence number
+    removalStartDate,
+    removalEndDate,
+    clearanceInspector,
+    clearanceInspectorLicence,
+    clearanceDate,
+    visualInspectionResult,  // pass | fail
+    airMonitoringRequired,
+    airMonitoringResult,     // pass | fail | not-required
+    airFibreCount_f_mL,      // fibres per mL — clearance level <0.01 f/mL
+    clearanceLevel_f_mL,     // default 0.01 f/mL per Worksafe guidance
+    wasteDisposalMethod,     // landfill | encapsulation | special-waste
+    wasteManifestNumber,
+    landfillFacility,
+    reoccupationApproved,
+    clearanceResult,         // CLEARED | NOT-CLEARED
+    photos,
+    notes,
+  } = req.body;
+
+  const clearanceLimit = parseFloat(clearanceLevel_f_mL) || 0.01;
+  const measuredFibres = parseFloat(airFibreCount_f_mL) || 0;
+
+  const issues = [];
+
+  // Visual inspection failure
+  if (visualInspectionResult === "fail") {
+    issues.push("Visual inspection failed — residual ACM or debris present in work area");
+  }
+
+  // Air monitoring exceedance
+  if (airMonitoringRequired && airMonitoringResult === "fail") {
+    issues.push(`Air monitoring result FAILED — fibre count exceeds clearance level`);
+  }
+  if (airMonitoringRequired && measuredFibres > clearanceLimit) {
+    issues.push(
+      `Fibre count ${measuredFibres} f/mL exceeds clearance level ${clearanceLimit} f/mL`
+    );
+  }
+
+  // Licence validation
+  if (!removalLicence || removalLicence.trim() === "") {
+    issues.push("Removal contractor licence not recorded — required for Class A/friable removal");
+  }
+
+  const overallResult = issues.length === 0 ? "CLEARED" : "NOT-CLEARED";
+
+  if (overallResult === "NOT-CLEARED") {
+    return res.status(422).json({
+      error: "Asbestos clearance NOT issued — issues identified",
+      issues,
+      immediateActions: [
+        "Do not allow re-occupation of cleared area",
+        "Re-clean and re-inspect before re-submitting for clearance",
+        "For air monitoring failures — decontaminate enclosure and re-test",
+        "Notify WorkSafe Victoria if Class A removal area not cleared",
+      ],
+      applicableStandards: [
+        "OHS Regulations 2017 (Vic) Part 4.4",
+        "How to Safely Remove Asbestos Code of Practice (Vic)",
+        "NOHSC 2002",
+        "AS 4964",
+      ],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    site_address: sanitiseInput(siteAddress),
+    removal_scope: sanitiseInput(removalScope),
+    removal_class: sanitiseInput(removalClass),
+    removal_contractor: sanitiseInput(removalContractor),
+    removal_licence: sanitiseInput(removalLicence),
+    removal_start_date: removalStartDate,
+    removal_end_date: removalEndDate,
+    clearance_inspector: sanitiseInput(clearanceInspector),
+    clearance_inspector_licence: sanitiseInput(clearanceInspectorLicence),
+    clearance_date: clearanceDate,
+    visual_inspection_result: visualInspectionResult,
+    air_monitoring_required: airMonitoringRequired,
+    air_monitoring_result: sanitiseInput(airMonitoringResult),
+    air_fibre_count_f_ml: airFibreCount_f_mL,
+    clearance_level_f_ml: clearanceLevel_f_mL || 0.01,
+    waste_disposal_method: sanitiseInput(wasteDisposalMethod),
+    waste_manifest_number: sanitiseInput(wasteManifestNumber),
+    landfill_facility: sanitiseInput(landfillFacility),
+    reoccupation_approved: true,
+    clearance_result: overallResult,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("asbestos_clearance_records")
+      .insert(record);
+    if (dbErr) console.error("DB error /asbestos-clearance-record:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Asbestos clearance certificate issued — area CLEARED for re-occupation",
+    clearanceResult: overallResult,
+    airFibreCount_f_mL: measuredFibres,
+    clearanceLimit_f_mL: clearanceLimit,
+    reoccupationApproved: true,
+    applicableStandards: [
+      "OHS Regulations 2017 (Vic) Part 4.4",
+      "How to Safely Remove Asbestos Code of Practice",
+      "AS 4964",
+      "NOHSC 2002",
+    ],
+    saved,
+  });
+});
+
+// POST /lead-paint-assessment — Lead paint survey and risk assessment per AS 4361.1 / OHS Regulations 2017 (Vic)
+app.post("/lead-paint-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    propertyAddress,
+    assessmentDate,
+    assessor,
+    assessorCertification,
+    buildingAge,          // pre-1970 | 1970-1997 | post-1997 | unknown
+    surveyMethod,         // XRF | paint-chip | visual
+    xrfReadings,          // array of { location, reading_mg_cm2, substrate }
+    paintChipResults,     // array of { location, result_mg_kg, substrate }
+    actionLevel_mg_cm2,   // XRF: 1.0 mg/cm² per AS 4361.1; 5000 mg/kg for paint chip
+    exceedingLocations,   // array of { location, reading, substrate }
+    conditionAreas,       // array of { location, condition: intact|deteriorated|damaged }
+    disturbanceRisk,      // low | medium | high — planned renovation/demolition
+    occupantVulnerability, // none | children | elderly | immunocompromised
+    exposurePathways,     // dust | chips | paint-film | soil
+    riskRating,           // low | medium | high | critical
+    controlStrategy,      // encapsulation | enclosure | removal | management-plan
+    managementPlan,       // true | false
+    photos,
+    notes,
+  } = req.body;
+
+  const xrfLimit = parseFloat(actionLevel_mg_cm2) || 1.0; // mg/cm² AS 4361.1
+
+  // Identify exceedances from XRF readings
+  const xrfExceedances = Array.isArray(xrfReadings)
+    ? xrfReadings.filter((r) => parseFloat(r.reading_mg_cm2) >= xrfLimit)
+    : [];
+
+  // Deteriorated paint with lead present is highest risk
+  const deterioratedLeadAreas = Array.isArray(conditionAreas)
+    ? conditionAreas.filter((a) => a.condition === "deteriorated" || a.condition === "damaged")
+    : [];
+
+  const highRisk =
+    riskRating === "high" ||
+    riskRating === "critical" ||
+    (xrfExceedances.length > 0 && deterioratedLeadAreas.length > 0) ||
+    (xrfExceedances.length > 0 && occupantVulnerability !== "none" && occupantVulnerability);
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    property_address: sanitiseInput(propertyAddress),
+    assessment_date: assessmentDate,
+    assessor: sanitiseInput(assessor),
+    assessor_certification: sanitiseInput(assessorCertification),
+    building_age: sanitiseInput(buildingAge),
+    survey_method: sanitiseInput(surveyMethod),
+    xrf_readings: xrfReadings || [],
+    paint_chip_results: paintChipResults || [],
+    action_level_mg_cm2: actionLevel_mg_cm2 || 1.0,
+    exceeding_locations: exceedingLocations || xrfExceedances,
+    condition_areas: conditionAreas || [],
+    disturbance_risk: sanitiseInput(disturbanceRisk),
+    occupant_vulnerability: sanitiseInput(occupantVulnerability),
+    exposure_pathways: exposurePathways || [],
+    risk_rating: sanitiseInput(riskRating),
+    control_strategy: sanitiseInput(controlStrategy),
+    management_plan: managementPlan || false,
+    xrf_exceedances_count: xrfExceedances.length,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("lead_paint_assessments")
+      .insert(record);
+    if (dbErr) console.error("DB error /lead-paint-assessment:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Lead paint assessment recorded",
+    riskRating: sanitiseInput(riskRating) || "medium",
+    xrfExceedancesCount: xrfExceedances.length,
+    actionLevelExceeded: xrfExceedances.length > 0,
+    deterioratedLeadAreasCount: deterioratedLeadAreas.length,
+    highRiskFlag: highRisk,
+    highRiskGuidance: highRisk
+      ? "High risk — prioritise lead paint removal or encapsulation before disturbance. Occupants with children/vulnerable persons must be relocated during works."
+      : null,
+    controlRecommendations: highRisk
+      ? ["Engage licensed lead paint removalist", "Air monitor during works", "Clearance air test post-removal"]
+      : ["Maintain intact paint condition", "Re-inspect every 2 years", "Develop management plan"],
+    applicableStandards: [
+      "AS 4361.1",
+      "AS 4361.2",
+      "OHS Regulations 2017 (Vic) Part 4.3",
+      "Safe Work Australia Lead Code of Practice",
+    ],
+    saved,
+  });
+});
+
+// POST /ai-asbestos-risk-assessment — AI assesses ACM risks, control measures, and regulatory compliance
+app.post("/ai-asbestos-risk-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    acmType,              // friable | non-friable | asbestos-containing-product
+    location,             // roof | wall | floor | ceiling | pipe-lagging | vinyl | etc
+    condition,            // good | deteriorated | damaged | friable-release
+    buildingAge,
+    plannedWork,          // disturbance | removal | encapsulation | no-work | demolition
+    area_m2,
+    accessibilityRisk,    // description of access and disturbance risk
+    nearbyOccupants,
+    worksafeNotifiable,   // true | false
+    existingControls,
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are an occupational hygienist and asbestos specialist with 20 years experience in Australian construction and building assessment. Assess asbestos-containing material (ACM) risk and compliance with OHS Regulations 2017 (Vic) Part 4.4, Safe Work Australia Model Code, and AS 4964.
+
+Assess:
+1. Fibre release risk based on ACM type, condition, and planned work
+2. Control hierarchy — elimination (removal) vs encapsulation vs management plan
+3. Licensing requirements — Class A (friable) vs Class B (non-friable) removal
+4. WorkSafe Victoria notification requirements
+5. Clearance requirements post-removal
+6. Occupant exposure risk and relocation requirements
+7. Asbestos register and management plan obligations
+
+Respond with JSON: { "fibreReleaseRisk": "negligible|low|medium|high|critical", "classificationRequired": "none|class-b|class-a", "licenceRequired": boolean, "licenceClass": "none|class-b|class-a", "worksafeNotificationRequired": boolean, "clearanceInspectionRequired": boolean, "airMonitoringRequired": boolean, "occupantRelocationRequired": boolean, "removalRecommended": boolean, "encapsulationViable": boolean, "managementPlanRequired": boolean, "controlMeasures": [], "ppeRequired": [], "disposalRequirements": "string", "asbestosRegisterRequired": boolean, "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const userContent = [
+    {
+      type: "text",
+      text: `ACM type: ${acmType || "non-friable"}
+Location: ${location || "not specified"}
+Condition: ${condition || "not specified"}
+Building age: ${buildingAge || "not specified"}
+Planned work: ${plannedWork || "no-work"}
+Area: ${area_m2 || "not specified"} m²
+Accessibility and disturbance risk: ${accessibilityRisk || "not specified"}
+Nearby occupants: ${nearbyOccupants || "none"}
+WorkSafe notifiable: ${worksafeNotifiable || "unknown"}
+Existing controls: ${existingControls || "none"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-asbestos-risk-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        fibreReleaseRisk: "medium",
+        classificationRequired: "class-b",
+        licenceRequired: true,
+        licenceClass: "class-b",
+        worksafeNotificationRequired: false,
+        clearanceInspectionRequired: true,
+        airMonitoringRequired: false,
+        occupantRelocationRequired: false,
+        removalRecommended: true,
+        encapsulationViable: true,
+        managementPlanRequired: true,
+        controlMeasures: [
+          "Wet methods to suppress fibre release during removal",
+          "Enclosure of work area with negative pressure where applicable",
+          "Asbestos removal sign and exclusion zone",
+          "Double-bag all waste in labelled asbestos waste bags",
+        ],
+        ppeRequired: [
+          "P2 half-face respirator minimum (P3 full-face for Class A)",
+          "Disposable coverall (Type 5/6)",
+          "Safety glasses and gloves",
+          "Decontamination procedure on exit",
+        ],
+        disposalRequirements:
+          "Dispose at licensed asbestos waste facility with waste tracking manifest under Environment Protection Act 2017 (Vic)",
+        asbestosRegisterRequired: true,
+        applicableStandards: [
+          "OHS Regulations 2017 (Vic) Part 4.4",
+          "How to Safely Remove Asbestos Code of Practice (Vic)",
+          "AS 4964",
+          "NOHSC 2002",
+          "Environment Protection Act 2017 (Vic)",
+        ],
+        recommendation:
+          "Engage a licensed Class B removalist. Update asbestos register. Obtain clearance inspection post-removal. Maintain waste tracking manifest.",
+        summary:
+          "Non-friable ACM in deteriorated condition presents medium fibre release risk. Class B licensed removal is required. Update the asbestos register and develop a management plan for any remaining ACM.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
