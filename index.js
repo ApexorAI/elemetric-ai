@@ -26526,6 +26526,223 @@ app.post("/site-clean-checklist", apiKeyAuth, async (req, res) => {
   return res.status(201).json({ ...record, saved: !!supabaseAdmin });
 });
 
+// POST /material-delivery  — Log a material delivery to site
+app.post("/material-delivery", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, deliveryDate, supplier, deliveryNote, items = [], receivedBy, conditionOnArrival, notes } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "items array required." });
+
+  const VALID_CONDITIONS = ["good", "damaged", "partial", "incorrect"];
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeDate   = deliveryDate ? sanitiseInput(String(deliveryDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeSupplier = supplier ? sanitiseInput(String(supplier)).slice(0, 150) : null;
+  const safeDN     = deliveryNote ? sanitiseInput(String(deliveryNote)).slice(0, 80) : null;
+  const safeBy     = receivedBy ? sanitiseInput(String(receivedBy)).slice(0, 100) : null;
+  const safeCond   = VALID_CONDITIONS.includes(String(conditionOnArrival || "").toLowerCase()) ? String(conditionOnArrival).toLowerCase() : "good";
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const deliveredItems = items.slice(0, 100).map(i => ({
+    description: sanitiseInput(String(i.description || "")).slice(0, 150),
+    quantity:    Math.max(0, parseFloat(i.quantity) || 0),
+    unit:        i.unit ? sanitiseInput(String(i.unit)).slice(0, 20) : "ea",
+    condition:   VALID_CONDITIONS.includes(String(i.condition || "").toLowerCase()) ? String(i.condition).toLowerCase() : "good",
+    notes:       i.notes ? sanitiseInput(String(i.notes)).slice(0, 100) : null,
+  }));
+
+  const damaged = deliveredItems.filter(i => i.condition === "damaged" || i.condition === "incorrect").length;
+  const record = {
+    deliveryId: `DEL-${(safeSiteId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId, jobId: safeJobId, deliveryDate: safeDate, supplier: safeSupplier,
+    deliveryNote: safeDN, itemCount: deliveredItems.length, damagedItems: damaged,
+    overallCondition: safeCond, receivedBy: safeBy, items: deliveredItems, notes: safeNotes,
+    hasIssues: damaged > 0 || safeCond !== "good",
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("material_deliveries").insert({
+        delivery_id: record.deliveryId, site_id: safeSiteId, job_id: safeJobId,
+        delivery_date: safeDate, supplier: safeSupplier, delivery_note: safeDN,
+        items: deliveredItems, overall_condition: safeCond, received_by: safeBy,
+        has_issues: record.hasIssues, notes: safeNotes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// GET /material-delivery/:siteId  — Get material deliveries for a site
+app.get("/material-delivery/:siteId", apiKeyAuth, async (req, res) => {
+  const siteId  = sanitiseInput(String(req.params.siteId || "")).slice(0, 80);
+  const fromDate = req.query.from ? sanitiseInput(String(req.query.from)).slice(0, 20) : null;
+  if (!siteId) return res.status(400).json({ error: "siteId required." });
+
+  let deliveries = [];
+  if (supabaseAdmin) {
+    try {
+      let q = supabaseAdmin.from("material_deliveries").select("*").eq("site_id", siteId).order("delivery_date", { ascending: false }).limit(100);
+      if (fromDate) q = q.gte("delivery_date", fromDate);
+      const { data } = await q;
+      deliveries = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const issues = deliveries.filter(d => d.has_issues).length;
+  return res.json({ siteId, deliveryCount: deliveries.length, deliveriesWithIssues: issues, deliveries, generatedAt: new Date().toISOString() });
+});
+
+// POST /subcontractor-briefing  — Log a briefing given to a subcontractor
+app.post("/subcontractor-briefing", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, subcontractorName, subcontractorLicence, briefingDate, briefingTopics = [], briefedBy, subAcknowledged, notes } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+  if (!subcontractorName) return res.status(400).json({ error: "subcontractorName required." });
+
+  const DEFAULT_TOPICS = [
+    "Site induction completed", "Emergency procedures reviewed", "Site rules explained",
+    "PPE requirements confirmed", "Scope of works confirmed", "Hazards specific to their trade identified",
+    "Permit to work requirements explained", "Insurance and licence verified",
+  ];
+
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeName   = sanitiseInput(String(subcontractorName)).slice(0, 100);
+  const safeLic    = subcontractorLicence ? sanitiseInput(String(subcontractorLicence)).slice(0, 80) : null;
+  const safeDate   = briefingDate ? sanitiseInput(String(briefingDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeBy     = briefedBy ? sanitiseInput(String(briefedBy)).slice(0, 100) : null;
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const topics = (Array.isArray(briefingTopics) && briefingTopics.length > 0)
+    ? briefingTopics.slice(0, 20).map(t => sanitiseInput(String(t)).slice(0, 150))
+    : DEFAULT_TOPICS;
+
+  const record = {
+    briefingId: `SUB-${(safeSiteId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId, jobId: safeJobId, subcontractorName: safeName, subcontractorLicence: safeLic,
+    briefingDate: safeDate, briefingTopics: topics, briefedBy: safeBy,
+    subAcknowledged: subAcknowledged !== false, notes: safeNotes,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("subcontractor_briefings").insert({
+        briefing_id: record.briefingId, site_id: safeSiteId, job_id: safeJobId,
+        subcontractor_name: safeName, subcontractor_licence: safeLic, briefing_date: safeDate,
+        briefing_topics: topics, briefed_by: safeBy, sub_acknowledged: record.subAcknowledged,
+        notes: safeNotes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// POST /ai-material-spec  — AI generates a material specification for a trade component
+app.post("/ai-material-spec", apiKeyAuth, async (req, res) => {
+  const { jobType, component, application, state = "VIC", grade } = req.body || {};
+  if (!jobType || !component) return res.status(400).json({ error: "jobType and component required." });
+
+  const safeType   = sanitiseInput(String(jobType)).slice(0, 40);
+  const safeComp   = sanitiseInput(String(component)).slice(0, 100);
+  const safeApp    = application ? sanitiseInput(String(application)).slice(0, 200) : null;
+  const safeState  = sanitiseInput(String(state)).toUpperCase().slice(0, 5);
+  const safeGrade  = grade ? sanitiseInput(String(grade)).slice(0, 40) : null;
+
+  const prompt = `You are a trade specification writer for ${safeType} work in ${safeState}, Australia.
+
+Write a material specification for:
+Component: ${safeComp}
+${safeApp ? `Application: ${safeApp}` : ""}
+${safeGrade ? `Grade/rating: ${safeGrade}` : ""}
+
+Respond with JSON:
+{
+  "material": "recommended material name",
+  "grade": "grade/classification",
+  "standard": "applicable AS/NZS standard",
+  "minimumSpec": {"property": "value"},
+  "installation": ["installation requirement"],
+  "alternatives": ["acceptable alternative"],
+  "notAcceptable": ["what NOT to use"],
+  "notes": "additional specification notes"
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 500 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      jobType: safeType, component: safeComp, state: safeState,
+      material:      parsed.material || safeComp,
+      grade:         parsed.grade || safeGrade || null,
+      standard:      parsed.standard || null,
+      minimumSpec:   parsed.minimumSpec && typeof parsed.minimumSpec === "object" ? parsed.minimumSpec : {},
+      installation:  Array.isArray(parsed.installation) ? parsed.installation : [],
+      alternatives:  Array.isArray(parsed.alternatives) ? parsed.alternatives : [],
+      notAcceptable: Array.isArray(parsed.notAcceptable) ? parsed.notAcceptable : [],
+      notes:         parsed.notes || null,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      jobType: safeType, component: safeComp, state: safeState,
+      material: safeComp, grade: null, standard: null, minimumSpec: {},
+      installation: [], alternatives: [], notAcceptable: [],
+      notes: "Material specification temporarily unavailable. Consult trade standards.",
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /waste-manifest  — Log a regulated/hazardous waste manifest
+app.post("/waste-manifest", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, wasteType, quantity, quantityUnit, disposalSite, transportCompany, manifestNumber, collectedDate, notes } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+  if (!wasteType) return res.status(400).json({ error: "wasteType required." });
+
+  const VALID_WASTE_TYPES = ["asbestos-friable", "asbestos-bonded", "contaminated-soil", "chemical-waste", "clinical-waste", "liquid-waste", "building-waste", "electronic-waste", "other"];
+  const VALID_UNITS = ["kg", "tonnes", "litres", "m3", "bags", "drums", "other"];
+  const LICENCED_REQUIRED = ["asbestos-friable", "asbestos-bonded", "contaminated-soil", "chemical-waste", "clinical-waste", "liquid-waste"];
+
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeType   = VALID_WASTE_TYPES.includes(String(wasteType).toLowerCase().replace(/ /g, "-")) ? String(wasteType).toLowerCase().replace(/ /g, "-") : "other";
+  const safeQty    = Math.max(0, parseFloat(quantity) || 0);
+  const safeUnit   = VALID_UNITS.includes(String(quantityUnit || "").toLowerCase()) ? String(quantityUnit).toLowerCase() : "kg";
+  const safeSite   = disposalSite ? sanitiseInput(String(disposalSite)).slice(0, 150) : null;
+  const safeTransport = transportCompany ? sanitiseInput(String(transportCompany)).slice(0, 100) : null;
+  const safeManifest = manifestNumber ? sanitiseInput(String(manifestNumber)).slice(0, 80) : null;
+  const safeDate   = collectedDate ? sanitiseInput(String(collectedDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const requiresLicence = LICENCED_REQUIRED.includes(safeType);
+  const record = {
+    manifestId:  safeManifest || `WM-${(safeSiteId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId, jobId: safeJobId, wasteType: safeType,
+    quantity: safeQty, quantityUnit: safeUnit, disposalSite: safeSite,
+    transportCompany: safeTransport, collectedDate: safeDate,
+    requiresLicencedTransport: requiresLicence, requiresEpaApproval: requiresLicence,
+    complianceNotes: requiresLicence ? `${safeType} requires EPA-licensed transporter and approved disposal facility` : null,
+    notes: safeNotes, createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("waste_manifests").insert({
+        manifest_id: record.manifestId, site_id: safeSiteId, job_id: safeJobId,
+        waste_type: safeType, quantity: safeQty, quantity_unit: safeUnit,
+        disposal_site: safeSite, transport_company: safeTransport, collected_date: safeDate,
+        requires_licence: requiresLicence, notes: safeNotes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
