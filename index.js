@@ -54493,6 +54493,332 @@ Return a JSON object with:
   }
 });
 
+// POST /work-at-heights-rescue-plan — Document a work at heights rescue plan per AS/NZS 1891 and OHS Regs
+app.post("/work-at-heights-rescue-plan", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      planRef,
+      date,
+      preparedBy,
+      approvedBy,
+      location,
+      workDescription,
+      maximumHeightM,
+      workerCount,
+      accessEquipment,
+      fallProtectionSystem,
+      anchorPoints,
+      anchorPointsEngineered,
+      harnessMake,
+      harnessModel,
+      lanyardType,
+      rescueEquipmentOnSite,
+      rescueEquipmentList,
+      rescueMethod,
+      rescuePersonsTrained,
+      rescuePersonNames,
+      emergencyContactName,
+      emergencyContactPhone,
+      ambulanceAccessConfirmed,
+      nearestHospital,
+      nearestHospitalAddress,
+      rescuePlanBriefedToWorkers,
+      lastRescueDrillDate,
+      harnessInspectionDate,
+      harnessInspectionResult,
+      anchorLoadRatingKn,
+      safeToCommence,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !preparedBy || !workDescription || !rescueMethod) {
+      return res.status(400).json({ error: "projectId, date, preparedBy, workDescription, and rescueMethod are required" });
+    }
+
+    const deficiencies = [];
+    if (!anchorPointsEngineered && maximumHeightM && Number(maximumHeightM) >= 3) {
+      deficiencies.push("Anchor points not confirmed as engineered — all fall arrest anchors must be designed for minimum 15 kN load per AS/NZS 1891.4");
+    }
+    if (anchorLoadRatingKn !== undefined && Number(anchorLoadRatingKn) < 15) {
+      deficiencies.push(`Anchor load rating ${anchorLoadRatingKn} kN is below AS/NZS 1891.4 minimum 15 kN`);
+    }
+    if (!rescueEquipmentOnSite) deficiencies.push("Rescue equipment not on site — rescue capability must be immediately available at all times during at-height work");
+    if (!rescuePersonsTrained) deficiencies.push("No trained rescue personnel on site — at least one trained rescuer must be present");
+    if (!rescuePlanBriefedToWorkers) deficiencies.push("Rescue plan has not been briefed to workers — mandatory before commencing work at heights");
+    if (!ambulanceAccessConfirmed) deficiencies.push("Ambulance access to site not confirmed — required as part of rescue plan");
+    if (harnessInspectionResult && harnessInspectionResult.toUpperCase() === "FAIL") {
+      deficiencies.push("Harness inspection failed — harness must not be used until replaced or recertified");
+    }
+
+    if (deficiencies.length > 0) console.warn(`[HEIGHTS RESCUE] ${location || projectId} — ${deficiencies.join("; ")}`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      plan_ref: sanitiseInput(planRef || `WAH-${Date.now()}`),
+      date,
+      prepared_by: sanitiseInput(preparedBy),
+      approved_by: sanitiseInput(approvedBy || ""),
+      location: sanitiseInput(location || ""),
+      work_description: sanitiseInput(workDescription),
+      maximum_height_m: maximumHeightM || null,
+      worker_count: workerCount || null,
+      access_equipment: sanitiseInput(accessEquipment || ""),
+      fall_protection_system: sanitiseInput(fallProtectionSystem || ""),
+      anchor_points: sanitiseInput(anchorPoints || ""),
+      anchor_points_engineered: !!anchorPointsEngineered,
+      harness_make: sanitiseInput(harnessMake || ""),
+      harness_model: sanitiseInput(harnessModel || ""),
+      lanyard_type: sanitiseInput(lanyardType || ""),
+      rescue_equipment_on_site: !!rescueEquipmentOnSite,
+      rescue_equipment_list: Array.isArray(rescueEquipmentList) ? rescueEquipmentList.map(e => sanitiseInput(e)) : [],
+      rescue_method: sanitiseInput(rescueMethod),
+      rescue_persons_trained: !!rescuePersonsTrained,
+      rescue_person_names: Array.isArray(rescuePersonNames) ? rescuePersonNames.map(n => sanitiseInput(n)) : [],
+      emergency_contact_name: sanitiseInput(emergencyContactName || ""),
+      emergency_contact_phone: sanitiseInput(emergencyContactPhone || ""),
+      ambulance_access_confirmed: !!ambulanceAccessConfirmed,
+      nearest_hospital: sanitiseInput(nearestHospital || ""),
+      nearest_hospital_address: sanitiseInput(nearestHospitalAddress || ""),
+      rescue_plan_briefed_to_workers: !!rescuePlanBriefedToWorkers,
+      last_rescue_drill_date: lastRescueDrillDate || null,
+      harness_inspection_date: harnessInspectionDate || null,
+      harness_inspection_result: sanitiseInput(harnessInspectionResult || ""),
+      anchor_load_rating_kn: anchorLoadRatingKn || null,
+      safe_to_commence: !!safeToCommence && deficiencies.length === 0,
+      deficiencies,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("work_at_heights_rescue_plans").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (deficiencies.length > 0) {
+      return res.status(422).json({
+        safeToCommence: false,
+        deficiencies,
+        message: "Work at heights must not commence until all rescue plan deficiencies are rectified.",
+        record,
+        saved,
+      });
+    }
+
+    res.json({
+      safeToCommence: true,
+      planRef: record.plan_ref,
+      deficiencies: [],
+      applicableStandards: ["AS/NZS 1891.1 Industrial fall-arrest systems", "AS/NZS 1891.4 Anchor points", "OHS Regulations 2017 (Vic) Part 3.3 — work at heights", "Safe Work Australia Code of Practice: Managing the Risk of Falls at Workplaces 2021"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/work-at-heights-rescue-plan error:", err.message);
+    res.status(500).json({ error: "Failed to record work at heights rescue plan" });
+  }
+});
+
+// POST /insurance-claim-record — Record a construction insurance claim (CAR/public liability/workers comp)
+app.post("/insurance-claim-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      claimRef,
+      incidentDate,
+      reportedDate,
+      reportedBy,
+      claimType,
+      insurer,
+      policyNumber,
+      policyExpiryDate,
+      brokerName,
+      brokerPhone,
+      incidentDescription,
+      causeOfLoss,
+      location,
+      estimatedLoss,
+      currency,
+      thirdPartyInvolved,
+      thirdPartyDetails,
+      injuredPersons,
+      injuredPersonDetails,
+      propertyDamaged,
+      propertyDamageDescription,
+      evidencePreserved,
+      photosAttached,
+      witnessNames,
+      policeReportNumber,
+      workSafeNotified,
+      workSafeRef,
+      claimStatus,
+      claimAssessorName,
+      assessmentDate,
+      settledAmount,
+      settlementDate,
+      notes,
+    } = req.body;
+
+    if (!projectId || !incidentDate || !claimType || !incidentDescription || !reportedBy) {
+      return res.status(400).json({ error: "projectId, incidentDate, claimType, incidentDescription, and reportedBy are required" });
+    }
+
+    const flags = [];
+    // WorkSafe notification requirements
+    if (injuredPersons && Number(injuredPersons) > 0 && !workSafeNotified) {
+      flags.push("Persons injured — confirm WorkSafe Victoria notification requirements. Serious injuries (hospitalisation, fracture, amputation, serious burns) require immediate notification.");
+    }
+    if (!evidencePreserved) flags.push("Evidence not preserved — photograph scene, preserve physical evidence, and record witness details immediately");
+    if (!photosAttached) flags.push("No photos attached — photographic evidence is critical for insurance claims");
+    // Typical CAR policy: notify insurer within 24-48 hours
+    if (incidentDate && reportedDate) {
+      const daysDiff = Math.floor((new Date(reportedDate) - new Date(incidentDate)) / 86400000);
+      if (daysDiff > 7) flags.push(`Claim reported ${daysDiff} days after incident — check policy notification timeframe requirements`);
+    }
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      claim_ref: sanitiseInput(claimRef || `IC-${Date.now()}`),
+      incident_date: incidentDate,
+      reported_date: reportedDate || null,
+      reported_by: sanitiseInput(reportedBy),
+      claim_type: sanitiseInput(claimType),
+      insurer: sanitiseInput(insurer || ""),
+      policy_number: sanitiseInput(policyNumber || ""),
+      policy_expiry_date: policyExpiryDate || null,
+      broker_name: sanitiseInput(brokerName || ""),
+      broker_phone: sanitiseInput(brokerPhone || ""),
+      incident_description: sanitiseInput(incidentDescription),
+      cause_of_loss: sanitiseInput(causeOfLoss || ""),
+      location: sanitiseInput(location || ""),
+      estimated_loss: estimatedLoss || null,
+      currency: sanitiseInput(currency || "AUD"),
+      third_party_involved: !!thirdPartyInvolved,
+      third_party_details: sanitiseInput(thirdPartyDetails || ""),
+      injured_persons: injuredPersons || 0,
+      injured_person_details: sanitiseInput(injuredPersonDetails || ""),
+      property_damaged: !!propertyDamaged,
+      property_damage_description: sanitiseInput(propertyDamageDescription || ""),
+      evidence_preserved: !!evidencePreserved,
+      photos_attached: !!photosAttached,
+      witness_names: Array.isArray(witnessNames) ? witnessNames.map(n => sanitiseInput(n)) : [],
+      police_report_number: sanitiseInput(policeReportNumber || ""),
+      worksafe_notified: !!workSafeNotified,
+      worksafe_ref: sanitiseInput(workSafeRef || ""),
+      claim_status: sanitiseInput(claimStatus || "OPEN"),
+      claim_assessor_name: sanitiseInput(claimAssessorName || ""),
+      assessment_date: assessmentDate || null,
+      settled_amount: settledAmount || null,
+      settlement_date: settlementDate || null,
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("insurance_claim_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({ claimRef: record.claim_ref, claimStatus: record.claim_status, flags, record, saved });
+  } catch (err) {
+    console.error("/insurance-claim-record error:", err.message);
+    res.status(500).json({ error: "Failed to record insurance claim" });
+  }
+});
+
+// POST /ai-heights-risk-assessment — AI assesses working at heights risk and recommends controls
+app.post("/ai-heights-risk-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      workType,
+      heightM,
+      accessMethod,
+      surfaceCondition,
+      weatherConditions,
+      workDuration,
+      workerCount,
+      existingControls,
+      proximityToEdge,
+      fragileRoofPresent,
+    } = req.body;
+
+    if (!workType || heightM === undefined) {
+      return res.status(400).json({ error: "workType and heightM are required" });
+    }
+
+    const prompt = `You are a safety engineer specialising in working at heights risk management under the Victorian OHS Regulations 2017 and Safe Work Australia guidance.
+
+Assess the working at heights risk for:
+- Work type: ${sanitiseInput(workType)}
+- Height: ${sanitiseInput(String(heightM))} m
+- Access method: ${sanitiseInput(accessMethod || "not specified")}
+- Surface condition: ${sanitiseInput(surfaceCondition || "not specified")}
+- Weather conditions: ${sanitiseInput(weatherConditions || "fine")}
+- Duration: ${sanitiseInput(workDuration || "not specified")}
+- Workers: ${sanitiseInput(String(workerCount || 1))}
+- Existing controls: ${sanitiseInput(existingControls || "none")}
+- Proximity to edge: ${sanitiseInput(String(proximityToEdge || "not specified"))}
+- Fragile roof present: ${sanitiseInput(String(fragileRoofPresent || false))}
+
+Return a JSON object with:
+{
+  "riskLevel": "LOW|MEDIUM|HIGH|CRITICAL",
+  "fallProtectionHierarchy": [string],
+  "preferredControlMeasures": [string],
+  "rescuePlanRequired": boolean,
+  "ppeRequired": [string],
+  "anchorPointRequirements": string,
+  "accessEquipmentRecommendation": string,
+  "permitRequired": boolean,
+  "minimumGuardrailHeight": string,
+  "fragmentileRoofControls": string,
+  "weatherRestrictions": string,
+  "trainingRequired": [string],
+  "applicableStandards": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ workType, heightM, assessment });
+  } catch (err) {
+    console.error("/ai-heights-risk-assessment error:", err.message);
+    res.json({
+      workType: req.body.workType || "",
+      heightM: req.body.heightM || null,
+      assessment: {
+        riskLevel: "HIGH",
+        fallProtectionHierarchy: ["Elimination — redesign task so work is done at ground level", "Passive collective protection — guardrails, edge protection, scaffolding", "Fall arrest systems — harness and lanyard with engineered anchor", "Administrative controls — SWMS, training, supervision"],
+        preferredControlMeasures: ["Perimeter scaffolding with guardrails (top rail 900–1100 mm, mid rail, kickboard)", "Safety mesh under roof framing where overhead work required", "Elevated work platforms (EWP) with guardrails"],
+        rescuePlanRequired: true,
+        ppeRequired: ["Full body harness (AS/NZS 1891.1)", "Energy-absorbing lanyard or PFAS", "Safety helmet", "Non-slip footwear"],
+        anchorPointRequirements: "Minimum 15 kN static load rating per AS/NZS 1891.4. Engineered anchor must be installed or inspected by a competent person.",
+        accessEquipmentRecommendation: "Scaffold or EWP preferred over ladders for sustained work. Ladders limited to light, short-duration access tasks.",
+        permitRequired: true,
+        minimumGuardrailHeight: "900 mm minimum top rail height per OHS Regulations 2017 (Vic), 1100 mm recommended for new construction",
+        fragmentileRoofControls: "Fragile roofs require structural support grid, safety mesh, or prohibition of foot traffic other than on structural supports",
+        weatherRestrictions: "Suspend at-height work in winds > 50 km/h, rain, ice, or when surface is slippery. Check BoM forecast before each shift.",
+        trainingRequired: ["Work at heights induction (site-specific)", "Harness fitting and pre-use inspection training", "Rescue trained person on site at all times during at-height work"],
+        applicableStandards: ["OHS Regulations 2017 (Vic) Part 3.3", "AS/NZS 1891.1–4 Industrial fall-arrest systems", "Safe Work Australia Code of Practice: Managing the Risk of Falls 2021", "AS 1657 Fixed platforms, walkways, stairways and ladders"],
+        recommendation: "Prepare a SWMS for all work at heights > 2 m. Implement the hierarchy of controls, prioritising collective protection. Ensure a trained rescuer and rescue equipment are on site before work commences.",
+        summary: "Work at heights is a leading cause of fatalities on Victorian construction sites. Strict application of the fall protection hierarchy, a site-specific SWMS, and a practised rescue plan are mandatory for all at-height tasks.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
