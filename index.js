@@ -75829,6 +75829,422 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 271 ─────────────────────────────────────────────────────────────────
+
+// POST /site-establishment-checklist — Record site setup and establishment compliance
+app.post("/site-establishment-checklist", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, siteAddress, checklistDate, completedBy,
+      siteSignageInstalled, siteSignageContent,
+      fencingInstalled, fencingType, fencingHeight,
+      siteOfficeInstalled, toiletFacilitiesInstalled, workerCount,
+      drinkingWaterAvailable, handwashingFacilitiesInstalled,
+      firstAidKitInstalled, firstAidOfficerOnSite,
+      emergencyContactsDisplayed, evacuationPlanDisplayed,
+      hazardousSubstancesRegisterDisplayed,
+      siteSafetyRulesDisplayed, inductionRegisterStarted,
+      trafficManagementPlanApproved, siteAccessSecured,
+      constructionInductionCardsVerified,
+      environmentalControlsInstalled, wasteManagementPlanOnSite,
+      buildingPermitOnSite, notes
+    } = req.body;
+
+    if (!projectId || !siteAddress || !checklistDate || !completedBy) {
+      return res.status(400).json({ error: "projectId, siteAddress, checklistDate, completedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeSite = sanitiseInput(String(siteAddress));
+    const safeCompletedBy = sanitiseInput(String(completedBy));
+
+    const workers = parseInt(workerCount) || 0;
+    const criticalIssues = [];
+    const warnings = [];
+
+    // OHS Regulations 2017 (Vic) — site welfare, safety management
+    if (!siteSignageInstalled) {
+      criticalIssues.push("Site signage not installed — mandatory before any work commences (OHS Regs 2017 Vic, Building Regulations 2018 Vic).");
+    }
+
+    if (!fencingInstalled) {
+      criticalIssues.push("Site security fencing not installed — required to prevent public access to construction site (Building Regulations 2018 Vic reg 502).");
+    } else {
+      const fenceH = parseFloat(fencingHeight) || 0;
+      if (fenceH < 1.8) {
+        criticalIssues.push(`Fencing height ${fenceH}m below minimum 1.8m — increase to meet Building Regulations 2018 (Vic) requirement.`);
+      }
+    }
+
+    if (!toiletFacilitiesInstalled) {
+      criticalIssues.push("Toilet facilities not installed — mandatory welfare facility for all construction sites (OHS Regs 2017 Vic reg 3.4.7).");
+    }
+
+    if (!drinkingWaterAvailable) {
+      criticalIssues.push("Drinking water not available — mandatory welfare requirement (OHS Regs 2017 Vic reg 3.4.7).");
+    }
+
+    if (!firstAidKitInstalled) {
+      criticalIssues.push("First aid kit not installed — mandatory before commencing works (OHS Regs 2017 Vic Part 3.4).");
+    }
+
+    if (!firstAidOfficerOnSite && workers >= 10) {
+      criticalIssues.push(`No first aid officer on site for ${workers} workers — required for 10+ workers (OHS Regs 2017 Vic reg 3.4.3).`);
+    }
+
+    if (!emergencyContactsDisplayed) {
+      warnings.push("Emergency contact numbers not displayed — must be visible to all workers.");
+    }
+    if (!evacuationPlanDisplayed) {
+      warnings.push("Evacuation plan not displayed — required at site entrance/office (AS 3745).");
+    }
+
+    if (!inductionRegisterStarted) {
+      warnings.push("Site induction register not started — all workers must complete site induction before commencing (OHS Act 2004 Vic).");
+    }
+
+    if (!constructionInductionCardsVerified) {
+      warnings.push("Construction Induction Training (White Card) records not verified — mandatory before workers can work on site (OHS Regs 2017 Vic).");
+    }
+
+    if (!trafficManagementPlanApproved) {
+      warnings.push("Traffic management plan not confirmed approved — required for sites with vehicle and pedestrian interaction.");
+    }
+
+    if (!buildingPermitOnSite) {
+      criticalIssues.push("Building permit not on site — must be displayed per Building Regulations 2018 (Vic) reg 501.");
+    }
+
+    if (!hazardousSubstancesRegisterDisplayed) {
+      warnings.push("Hazardous substances register not on site — required where chemicals/substances are present (OHS Regs 2017 Vic Part 4.1).");
+    }
+
+    if (!environmentalControlsInstalled) {
+      warnings.push("Environmental controls (silt fence, sediment basin) not confirmed installed.");
+    }
+
+    const readyToCommence = criticalIssues.length === 0;
+    const checklistStatus = criticalIssues.length > 0 ? "NOT_READY_TO_COMMENCE" : warnings.length > 0 ? "READY_WITH_CONDITIONS" : "READY_TO_COMMENCE";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("site_establishment_checklists")
+        .insert({
+          project_id: safeProject,
+          site_address: safeSite,
+          checklist_date: checklistDate,
+          completed_by: safeCompletedBy,
+          site_signage_installed: siteSignageInstalled || false,
+          fencing_installed: fencingInstalled || false,
+          fencing_type: fencingType ? sanitiseInput(String(fencingType)) : null,
+          fencing_height_m: fencingHeight || null,
+          toilet_facilities_installed: toiletFacilitiesInstalled || false,
+          worker_count: workers || null,
+          drinking_water_available: drinkingWaterAvailable || false,
+          first_aid_kit_installed: firstAidKitInstalled || false,
+          first_aid_officer_on_site: firstAidOfficerOnSite || false,
+          emergency_contacts_displayed: emergencyContactsDisplayed || false,
+          evacuation_plan_displayed: evacuationPlanDisplayed || false,
+          induction_register_started: inductionRegisterStarted || false,
+          construction_induction_cards_verified: constructionInductionCardsVerified || false,
+          traffic_management_plan_approved: trafficManagementPlanApproved || false,
+          building_permit_on_site: buildingPermitOnSite || false,
+          environmental_controls_installed: environmentalControlsInstalled || false,
+          waste_management_plan_on_site: wasteManagementPlanOnSite || false,
+          ready_to_commence: readyToCommence,
+          checklist_status: checklistStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        checklistStatus,
+        readyToCommence,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Site not ready to commence — resolve all critical issues before starting work.",
+        standards: ["OHS Regulations 2017 (Vic)", "Building Regulations 2018 (Vic)", "AS 3745"],
+      });
+    }
+
+    res.json({
+      checklistStatus,
+      readyToCommence,
+      criticalIssues,
+      warnings,
+      savedId,
+      standards: ["OHS Regulations 2017 (Vic)", "Building Regulations 2018 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /site-establishment-checklist error:", err.message);
+    res.status(500).json({ error: "Failed to record site establishment checklist." });
+  }
+});
+
+// POST /subcontractor-prequalification — Record subcontractor safety and quality prequalification
+app.post("/subcontractor-prequalification", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, subcontractorName, abn, tradeCategory,
+      licenceNumber, licenceType, licenceExpiry, licenceState,
+      publicLiabilityInsurer, publicLiabilityAmount, publicLiabilityExpiry,
+      workersCompInsurer, workersCompExpiry,
+      safetyManagementSystemCertified, smsStandard, smsCertRef,
+      qualitySystemCertified, qmsCertRef,
+      ltifr, trifr, driveReportCard,
+      previousProjects, referencesChecked,
+      icaraLicence, buildersLicenceNumber,
+      inductionCompleted, safetyInductionDate, notes
+    } = req.body;
+
+    if (!subcontractorName || !tradeCategory) {
+      return res.status(400).json({ error: "subcontractorName and tradeCategory are required." });
+    }
+
+    const safeName = sanitiseInput(String(subcontractorName));
+    const safeTrade = sanitiseInput(String(tradeCategory));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+
+    const criticalIssues = [];
+    const warnings = [];
+    const now = new Date();
+
+    // Licence checks
+    if (!licenceNumber) {
+      criticalIssues.push("Contractor licence number not provided — verify registration before engaging.");
+    }
+
+    if (licenceExpiry) {
+      const licExpiry = new Date(licenceExpiry);
+      const daysToExpiry = Math.floor((licExpiry - now) / (1000 * 60 * 60 * 24));
+      if (daysToExpiry < 0) {
+        criticalIssues.push(`Contractor licence expired ${Math.abs(daysToExpiry)} days ago — must not be engaged until renewed.`);
+      } else if (daysToExpiry < 30) {
+        warnings.push(`Contractor licence expires in ${daysToExpiry} days — request renewal proof before works commence.`);
+      }
+    }
+
+    // Insurance checks
+    if (!publicLiabilityInsurer) {
+      criticalIssues.push("Public liability insurance details not provided — minimum $20M required (standard principal requirement).");
+    }
+
+    if (publicLiabilityAmount) {
+      const plAmount = parseFloat(String(publicLiabilityAmount).replace(/[^0-9.]/g, "")) || 0;
+      if (plAmount < 10000000) {
+        criticalIssues.push(`Public liability cover $${(plAmount / 1000000).toFixed(1)}M — below standard minimum $10M for construction.`);
+      } else if (plAmount < 20000000) {
+        warnings.push(`Public liability cover $${(plAmount / 1000000).toFixed(1)}M — verify principal requires minimum $20M.`);
+      }
+    }
+
+    if (publicLiabilityExpiry) {
+      const plExpiry = new Date(publicLiabilityExpiry);
+      const daysToPL = Math.floor((plExpiry - now) / (1000 * 60 * 60 * 24));
+      if (daysToPL < 0) {
+        criticalIssues.push("Public liability insurance EXPIRED — contractor must not be on site.");
+      } else if (daysToPL < 30) {
+        warnings.push(`Public liability insurance expires in ${daysToPL} days — obtain renewal certificate.`);
+      }
+    }
+
+    if (workersCompExpiry) {
+      const wcExpiry = new Date(workersCompExpiry);
+      const daysToWC = Math.floor((wcExpiry - now) / (1000 * 60 * 60 * 24));
+      if (daysToWC < 0) {
+        criticalIssues.push("Workers compensation insurance EXPIRED — contractor must not employ workers on site.");
+      } else if (daysToWC < 30) {
+        warnings.push(`Workers compensation expires in ${daysToWC} days — obtain renewal proof.`);
+      }
+    }
+
+    // Safety performance
+    const ltifRate = parseFloat(ltifr) || null;
+    if (ltifRate !== null && ltifRate > 5) {
+      warnings.push(`LTIFR of ${ltifRate} above industry benchmark of 5.0 — review safety management system before engaging.`);
+    }
+
+    if (!safetyManagementSystemCertified) {
+      warnings.push("Safety management system not certified — verify SMS is documented and current.");
+    }
+
+    if (!inductionCompleted) {
+      warnings.push("Site induction not confirmed completed — must be completed before any on-site works.");
+    }
+
+    const prequalStatus = criticalIssues.length > 0 ? "REJECTED" : warnings.length > 0 ? "CONDITIONAL_APPROVAL" : "APPROVED";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("subcontractor_prequalifications")
+        .insert({
+          project_id: safeProject,
+          subcontractor_name: safeName,
+          abn: abn ? sanitiseInput(String(abn)) : null,
+          trade_category: safeTrade,
+          licence_number: licenceNumber ? sanitiseInput(String(licenceNumber)) : null,
+          licence_type: licenceType ? sanitiseInput(String(licenceType)) : null,
+          licence_expiry: licenceExpiry || null,
+          public_liability_insurer: publicLiabilityInsurer ? sanitiseInput(String(publicLiabilityInsurer)) : null,
+          public_liability_expiry: publicLiabilityExpiry || null,
+          workers_comp_insurer: workersCompInsurer ? sanitiseInput(String(workersCompInsurer)) : null,
+          workers_comp_expiry: workersCompExpiry || null,
+          safety_management_system_certified: safetyManagementSystemCertified || false,
+          ltifr: ltifRate,
+          induction_completed: inductionCompleted || false,
+          prequal_status: prequalStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        prequalStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Subcontractor fails prequalification — do not engage until issues resolved.",
+        standards: ["OHS Act 2004 (Vic)", "Workplace Injury Rehabilitation and Compensation Act 2013 (Vic)"],
+      });
+    }
+
+    res.json({
+      prequalStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      subcontractorName: safeName,
+      standards: ["OHS Act 2004 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /subcontractor-prequalification error:", err.message);
+    res.status(500).json({ error: "Failed to record subcontractor prequalification." });
+  }
+});
+
+// POST /ai-project-risk-register — AI generates a comprehensive project risk register
+app.post("/ai-project-risk-register", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectType, projectValue, location, programDurationMonths,
+      buildingClass, complexityFactors, knownRisks, siteContext
+    } = req.body;
+
+    if (!projectType) {
+      return res.status(400).json({ error: "projectType is required." });
+    }
+
+    const safeProjectType = sanitiseInput(String(projectType));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const complexity = Array.isArray(complexityFactors) ? complexityFactors.map(c => sanitiseInput(String(c))) : [];
+    const known = Array.isArray(knownRisks) ? knownRisks.map(r => sanitiseInput(String(r))) : [];
+
+    const prompt = `You are a senior construction risk manager developing a project risk register for a Victorian construction project.
+
+Project type: ${safeProjectType}
+Project value: ${projectValue ? "$" + projectValue : "Not stated"}
+Location: ${safeSite}
+Program duration: ${programDurationMonths ? programDurationMonths + " months" : "Not stated"}
+Building class: ${buildingClass || "Not stated"}
+Complexity factors: ${complexity.join(", ") || "None specified"}
+Known risks: ${known.join("; ") || "None specified"}
+
+Generate a comprehensive risk register covering:
+1. Safety and health risks (OHS Act 2004 Vic, OHS Regulations 2017 Vic)
+2. Environmental risks (Environment Protection Act 2017 Vic)
+3. Commercial and programme risks
+4. Technical/design risks
+5. Stakeholder and approvals risks
+6. Regulatory compliance risks (Building Act 1993 Vic, NCC 2022)
+
+For each risk category, identify top risks with likelihood, consequence, inherent rating, and recommended controls.
+
+Respond ONLY in JSON:
+{
+  "projectRiskProfile": "LOW|MODERATE|HIGH|EXTREME",
+  "topRisks": [
+    {
+      "riskId": "R001",
+      "category": "string",
+      "riskDescription": "string",
+      "likelihood": "RARE|UNLIKELY|POSSIBLE|LIKELY|ALMOST_CERTAIN",
+      "consequence": "INSIGNIFICANT|MINOR|MODERATE|MAJOR|CATASTROPHIC",
+      "inherentRating": "LOW|MODERATE|HIGH|EXTREME",
+      "controls": ["string"],
+      "residualRating": "LOW|MODERATE|HIGH|EXTREME",
+      "owner": "string"
+    }
+  ],
+  "criticalRiskCount": number,
+  "recommendedRiskManagementActions": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 1200,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        projectRiskProfile: "MODERATE",
+        topRisks: [
+          {
+            riskId: "R001",
+            category: "Safety",
+            riskDescription: "AI analysis unavailable — manual risk assessment required",
+            likelihood: "POSSIBLE",
+            consequence: "MAJOR",
+            inherentRating: "HIGH",
+            controls: ["Develop site-specific SWMS", "Complete OHS management plan"],
+            residualRating: "MODERATE",
+            owner: "Project Manager",
+          },
+        ],
+        criticalRiskCount: 0,
+        recommendedRiskManagementActions: [
+          "Engage WHS consultant to develop project-specific risk register",
+          "Complete site-specific SWMS for all HRCW",
+          "Register all notifiable works with WorkSafe Victoria",
+        ],
+        applicableStandards: ["OHS Act 2004 (Vic)", "OHS Regulations 2017 (Vic)", "AS/NZS ISO 45001:2018"],
+        summary: "AI risk register generation unavailable. Engage WHS and risk management consultants.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      projectType: safeProjectType,
+      standards: ["OHS Act 2004 (Vic)", "OHS Regulations 2017 (Vic)", "AS/NZS ISO 31000:2018"],
+    });
+  } catch (err) {
+    console.error("POST /ai-project-risk-register error:", err.message);
+    res.status(500).json({ error: "Failed to generate project risk register." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
