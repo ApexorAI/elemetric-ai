@@ -20125,6 +20125,240 @@ app.get("/maintenance-log/:assetId", apiKeyAuth, async (req, res) => {
   });
 });
 
+// ── Round 52 ──────────────────────────────────────────────────────────────────
+
+// POST /job-cluster  — Group a set of jobs by location proximity for route planning
+app.post("/job-cluster", apiKeyAuth, (req, res) => {
+  const { jobs, maxDistanceKm } = req.body;
+
+  if (!jobs || !Array.isArray(jobs) || jobs.length === 0) {
+    return res.status(400).json({ error: "jobs array is required." });
+  }
+
+  const maxDist = parseFloat(maxDistanceKm) || 10; // 10km default clustering radius
+
+  const haversineKm = (lat1, lng1, lat2, lng2) => {
+    const R    = 6371;
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLng = (lng2 - lng1) * Math.PI / 180;
+    const a    = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  };
+
+  const jobsWithCoords = jobs.slice(0, 100).map((j, i) => ({
+    index:    i,
+    jobId:    j.jobId ? sanitiseInput(String(j.jobId)) : null,
+    address:  j.address ? sanitiseInput(String(j.address)) : null,
+    jobType:  sanitiseInput(String(j.jobType || "general")).toLowerCase(),
+    lat:      parseFloat(j.latitude  || j.lat || ""),
+    lng:      parseFloat(j.longitude || j.lng || ""),
+    hasCoords: !isNaN(parseFloat(j.latitude || j.lat || "")) && !isNaN(parseFloat(j.longitude || j.lng || "")),
+  }));
+
+  const withCoords    = jobsWithCoords.filter(j => j.hasCoords);
+  const withoutCoords = jobsWithCoords.filter(j => !j.hasCoords);
+
+  const clusters    = [];
+  const assigned    = new Set();
+
+  for (const job of withCoords) {
+    if (assigned.has(job.index)) continue;
+    const cluster = [job];
+    assigned.add(job.index);
+
+    for (const other of withCoords) {
+      if (assigned.has(other.index)) continue;
+      if (haversineKm(job.lat, job.lng, other.lat, other.lng) <= maxDist) {
+        cluster.push(other);
+        assigned.add(other.index);
+      }
+    }
+
+    const centLat = cluster.reduce((s, j) => s + j.lat, 0) / cluster.length;
+    const centLng = cluster.reduce((s, j) => s + j.lng, 0) / cluster.length;
+
+    clusters.push({
+      clusterId:   `CLU-${clusters.length + 1}`,
+      jobCount:    cluster.length,
+      centroid:    { latitude: Math.round(centLat * 100000) / 100000, longitude: Math.round(centLng * 100000) / 100000 },
+      jobs:        cluster.map(j => ({ jobId: j.jobId, address: j.address, jobType: j.jobType, latitude: j.lat, longitude: j.lng })),
+    });
+  }
+
+  return res.json({
+    totalJobs:       jobs.length,
+    jobsWithCoords:  withCoords.length,
+    jobsWithoutCoords: withoutCoords.length,
+    clusterCount:    clusters.length,
+    maxDistanceKm:   maxDist,
+    clusters,
+    unclusteredJobs: withoutCoords.map(j => ({ jobId: j.jobId, address: j.address })),
+    note:            "Jobs without GPS coordinates are not clustered. Ensure all jobs have coordinates for accurate clustering.",
+    generatedAt:     new Date().toISOString(),
+  });
+});
+
+// POST /photo-compliance-score  — Score a set of photos specifically for compliance purposes
+app.post("/photo-compliance-score", apiKeyAuth, async (req, res) => {
+  const { jobType, photos, useAI } = req.body;
+
+  if (!photos || !Array.isArray(photos) || photos.length === 0) {
+    return res.status(400).json({ error: "photos array is required." });
+  }
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+
+  const safeJobType = sanitiseInput(String(jobType)).toLowerCase();
+  const numPhotos   = photos.length;
+
+  const MIN_PHOTOS    = { plumbing: 6, gas: 5, electrical: 6, drainage: 6, carpentry: 6, hvac: 6 };
+  const minRequired   = MIN_PHOTOS[safeJobType] || 4;
+
+  const withGps         = photos.filter(p => !!(p.gpsLat && p.gpsLng) || !!p.gpsCoords).length;
+  const withTimestamp   = photos.filter(p => !!(p.timestamp || p.takenAt)).length;
+  const withCaption     = photos.filter(p => !!(p.caption || p.description)).length;
+  const stages          = { Before: 0, During: 0, After: 0 };
+  for (const p of photos) {
+    if (["Before", "During", "After"].includes(p.stage)) stages[p.stage]++;
+  }
+
+  // Scoring (out of 25)
+  const quantityScore  = Math.min(numPhotos / minRequired, 1) * 8;
+  const gpsScore       = (withGps / numPhotos) * 6;
+  const timestampScore = (withTimestamp / numPhotos) * 5;
+  const captionScore   = (withCaption / numPhotos) * 3;
+  const stageScore     = [stages.Before > 0, stages.During > 0, stages.After > 0].filter(Boolean).length * (3 / 3);
+
+  const totalScore   = Math.round((quantityScore + gpsScore + timestampScore + captionScore + stageScore) * 4); // scale to 100
+  const photoGrade   = totalScore >= 90 ? "A" : totalScore >= 75 ? "B" : totalScore >= 60 ? "C" : totalScore >= 45 ? "D" : "F";
+
+  let aiFindings = null;
+  if (useAI && photos.some(p => p.dataUrl || p.url)) {
+    const imageMessages = photos.slice(0, 4).filter(p => p.dataUrl || p.url).map(p => ({
+      type: "image_url", image_url: { url: p.dataUrl || p.url, detail: "low" },
+    }));
+    try {
+      const aiRes = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [
+          { role: "system", content: `Evaluate ${safeJobType} compliance photos. Return JSON: {"overallQuality":"good|acceptable|poor","commonIssues":[],"positives":[],"recommendation":""}.` },
+          { role: "user",   content: [{ type: "text", text: `${numPhotos} photos for a ${safeJobType} job.` }, ...imageMessages] },
+        ],
+        max_tokens: 250,
+        response_format: { type: "json_object" },
+      });
+      aiFindings = JSON.parse(aiRes.choices[0].message.content);
+    } catch { /* non-fatal */ }
+  }
+
+  return res.json({
+    jobType:          safeJobType,
+    photoCount:       numPhotos,
+    minimumRequired:  minRequired,
+    complianceScore:  totalScore,
+    grade:            photoGrade,
+    breakdown: {
+      quantity:   Math.round(quantityScore * 4),
+      gpsScore:   Math.round(gpsScore * 4),
+      timestamps: Math.round(timestampScore * 4),
+      captions:   Math.round(captionScore * 4),
+      stages:     Math.round(stageScore * 4),
+    },
+    stageCount:       stages,
+    metadata: { withGps, withTimestamp, withCaption },
+    aiFindings,
+    generatedAt:      new Date().toISOString(),
+  });
+});
+
+// POST /apprentice-logbook  — Log an apprentice's on-the-job training entry
+app.post("/apprentice-logbook", apiKeyAuth, async (req, res) => {
+  const { apprenticeId, apprenticeName, tradeType, supervisorName, supervisorLicence,
+          logDate, hoursWorked, tasksPerformed, competenciesAchieved, notes } = req.body;
+
+  if (!apprenticeName || !tradeType || !hoursWorked) {
+    return res.status(400).json({ error: "apprenticeName, tradeType, and hoursWorked are required." });
+  }
+
+  const safeName     = sanitiseInput(String(apprenticeName));
+  const safeTrade    = sanitiseInput(String(tradeType)).toLowerCase();
+  const safeSupervisor = sanitiseInput(String(supervisorName || "Supervisor"));
+  const safeLicence  = sanitiseInput(String(supervisorLicence || "Not provided"));
+  const safeNotes    = sanitiseInput(String(notes || ""));
+  const hours        = parseFloat(hoursWorked) || 0;
+  const logDateStr   = logDate ? sanitiseInput(String(logDate)) : new Date().toISOString().slice(0, 10);
+
+  const tasks = Array.isArray(tasksPerformed)         ? tasksPerformed.slice(0, 10).map(t => sanitiseInput(String(t)))         : [];
+  const comps = Array.isArray(competenciesAchieved)   ? competenciesAchieved.slice(0, 10).map(c => sanitiseInput(String(c)))   : [];
+
+  const entryId = `LOG-${Date.now().toString(36).toUpperCase()}`;
+
+  const entry = {
+    entryId,
+    apprenticeId:         apprenticeId ? sanitiseInput(String(apprenticeId)) : null,
+    apprenticeName:       safeName,
+    tradeType:            safeTrade,
+    supervisor:           { name: safeSupervisor, licenceNumber: safeLicence },
+    logDate:              logDateStr,
+    hoursWorked:          hours,
+    tasksPerformed:       tasks,
+    competenciesAchieved: comps,
+    notes:                safeNotes || null,
+    loggedAt:             new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("apprentice_logbook").insert({
+      entry_id:       entryId,
+      apprentice_id:  entry.apprenticeId,
+      apprentice_name: safeName,
+      trade_type:     safeTrade,
+      supervisor_name: safeSupervisor,
+      log_date:       logDateStr,
+      hours_worked:   hours,
+      tasks:          tasks,
+      competencies:   comps,
+      created_at:     new Date().toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...entry, saved });
+});
+
+// GET /apprentice-logbook/:apprenticeId  — Retrieve logbook entries for an apprentice
+app.get("/apprentice-logbook/:apprenticeId", apiKeyAuth, async (req, res) => {
+  const apprenticeId = sanitiseInput(String(req.params.apprenticeId || ""));
+  if (!apprenticeId) return res.status(400).json({ error: "apprenticeId is required." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  const { data, error } = await supabaseAdmin
+    .from("apprentice_logbook")
+    .select("*")
+    .eq("apprentice_id", apprenticeId)
+    .order("log_date", { ascending: false })
+    .limit(500);
+
+  if (error) return res.status(500).json({ error: "Failed to retrieve logbook." });
+
+  const entries     = data || [];
+  const totalHours  = Math.round(entries.reduce((s, e) => s + (parseFloat(e.hours_worked) || 0), 0) * 10) / 10;
+  const allComps    = entries.flatMap(e => e.competencies || []);
+  const uniqueComps = [...new Set(allComps)];
+
+  return res.json({
+    apprenticeId,
+    apprenticeName: entries.length > 0 ? entries[0].apprentice_name : null,
+    tradeType:      entries.length > 0 ? entries[0].trade_type : null,
+    totalEntries:   entries.length,
+    totalHours,
+    uniqueCompetencies: uniqueComps.length,
+    competenciesAchieved: uniqueComps.slice(0, 20),
+    entries: entries.slice(0, 50),
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
