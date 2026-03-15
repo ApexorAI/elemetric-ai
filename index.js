@@ -53580,6 +53580,316 @@ Return a JSON object with:
   }
 });
 
+// POST /dewatering-record — Record dewatering operations for excavations and basements
+app.post("/dewatering-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      recordRef,
+      date,
+      time,
+      location,
+      recordedBy,
+      dewateringMethod,
+      pumpType,
+      dischargePumpCapacityLps,
+      dischargePoint,
+      dischargeApproval,
+      dischargeApprovalRef,
+      excavationDepthM,
+      groundwaterLevelM,
+      waterRateInflowLpm,
+      turbidityNtu,
+      turbidityCompliant,
+      sedimentControlMeasures,
+      pumpRunningHours,
+      totalVolumePumpedM3,
+      settlementMonitoringOk,
+      adjacentStructureMonitoring,
+      dewatering_plan_current,
+      epaPermitRequired,
+      epaPermitNumber,
+      abnormalConditions,
+      abnormalDescription,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !location || !dewateringMethod) {
+      return res.status(400).json({ error: "projectId, date, location, and dewateringMethod are required" });
+    }
+
+    const flags = [];
+    // EPA Victoria: turbidity of discharge must be < 50 NTU (SEPP Waters guidelines)
+    if (turbidityNtu !== undefined && Number(turbidityNtu) > 50) {
+      flags.push(`Discharge turbidity ${turbidityNtu} NTU exceeds 50 NTU limit — SEPP Waters of Victoria. Cease discharge and improve sediment controls.`);
+    }
+    if (!dischargeApproval) flags.push("No discharge approval recorded — confirm EPA/council stormwater discharge permit before pumping to drainage");
+    if (abnormalConditions) flags.push(`Abnormal dewatering conditions: ${sanitiseInput(abnormalDescription || "not described")} — review dewatering plan`);
+    if (groundwaterLevelM !== undefined && excavationDepthM !== undefined && Number(groundwaterLevelM) < Number(excavationDepthM)) {
+      flags.push(`Groundwater level ${groundwaterLevelM} m is above excavation depth ${excavationDepthM} m — active ingress expected, maintain continuous pumping`);
+    }
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      record_ref: sanitiseInput(recordRef || `DW-${Date.now()}`),
+      date,
+      time: sanitiseInput(time || ""),
+      location: sanitiseInput(location),
+      recorded_by: sanitiseInput(recordedBy || ""),
+      dewatering_method: sanitiseInput(dewateringMethod),
+      pump_type: sanitiseInput(pumpType || ""),
+      discharge_pump_capacity_lps: dischargePumpCapacityLps || null,
+      discharge_point: sanitiseInput(dischargePoint || ""),
+      discharge_approval: !!dischargeApproval,
+      discharge_approval_ref: sanitiseInput(dischargeApprovalRef || ""),
+      excavation_depth_m: excavationDepthM || null,
+      groundwater_level_m: groundwaterLevelM || null,
+      water_rate_inflow_lpm: waterRateInflowLpm || null,
+      turbidity_ntu: turbidityNtu || null,
+      turbidity_compliant: turbidityNtu !== undefined ? Number(turbidityNtu) <= 50 : !!turbidityCompliant,
+      sediment_control_measures: sanitiseInput(sedimentControlMeasures || ""),
+      pump_running_hours: pumpRunningHours || null,
+      total_volume_pumped_m3: totalVolumePumpedM3 || null,
+      settlement_monitoring_ok: !!settlementMonitoringOk,
+      adjacent_structure_monitoring: !!adjacentStructureMonitoring,
+      dewatering_plan_current: !!dewatering_plan_current,
+      epa_permit_required: !!epaPermitRequired,
+      epa_permit_number: sanitiseInput(epaPermitNumber || ""),
+      abnormal_conditions: !!abnormalConditions,
+      abnormal_description: sanitiseInput(abnormalDescription || ""),
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("dewatering_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      flags,
+      turbidityCompliant: Number(turbidityNtu || 0) <= 50,
+      applicableRegulations: ["EPA Victoria SEPP Waters — 50 NTU turbidity discharge limit", "Water Act 1989 (Vic) — works in waterways", "EPA Works Approval for high-volume dewatering"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/dewatering-record error:", err.message);
+    res.status(500).json({ error: "Failed to record dewatering operation" });
+  }
+});
+
+// POST /piling-record — Record a bored or driven pile installation per AS 2159
+app.post("/piling-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      pileRef,
+      pileType,
+      installationDate,
+      contractor,
+      rigOperator,
+      gridReference,
+      designedDiameterMm,
+      actualDiameterMm,
+      designedDepthM,
+      actualDepthM,
+      cutOffLevelM,
+      toeLevel,
+      concreteMix,
+      concreteStrengthMpa,
+      slumpMm,
+      concreteVolumeM3,
+      reinforcementCage,
+      rebarGrade,
+      rebarDiameterMm,
+      socketLength,
+      sidewall_condition,
+      soilProfile,
+      groundwaterEncountered,
+      groundwaterDepthM,
+      drillingFluid,
+      casing,
+      casingDepthM,
+      augerRefusal,
+      setCount,
+      staticLoadTestRequired,
+      dynamicLoadTestRequired,
+      integrityTestRequired,
+      anomaliesObserved,
+      anomalyDescription,
+      notes,
+    } = req.body;
+
+    if (!projectId || !pileRef || !pileType || !installationDate || !actualDepthM) {
+      return res.status(400).json({ error: "projectId, pileRef, pileType, installationDate, and actualDepthM are required" });
+    }
+
+    const flags = [];
+    if (designedDepthM && actualDepthM && Number(actualDepthM) < Number(designedDepthM) - 0.5) {
+      flags.push(`Pile ${pileRef} installed at ${actualDepthM} m — ${Number(designedDepthM) - Number(actualDepthM)} m short of design depth ${designedDepthM} m. Engineer review required.`);
+    }
+    if (designedDiameterMm && actualDiameterMm && Number(actualDiameterMm) < Number(designedDiameterMm) * 0.95) {
+      flags.push(`Actual diameter ${actualDiameterMm} mm is more than 5% below designed diameter ${designedDiameterMm} mm — notify geotechnical engineer`);
+    }
+    if (anomaliesObserved) flags.push(`Anomaly during installation: ${sanitiseInput(anomalyDescription || "not described")} — record for integrity testing review`);
+    if (concreteStrengthMpa && Number(concreteStrengthMpa) < 32) flags.push(`Concrete strength ${concreteStrengthMpa} MPa — below typical minimum 32 MPa for piles per AS 2159`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      pile_ref: sanitiseInput(pileRef),
+      pile_type: sanitiseInput(pileType),
+      installation_date: installationDate,
+      contractor: sanitiseInput(contractor || ""),
+      rig_operator: sanitiseInput(rigOperator || ""),
+      grid_reference: sanitiseInput(gridReference || ""),
+      designed_diameter_mm: designedDiameterMm || null,
+      actual_diameter_mm: actualDiameterMm || null,
+      designed_depth_m: designedDepthM || null,
+      actual_depth_m: Number(actualDepthM),
+      cut_off_level_m: cutOffLevelM || null,
+      toe_level: toeLevel || null,
+      concrete_mix: sanitiseInput(concreteMix || ""),
+      concrete_strength_mpa: concreteStrengthMpa || null,
+      slump_mm: slumpMm || null,
+      concrete_volume_m3: concreteVolumeM3 || null,
+      reinforcement_cage: sanitiseInput(reinforcementCage || ""),
+      rebar_grade: sanitiseInput(rebarGrade || ""),
+      rebar_diameter_mm: rebarDiameterMm || null,
+      socket_length: socketLength || null,
+      sidewall_condition: sanitiseInput(sidewall_condition || ""),
+      soil_profile: sanitiseInput(soilProfile || ""),
+      groundwater_encountered: !!groundwaterEncountered,
+      groundwater_depth_m: groundwaterDepthM || null,
+      drilling_fluid: sanitiseInput(drillingFluid || ""),
+      casing: !!casing,
+      casing_depth_m: casingDepthM || null,
+      auger_refusal: !!augerRefusal,
+      set_count: setCount || null,
+      static_load_test_required: !!staticLoadTestRequired,
+      dynamic_load_test_required: !!dynamicLoadTestRequired,
+      integrity_test_required: !!integrityTestRequired,
+      anomalies_observed: !!anomaliesObserved,
+      anomaly_description: sanitiseInput(anomalyDescription || ""),
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("piling_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      pileRef,
+      pileType,
+      actualDepthM: Number(actualDepthM),
+      flags,
+      applicableStandards: ["AS 2159 Piling — design and installation", "AS 1726 Geotechnical site investigations", "AS 3600 Concrete structures"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/piling-record error:", err.message);
+    res.status(500).json({ error: "Failed to record pile installation" });
+  }
+});
+
+// POST /ai-foundation-risk-assessment — AI assesses foundation and geotechnical risks
+app.post("/ai-foundation-risk-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      foundationType,
+      soilClassification,
+      siteDescription,
+      groundwaterDepthM,
+      adjacentStructures,
+      existingFoundations,
+      retainingRequired,
+      fillPresent,
+      contaminationSuspected,
+      seismicZone,
+      loadingDescription,
+    } = req.body;
+
+    if (!foundationType || !soilClassification) {
+      return res.status(400).json({ error: "foundationType and soilClassification are required" });
+    }
+
+    const prompt = `You are a geotechnical engineer with expertise in Victorian subsurface conditions, AS 2159, AS 1726, and NCC 2022 foundation requirements.
+
+Assess foundation risk for:
+- Project: ${sanitiseInput(projectId || "not specified")}
+- Foundation type: ${sanitiseInput(foundationType)}
+- Soil classification (AS 2870): ${sanitiseInput(soilClassification)}
+- Site description: ${sanitiseInput(siteDescription || "not provided")}
+- Groundwater depth: ${sanitiseInput(String(groundwaterDepthM || "unknown"))} m
+- Adjacent structures: ${sanitiseInput(adjacentStructures || "none")}
+- Existing foundations: ${sanitiseInput(existingFoundations || "none")}
+- Retaining required: ${sanitiseInput(String(retainingRequired || false))}
+- Fill present: ${sanitiseInput(String(fillPresent || false))}
+- Contamination suspected: ${sanitiseInput(String(contaminationSuspected || false))}
+- Seismic zone: ${sanitiseInput(seismicZone || "low")}
+- Loading: ${sanitiseInput(loadingDescription || "residential")}
+
+Return a JSON object with:
+{
+  "riskLevel": "LOW|MEDIUM|HIGH|EXTREME",
+  "siteInvestigationRequired": boolean,
+  "geotechnicalReportRequired": boolean,
+  "keyRisks": [string],
+  "foundationRecommendations": [string],
+  "dewateringLikely": boolean,
+  "settlementRisk": string,
+  "bearingCapacityNotes": string,
+  "retainingWallConsiderations": string,
+  "contaminationActions": string,
+  "pileTestingRecommended": boolean,
+  "applicableStandards": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ foundationType, soilClassification, assessment });
+  } catch (err) {
+    console.error("/ai-foundation-risk-assessment error:", err.message);
+    res.json({
+      foundationType: req.body.foundationType || "",
+      soilClassification: req.body.soilClassification || "",
+      assessment: {
+        riskLevel: "HIGH",
+        siteInvestigationRequired: true,
+        geotechnicalReportRequired: true,
+        keyRisks: ["Reactive clay soil movement (Class M/H common in Melbourne)", "Shallow groundwater causing excavation instability", "Differential settlement on fill or disturbed ground", "Underpinning requirements for adjacent structures"],
+        foundationRecommendations: ["Engage geotechnical engineer before finalising foundation design", "Design raft or pier-and-beam foundations for reactive clay sites", "Obtain geotechnical report with minimum 2 boreholes per AS 1726"],
+        dewateringLikely: true,
+        settlementRisk: "MEDIUM — reactive clay soils common across Melbourne metropolitan area. AS 2870 site classification essential.",
+        bearingCapacityNotes: "Establish allowable bearing pressure from geotechnical investigation. Minimum 100 kPa typically required for standard residential construction.",
+        retainingWallConsiderations: "Retaining walls > 1 m adjacent to boundaries or structures require engineering design per AS 4678 and building permit.",
+        contaminationActions: "Where fill or contamination is suspected, engage environmental consultant for Phase 1 desktop study and targeted soil sampling.",
+        pileTestingRecommended: true,
+        applicableStandards: ["AS 2159 Piling", "AS 2870 Residential slabs and footings", "AS 1726 Geotechnical site investigations", "AS 4678 Earth-retaining structures"],
+        recommendation: "Commission a geotechnical site investigation before design. Prepare a detailed foundation design with an engineer familiar with Melbourne's reactive clay conditions.",
+        summary: "Foundation risk is elevated by potentially reactive clay soils and groundwater. A geotechnical investigation and engineering-designed foundations are required for this site.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
