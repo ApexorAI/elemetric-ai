@@ -36286,6 +36286,211 @@ Return a JSON object with:
   }
 });
 
+// POST /whs-action-register — Create a WHS improvement action
+app.post("/whs-action-register", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, actionDescription, actionSource, raisedBy, assignedTo,
+    dueDate, priority = "MEDIUM", status = "OPEN", relatedHazard,
+    controlMeasure, verificationMethod, closedDate, closedBy, closeOutNotes,
+  } = req.body;
+  if (!actionDescription || !assignedTo || !dueDate) {
+    return res.status(400).json({ error: "actionDescription, assignedTo, and dueDate are required." });
+  }
+  const validPriorities = ["CRITICAL", "HIGH", "MEDIUM", "LOW"];
+  const validStatuses = ["OPEN", "IN_PROGRESS", "OVERDUE", "CLOSED", "CANCELLED"];
+  if (!validPriorities.includes(priority)) return res.status(400).json({ error: `priority must be one of: ${validPriorities.join(", ")}` });
+  if (!validStatuses.includes(status)) return res.status(400).json({ error: `status must be one of: ${validStatuses.join(", ")}` });
+  const actionRef = `WHS-${Date.now().toString(36).toUpperCase()}`;
+  const daysUntilDue = Math.ceil((new Date(dueDate) - new Date()) / (1000 * 60 * 60 * 24));
+  const isOverdue = daysUntilDue < 0 && status !== "CLOSED" && status !== "CANCELLED";
+  const record = {
+    action_ref: actionRef,
+    project_id: projectId || null,
+    action_description: sanitiseInput(actionDescription),
+    action_source: sanitiseInput(actionSource || ""),
+    raised_by: sanitiseInput(raisedBy || ""),
+    assigned_to: sanitiseInput(assignedTo),
+    due_date: dueDate,
+    priority,
+    status: isOverdue ? "OVERDUE" : status,
+    related_hazard: sanitiseInput(relatedHazard || ""),
+    control_measure: sanitiseInput(controlMeasure || ""),
+    verification_method: sanitiseInput(verificationMethod || ""),
+    closed_date: closedDate || null,
+    closed_by: sanitiseInput(closedBy || ""),
+    close_out_notes: sanitiseInput(closeOutNotes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("whs_actions").insert(record);
+    if (error) console.error("whs-action-register DB error:", error.message);
+  }
+  res.json({
+    actionRef,
+    priority,
+    status: record.status,
+    assignedTo,
+    dueDate,
+    daysUntilDue,
+    isOverdue,
+    saved: !!supabaseAdmin,
+  });
+});
+
+// GET /whs-action-register — List open WHS actions for a project
+app.get("/whs-action-register", apiKeyAuth, async (req, res) => {
+  const { projectId, status, priority } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("whs_actions").select("*").order("due_date", { ascending: true });
+  if (projectId) query = query.eq("project_id", projectId);
+  if (status) query = query.eq("status", status);
+  if (priority) query = query.eq("priority", priority);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  const now = new Date();
+  const summary = {
+    total: data.length,
+    open: data.filter(a => a.status === "OPEN").length,
+    overdue: data.filter(a => a.status === "OVERDUE" || (a.due_date && new Date(a.due_date) < now && a.status !== "CLOSED")).length,
+    closed: data.filter(a => a.status === "CLOSED").length,
+    critical: data.filter(a => a.priority === "CRITICAL").length,
+  };
+  res.json({ summary, actions: data });
+});
+
+// POST /toolbox-talk-record — Record a toolbox talk session
+app.post("/toolbox-talk-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, talkDate, talkTitle, facilitated_by, topics = [], attendees = [],
+    duration_minutes, signatureConfirmed = false, actionItems = [], notes,
+  } = req.body;
+  if (!talkTitle || !facilitated_by || !talkDate) {
+    return res.status(400).json({ error: "talkTitle, facilitated_by, and talkDate are required." });
+  }
+  const talkRef = `TBT-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    talk_ref: talkRef,
+    project_id: projectId || null,
+    talk_date: talkDate,
+    talk_title: sanitiseInput(talkTitle),
+    facilitated_by: sanitiseInput(facilitated_by),
+    topics: Array.isArray(topics) ? topics.map(t => sanitiseInput(t)) : [],
+    attendees: Array.isArray(attendees) ? attendees.map(a => sanitiseInput(a)) : [],
+    attendee_count: Array.isArray(attendees) ? attendees.length : 0,
+    duration_minutes: Number(duration_minutes) || 15,
+    signature_confirmed: signatureConfirmed,
+    action_items: Array.isArray(actionItems) ? actionItems.map(i => sanitiseInput(i)) : [],
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("toolbox_talks").insert(record);
+    if (error) console.error("toolbox-talk-record DB error:", error.message);
+  }
+  res.json({
+    talkRef,
+    talkTitle,
+    attendeeCount: record.attendee_count,
+    topicsCovered: record.topics.length,
+    actionItems: record.action_items.length,
+    signatureConfirmed,
+    saved: !!supabaseAdmin,
+  });
+});
+
+// GET /toolbox-talk-record — List toolbox talks for a project
+app.get("/toolbox-talk-record", apiKeyAuth, async (req, res) => {
+  const { projectId, from, to } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("toolbox_talks").select("*").order("talk_date", { ascending: false });
+  if (projectId) query = query.eq("project_id", projectId);
+  if (from) query = query.gte("talk_date", from);
+  if (to) query = query.lte("talk_date", to);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ count: data.length, talks: data });
+});
+
+// POST /ai-safety-induction-quiz — AI generates a safety induction quiz
+app.post("/ai-safety-induction-quiz", apiKeyAuth, async (req, res) => {
+  const {
+    trade = "general", state = "VIC", siteHazards = [], questionCount = 10,
+    difficultyLevel = "STANDARD",
+  } = req.body;
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedState = sanitiseInput(state);
+  const hazardList = Array.isArray(siteHazards) ? siteHazards.map(h => sanitiseInput(h)).join(", ") : "";
+  const systemPrompt = `You are a Work Health & Safety (WHS) training expert in Australia. Generate safety induction quiz questions for tradespeople.`;
+  const userPrompt = `Generate a ${sanitisedState} safety induction quiz for a ${sanitisedTrade} worker.
+Site-specific hazards: ${hazardList || "standard construction site hazards"}.
+Difficulty: ${difficultyLevel}. Number of questions: ${questionCount}.
+
+Return JSON with this structure:
+{
+  "quizTitle": "...",
+  "passMark": 80,
+  "questions": [
+    {
+      "id": 1,
+      "question": "...",
+      "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
+      "correctAnswer": "A",
+      "explanation": "...",
+      "regulatoryReference": "..."
+    }
+  ],
+  "legislativeFramework": ["...", "..."],
+  "inductionCompletionStatement": "...",
+  "reviewedBy": "AI Safety System",
+  "version": "1.0"
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 3000,
+    });
+    usageStats.openaiCalls++;
+    const quiz = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ trade: sanitisedTrade, state: sanitisedState, questionCount, difficultyLevel, quiz });
+  } catch (err) {
+    console.error("ai-safety-induction-quiz error:", err.message);
+    res.json({
+      trade: sanitisedTrade, state: sanitisedState, questionCount, difficultyLevel,
+      quiz: {
+        quizTitle: `${sanitisedState} Safety Induction Quiz — ${sanitisedTrade}`,
+        passMark: 80,
+        questions: [
+          {
+            id: 1,
+            question: "What must you do before commencing work on a construction site?",
+            options: ["A. Start work immediately", "B. Complete site induction and sign in", "C. Wait for another worker to arrive", "D. Check your phone"],
+            correctAnswer: "B",
+            explanation: "All workers must complete site induction and sign the site register before commencing any work.",
+            regulatoryReference: "WHS Act 2011 — Duty of Care",
+          },
+          {
+            id: 2,
+            question: "Who is responsible for your safety on site?",
+            options: ["A. Site supervisor only", "B. Principal contractor only", "C. Everyone on site including yourself", "D. The client"],
+            correctAnswer: "C",
+            explanation: "Under WHS legislation, all persons at a workplace share responsibility for health and safety.",
+            regulatoryReference: "WHS Act 2011 s.28",
+          },
+        ],
+        legislativeFramework: ["Work Health and Safety Act 2011", "Work Health and Safety Regulation 2017", `${sanitisedState} WHS legislation`],
+        inductionCompletionStatement: "I have read and understood the safety induction requirements and agree to comply with all site safety rules.",
+        reviewedBy: "AI Safety System (fallback)",
+        version: "1.0",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
