@@ -26896,6 +26896,183 @@ app.post("/return-to-work", apiKeyAuth, async (req, res) => {
   return res.status(201).json({ ...record, saved: !!supabaseAdmin });
 });
 
+// POST /plant-prestart  — Log a plant/equipment pre-start inspection
+app.post("/plant-prestart", apiKeyAuth, async (req, res) => {
+  const { plantId, plantName, siteId, jobId, operator, inspectionDate, items = [], fuelLevel, hoursReading, defectsFound, faultDescription, safeToOperate, notes } = req.body || {};
+  if (!plantId && !plantName) return res.status(400).json({ error: "plantId or plantName required." });
+
+  const DEFAULT_CHECKS = [
+    "Engine oil level", "Coolant level", "Hydraulic fluid level", "Fuel level",
+    "Tyre condition and pressure", "Lights and indicators", "Brakes functional",
+    "Seat belt present and functional", "ROPS/FOPS intact", "Fire extinguisher present",
+    "No fluid leaks", "No unusual noises", "Emergency stop functional",
+  ];
+
+  const safePlantId = plantId ? sanitiseInput(String(plantId)).slice(0, 80) : null;
+  const safeName    = plantName ? sanitiseInput(String(plantName)).slice(0, 100) : null;
+  const safeSiteId  = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId   = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeOp      = operator ? sanitiseInput(String(operator)).slice(0, 100) : null;
+  const safeDate    = inspectionDate ? sanitiseInput(String(inspectionDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeFuel    = fuelLevel ? sanitiseInput(String(fuelLevel)).slice(0, 20) : null;
+  const safeHours   = hoursReading ? Math.max(0, parseFloat(hoursReading) || 0) : null;
+  const safeFault   = faultDescription ? sanitiseInput(String(faultDescription)).slice(0, 300) : null;
+  const safeNotes   = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const checkItems = (Array.isArray(items) && items.length > 0)
+    ? items.slice(0, 30).map(i => ({ item: sanitiseInput(String(i.item || i)).slice(0, 100), passed: i.passed !== false }))
+    : DEFAULT_CHECKS.map(i => ({ item: i, passed: !defectsFound }));
+
+  const passed = checkItems.filter(c => c.passed).length;
+  const safe   = safeToOperate !== undefined ? safeToOperate === true : (passed === checkItems.length && !defectsFound);
+
+  const record = {
+    prestartId: `PST-${(safePlantId || safeName || "PLT").slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    plantId: safePlantId, plantName: safeName, siteId: safeSiteId, jobId: safeJobId,
+    operator: safeOp, inspectionDate: safeDate, items: checkItems,
+    passedCount: passed, totalChecks: checkItems.length,
+    fuelLevel: safeFuel, hoursReading: safeHours, defectsFound: defectsFound === true,
+    faultDescription: safeFault, safeToOperate: safe,
+    result: safe ? "CLEARED_TO_OPERATE" : "TAGGED_OUT",
+    notes: safeNotes, createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("plant_prestarts").insert({
+        prestart_id: record.prestartId, plant_id: safePlantId, plant_name: safeName,
+        site_id: safeSiteId, job_id: safeJobId, operator: safeOp, inspection_date: safeDate,
+        items: checkItems, passed_count: passed, fuel_level: safeFuel, hours_reading: safeHours,
+        defects_found: record.defectsFound, fault_description: safeFault, safe_to_operate: safe,
+        result: record.result, notes: safeNotes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// GET /plant-prestart/:plantId  — Get pre-start inspection history for a piece of plant
+app.get("/plant-prestart/:plantId", apiKeyAuth, async (req, res) => {
+  const plantId = sanitiseInput(String(req.params.plantId || "")).slice(0, 80);
+  if (!plantId) return res.status(400).json({ error: "plantId required." });
+
+  let records = [];
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin.from("plant_prestarts").select("*").eq("plant_id", plantId).order("inspection_date", { ascending: false }).limit(50);
+      records = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const taggedOut = records.filter(r => r.result === "TAGGED_OUT").length;
+  return res.json({ plantId, inspectionCount: records.length, taggedOutCount: taggedOut, records, generatedAt: new Date().toISOString() });
+});
+
+// POST /lifting-plan  — Log a lifting/crane operation plan
+app.post("/lifting-plan", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, liftDate, liftDescription, craneType, craneSWLKg, liftWeightKg, radius, rigger, dogman, craneOperator, liftClass, engineerApproved, ica, notes } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+
+  const CRANE_TYPES  = ["mobile-crane", "tower-crane", "pick-and-carry", "boom-lift", "forklift", "overhead-crane", "other"];
+  const LIFT_CLASSES = ["A", "B", "C"]; // AS 2550 classes
+
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeDate   = liftDate ? sanitiseInput(String(liftDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeDesc   = liftDescription ? sanitiseInput(String(liftDescription)).slice(0, 300) : null;
+  const safeCrane  = CRANE_TYPES.includes(String(craneType || "").toLowerCase().replace(/ /g, "-")) ? String(craneType).toLowerCase().replace(/ /g, "-") : "other";
+  const swl        = craneSWLKg ? Math.max(0, parseFloat(craneSWLKg) || 0) : null;
+  const liftWt     = liftWeightKg ? Math.max(0, parseFloat(liftWeightKg) || 0) : null;
+  const safeRadius = radius ? Math.max(0, parseFloat(radius) || 0) : null;
+  const liftClass_ = LIFT_CLASSES.includes(String(liftClass || "").toUpperCase()) ? String(liftClass).toUpperCase() : "B";
+  const utilisation = (swl && liftWt) ? parseFloat(((liftWt / swl) * 100).toFixed(1)) : null;
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const risks = [];
+  if (utilisation && utilisation > 90) risks.push("CRITICAL: Lift exceeds 90% SWL — re-evaluate or use larger crane");
+  if (utilisation && utilisation > 75) risks.push("HIGH: Lift >75% SWL — critical lift procedures apply");
+  if (liftClass_ === "A") risks.push("Class A (engineered) lift — engineer's lift study and pre-lift meeting required");
+
+  const record = {
+    liftId: `LFT-${(safeSiteId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId, jobId: safeJobId, liftDate: safeDate, liftDescription: safeDesc,
+    craneType: safeCrane, craneSWLKg: swl, liftWeightKg: liftWt, radiusM: safeRadius,
+    utilisationPercent: utilisation, liftClass: liftClass_,
+    rigger: rigger ? sanitiseInput(String(rigger)).slice(0, 100) : null,
+    dogman: dogman ? sanitiseInput(String(dogman)).slice(0, 100) : null,
+    craneOperator: craneOperator ? sanitiseInput(String(craneOperator)).slice(0, 100) : null,
+    engineerApproved: engineerApproved === true, ica: ica === true,
+    risks, notes: safeNotes, createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("lifting_plans").insert({
+        lift_id: record.liftId, site_id: safeSiteId, job_id: safeJobId, lift_date: safeDate,
+        description: safeDesc, crane_type: safeCrane, swl_kg: swl, lift_weight_kg: liftWt,
+        radius_m: safeRadius, utilisation_percent: utilisation, lift_class: liftClass_,
+        rigger: record.rigger, dogman: record.dogman, crane_operator: record.craneOperator,
+        engineer_approved: record.engineerApproved, ica: record.ica, risks, notes: safeNotes,
+        created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// POST /scaffolding-inspection  — Log a scaffolding inspection record
+app.post("/scaffolding-inspection", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, inspectionDate, inspectedBy, scaffoldType, maxHeightM, anchorage, bracing, decking, guardrails, toeboards, access, loadCapacity, weatherChecked, result, defects = [], notes } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+
+  const SCAFFOLD_TYPES = ["tube-and-coupler", "modular-system", "suspended", "mobile", "trestle", "kwikstage", "other"];
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeDate   = inspectionDate ? sanitiseInput(String(inspectionDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeBy     = inspectedBy ? sanitiseInput(String(inspectedBy)).slice(0, 100) : null;
+  const safeType   = SCAFFOLD_TYPES.includes(String(scaffoldType || "").toLowerCase().replace(/ /g, "-")) ? String(scaffoldType).toLowerCase().replace(/ /g, "-") : "other";
+  const safeHeight = maxHeightM ? Math.max(0, parseFloat(maxHeightM) || 0) : null;
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+  const safeDefects = Array.isArray(defects) ? defects.slice(0, 20).map(d => sanitiseInput(String(d)).slice(0, 150)) : [];
+
+  const checks = [
+    { item: "Anchorage to structure",   passed: anchorage !== false },
+    { item: "Bracing installed",        passed: bracing !== false },
+    { item: "Decking planks secure",    passed: decking !== false },
+    { item: "Guardrails installed",     passed: guardrails !== false },
+    { item: "Toeboards present",        passed: toeboards !== false },
+    { item: "Safe access (ladder/stair)", passed: access !== false },
+    { item: "Load capacity within spec",  passed: loadCapacity !== false },
+    { item: "Weather conditions checked", passed: weatherChecked !== false },
+  ];
+  const passed = checks.filter(c => c.passed).length;
+  const safeResult = ["PASS", "FAIL", "CONDITIONAL"].includes(String(result || "").toUpperCase()) ? String(result).toUpperCase() : (passed === checks.length && safeDefects.length === 0 ? "PASS" : safeDefects.length > 0 ? "CONDITIONAL" : "PASS");
+
+  const record = {
+    inspectionId: `SCF-${(safeSiteId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId, jobId: safeJobId, inspectionDate: safeDate, inspectedBy: safeBy,
+    scaffoldType: safeType, maxHeightM: safeHeight,
+    checks, passedCount: passed, defects: safeDefects, result: safeResult,
+    requiresScaffolderLicence: safeHeight && safeHeight > 4,
+    notes: safeNotes, createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("scaffolding_inspections").insert({
+        inspection_id: record.inspectionId, site_id: safeSiteId, job_id: safeJobId,
+        inspection_date: safeDate, inspected_by: safeBy, scaffold_type: safeType,
+        max_height_m: safeHeight, checks, defects: safeDefects, result: safeResult,
+        notes: safeNotes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
