@@ -85315,6 +85315,476 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 294 ─────────────────────────────────────────────────────────────────
+
+// POST /mine-site-inspection — Record mine site safety inspection per Mineral Resources (Sustainable Development) Act 1990 (Vic)
+app.post("/mine-site-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, mineId, mineName, inspectionDate, inspectedBy,
+      inspectorLicence, mineType, operatingLicenceNumber, operatingLicenceExpiry,
+      workPlanCurrent, mineManagerAppointed, mineManagerCompetency,
+      ventilationAdequate, ventilationMeasuredLsPerPerson,
+      dustMonitoringCurrent, respirableDustMgm3, dustLimit,
+      gasMixesMonitored, methanePercent, co2Percent, o2Percent,
+      groundControlPlanCurrent, supportInstallationOk, roofRockSafe,
+      explosivesStoredCorrectly, explosivesRegisterCurrent,
+      firingLineClearanceOk, blastNotificationCompliant,
+      emergencyResponsePlanCurrent, rescueEquipmentOk, firstAidKitsOk,
+      evacuationDrillLastDate,
+      haulsRoadOk, pitSlopeMonitored, pitSlopeAngleDeg, designSlopeAngleDeg,
+      dewateringAdequate, waterwayProtection,
+      incidentReportingSystem, seriousIncidents12Months,
+      rehabPlanCurrent, rehabProgressOnSchedule,
+      defectsFound, defectDetails, nextInspectionDue, certRef, notes
+    } = req.body;
+
+    if (!mineId || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "mineId, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeMineId = sanitiseInput(String(mineId));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const criticalIssues = [];
+    const warnings = [];
+
+    const respDust = parseFloat(respirableDustMgm3) || null;
+    const dustLimitVal = parseFloat(dustLimit) || 1.5; // mg/m³ TWA
+    const methane = parseFloat(methanePercent) || null;
+    const co2 = parseFloat(co2Percent) || null;
+    const o2Val = parseFloat(o2Percent) || null;
+    const pitSlope = parseFloat(pitSlopeAngleDeg) || null;
+    const designSlope = parseFloat(designSlopeAngleDeg) || null;
+
+    // Mineral Resources (Sustainable Development) Act 1990 (Vic)
+    // Mineral Resources (Sustainable Development) (Mineral Industries) Regulations 2019 (Vic)
+    // OHS Regulations 2017 (Vic) Part 3 (underground mines)
+    if (!workPlanCurrent) {
+      criticalIssues.push("Mine work plan not current — operations must be conducted in accordance with an approved work plan (Mineral Resources (Sustainable Development) Act 1990 (Vic) s.40).");
+    }
+
+    if (!mineManagerAppointed) {
+      criticalIssues.push("Mine manager not appointed — a competent mine manager must be appointed for all mining operations (Mineral Resources Regulations 2019 (Vic) reg 16).");
+    }
+
+    if (methane !== null && methane > 1.25) {
+      criticalIssues.push(`Methane concentration ${methane}% exceeds 1.25% — EXPLOSIVE ATMOSPHERE RISK. Evacuate immediately and ventilate before re-entry (OHS Regulations 2017 (Vic) Part 3.2.4).`);
+    }
+
+    if (o2Val !== null && (o2Val < 19.5 || o2Val > 23.5)) {
+      criticalIssues.push(`Mine atmosphere O₂ level ${o2Val}% outside safe range 19.5–23.5% — evacuate immediately (OHS Regulations 2017 (Vic)).`);
+    }
+
+    if (co2 !== null && co2 > 0.5) {
+      criticalIssues.push(`CO₂ level ${co2}% exceeds 0.5% action level — investigate ventilation failure. Evacuate if CO₂ > 0.5% (OHS Regulations 2017 (Vic)).`);
+    }
+
+    if (respDust !== null && respDust > dustLimitVal) {
+      criticalIssues.push(`Respirable dust ${respDust} mg/m³ exceeds TWA limit ${dustLimitVal} mg/m³ — silica/coal dust exposure risk. Implement immediate dust suppression and respiratory protection (OHS Regulations 2017 (Vic) Part 4.1).`);
+    }
+
+    if (!groundControlPlanCurrent) {
+      criticalIssues.push("Ground control plan not current — underground and open cut mines must maintain a current ground control plan (Mineral Resources Regulations 2019 (Vic)).");
+    }
+
+    if (!supportInstallationOk || !roofRockSafe) {
+      criticalIssues.push("Ground support deficiency — unsafe ground conditions. Stop work in affected areas until ground is made safe (OHS Regulations 2017 (Vic) Part 3.2.2).");
+    }
+
+    if (pitSlope !== null && designSlope !== null && pitSlope > designSlope) {
+      criticalIssues.push(`Pit slope angle ${pitSlope}° exceeds design slope ${designSlope}° — slope stability compromised. Notify mine manager and geotechnical engineer. Do not allow personnel or equipment near crest.`);
+    }
+
+    if (!explosivesRegisterCurrent) {
+      criticalIssues.push("Explosives register not current — all explosives must be registered and reconciled (Dangerous Goods (Explosives) Regulations 2011 (Vic)).");
+    }
+
+    if (!emergencyResponsePlanCurrent) {
+      warnings.push("Emergency response plan not current — must be reviewed annually (Mineral Resources Regulations 2019 (Vic)).");
+    }
+
+    if (!evacuationDrillLastDate) {
+      warnings.push("No evacuation drill date recorded — regular evacuation drills are required for all mine operations.");
+    }
+
+    if (!rehabPlanCurrent || !rehabProgressOnSchedule) {
+      warnings.push("Rehabilitation plan not current or progress behind schedule — progressive rehabilitation is required under the Mineral Resources (Sustainable Development) Act 1990 (Vic).");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "UNSAFE" : warnings.length > 0 ? "ATTENTION_REQUIRED" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("mine_site_inspections")
+        .insert({
+          project_id: safeProject,
+          mine_id: safeMineId,
+          mine_name: mineName ? sanitiseInput(String(mineName)) : null,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          inspector_licence: inspectorLicence ? sanitiseInput(String(inspectorLicence)) : null,
+          mine_type: mineType ? sanitiseInput(String(mineType)) : null,
+          operating_licence: operatingLicenceNumber ? sanitiseInput(String(operatingLicenceNumber)) : null,
+          operating_licence_expiry: operatingLicenceExpiry || null,
+          work_plan_current: workPlanCurrent !== false && workPlanCurrent !== "false",
+          mine_manager_appointed: mineManagerAppointed !== false && mineManagerAppointed !== "false",
+          ventilation_adequate: ventilationAdequate !== false && ventilationAdequate !== "false",
+          dust_mg_m3: respDust,
+          dust_limit_mg_m3: dustLimitVal,
+          methane_percent: methane,
+          co2_percent: co2,
+          o2_percent: o2Val,
+          ground_control_plan_current: groundControlPlanCurrent !== false && groundControlPlanCurrent !== "false",
+          support_ok: supportInstallationOk !== false && supportInstallationOk !== "false",
+          explosives_register_current: explosivesRegisterCurrent !== false && explosivesRegisterCurrent !== "false",
+          pit_slope_deg: pitSlope,
+          design_slope_deg: designSlope,
+          emergency_plan_current: emergencyResponsePlanCurrent !== false && emergencyResponsePlanCurrent !== "false",
+          rehab_plan_current: rehabPlanCurrent !== false && rehabPlanCurrent !== "false",
+          serious_incidents: parseInt(seriousIncidents12Months) || 0,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          next_inspection_due: nextInspectionDue || null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          defect_details: Array.isArray(defectDetails) ? defectDetails : [],
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Mine site UNSAFE — critical safety issues identified. Stop affected operations until defects are rectified. Notify Earth Resources Regulation (Vic).",
+        standards: ["Mineral Resources (Sustainable Development) Act 1990 (Vic)", "Mineral Resources Regulations 2019 (Vic)", "OHS Regulations 2017 (Vic)"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      mineId: safeMineId,
+      nextInspectionDue: nextInspectionDue || null,
+      standards: ["Mineral Resources (Sustainable Development) Act 1990 (Vic)", "OHS Regulations 2017 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /mine-site-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record mine site inspection." });
+  }
+});
+
+// POST /quarry-inspection — Record quarry/extractive industry safety inspection
+app.post("/quarry-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, quarryId, quarryName, address, inspectionDate, inspectedBy,
+      extractionLicenceNumber, extractionLicenceExpiry, materialExtracted,
+      productionTpa, quarryOperatorName,
+      faceSlopeAngleDeg, designFaceSlopeAngleDeg, benchWidthM, benchHeightM,
+      blastedAreaSecured, blastSignageOk, blastNotification,
+      explosivesStoredCompliant, explosivesRegisterCurrent,
+      plantSafetyOk, excavatorOk, rigidDumpTruckOk,
+      haulsRoadCondition, roadSpeedLimit, dustSuppressionRoad,
+      crushingScreeningPlantSafeGuarded, beltGuardsOk,
+      noiseMeasured, noiseDbA, noiseLimit,
+      vibrationMonitored, vibrationMmS, vibrationLimit,
+      dustMeasured, dustMgm3, dustLimitVal,
+      stormwaterManaged, sedimentPondsOk,
+      rehabilitationPlanCurrent, rehabilitationBondPaid,
+      planningPermitCurrent, extractionAreaWithinPermit,
+      defectsFound, defectDetails, nextInspectionDue, certRef, notes
+    } = req.body;
+
+    if (!quarryId || !address || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "quarryId, address, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeQuarryId = sanitiseInput(String(quarryId));
+    const safeAddress = sanitiseInput(String(address));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const criticalIssues = [];
+    const warnings = [];
+
+    const faceSlope = parseFloat(faceSlopeAngleDeg) || null;
+    const designFaceSlope = parseFloat(designFaceSlopeAngleDeg) || null;
+    const benchW = parseFloat(benchWidthM) || null;
+    const benchH = parseFloat(benchHeightM) || null;
+    const noiseLevel = parseFloat(noiseDbA) || null;
+    const noiseLimitVal = parseFloat(noiseLimit) || null;
+    const vibration = parseFloat(vibrationMmS) || null;
+    const vibrationLimitVal = parseFloat(vibrationLimit) || null;
+    const dustLevel = parseFloat(dustMgm3) || null;
+    const dustLimitParsed = parseFloat(dustLimitVal) || null;
+
+    // Mineral Resources (Sustainable Development) Act 1990 (Vic)
+    // Dangerous Goods (Explosives) Regulations 2011 (Vic)
+    // Environment Protection Act 2017 (Vic)
+    // Planning and Environment Act 1987 (Vic)
+    if (faceSlope !== null && designFaceSlope !== null && faceSlope > designFaceSlope + 5) {
+      criticalIssues.push(`Quarry face slope ${faceSlope}° exceeds design slope ${designFaceSlope}° by more than 5° — rock fall/slope failure risk. Stop work in area and engage geotechnical engineer (MRSD Act 1990 (Vic)).`);
+    }
+
+    if (!planningPermitCurrent) {
+      criticalIssues.push("Planning permit not current — quarry operations must be conducted within the scope of a current planning permit (Planning and Environment Act 1987 (Vic)).");
+    }
+
+    if (!extractionAreaWithinPermit) {
+      criticalIssues.push("Extraction area not within current permit boundaries — extraction outside permitted area constitutes a planning permit breach. Stop operations outside permit boundary.");
+    }
+
+    if (!explosivesRegisterCurrent || !explosivesStoredCompliant) {
+      criticalIssues.push("Explosives storage or register non-compliant — explosives must be stored in approved magazines and fully reconciled (Dangerous Goods (Explosives) Regulations 2011 (Vic)).");
+    }
+
+    if (!blastedAreaSecured) {
+      criticalIssues.push("Blasted area not secured — all access to blasted faces must be restricted until the area is declared safe by the shotfirer (Dangerous Goods (Explosives) Regulations 2011 (Vic)).");
+    }
+
+    if (noiseLevel !== null && noiseLimitVal !== null && noiseLevel > noiseLimitVal) {
+      criticalIssues.push(`Quarry noise ${noiseLevel} dBA exceeds planning permit limit ${noiseLimitVal} dBA — potential EPA and planning permit breach. Implement immediate noise controls (Environment Protection Act 2017 (Vic)).`);
+    }
+
+    if (vibration !== null && vibrationLimitVal !== null && vibration > vibrationLimitVal) {
+      criticalIssues.push(`Ground vibration ${vibration} mm/s exceeds limit ${vibrationLimitVal} mm/s — damage risk to nearby structures. Review blasting design immediately (AS 2187.2).`);
+    }
+
+    if (dustLevel !== null && dustLimitParsed !== null && dustLevel > dustLimitParsed) {
+      criticalIssues.push(`Dust level ${dustLevel} mg/m³ exceeds limit ${dustLimitParsed} mg/m³ — EPA exceedance. Implement dust suppression measures (Environment Protection Act 2017 (Vic)).`);
+    }
+
+    if (!stormwaterManaged || !sedimentPondsOk) {
+      warnings.push("Stormwater management deficiency — sediment and contaminated run-off from quarries must be managed per SEPP Waters 2018 (Vic).");
+    }
+
+    if (!rehabilitationPlanCurrent || !rehabilitationBondPaid) {
+      warnings.push("Rehabilitation plan or bond status issue — progressive rehabilitation and a current rehabilitation bond are required under the MRSD Act 1990 (Vic).");
+    }
+
+    if (!benchWidthM || (benchW !== null && benchH !== null && benchW < benchH * 0.5)) {
+      warnings.push(`Bench width ${benchW || "unknown"} m may be insufficient relative to bench height ${benchH || "unknown"} m — review face geometry against geotechnical design.`);
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "ATTENTION_REQUIRED" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("quarry_inspections")
+        .insert({
+          project_id: safeProject,
+          quarry_id: safeQuarryId,
+          quarry_name: quarryName ? sanitiseInput(String(quarryName)) : null,
+          address: safeAddress,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          extraction_licence: extractionLicenceNumber ? sanitiseInput(String(extractionLicenceNumber)) : null,
+          extraction_licence_expiry: extractionLicenceExpiry || null,
+          material_extracted: materialExtracted ? sanitiseInput(String(materialExtracted)) : null,
+          face_slope_deg: faceSlope,
+          design_face_slope_deg: designFaceSlope,
+          bench_width_m: benchW,
+          bench_height_m: benchH,
+          explosives_register_current: explosivesRegisterCurrent !== false && explosivesRegisterCurrent !== "false",
+          blasted_area_secured: blastedAreaSecured !== false && blastedAreaSecured !== "false",
+          noise_dba: noiseLevel,
+          noise_limit_dba: noiseLimitVal,
+          vibration_mm_s: vibration,
+          vibration_limit: vibrationLimitVal,
+          dust_mg_m3: dustLevel,
+          stormwater_managed: stormwaterManaged !== false && stormwaterManaged !== "false",
+          rehab_plan_current: rehabilitationPlanCurrent !== false && rehabilitationPlanCurrent !== "false",
+          rehab_bond_paid: rehabilitationBondPaid !== false && rehabilitationBondPaid !== "false",
+          planning_permit_current: planningPermitCurrent !== false && planningPermitCurrent !== "false",
+          extraction_within_permit: extractionAreaWithinPermit !== false && extractionAreaWithinPermit !== "false",
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          next_inspection_due: nextInspectionDue || null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          defect_details: Array.isArray(defectDetails) ? defectDetails : [],
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Quarry compliance failures — stop affected operations and notify Earth Resources Regulation (Vic) and EPA Victoria as required.",
+        standards: ["Mineral Resources (Sustainable Development) Act 1990 (Vic)", "Planning and Environment Act 1987 (Vic)", "Environment Protection Act 2017 (Vic)"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      quarryId: safeQuarryId,
+      nextInspectionDue: nextInspectionDue || null,
+      standards: ["Mineral Resources (Sustainable Development) Act 1990 (Vic)", "Planning and Environment Act 1987 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /quarry-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record quarry inspection." });
+  }
+});
+
+// POST /ai-mining-compliance-assessment — AI assesses mining/extractive industry compliance
+app.post("/ai-mining-compliance-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      operationId, operationType, commodityType, annualProductionTpa,
+      licenceStatus, licenceExpiry, workPlanVersion,
+      mineManagerCompetent, safetyManagementSystem,
+      atmosphericMonitoringProgram, groundControlProgram,
+      explosivesManagementCompliant, equipmentMaintenanceProgram,
+      dustMonitoringProgram, noiseMonitoringProgram,
+      seriousIncidents12Months, fatalities,
+      regulatoryInspectionsReceived, noticesIssued, prosecutions,
+      rehabilitationBondCurrent, rehabProgressPercent,
+      environmentalMonitoringProgram, waterManagementPlan,
+      planningPermitCompliant, epaLicenceCurrent,
+      communityConsultationCurrent, deficienciesNoted, notes
+    } = req.body;
+
+    if (!operationId) {
+      return res.status(400).json({ error: "operationId is required." });
+    }
+
+    const safeOpId = sanitiseInput(String(operationId));
+    const deficiencies = Array.isArray(deficienciesNoted) ? deficienciesNoted : [];
+
+    const prompt = `You are an expert in mining and extractive industry safety and regulatory compliance. Assess this mining/quarrying operation's compliance posture under Victorian and Australian regulations.
+
+Operation ID: ${safeOpId}
+Operation type: ${operationType || "Unknown"}
+Commodity: ${commodityType || "Unknown"}
+Annual production: ${annualProductionTpa ? annualProductionTpa + " t/pa" : "Unknown"}
+
+LICENCING:
+- Licence status: ${licenceStatus || "Unknown"}, expiry: ${licenceExpiry || "Unknown"}
+- Work plan version: ${workPlanVersion || "Unknown"}
+
+SAFETY MANAGEMENT:
+- Mine manager competent: ${mineManagerCompetent ? "Yes" : "No/Unknown"}
+- Safety management system: ${safetyManagementSystem || "Unknown"}
+- Atmospheric monitoring: ${atmosphericMonitoringProgram ? "Yes" : "No"}
+- Ground control program: ${groundControlProgram ? "Yes" : "No"}
+- Explosives management compliant: ${explosivesManagementCompliant ? "Yes" : "No"}
+- Equipment maintenance program: ${equipmentMaintenanceProgram ? "Yes" : "No"}
+- Dust monitoring: ${dustMonitoringProgram ? "Yes" : "No"}
+- Noise monitoring: ${noiseMonitoringProgram ? "Yes" : "No"}
+
+INCIDENT HISTORY:
+- Serious incidents (12 months): ${seriousIncidents12Months || 0}
+- Fatalities: ${fatalities || 0}
+- Regulatory inspections: ${regulatoryInspectionsReceived || 0}
+- Notices issued: ${noticesIssued || 0}
+- Prosecutions: ${prosecutions || 0}
+
+REHABILITATION AND ENVIRONMENT:
+- Rehab bond current: ${rehabilitationBondCurrent ? "Yes" : "No"}
+- Rehab progress: ${rehabProgressPercent || "Unknown"}%
+- Environmental monitoring: ${environmentalMonitoringProgram ? "Yes" : "No"}
+- Water management plan: ${waterManagementPlan ? "Yes" : "No"}
+- Planning permit compliant: ${planningPermitCompliant ? "Yes" : "No"}
+- EPA licence current: ${epaLicenceCurrent ? "Yes" : "No/NA"}
+
+Deficiencies: ${deficiencies.join("; ") || "None"}
+
+Assess under:
+- Mineral Resources (Sustainable Development) Act 1990 (Vic)
+- Mineral Resources (Sustainable Development) (Mineral Industries) Regulations 2019 (Vic)
+- OHS Regulations 2017 (Vic) Part 3 (underground mines)
+- Dangerous Goods (Explosives) Regulations 2011 (Vic)
+- Environment Protection Act 2017 (Vic)
+- Planning and Environment Act 1987 (Vic)
+- AS 2187.1/2 (explosives — storage and use)
+- ANCOLD Guidelines (dams — if applicable)
+
+Provide:
+1. Overall compliance risk rating
+2. Safety management system adequacy
+3. Geotechnical and ground control risk
+4. Explosives and blasting risk
+5. Environmental compliance risk
+6. Regulatory standing and enforcement risk
+
+Respond ONLY in JSON:
+{
+  "overallRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "safetyManagementRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "geotechnicalRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "explosivesRisk": "LOW|MODERATE|HIGH",
+  "environmentalRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "regulatoryStandingRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "immediateActions": ["string"],
+  "safetyFindings": ["string"],
+  "environmentalFindings": ["string"],
+  "regulatoryFindings": ["string"],
+  "rehabFindings": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 900,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallRisk: "MODERATE",
+        safetyManagementRisk: "MODERATE",
+        geotechnicalRisk: "MODERATE",
+        explosivesRisk: "LOW",
+        environmentalRisk: "MODERATE",
+        regulatoryStandingRisk: "LOW",
+        immediateActions: ["Review work plan currency with Earth Resources Regulation", "Confirm mine manager appointment and competency documentation"],
+        safetyFindings: ["AI assessment unavailable — engage registered mine safety consultant for formal safety management system audit"],
+        environmentalFindings: ["AI assessment unavailable — review EPA licence conditions and rehabilitation plan"],
+        regulatoryFindings: ["Ensure operating licence is current and work plan is approved under MRSD Act 1990 (Vic)"],
+        rehabFindings: ["Verify rehabilitation bond is current and progressive rehabilitation is on schedule"],
+        applicableStandards: ["Mineral Resources (Sustainable Development) Act 1990 (Vic)", "OHS Regulations 2017 (Vic)", "Environment Protection Act 2017 (Vic)"],
+        summary: "AI mining compliance assessment unavailable. Engage Earth Resources Regulation registered inspector for formal compliance audit.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      operationId: safeOpId,
+      standards: ["Mineral Resources (Sustainable Development) Act 1990 (Vic)", "OHS Regulations 2017 (Vic)", "Environment Protection Act 2017 (Vic)", "AS 2187.1"],
+    });
+  } catch (err) {
+    console.error("POST /ai-mining-compliance-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess mining compliance." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
