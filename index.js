@@ -82520,6 +82520,478 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 288 ─────────────────────────────────────────────────────────────────
+
+// POST /solar-pv-inspection — Record solar PV installation inspection per AS/NZS 5033 / AS/NZS 4777.1
+app.post("/solar-pv-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, installationId, address, inspectionDate, inspectedBy,
+      installerLicenceNumber, installerAccreditationNumber, cleanEnergyCouncilAccredited,
+      systemSizeKwp, panelCount, panelMake, panelModel,
+      inverterMake, inverterModel, inverterRatedKva,
+      batteryStorageInstalled, batteryCapacityKwh, batteryMake,
+      mountingStructureType, roofPenetrationsSealed,
+      stringVoltageVoc, maximumStringVoltageV,
+      isoResistanceMohm, minimumIsoResistanceMohm,
+      polarity, earthContinuityOhm,
+      acDisconnectInstalled, dcDisconnectInstalled,
+      acDisconnectLabelled, dcDisconnectLabelled,
+      antiIslandingTested, antiIslandingPassed,
+      rcdProtected, rcdRatingMa, rcdTestPassed,
+      warningLabelsInstalled, generatorWarningLabel,
+      gridConnectionApproved, networkApprovalReference,
+      stdcFormCompleted, stcClaimed,
+      defectsFound, defectDetails, notes
+    } = req.body;
+
+    if (!installationId || !address || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "installationId, address, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeInstId = sanitiseInput(String(installationId));
+    const safeAddress = sanitiseInput(String(address));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const defects = Array.isArray(defectDetails) ? defectDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const stringVoc = parseFloat(stringVoltageVoc) || null;
+    const maxStringV = parseFloat(maximumStringVoltageV) || null;
+    const isoResistance = parseFloat(isoResistanceMohm) || null;
+    const minIsoResistance = parseFloat(minimumIsoResistanceMohm) || 1; // AS/NZS 5033 minimum 1 MΩ
+    const earthCont = parseFloat(earthContinuityOhm) || null;
+
+    // AS/NZS 5033 — Installation and safety requirements for photovoltaic (PV) arrays
+    // AS/NZS 4777.1 — Grid connection of energy systems via inverters
+    // AS/NZS 3000 — Wiring rules
+    // Clean Energy Council (CEC) Solar PV Installation guidelines
+    if (!cleanEnergyCouncilAccredited) {
+      criticalIssues.push("Installer not confirmed CEC accredited — grid-connected solar PV systems in Victoria must be installed by a CEC accredited installer for STCs and grid connection approval (Energy Safe Victoria).");
+    }
+
+    if (stringVoc !== null && maxStringV !== null && stringVoc > maxStringV) {
+      criticalIssues.push(`String open circuit voltage ${stringVoc} V exceeds maximum system voltage ${maxStringV} V — overvoltage risk. Check panel configuration and inverter rating (AS/NZS 5033 cl.3.3).`);
+    }
+
+    if (isoResistance !== null && isoResistance < minIsoResistance) {
+      criticalIssues.push(`DC isolation resistance ${isoResistance} MΩ below minimum ${minIsoResistance} MΩ — insulation fault. Do not energise until fault located and repaired (AS/NZS 5033 cl.5.3).`);
+    }
+
+    if (!dcDisconnectInstalled) {
+      criticalIssues.push("DC isolator not installed — all grid-connected PV systems require a DC isolator accessible to the installer, emergency services, and occupant (AS/NZS 5033 cl.4.3).");
+    } else if (!dcDisconnectLabelled) {
+      criticalIssues.push("DC isolator not labelled — AS/NZS 5033 requires all DC isolators to be labelled identifying PV source and load circuits.");
+    }
+
+    if (!acDisconnectInstalled) {
+      criticalIssues.push("AC isolator not installed — a main AC disconnect must be provided near the inverter for emergency service use (AS/NZS 4777.1 cl.5).");
+    }
+
+    if (!antiIslandingTested) {
+      criticalIssues.push("Anti-islanding protection not tested — all grid-tied inverters must have anti-islanding tested before connection to the grid (AS/NZS 4777.1 cl.7.3).");
+    } else if (!antiIslandingPassed) {
+      criticalIssues.push("Anti-islanding test FAILED — inverter must not be connected to grid until anti-islanding protection is confirmed functional (AS/NZS 4777.1 cl.7.3).");
+    }
+
+    if (!gridConnectionApproved) {
+      criticalIssues.push("Grid connection not approved by network operator — system must not export to grid without prior network operator approval (National Electricity Rules cl.5.3).");
+    }
+
+    if (earthCont !== null && earthCont > 1) {
+      criticalIssues.push(`Earth continuity ${earthCont} Ω above maximum 1 Ω — insufficient earthing. Check all earth connections and bonding (AS/NZS 5033 cl.3.4).`);
+    }
+
+    if (!roofPenetrationsSealed) {
+      warnings.push("Roof penetrations not confirmed sealed — all cable entry points must be sealed to prevent water ingress (AS/NZS 5033).");
+    }
+
+    if (!warningLabelsInstalled || !generatorWarningLabel) {
+      warnings.push("Warning labels not fully installed — AS/NZS 5033 requires warning labels at all relevant points including main switchboard, meter box, and inverter location.");
+    }
+
+    if (!rcdProtected) {
+      warnings.push("RCD protection for AC circuits not confirmed — AS/NZS 3000 requires RCD protection for solar inverter AC output circuits.");
+    } else if (!rcdTestPassed) {
+      warnings.push("RCD test not passed — verify RCD operation meets AS/NZS 3000 requirements.");
+    }
+
+    if (!stdcFormCompleted) {
+      warnings.push("Solar installation compliance form (STDC/EVEC) not completed — required for compliance and STC claiming (CEC guidelines).");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "FAIL" : warnings.length > 0 ? "CONDITIONAL_PASS" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("solar_pv_inspections")
+        .insert({
+          project_id: safeProject,
+          installation_id: safeInstId,
+          address: safeAddress,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          installer_licence: installerLicenceNumber ? sanitiseInput(String(installerLicenceNumber)) : null,
+          cec_accreditation: installerAccreditationNumber ? sanitiseInput(String(installerAccreditationNumber)) : null,
+          cec_accredited: cleanEnergyCouncilAccredited !== false && cleanEnergyCouncilAccredited !== "false",
+          system_size_kwp: parseFloat(systemSizeKwp) || null,
+          panel_count: parseInt(panelCount) || null,
+          panel_make: panelMake ? sanitiseInput(String(panelMake)) : null,
+          panel_model: panelModel ? sanitiseInput(String(panelModel)) : null,
+          inverter_make: inverterMake ? sanitiseInput(String(inverterMake)) : null,
+          inverter_model: inverterModel ? sanitiseInput(String(inverterModel)) : null,
+          inverter_rated_kva: parseFloat(inverterRatedKva) || null,
+          battery_installed: batteryStorageInstalled || false,
+          battery_capacity_kwh: parseFloat(batteryCapacityKwh) || null,
+          battery_make: batteryMake ? sanitiseInput(String(batteryMake)) : null,
+          mounting_type: mountingStructureType ? sanitiseInput(String(mountingStructureType)) : null,
+          roof_penetrations_sealed: roofPenetrationsSealed !== false && roofPenetrationsSealed !== "false",
+          string_voltage_voc: stringVoc,
+          max_string_voltage_v: maxStringV,
+          iso_resistance_mohm: isoResistance,
+          polarity_ok: polarity !== false && polarity !== "false",
+          earth_continuity_ohm: earthCont,
+          ac_disconnect_installed: acDisconnectInstalled !== false && acDisconnectInstalled !== "false",
+          dc_disconnect_installed: dcDisconnectInstalled !== false && dcDisconnectInstalled !== "false",
+          anti_islanding_tested: antiIslandingTested !== false && antiIslandingTested !== "false",
+          anti_islanding_passed: antiIslandingPassed !== false && antiIslandingPassed !== "false",
+          rcd_protected: rcdProtected !== false && rcdProtected !== "false",
+          rcd_test_passed: rcdTestPassed !== false && rcdTestPassed !== "false",
+          warning_labels_ok: warningLabelsInstalled !== false && warningLabelsInstalled !== "false",
+          grid_connection_approved: gridConnectionApproved !== false && gridConnectionApproved !== "false",
+          network_approval_ref: networkApprovalReference ? sanitiseInput(String(networkApprovalReference)) : null,
+          stdc_form_completed: stdcFormCompleted !== false && stdcFormCompleted !== "false",
+          defects_found: defectsFound || false,
+          defect_details: defects,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Solar PV installation defects — do not energise/connect to grid until all critical issues are rectified.",
+        standards: ["AS/NZS 5033", "AS/NZS 4777.1", "AS/NZS 3000", "Energy Safe Victoria"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      installationId: safeInstId,
+      standards: ["AS/NZS 5033", "AS/NZS 4777.1", "AS/NZS 3000"],
+    });
+  } catch (err) {
+    console.error("POST /solar-pv-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record solar PV inspection." });
+  }
+});
+
+// POST /ev-charging-station-inspection — Record EV charging station inspection per AS/NZS 3000 / AS 4044
+app.post("/ev-charging-station-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, stationId, location, inspectionDate, inspectedBy,
+      stationMake, stationModel, stationType, ratedOutputKw,
+      installationYear, installedByLicensedElectrician, installerLicenceNumber,
+      networkConnected, networkOperator,
+      enclosureIntegrityOk, displayFunctional, connectorCondition,
+      cableCondition, cableLength,
+      earthingOk, rcdInstalled, rcdTested, rcdTestPassed, rcdRatingMa,
+      protectiveBondingOk, circuitBreakerRatingA, circuitBreakerOk,
+      voltageAtOutletV, currentOutputA,
+      accessibilityCompliant, clearanceFromFlammablesM, outdoorWeatherRating,
+      remoteManagementFunctional, billingSystemFunctional,
+      emergencyStopInstalled, emergencyStopFunctional,
+      lastServiceDate, firmwareUpToDate,
+      defectsFound, defectDetails, notes
+    } = req.body;
+
+    if (!stationId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "stationId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeStationId = sanitiseInput(String(stationId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const defects = Array.isArray(defectDetails) ? defectDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const voltageAtOutlet = parseFloat(voltageAtOutletV) || null;
+    const clearance = parseFloat(clearanceFromFlammablesM) || null;
+
+    // AS/NZS 3000 — Wiring rules
+    // AS 4044 — Electrical vehicle supply equipment (EVSE)
+    // Energy Safe Victoria — EV charging installation requirements
+    if (!enclosureIntegrityOk) {
+      criticalIssues.push("Charging station enclosure not intact — live components potentially accessible. Take out of service immediately (AS/NZS 3000 cl.2.12).");
+    }
+
+    if (!rcdInstalled) {
+      criticalIssues.push("RCD not installed — all EV charging equipment must be RCD protected (AS/NZS 3000 cl.2.6 / AS 4044).");
+    } else if (!rcdTestPassed) {
+      criticalIssues.push("RCD test FAILED — RCD must be replaced before charging station is energised (AS/NZS 3000 cl.2.6).");
+    }
+
+    if (!earthingOk || !protectiveBondingOk) {
+      criticalIssues.push("Earthing or protective bonding fault — potential electrocution hazard for vehicle users. Remove from service (AS/NZS 3000 cl.5.4).");
+    }
+
+    const connCond = String(connectorCondition || "").toUpperCase();
+    if (connCond === "DAMAGED" || connCond === "FAILED") {
+      criticalIssues.push("Charging connector damaged — damaged connectors pose electrical shock and fire risk. Replace before use.");
+    }
+
+    const cableCond = String(cableCondition || "").toUpperCase();
+    if (cableCond === "DAMAGED" || cableCond === "FRAYED") {
+      criticalIssues.push("Charging cable damaged/frayed — replace charging cable immediately. Damaged insulation is a shock hazard (AS/NZS 3000).");
+    }
+
+    if (!installedByLicensedElectrician) {
+      criticalIssues.push("EV charging station not confirmed installed by licensed electrician — all electrical installations require a licensed electrician under Energy Safe Victoria regulations.");
+    }
+
+    if (!emergencyStopInstalled) {
+      warnings.push("Emergency stop not confirmed installed — Level 2 and DC fast chargers should have an accessible emergency stop (AS 4044).");
+    } else if (!emergencyStopFunctional) {
+      warnings.push("Emergency stop not functional — repair or replace before returning to service.");
+    }
+
+    if (voltageAtOutlet !== null && (voltageAtOutlet < 216 || voltageAtOutlet > 253)) {
+      warnings.push(`Output voltage ${voltageAtOutlet} V outside nominal range 216–253 V (AS 60038 tolerance ±10% of 230 V) — investigate supply quality.`);
+    }
+
+    if (clearance !== null && clearance < 1) {
+      warnings.push(`Clearance from flammables ${clearance} m — EV chargers should maintain minimum 1 m clearance from flammable storage (Dangerous Goods Act 1985 (Vic)).`);
+    }
+
+    if (!accessibilityCompliant) {
+      warnings.push("Accessibility compliance not confirmed — public EV charging stations must comply with AS 1428.1 access requirements.");
+    }
+
+    if (!firmwareUpToDate) {
+      warnings.push("Firmware not confirmed up to date — outdated firmware can cause safety, interoperability, and billing issues.");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "OUT_OF_SERVICE" : warnings.length > 0 ? "CONDITIONAL_PASS" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("ev_charging_inspections")
+        .insert({
+          project_id: safeProject,
+          station_id: safeStationId,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          station_make: stationMake ? sanitiseInput(String(stationMake)) : null,
+          station_model: stationModel ? sanitiseInput(String(stationModel)) : null,
+          station_type: stationType ? sanitiseInput(String(stationType)) : null,
+          rated_output_kw: parseFloat(ratedOutputKw) || null,
+          installation_year: parseInt(installationYear) || null,
+          licensed_electrician: installedByLicensedElectrician !== false && installedByLicensedElectrician !== "false",
+          installer_licence: installerLicenceNumber ? sanitiseInput(String(installerLicenceNumber)) : null,
+          network_connected: networkConnected || false,
+          network_operator: networkOperator ? sanitiseInput(String(networkOperator)) : null,
+          enclosure_ok: enclosureIntegrityOk !== false && enclosureIntegrityOk !== "false",
+          rcd_installed: rcdInstalled !== false && rcdInstalled !== "false",
+          rcd_tested: rcdTested !== false && rcdTested !== "false",
+          rcd_test_passed: rcdTestPassed !== false && rcdTestPassed !== "false",
+          rcd_rating_ma: parseFloat(rcdRatingMa) || null,
+          earthing_ok: earthingOk !== false && earthingOk !== "false",
+          protective_bonding_ok: protectiveBondingOk !== false && protectiveBondingOk !== "false",
+          circuit_breaker_ok: circuitBreakerOk !== false && circuitBreakerOk !== "false",
+          voltage_v: voltageAtOutlet,
+          connector_condition: connectorCondition ? sanitiseInput(String(connectorCondition)) : null,
+          cable_condition: cableCondition ? sanitiseInput(String(cableCondition)) : null,
+          emergency_stop_installed: emergencyStopInstalled !== false && emergencyStopInstalled !== "false",
+          emergency_stop_functional: emergencyStopFunctional !== false && emergencyStopFunctional !== "false",
+          accessibility_compliant: accessibilityCompliant !== false && accessibilityCompliant !== "false",
+          firmware_current: firmwareUpToDate !== false && firmwareUpToDate !== "false",
+          defects_found: defectsFound || false,
+          defect_details: defects,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "EV charging station removed from service — electrical safety defects must be rectified before re-energising.",
+        standards: ["AS/NZS 3000", "AS 4044", "Energy Safe Victoria"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      stationId: safeStationId,
+      standards: ["AS/NZS 3000", "AS 4044"],
+    });
+  } catch (err) {
+    console.error("POST /ev-charging-station-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record EV charging station inspection." });
+  }
+});
+
+// POST /ai-renewable-energy-compliance — AI assesses building renewable energy system compliance
+app.post("/ai-renewable-energy-compliance", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      buildingId, buildingType, buildingClass, nccClimateZone,
+      solarPvInstalled, solarCapacityKwp, solarSystemAge, solarLastInspection,
+      batteryStorageInstalled, batteryCapacityKwh, batterySystemAge,
+      evChargingInstalled, evChargingCount, evChargingCapacityKw,
+      gridExportEnabled, exportLimitKw,
+      nccSectionJCompliant, basixCertificate, greenStarRating,
+      energyBenchmarkNabers, targetNabers,
+      energyAuditConducted, lastAuditDate,
+      metersSubmetered, energyManagementSystemInstalled,
+      annualEnergyKwh, peakDemandKw,
+      deficienciesNoted, notes
+    } = req.body;
+
+    if (!buildingId) {
+      return res.status(400).json({ error: "buildingId is required." });
+    }
+
+    const safeBuildingId = sanitiseInput(String(buildingId));
+    const deficiencies = Array.isArray(deficienciesNoted) ? deficienciesNoted : [];
+
+    const prompt = `You are a renewable energy and building energy efficiency expert. Assess this building's renewable energy systems and energy compliance under Victorian and Australian regulations.
+
+Building ID: ${safeBuildingId}
+Building type: ${buildingType || "Unknown"}
+Building class: ${buildingClass || "Unknown"}
+NCC climate zone: ${nccClimateZone || "Unknown"}
+
+SOLAR PV:
+- Installed: ${solarPvInstalled ? "Yes — " + (solarCapacityKwp || "unknown") + " kWp, age: " + (solarSystemAge || "unknown") + " years" : "No"}
+- Last inspection: ${solarLastInspection || "Unknown"}
+
+BATTERY STORAGE:
+- Installed: ${batteryStorageInstalled ? "Yes — " + (batteryCapacityKwh || "unknown") + " kWh, age: " + (batterySystemAge || "unknown") + " years" : "No"}
+
+EV CHARGING:
+- Installed: ${evChargingInstalled ? "Yes — " + (evChargingCount || 0) + " chargers, " + (evChargingCapacityKw || "unknown") + " kW total" : "No"}
+
+GRID CONNECTION:
+- Export enabled: ${gridExportEnabled ? "Yes (limit: " + (exportLimitKw || "unlimited") + " kW)" : "No"}
+
+COMPLIANCE RATINGS:
+- NCC Section J compliant: ${nccSectionJCompliant ? "Yes" : "No/Unknown"}
+- BASIX certificate: ${basixCertificate || "N/A"}
+- NABERS energy rating: ${energyBenchmarkNabers ? energyBenchmarkNabers + " stars (target: " + (targetNabers || "N/A") + " stars)" : "Not rated"}
+- Green Star rating: ${greenStarRating || "Not rated"}
+
+MANAGEMENT:
+- Energy audit conducted: ${energyAuditConducted ? "Yes — last: " + (lastAuditDate || "unknown") : "No"}
+- Submetered: ${metersSubmetered ? "Yes" : "No"}
+- EMS installed: ${energyManagementSystemInstalled ? "Yes" : "No"}
+- Annual energy: ${annualEnergyKwh ? annualEnergyKwh + " kWh/year" : "Unknown"}
+- Peak demand: ${peakDemandKw ? peakDemandKw + " kW" : "Unknown"}
+
+Deficiencies: ${deficiencies.join("; ") || "None"}
+
+Assess under:
+- NCC 2022 Volume 1 Section J (energy efficiency — Class 2–9 buildings)
+- NCC 2022 Volume 2 (energy efficiency — Class 1 buildings)
+- AS/NZS 5033 (solar PV installation)
+- AS/NZS 4777.1 (grid-connected inverters)
+- AS/NZS 4755 (demand response)
+- Victorian Energy Upgrades (VEU) program
+- Victoria's renewable energy targets (VRET)
+- NABERS Energy for Offices/Hotels/Data Centres
+
+Provide:
+1. Overall renewable energy compliance status
+2. Solar PV system compliance
+3. Battery storage compliance
+4. NCC energy efficiency compliance
+5. Energy performance against benchmarks
+6. Opportunities and recommendations
+
+Respond ONLY in JSON:
+{
+  "overallCompliance": "COMPLIANT|PARTIALLY_COMPLIANT|NON_COMPLIANT",
+  "solarCompliance": "COMPLIANT|ATTENTION_REQUIRED|NON_COMPLIANT|NOT_INSTALLED",
+  "batteryCompliance": "COMPLIANT|ATTENTION_REQUIRED|NON_COMPLIANT|NOT_INSTALLED",
+  "nccEnergyCompliance": "COMPLIANT|PARTIALLY_COMPLIANT|NON_COMPLIANT|UNKNOWN",
+  "nabersBenchmarkStatus": "string",
+  "complianceGaps": ["string"],
+  "energyOpportunities": ["string"],
+  "renewableEnergyFindings": ["string"],
+  "recommendedActions": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallCompliance: "PARTIALLY_COMPLIANT",
+        solarCompliance: solarPvInstalled ? "ATTENTION_REQUIRED" : "NOT_INSTALLED",
+        batteryCompliance: batteryStorageInstalled ? "ATTENTION_REQUIRED" : "NOT_INSTALLED",
+        nccEnergyCompliance: "UNKNOWN",
+        nabersBenchmarkStatus: "Not assessed — AI unavailable",
+        complianceGaps: ["AI assessment unavailable — engage energy assessor for formal NCC Section J and NABERS review"],
+        energyOpportunities: ["Consider solar PV to offset energy consumption and achieve Victorian renewable energy targets"],
+        renewableEnergyFindings: ["Verify all solar installations are inspected per AS/NZS 5033 annually"],
+        recommendedActions: ["Commission NABERS energy assessment", "Review NCC Section J compliance documentation"],
+        applicableStandards: ["NCC 2022 Section J", "AS/NZS 5033", "AS/NZS 4777.1"],
+        summary: "AI renewable energy compliance assessment unavailable. Engage an accredited energy assessor for formal review.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      buildingId: safeBuildingId,
+      standards: ["NCC 2022 Section J", "AS/NZS 5033", "AS/NZS 4777.1", "Victorian Energy Upgrades (VEU)"],
+    });
+  } catch (err) {
+    console.error("POST /ai-renewable-energy-compliance error:", err.message);
+    res.status(500).json({ error: "Failed to assess renewable energy compliance." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
