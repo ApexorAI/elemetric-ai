@@ -48608,6 +48608,267 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /building-permit-register — Register a building permit
+app.post("/building-permit-register", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectAddress, propertyTitle,
+    ownerName, builderName, builderRegistrationNumber,
+    buildingSurveyorName, buildingSurveyorRegistration, surveyorOrganisation,
+    permitType, permitNumber, issueDate, expiryDate,
+    worksDescription, buildingClass, storeys,
+    permitCost, estimatedCostOfWorks,
+    occupancyPermitRequired, occupancyPermitNumber, occupancyPermitDate,
+    mandatoryInspections, inspectionsSatisfied,
+    status, notes,
+  } = req.body;
+
+  if (!projectId || !projectAddress || !permitType) {
+    return res.status(400).json({ error: "projectId, projectAddress, and permitType are required." });
+  }
+
+  const sanitisedAddress = sanitiseInput(projectAddress, 300);
+  const sanitisedPermitType = sanitiseInput(permitType, 80);
+
+  const validStatuses = ["APPLIED", "ISSUED", "ACTIVE", "EXPIRED", "CANCELLED", "COMPLETE"];
+  const resolvedStatus = validStatuses.includes((status || "").toUpperCase()) ? status.toUpperCase() : "APPLIED";
+
+  // Victorian permit types under Building Act 1993
+  const permitTypeInfo = {
+    "BUILDING_PERMIT": "Required for all building work under Building Act 1993 s.16",
+    "PLANNING_PERMIT": "Required for development subject to Planning and Environment Act 1987",
+    "PLUMBING_PERMIT": "Required for all plumbing work under Plumbing Regulations 2018",
+    "OCCUPANCY_PERMIT": "Required before occupying a new or refurbished building (s.37 BA)",
+    "WORKS_ON_ROAD_PERMIT": "Required for works within road reserve",
+    "ASSET_PROTECTION_PERMIT": "Required by most councils for works adjacent to public assets",
+    "DEMOLITION_PERMIT": "Required for demolition of buildings under Building Act 1993 s.29",
+  };
+
+  const permitTypeDescription = permitTypeInfo[sanitisedPermitType.toUpperCase().replace(/ /g, "_")] || "Refer to the relevant legislation.";
+
+  // Check expiry
+  const today = new Date();
+  let daysUntilExpiry = null;
+  let expiryWarning = null;
+  if (expiryDate) {
+    daysUntilExpiry = Math.ceil((new Date(expiryDate) - today) / (1000 * 60 * 60 * 24));
+    if (daysUntilExpiry < 0) expiryWarning = "Permit has EXPIRED. Works cannot continue — apply for extension or new permit.";
+    else if (daysUntilExpiry <= 30) expiryWarning = `Permit expires in ${daysUntilExpiry} day(s) — apply for extension now.`;
+  }
+
+  // Mandatory inspections tracking
+  const processedInspections = Array.isArray(mandatoryInspections)
+    ? mandatoryInspections.slice(0, 20).map(insp => ({
+        stage: sanitiseInput(String(insp.stage || insp), 100),
+        required: true,
+        satisfied: Array.isArray(inspectionsSatisfied) && inspectionsSatisfied.includes(insp.stage || insp),
+        satisfiedDate: null,
+      }))
+    : [];
+
+  const ref = `BPR-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectAddress: sanitisedAddress,
+    propertyTitle: sanitiseInput(propertyTitle || "", 80),
+    owner: { name: sanitiseInput(ownerName || "", 150) },
+    builder: {
+      name: sanitiseInput(builderName || "", 150),
+      registrationNumber: sanitiseInput(builderRegistrationNumber || "", 60),
+    },
+    buildingSurveyor: {
+      name: sanitiseInput(buildingSurveyorName || "", 150),
+      registration: sanitiseInput(buildingSurveyorRegistration || "", 60),
+      organisation: sanitiseInput(surveyorOrganisation || "", 150),
+    },
+    permit: {
+      type: sanitisedPermitType,
+      typeDescription: permitTypeDescription,
+      number: sanitiseInput(permitNumber || "", 60),
+      issueDate: issueDate || null,
+      expiryDate: expiryDate || null,
+      daysUntilExpiry,
+      estimatedCostOfWorks: estimatedCostOfWorks || null,
+      permitCost: permitCost || null,
+    },
+    works: {
+      description: sanitiseInput(worksDescription || "", 400),
+      buildingClass: sanitiseInput(String(buildingClass || ""), 20),
+      storeys: storeys || null,
+    },
+    occupancyPermit: {
+      required: !!occupancyPermitRequired,
+      number: sanitiseInput(occupancyPermitNumber || "", 60),
+      issueDate: occupancyPermitDate || null,
+    },
+    mandatoryInspections: processedInspections,
+    status: resolvedStatus,
+    expiryWarning,
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("building_permit_register").insert(record);
+      if (error) console.error("Building permit insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Building permit DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    permitType: sanitisedPermitType,
+    status: resolvedStatus,
+    daysUntilExpiry,
+    expiryWarning,
+    message: expiryWarning || `Building permit registered: ${permitNumber || ref} (${sanitisedPermitType}).`,
+    saved,
+    record,
+  });
+});
+
+// GET /building-permit-register/:projectId — List permits for a project
+app.get("/building-permit-register/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { status, type } = req.query;
+
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  try {
+    let query = supabaseAdmin
+      .from("building_permit_register")
+      .select("*")
+      .eq("projectId", sanitiseInput(String(projectId), 80))
+      .order("createdAt", { ascending: false });
+
+    if (status) query = query.eq("status", sanitiseInput(String(status), 20).toUpperCase());
+    if (type) query = query.ilike("permit->type", `%${sanitiseInput(String(type), 40)}%`);
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const records = data || [];
+    const today = new Date();
+    const activeCount = records.filter(r => r.status === "ACTIVE" || r.status === "ISSUED").length;
+    const expiredCount = records.filter(r => r.expiryWarning && r.expiryWarning.includes("EXPIRED")).length;
+    const expiringSoonCount = records.filter(r => r.daysUntilExpiry !== null && r.daysUntilExpiry >= 0 && r.daysUntilExpiry <= 30).length;
+
+    return res.json({
+      projectId,
+      total: records.length,
+      activeCount,
+      expiredCount,
+      expiringSoonCount,
+      permits: records,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to retrieve building permits.", detail: e.message });
+  }
+});
+
+// POST /ai-permit-checklist — AI generates a checklist of required permits for a proposed project
+app.post("/ai-permit-checklist", apiKeyAuth, async (req, res) => {
+  const {
+    projectType, buildingClass, projectAddress, councilArea,
+    worksDescription, storeys, siteAreaM2, floorAreaM2,
+    demolitionInvolved, heritageSite, floodZone, bushfireZone,
+    nearWaterway, asbestosSuspected, notes,
+  } = req.body;
+
+  if (!projectType || !worksDescription) {
+    return res.status(400).json({ error: "projectType and worksDescription are required." });
+  }
+
+  const sanitisedType = sanitiseInput(projectType, 100);
+  const sanitisedWorks = sanitiseInput(worksDescription, 400);
+
+  const prompt = `You are a Victorian building permit consultant with expertise in the Building Act 1993, Planning and Environment Act 1987, and all relevant Victorian legislation.
+
+Identify all required permits and approvals for the following project:
+- Project type: ${sanitisedType}
+- Building class (NCC): ${sanitiseInput(String(buildingClass || ""), 20)}
+- Address: ${sanitiseInput(projectAddress || "Victoria, Australia", 200)}
+- Council area: ${sanitiseInput(councilArea || "Not specified", 100)}
+- Works: ${sanitisedWorks}
+- Storeys: ${storeys || "Not specified"}
+- Site area: ${siteAreaM2 ? `${siteAreaM2}m²` : "Not specified"}
+- Floor area: ${floorAreaM2 ? `${floorAreaM2}m²` : "Not specified"}
+- Demolition: ${demolitionInvolved ? "Yes" : "No"}
+- Heritage site: ${heritageSite ? "Yes" : "No"}
+- Flood zone: ${floodZone ? "Yes" : "No"}
+- Bushfire zone: ${bushfireZone ? "Yes" : "No"}
+- Near waterway: ${nearWaterway ? "Yes" : "No"}
+- Asbestos suspected: ${asbestosSuspected ? "Yes" : "No"}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Respond ONLY with a JSON object:
+{
+  "requiredPermits": [{"permit": string, "authority": string, "legislation": string, "mandatory": boolean, "estimatedTimeDays": number, "estimatedCost": string, "notes": string}],
+  "conditionalPermits": [{"permit": string, "condition": string, "authority": string}],
+  "notifications": [{"notification": string, "authority": string, "timing": string}],
+  "exemptions": [string],
+  "criticalPathItems": [string],
+  "totalEstimatedLeadTimeDays": number,
+  "summary": string (2-3 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1200,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      projectType: sanitisedType,
+      requiredPermits: parsed.requiredPermits || [],
+      conditionalPermits: parsed.conditionalPermits || [],
+      notifications: parsed.notifications || [],
+      exemptions: parsed.exemptions || [],
+      criticalPathItems: parsed.criticalPathItems || [],
+      totalEstimatedLeadTimeDays: parsed.totalEstimatedLeadTimeDays || null,
+      summary: parsed.summary || "Permit checklist generated.",
+      disclaimer: "This is a preliminary checklist only. Confirm all requirements with the relevant council, VBA, and building surveyor.",
+    });
+  } catch (e) {
+    console.error("AI permit checklist error:", e.message);
+    const permits = [
+      { permit: "Building Permit", authority: "Private or Municipal Building Surveyor", legislation: "Building Act 1993 s.16", mandatory: true, estimatedTimeDays: 10, estimatedCost: "0.5–1% of works cost", notes: "Required for all building work above $10,000 (certain exemptions apply)" },
+      { permit: "Planning Permit", authority: "Local Council", legislation: "Planning and Environment Act 1987", mandatory: null, estimatedTimeDays: 60, estimatedCost: "$1,500–$3,000+", notes: "May be required depending on zone and overlay" },
+      { permit: "Plumbing Permit", authority: "VBA (self-reported by licensed plumber)", legislation: "Plumbing Regulations 2018", mandatory: true, estimatedTimeDays: 1, estimatedCost: "$200–$500", notes: "Required for all notifiable plumbing work" },
+    ];
+    if (demolitionInvolved) {
+      permits.push({ permit: "Demolition Permit", authority: "Building Surveyor", legislation: "Building Act 1993 s.29", mandatory: true, estimatedTimeDays: 5, estimatedCost: "$500–$1,500", notes: "Required for demolition of buildings over certain size thresholds" });
+    }
+    return res.json({
+      success: true,
+      projectType: sanitisedType,
+      requiredPermits: permits,
+      conditionalPermits: [],
+      notifications: [
+        { notification: "WorkSafe Victoria notification for notifiable construction work", authority: "WorkSafe Victoria", timing: "Before construction commences" },
+      ],
+      exemptions: ["Minor maintenance works may be exempt from building permit requirements — confirm with building surveyor"],
+      criticalPathItems: ["Obtain planning permit (if required) before applying for building permit", "Engage building surveyor early — they issue the building permit"],
+      totalEstimatedLeadTimeDays: demolitionInvolved ? 75 : 65,
+      summary: "Standard Victorian permit requirements identified. A building permit from a registered building surveyor is typically the critical first step.",
+      disclaimer: "This is a preliminary checklist only. Confirm all requirements with the relevant council, VBA, and building surveyor.",
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
