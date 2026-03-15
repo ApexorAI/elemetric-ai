@@ -24101,6 +24101,167 @@ Assess in JSON:
   }
 });
 
+// POST /job-budget  — Create or update a job budget
+app.post("/job-budget", apiKeyAuth, async (req, res) => {
+  const { jobId, contractorId, budgetItems = [] } = req.body || {};
+  if (!jobId || !Array.isArray(budgetItems) || budgetItems.length === 0) return res.status(400).json({ error: "jobId and budgetItems array required." });
+
+  const VALID_CATEGORIES = ["labour", "materials", "equipment-hire", "subcontractors", "permits", "travel", "overhead", "contingency", "other"];
+  const safeJobId = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeCId   = contractorId ? sanitiseInput(String(contractorId)).slice(0, 80) : null;
+
+  const items = budgetItems.slice(0, 50).map(item => ({
+    category:    VALID_CATEGORIES.includes(String(item.category || "").toLowerCase().replace(/ /g, "-")) ? String(item.category).toLowerCase().replace(/ /g, "-") : "other",
+    description: sanitiseInput(String(item.description || "")).slice(0, 150),
+    estimated:   Math.max(0, parseFloat(item.estimated) || 0),
+    actual:      item.actual !== undefined ? Math.max(0, parseFloat(item.actual) || 0) : null,
+  }));
+
+  const totalEstimated = parseFloat(items.reduce((s, i) => s + i.estimated, 0).toFixed(2));
+  const itemsWithActual = items.filter(i => i.actual !== null);
+  const totalActual = itemsWithActual.length > 0 ? parseFloat(itemsWithActual.reduce((s, i) => s + (i.actual || 0), 0).toFixed(2)) : null;
+  const variance = totalActual !== null ? parseFloat((totalActual - totalEstimated).toFixed(2)) : null;
+
+  const budget = {
+    jobId: safeJobId, contractorId: safeCId,
+    totalEstimated, totalActual, variance,
+    status: variance === null ? "DRAFT" : variance > totalEstimated * 0.1 ? "OVER_BUDGET" : variance < 0 ? "UNDER_BUDGET" : "ON_BUDGET",
+    items, updatedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("job_budgets").upsert({
+        job_id: safeJobId, contractor_id: safeCId, total_estimated: totalEstimated,
+        total_actual: totalActual, variance, status: budget.status, items,
+        updated_at: budget.updatedAt,
+      }, { onConflict: "job_id" });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.json({ ...budget, saved: !!supabaseAdmin });
+});
+
+// GET /job-budget/:jobId  — Get the current budget for a job
+app.get("/job-budget/:jobId", apiKeyAuth, async (req, res) => {
+  const jobId = sanitiseInput(String(req.params.jobId || "")).slice(0, 80);
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  let budget = null;
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin.from("job_budgets").select("*").eq("job_id", jobId).order("updated_at", { ascending: false }).limit(1).single();
+      budget = data || null;
+    } catch (_) { /* ignore */ }
+  }
+
+  if (!budget) return res.json({ jobId, budget: null, message: "No budget found." });
+  return res.json({ jobId, budget, generatedAt: new Date().toISOString() });
+});
+
+// POST /purchase-order  — Raise a purchase order for materials
+app.post("/purchase-order", apiKeyAuth, async (req, res) => {
+  const { jobId, contractorId, supplier, items = [], requiredByDate, notes } = req.body || {};
+  if (!jobId || !supplier || !Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "jobId, supplier, and items required." });
+
+  const safeJobId  = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeCId    = contractorId ? sanitiseInput(String(contractorId)).slice(0, 80) : null;
+  const safeSupplier = sanitiseInput(String(supplier)).slice(0, 150);
+  const safeReqDate = requiredByDate ? sanitiseInput(String(requiredByDate)).slice(0, 20) : null;
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const orderItems = items.slice(0, 100).map(item => ({
+    description: sanitiseInput(String(item.description || "")).slice(0, 150),
+    quantity:    Math.max(0, parseFloat(item.quantity) || 1),
+    unit:        item.unit ? sanitiseInput(String(item.unit)).slice(0, 20) : "unit",
+    unitPrice:   Math.max(0, parseFloat(item.unitPrice) || 0),
+    lineTotal:   parseFloat((Math.max(0, parseFloat(item.quantity) || 1) * Math.max(0, parseFloat(item.unitPrice) || 0)).toFixed(2)),
+  }));
+
+  const subtotal = parseFloat(orderItems.reduce((s, i) => s + i.lineTotal, 0).toFixed(2));
+  const gst      = parseFloat((subtotal * 0.1).toFixed(2));
+  const total    = parseFloat((subtotal + gst).toFixed(2));
+
+  const po = {
+    poNumber: `PO-${safeJobId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    jobId: safeJobId, contractorId: safeCId, supplier: safeSupplier,
+    items: orderItems, subtotal, gst, total,
+    requiredByDate: safeReqDate, status: "PENDING", notes: safeNotes,
+    issuedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("purchase_orders").insert({
+        po_number: po.poNumber, job_id: safeJobId, contractor_id: safeCId, supplier: safeSupplier,
+        items: orderItems, subtotal, gst, total, required_by_date: safeReqDate,
+        status: "PENDING", notes: safeNotes, issued_at: po.issuedAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...po, saved: !!supabaseAdmin });
+});
+
+// GET /purchase-order/:jobId  — Get all purchase orders for a job
+app.get("/purchase-order/:jobId", apiKeyAuth, async (req, res) => {
+  const jobId  = sanitiseInput(String(req.params.jobId || "")).slice(0, 80);
+  const status = req.query.status ? sanitiseInput(String(req.query.status)).toUpperCase() : null;
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  let orders = [];
+  if (supabaseAdmin) {
+    try {
+      let q = supabaseAdmin.from("purchase_orders").select("*").eq("job_id", jobId).order("issued_at", { ascending: false }).limit(50);
+      if (status) q = q.eq("status", status);
+      const { data } = await q;
+      orders = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const totalValue = parseFloat(orders.reduce((s, o) => s + (o.total || 0), 0).toFixed(2));
+  return res.json({ jobId, orderCount: orders.length, totalValue, filter: status || "all", orders, generatedAt: new Date().toISOString() });
+});
+
+// POST /ai-photo-caption  — AI generates a caption for a compliance photo
+app.post("/ai-photo-caption", apiKeyAuth, async (req, res) => {
+  const { jobType, photoCategory, context, imageUrl } = req.body || {};
+  if (!jobType || !photoCategory) return res.status(400).json({ error: "jobType and photoCategory required." });
+  if (imageUrl && !isSafeUrl(imageUrl)) return res.status(400).json({ error: "Invalid imageUrl." });
+
+  const safeType     = sanitiseInput(String(jobType)).slice(0, 40);
+  const safeCategory = sanitiseInput(String(photoCategory)).slice(0, 60);
+  const safeContext  = context ? sanitiseInput(String(context)).slice(0, 300) : null;
+
+  const messages = imageUrl
+    ? [{ role: "user", content: [
+        { type: "text", text: `Generate a professional compliance photo caption for a ${safeType} job.\nPhoto category: ${safeCategory}${safeContext ? `\nContext: ${safeContext}` : ""}\n\nRespond with JSON: {"caption": "...", "complianceNote": "...", "suggestedFilename": "YYYY-MM-DD_category_description.jpg"}` },
+        { type: "image_url", image_url: { url: imageUrl } },
+      ]}]
+    : [{ role: "user", content: `Generate a professional compliance photo caption for a ${safeType} job.\nPhoto category: ${safeCategory}${safeContext ? `\nContext: ${safeContext}` : ""}\n\nRespond with JSON: {"caption": "...", "complianceNote": "...", "suggestedFilename": "YYYY-MM-DD_category_description.jpg"}` }];
+
+  try {
+    const aiRes = await callOpenAIWithRetry(messages, { response_format: { type: "json_object" }, max_tokens: 200 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      jobType: safeType, photoCategory: safeCategory,
+      caption:           parsed.caption || `${safeType} — ${safeCategory}`,
+      complianceNote:    parsed.complianceNote || null,
+      suggestedFilename: parsed.suggestedFilename || `${new Date().toISOString().split("T")[0]}_${safeCategory.replace(/ /g, "_")}.jpg`,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      jobType: safeType, photoCategory: safeCategory,
+      caption: `${safeType.charAt(0).toUpperCase() + safeType.slice(1)} — ${safeCategory}`,
+      complianceNote: null,
+      suggestedFilename: `${new Date().toISOString().split("T")[0]}_${safeCategory.replace(/ /g, "_")}.jpg`,
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
