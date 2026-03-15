@@ -43767,6 +43767,332 @@ Return JSON with:
   }
 });
 
+// POST /erosion-sediment-control — Log an ESC inspection (EPA Victoria SEPP Waters)
+app.post("/erosion-sediment-control", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, inspectorName, inspectionDate,
+    rainfall24hMm, siteSlopePercent, distanceToWaterwaym,
+    sedimentBasinInstalled, sedimentBasinFunctional, sedimentBasinCapacityM3,
+    siltFenceInstalled, siltFenceDamaged, siltFenceLength,
+    stabExitInstalled, stabExitCondition,
+    turbidBarrierInstalled, turbidBarrierCondition,
+    vegetationCoverPercent, exposedAreaM2,
+    drainageConnected, turbidDischargeObserved, odourObserved,
+    correctiveActions, nextInspectionDate, notes,
+  } = req.body;
+
+  if (!projectId || !inspectorName || !inspectionDate) {
+    return res.status(400).json({ error: "projectId, inspectorName, and inspectionDate are required." });
+  }
+
+  const sanitisedInspector = sanitiseInput(inspectorName, 120);
+  const sanitisedProject = sanitiseInput(projectName || "", 200);
+
+  // Risk scoring per EPA SEPP Waters factors
+  let riskPoints = 0;
+  if ((rainfall24hMm || 0) > 10) riskPoints += 2;
+  if ((rainfall24hMm || 0) > 25) riskPoints += 2;
+  if ((siteSlopePercent || 0) > 5) riskPoints += 1;
+  if ((distanceToWaterwaym || 999) < 50) riskPoints += 3;
+  if ((distanceToWaterwaym || 999) < 10) riskPoints += 2;
+  if (sedimentBasinInstalled && !sedimentBasinFunctional) riskPoints += 3;
+  if (!sedimentBasinInstalled) riskPoints += 2;
+  if (siltFenceDamaged) riskPoints += 2;
+  if (!siltFenceInstalled) riskPoints += 1;
+  if (!stabExitInstalled) riskPoints += 1;
+  if (turbidDischargeObserved) riskPoints += 5;
+  if (drainageConnected) riskPoints += 3;
+  if ((vegetationCoverPercent || 100) < 50) riskPoints += 1;
+  if ((exposedAreaM2 || 0) > 2000) riskPoints += 1;
+
+  const riskRating = riskPoints >= 10 ? "HIGH" : riskPoints >= 5 ? "MEDIUM" : "LOW";
+  const epaNotificationRequired = turbidDischargeObserved || drainageConnected || riskPoints >= 12;
+
+  const failures = [];
+  if (turbidDischargeObserved) failures.push("Turbid discharge to stormwater — immediate action required");
+  if (drainageConnected) failures.push("Site drainage connected to stormwater system without treatment");
+  if (sedimentBasinInstalled && !sedimentBasinFunctional) failures.push("Sediment basin not functional — desilt or repair immediately");
+  if (siltFenceDamaged) failures.push("Silt fence damaged — repair before next rain event");
+
+  const ref = `ESC-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectName: sanitisedProject,
+    inspectorName: sanitisedInspector,
+    inspectionDate,
+    rainfall24hMm: rainfall24hMm || 0,
+    siteSlopePercent: siteSlopePercent || 0,
+    distanceToWaterwaym: distanceToWaterwaym || null,
+    controls: {
+      sedimentBasin: { installed: !!sedimentBasinInstalled, functional: sedimentBasinFunctional ?? null, capacityM3: sedimentBasinCapacityM3 || null },
+      siltFence: { installed: !!siltFenceInstalled, damaged: !!siltFenceDamaged, lengthM: siltFenceLength || null },
+      stabiliisedExit: { installed: !!stabExitInstalled, condition: stabExitCondition || null },
+      turbidityBarrier: { installed: !!turbidBarrierInstalled, condition: turbidBarrierCondition || null },
+    },
+    siteConditions: {
+      vegetationCoverPercent: vegetationCoverPercent ?? null,
+      exposedAreaM2: exposedAreaM2 || null,
+      turbidDischargeObserved: !!turbidDischargeObserved,
+      drainageConnected: !!drainageConnected,
+      odourObserved: !!odourObserved,
+    },
+    riskRating,
+    riskPoints,
+    epaNotificationRequired,
+    failures,
+    correctiveActions: correctiveActions || null,
+    nextInspectionDate: nextInspectionDate || null,
+    notes: sanitiseInput(notes || "", 500),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("esc_inspections").insert(record);
+      if (error) console.error("ESC insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("ESC DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    riskRating,
+    riskPoints,
+    epaNotificationRequired,
+    failures,
+    message: epaNotificationRequired
+      ? "HIGH risk — notify EPA Victoria and implement corrective actions immediately."
+      : failures.length > 0
+        ? "Failures detected — rectify before next rain event."
+        : "ESC controls satisfactory.",
+    saved,
+    record,
+  });
+});
+
+// GET /erosion-sediment-control/:projectId — List ESC inspections for a project
+app.get("/erosion-sediment-control/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { limit = 20, offset = 0 } = req.query;
+
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  try {
+    const { data, error, count } = await supabaseAdmin
+      .from("esc_inspections")
+      .select("*", { count: "exact" })
+      .eq("projectId", sanitiseInput(String(projectId), 80))
+      .order("inspectionDate", { ascending: false })
+      .range(Number(offset), Number(offset) + Number(limit) - 1);
+
+    if (error) throw error;
+
+    const highRiskCount = (data || []).filter(r => r.riskRating === "HIGH").length;
+    const epaNotificationCount = (data || []).filter(r => r.epaNotificationRequired).length;
+
+    return res.json({
+      projectId,
+      total: count,
+      highRiskCount,
+      epaNotificationCount,
+      inspections: data || [],
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to retrieve ESC inspections.", detail: e.message });
+  }
+});
+
+// POST /stormwater-management-plan — Create or update a site SMP
+app.post("/stormwater-management-plan", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, siteAreaM2, percentageImpervious,
+    designStormAri, peakFlowRateL, detentionVolumeM3,
+    treatmentTrain, outlets, soakageTestKSat, receivingWaterbody,
+    preparerName, preparerLicence, approvedByCouncil, councilRef, notes,
+  } = req.body;
+
+  if (!projectId || !siteAreaM2) {
+    return res.status(400).json({ error: "projectId and siteAreaM2 are required." });
+  }
+
+  const sanitisedProject = sanitiseInput(projectName || "", 200);
+  const sanitisedPreparer = sanitiseInput(preparerName || "", 120);
+
+  // Rational method peak flow estimate (Q = C * i * A / 360)
+  // Using 1-in-5yr Melbourne rainfall intensity ~55 mm/hr as default if not specified
+  const runoffCoefficient = (percentageImpervious || 50) / 100 * 0.9 + 0.1;
+  const intensityMmHr = designStormAri === "1-in-100yr" ? 100 : designStormAri === "1-in-20yr" ? 75 : 55;
+  const calculatedPeakFlowL = Math.round(runoffCoefficient * intensityMmHr * (siteAreaM2 / 10000) / 0.36);
+
+  const waterQualityTargets = {
+    totalSuspendedSolids: "80% reduction (EPA SEPP Waters)",
+    totalPhosphorus: "45% reduction",
+    totalNitrogen: "45% reduction",
+    grossPollutants: "Capture litter > 5mm (100%)",
+  };
+
+  const treatmentTrainItems = treatmentTrain || ["Sediment basin", "Bio-retention basin", "Gross pollutant trap"];
+
+  const ref = `SMP-${sanitiseInput(String(projectId), 30)}-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectName: sanitisedProject,
+    siteAreaM2,
+    percentageImpervious: percentageImpervious || 50,
+    runoffCoefficient: Math.round(runoffCoefficient * 100) / 100,
+    designStormAri: designStormAri || "1-in-5yr",
+    calculatedPeakFlowL,
+    nominatedPeakFlowL: peakFlowRateL || calculatedPeakFlowL,
+    detentionVolumeM3: detentionVolumeM3 || null,
+    treatmentTrain: treatmentTrainItems,
+    outlets: outlets || [],
+    soakageTestKSat: soakageTestKSat || null,
+    receivingWaterbody: sanitiseInput(receivingWaterbody || "", 200),
+    waterQualityTargets,
+    preparerName: sanitisedPreparer,
+    preparerLicence: sanitiseInput(preparerLicence || "", 60),
+    approvedByCouncil: !!approvedByCouncil,
+    councilRef: sanitiseInput(councilRef || "", 80),
+    notes: sanitiseInput(notes || "", 500),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin
+        .from("stormwater_management_plans")
+        .upsert(record, { onConflict: "projectId" });
+      if (error) console.error("SMP upsert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("SMP DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    calculatedPeakFlowL,
+    waterQualityTargets,
+    treatmentTrain: treatmentTrainItems,
+    saved,
+    record,
+  });
+});
+
+// POST /ai-environmental-compliance — AI reviews project environmental compliance
+app.post("/ai-environmental-compliance", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectType, siteDescription, nearWaterway, nearHeritageSite,
+    vegetationClearing, contaminatedLand, noiseSensitiveReceivers,
+    existingApprovals, constructionActivities, worksHours, notes,
+  } = req.body;
+
+  if (!projectType || !siteDescription) {
+    return res.status(400).json({ error: "projectType and siteDescription are required." });
+  }
+
+  const sanitisedDesc = sanitiseInput(siteDescription, 800);
+  const sanitisedType = sanitiseInput(projectType, 100);
+  const sanitisedActivities = Array.isArray(constructionActivities)
+    ? constructionActivities.map(a => sanitiseInput(String(a), 100)).slice(0, 20)
+    : [];
+
+  const prompt = `You are an environmental compliance advisor specialising in Victorian construction regulations.
+
+PROJECT DETAILS:
+- Type: ${sanitisedType}
+- Site: ${sanitisedDesc}
+- Near waterway: ${nearWaterway ? "Yes" : "No"}
+- Near heritage site: ${nearHeritageSite ? "Yes" : "No"}
+- Vegetation clearing: ${vegetationClearing ? "Yes" : "No"}
+- Contaminated land: ${contaminatedLand ? "Yes" : "No"}
+- Noise-sensitive receivers: ${noiseSensitiveReceivers ? "Yes" : "No"}
+- Works hours: ${sanitiseInput(worksHours || "Not specified", 80)}
+- Construction activities: ${sanitisedActivities.join("; ") || "Not specified"}
+- Existing approvals: ${sanitiseInput(existingApprovals || "None specified", 300)}
+${notes ? `- Notes: ${sanitiseInput(notes, 300)}` : ""}
+
+Assess environmental compliance under:
+- EPA Victoria SEPP Waters (stormwater/waterway protection)
+- EPA Publication 1411 (Construction Noise/Vibration)
+- Environment Protection Act 2017 (general environmental duty)
+- Flora & Fauna Guarantee Act 1988 (if vegetation clearing)
+- Heritage Act 2017 (if near heritage site)
+- Contaminated Land Management (if applicable)
+- NCC 2022 Section J (if energy works)
+
+Respond ONLY with a JSON object:
+{
+  "overallCompliance": "COMPLIANT|NON_COMPLIANT|NEEDS_REVIEW",
+  "approvalsTrigger": [list of approvals/permits likely required],
+  "riskAreas": [{"area": string, "regulation": string, "risk": "HIGH|MEDIUM|LOW", "action": string}],
+  "environmentalManagementPlanRequired": boolean,
+  "noiseManagementPlanRequired": boolean,
+  "esdRequirements": [list of environmentally sustainable design requirements],
+  "constructionEnvironmentProtection": [key actions during construction],
+  "monitoringRequirements": [what must be monitored and how often],
+  "emergencyProcedures": [spill/incident procedures specific to site],
+  "summary": string (2-3 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1400,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      projectId: projectId || null,
+      overallCompliance: parsed.overallCompliance || "NEEDS_REVIEW",
+      approvalsTrigger: parsed.approvalsTrigger || [],
+      riskAreas: parsed.riskAreas || [],
+      environmentalManagementPlanRequired: parsed.environmentalManagementPlanRequired ?? false,
+      noiseManagementPlanRequired: parsed.noiseManagementPlanRequired ?? false,
+      esdRequirements: parsed.esdRequirements || [],
+      constructionEnvironmentProtection: parsed.constructionEnvironmentProtection || [],
+      monitoringRequirements: parsed.monitoringRequirements || [],
+      emergencyProcedures: parsed.emergencyProcedures || [],
+      summary: parsed.summary || "Environmental compliance assessment complete.",
+    });
+  } catch (e) {
+    console.error("AI environmental compliance error:", e.message);
+    return res.json({
+      success: true,
+      projectId: projectId || null,
+      overallCompliance: "NEEDS_REVIEW",
+      approvalsTrigger: ["Planning permit (confirm with council)", "Works on Road permit if applicable"],
+      riskAreas: [
+        { area: "Stormwater", regulation: "EPA SEPP Waters", risk: "MEDIUM", action: "Install sediment controls before earthworks commence" },
+        { area: "Noise", regulation: "EPA Publication 1411", risk: "MEDIUM", action: "Restrict noisy works to allowed hours (7am–6pm Mon–Fri)" },
+      ],
+      environmentalManagementPlanRequired: true,
+      noiseManagementPlanRequired: !!noiseSensitiveReceivers,
+      esdRequirements: ["Document stormwater management", "Minimise site clearing", "Manage construction waste"],
+      constructionEnvironmentProtection: ["Install ESC controls", "Conduct site induction covering environmental obligations"],
+      monitoringRequirements: ["Weekly ESC inspection during earthworks", "Noise monitoring if complaints received"],
+      emergencyProcedures: ["Chemical spill kit on site", "EPA Victoria spill hotline: 1800 210 010"],
+      summary: "Environmental compliance review flagged for manual assessment. Ensure Environmental Management Plan is in place before construction commences.",
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
