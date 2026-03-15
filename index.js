@@ -31136,6 +31136,190 @@ app.get("/project-timeline/:projectId", apiKeyAuth, async (req, res) => {
   res.status(503).json({ error: "Database not configured." });
 });
 
+// ── Round 112: Insurance management, bond tracking, legal notices ─────────────
+
+// POST /insurance-certificate — Record a certificate of insurance for a project or contractor
+app.post("/insurance-certificate", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, projectId, insurerName, policyNumber,
+    insuranceType, coverAmount, expiryDate, insuredName,
+    brokerName, brokerPhone, certificateUrl, notes,
+  } = req.body;
+
+  if (!insuranceType || !policyNumber || !expiryDate)
+    return res.status(400).json({ error: "insuranceType, policyNumber, expiryDate required." });
+
+  const validTypes = [
+    "PUBLIC_LIABILITY", "PROFESSIONAL_INDEMNITY", "WORKERS_COMPENSATION",
+    "PLANT_EQUIPMENT", "CONTRACT_WORKS", "PRODUCT_LIABILITY",
+    "MANAGEMENT_LIABILITY", "CYBER", "OTHER",
+  ];
+  const type = (insuranceType || "OTHER").toUpperCase();
+
+  const expiry = new Date(expiryDate);
+  const daysToExpiry = Math.ceil((expiry - new Date()) / (1000 * 60 * 60 * 24));
+  const isExpired = daysToExpiry < 0;
+  const isExpiringSoon = !isExpired && daysToExpiry <= 30;
+  const alertStatus = isExpired ? "EXPIRED" : isExpiringSoon ? "EXPIRING_SOON" : "VALID";
+
+  const record = {
+    contractor_id: sanitiseInput(contractorId || ""),
+    project_id: sanitiseInput(projectId || ""),
+    insurer_name: sanitiseInput(insurerName || ""),
+    policy_number: sanitiseInput(policyNumber),
+    insurance_type: validTypes.includes(type) ? type : "OTHER",
+    cover_amount: Number(coverAmount) || null,
+    expiry_date: expiryDate,
+    days_to_expiry: daysToExpiry,
+    is_expired: isExpired,
+    is_expiring_soon: isExpiringSoon,
+    alert_status: alertStatus,
+    insured_name: sanitiseInput(insuredName || ""),
+    broker_name: sanitiseInput(brokerName || ""),
+    broker_phone: sanitiseInput(brokerPhone || ""),
+    certificate_url: certificateUrl && isSafeUrl(certificateUrl) ? certificateUrl : null,
+    notes: sanitiseInput(notes || ""),
+    status: isExpired ? "EXPIRED" : "ACTIVE",
+    recorded_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("insurance_certificates")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, certId: data.id, alertStatus, daysToExpiry, ...record });
+  }
+
+  res.json({ success: true, certId: null, alertStatus, daysToExpiry, ...record, saved: false });
+});
+
+// POST /bank-guarantee — Record a bank guarantee or performance bond
+app.post("/bank-guarantee", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, contractorId, bankName, guaranteeNumber,
+    guaranteeType, guaranteeAmount, issueDate, expiryDate,
+    beneficiary, conditions, status = "ACTIVE",
+  } = req.body;
+
+  if (!projectId || !guaranteeNumber || !guaranteeAmount)
+    return res.status(400).json({ error: "projectId, guaranteeNumber, guaranteeAmount required." });
+
+  const validTypes = ["PERFORMANCE", "RETENTION", "ADVANCE_PAYMENT", "PAYMENT", "BID_BOND", "MAINTENANCE"];
+  const type = (guaranteeType || "PERFORMANCE").toUpperCase();
+  const validStatuses = ["ACTIVE", "CALLED", "RELEASED", "EXPIRED", "REPLACED"];
+  const st = (status || "ACTIVE").toUpperCase();
+
+  const expiry = expiryDate ? new Date(expiryDate) : null;
+  const daysToExpiry = expiry ? Math.ceil((expiry - new Date()) / (1000 * 60 * 60 * 24)) : null;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    contractor_id: sanitiseInput(contractorId || ""),
+    bank_name: sanitiseInput(bankName || ""),
+    guarantee_number: sanitiseInput(guaranteeNumber),
+    guarantee_type: validTypes.includes(type) ? type : "PERFORMANCE",
+    guarantee_amount: Number(guaranteeAmount),
+    issue_date: issueDate || new Date().toISOString().split("T")[0],
+    expiry_date: expiryDate || null,
+    days_to_expiry: daysToExpiry,
+    beneficiary: sanitiseInput(beneficiary || ""),
+    conditions: sanitiseInput(conditions || ""),
+    status: validStatuses.includes(st) ? st : "ACTIVE",
+    recorded_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("bank_guarantees")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, guaranteeId: data.id, daysToExpiry, ...record });
+  }
+
+  res.json({ success: true, guaranteeId: null, daysToExpiry, ...record, saved: false });
+});
+
+// POST /legal-notice — Issue or record a formal legal notice under the contract
+app.post("/legal-notice", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, noticeType, issuedBy, issuedTo,
+    subject, noticeBody, contractClause,
+    responseRequired = false, responseDueDate,
+    deliveryMethod = "EMAIL", attachmentUrl,
+  } = req.body;
+
+  if (!projectId || !noticeType || !noticeBody)
+    return res.status(400).json({ error: "projectId, noticeType, noticeBody required." });
+
+  const validNoticeTypes = [
+    "SHOW_CAUSE", "NOTICE_TO_REMEDY", "NOTICE_OF_DEFAULT",
+    "SUSPENSION_NOTICE", "TERMINATION_NOTICE", "EXTENSION_OF_TIME",
+    "CLAIM_NOTICE", "PAYMENT_CLAIM", "NOTICE_OF_DISPUTE",
+    "PRACTICAL_COMPLETION_NOTICE", "DIRECTION", "OTHER",
+  ];
+  const validMethods = ["EMAIL", "REGISTERED_MAIL", "COURIER", "HAND_DELIVERED", "FACSIMILE"];
+  const type = (noticeType || "OTHER").toUpperCase();
+  const method = (deliveryMethod || "EMAIL").toUpperCase();
+
+  const noticeRef = `LN-${Date.now().toString(36).toUpperCase().slice(-8)}`;
+
+  const record = {
+    notice_ref: noticeRef,
+    project_id: sanitiseInput(projectId),
+    notice_type: validNoticeTypes.includes(type) ? type : "OTHER",
+    issued_by: sanitiseInput(issuedBy || ""),
+    issued_to: sanitiseInput(issuedTo || ""),
+    subject: sanitiseInput(subject || `${type} Notice`),
+    notice_body: sanitiseInput(noticeBody),
+    contract_clause: sanitiseInput(contractClause || ""),
+    response_required: Boolean(responseRequired),
+    response_due_date: responseDueDate || null,
+    delivery_method: validMethods.includes(method) ? method : "EMAIL",
+    attachment_url: attachmentUrl && isSafeUrl(attachmentUrl) ? attachmentUrl : null,
+    status: "ISSUED",
+    issued_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("legal_notices")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, noticeId: data.id, noticeRef, ...record });
+  }
+
+  res.json({ success: true, noticeId: null, noticeRef, ...record, saved: false });
+});
+
+// GET /legal-notices/:projectId — List legal notices for a project
+app.get("/legal-notices/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("legal_notices")
+      .select("*")
+      .eq("project_id", projectId)
+      .order("issued_at", { ascending: false });
+
+    if (error) return res.status(500).json({ error: "DB error." });
+
+    const pendingResponse = (data || []).filter(n => n.response_required && n.status === "ISSUED").length;
+    const overdue = (data || []).filter(n => n.response_required && n.response_due_date && new Date(n.response_due_date) < new Date() && n.status === "ISSUED").length;
+
+    return res.json({ projectId, notices: data || [], count: (data || []).length, pendingResponseCount: pendingResponse, overdueResponseCount: overdue });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
