@@ -23283,6 +23283,137 @@ app.get("/emergency-contact/:siteId", apiKeyAuth, async (req, res) => {
   return res.json({ siteId, count: contacts.length, contacts, generatedAt: new Date().toISOString() });
 });
 
+// POST /payment-schedule  — Create a milestone payment schedule for a project
+app.post("/payment-schedule", apiKeyAuth, async (req, res) => {
+  const { projectId, contractorId, clientId, totalContractValue, milestones = [] } = req.body || {};
+  if (!projectId || !totalContractValue) return res.status(400).json({ error: "projectId and totalContractValue required." });
+  if (!Array.isArray(milestones) || milestones.length === 0) return res.status(400).json({ error: "milestones array required." });
+
+  const safeProjectId = sanitiseInput(String(projectId)).slice(0, 80);
+  const safeCId       = contractorId ? sanitiseInput(String(contractorId)).slice(0, 80) : null;
+  const safeClientId  = clientId ? sanitiseInput(String(clientId)).slice(0, 80) : null;
+  const totalValue    = Math.max(0, parseFloat(totalContractValue) || 0);
+
+  const items = milestones.slice(0, 20).map((m, idx) => ({
+    milestoneId: `MS-${safeProjectId.slice(0, 6).toUpperCase()}-${String(idx + 1).padStart(2, "0")}`,
+    name:        sanitiseInput(String(m.name || `Milestone ${idx + 1}`)).slice(0, 100),
+    description: m.description ? sanitiseInput(String(m.description)).slice(0, 300) : null,
+    amount:      Math.max(0, parseFloat(m.amount) || 0),
+    dueDate:     m.dueDate ? sanitiseInput(String(m.dueDate)).slice(0, 20) : null,
+    status:      "PENDING",
+  }));
+
+  const scheduledTotal = parseFloat(items.reduce((s, m) => s + m.amount, 0).toFixed(2));
+  const variance       = parseFloat((totalValue - scheduledTotal).toFixed(2));
+
+  const schedule = {
+    projectId: safeProjectId, contractorId: safeCId, clientId: safeClientId,
+    totalContractValue: totalValue, scheduledTotal, variance,
+    milestoneCount: items.length, milestones: items,
+    balanced: Math.abs(variance) < 1,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("payment_schedules").insert({
+        project_id: safeProjectId, contractor_id: safeCId, client_id: safeClientId,
+        total_contract_value: totalValue, scheduled_total: scheduledTotal,
+        milestones: items, created_at: schedule.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...schedule, saved: !!supabaseAdmin });
+});
+
+// GET /payment-schedule/:projectId  — Get the payment schedule for a project
+app.get("/payment-schedule/:projectId", apiKeyAuth, async (req, res) => {
+  const projectId = sanitiseInput(String(req.params.projectId || "")).slice(0, 80);
+  if (!projectId) return res.status(400).json({ error: "projectId required." });
+
+  let schedule = null;
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin.from("payment_schedules").select("*").eq("project_id", projectId).order("created_at", { ascending: false }).limit(1).single();
+      schedule = data || null;
+    } catch (_) { /* ignore */ }
+  }
+
+  if (!schedule) return res.json({ projectId, schedule: null, message: "No payment schedule found." });
+  return res.json({ projectId, schedule, generatedAt: new Date().toISOString() });
+});
+
+// POST /payment-received  — Log a payment received against a milestone
+app.post("/payment-received", apiKeyAuth, async (req, res) => {
+  const { projectId, milestoneId, amount, paymentDate, paymentMethod, reference, notes } = req.body || {};
+  if (!projectId || !amount) return res.status(400).json({ error: "projectId and amount required." });
+
+  const VALID_METHODS = ["bank-transfer", "bpay", "credit-card", "cash", "cheque", "other"];
+  const safeProjectId = sanitiseInput(String(projectId)).slice(0, 80);
+  const safeMilestone = milestoneId ? sanitiseInput(String(milestoneId)).slice(0, 30) : null;
+  const safeAmount    = Math.max(0, parseFloat(amount) || 0);
+  const safeDate      = paymentDate ? sanitiseInput(String(paymentDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeMethod    = VALID_METHODS.includes(String(paymentMethod || "").toLowerCase().replace(/ /g, "-")) ? String(paymentMethod).toLowerCase().replace(/ /g, "-") : "bank-transfer";
+  const safeRef       = reference ? sanitiseInput(String(reference)).slice(0, 80) : null;
+  const safeNotes     = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const payment = {
+    paymentId:  `PAY-${safeProjectId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    projectId:  safeProjectId, milestoneId: safeMilestone,
+    amount: safeAmount, paymentDate: safeDate,
+    paymentMethod: safeMethod, reference: safeRef, notes: safeNotes,
+    recordedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("payments_received").insert({
+        payment_id: payment.paymentId, project_id: payment.projectId, milestone_id: payment.milestoneId,
+        amount: payment.amount, payment_date: payment.paymentDate, payment_method: payment.paymentMethod,
+        reference: payment.reference, notes: payment.notes, recorded_at: payment.recordedAt,
+      });
+      if (safeMilestone) {
+        await supabaseAdmin.from("payment_schedules")
+          .update({ [`milestone_status_${safeMilestone}`]: "PAID" })
+          .eq("project_id", safeProjectId).catch(() => {});
+      }
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...payment, saved: !!supabaseAdmin });
+});
+
+// GET /payment-summary/:projectId  — Summary of payments for a project
+app.get("/payment-summary/:projectId", apiKeyAuth, async (req, res) => {
+  const projectId = sanitiseInput(String(req.params.projectId || "")).slice(0, 80);
+  if (!projectId) return res.status(400).json({ error: "projectId required." });
+
+  let payments = [];
+  let schedule = null;
+  if (supabaseAdmin) {
+    try {
+      const [{ data: pays }, { data: sched }] = await Promise.all([
+        supabaseAdmin.from("payments_received").select("amount, payment_date, payment_method").eq("project_id", projectId).order("payment_date", { ascending: false }).limit(100),
+        supabaseAdmin.from("payment_schedules").select("total_contract_value, scheduled_total").eq("project_id", projectId).order("created_at", { ascending: false }).limit(1).single(),
+      ]);
+      payments = pays || [];
+      schedule = sched || null;
+    } catch (_) { /* ignore */ }
+  }
+
+  const totalReceived = parseFloat(payments.reduce((s, p) => s + (p.amount || 0), 0).toFixed(2));
+  const contractValue = schedule?.total_contract_value || 0;
+  const outstanding   = contractValue > 0 ? parseFloat((contractValue - totalReceived).toFixed(2)) : null;
+
+  return res.json({
+    projectId, paymentCount: payments.length, totalReceived,
+    contractValue: contractValue || null, outstanding,
+    percentReceived: contractValue > 0 ? parseFloat(((totalReceived / contractValue) * 100).toFixed(1)) : null,
+    payments, generatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
