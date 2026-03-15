@@ -24439,6 +24439,185 @@ Respond with JSON:
   }
 });
 
+// POST /project-team  — Register team members for a project
+app.post("/project-team", apiKeyAuth, async (req, res) => {
+  const { projectId, members = [] } = req.body || {};
+  if (!projectId || !Array.isArray(members) || members.length === 0) return res.status(400).json({ error: "projectId and members array required." });
+
+  const VALID_ROLES = ["project-manager", "site-supervisor", "licensed-tradesperson", "apprentice", "labourer", "subcontractor", "safety-officer", "estimator", "other"];
+  const safeProjectId = sanitiseInput(String(projectId)).slice(0, 80);
+
+  const team = members.slice(0, 50).map(m => ({
+    memberId:     m.memberId ? sanitiseInput(String(m.memberId)).slice(0, 80) : null,
+    name:         sanitiseInput(String(m.name || "")).slice(0, 100),
+    role:         VALID_ROLES.includes(String(m.role || "").toLowerCase().replace(/ /g, "-")) ? String(m.role).toLowerCase().replace(/ /g, "-") : "other",
+    trade:        m.trade ? sanitiseInput(String(m.trade)).toLowerCase().slice(0, 40) : null,
+    licenceNumber: m.licenceNumber ? sanitiseInput(String(m.licenceNumber)).slice(0, 80) : null,
+    email:        m.email && isValidEmail(m.email) ? m.email.toLowerCase() : null,
+    phone:        m.phone ? sanitiseInput(String(m.phone)).replace(/[^0-9+ ()-]/g, "").slice(0, 20) : null,
+    startDate:    m.startDate ? sanitiseInput(String(m.startDate)).slice(0, 20) : null,
+    endDate:      m.endDate ? sanitiseInput(String(m.endDate)).slice(0, 20) : null,
+    isActive:     m.isActive !== false,
+  }));
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("project_teams").upsert(
+        team.map(m => ({ project_id: safeProjectId, ...m, updated_at: new Date().toISOString() })),
+        { onConflict: "project_id,member_id" }
+      );
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.json({ projectId: safeProjectId, memberCount: team.length, active: team.filter(m => m.isActive).length, team, savedAt: new Date().toISOString() });
+});
+
+// GET /project-team/:projectId  — Get all team members on a project
+app.get("/project-team/:projectId", apiKeyAuth, async (req, res) => {
+  const projectId = sanitiseInput(String(req.params.projectId || "")).slice(0, 80);
+  const activeOnly = req.query.active === "true";
+  if (!projectId) return res.status(400).json({ error: "projectId required." });
+
+  let members = [];
+  if (supabaseAdmin) {
+    try {
+      let q = supabaseAdmin.from("project_teams").select("*").eq("project_id", projectId).order("role", { ascending: true }).limit(100);
+      if (activeOnly) q = q.eq("is_active", true);
+      const { data } = await q;
+      members = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const byRole = {};
+  members.forEach(m => { byRole[m.role] = (byRole[m.role] || 0) + 1; });
+
+  return res.json({ projectId, memberCount: members.length, activeCount: members.filter(m => m.is_active).length, byRole, members, generatedAt: new Date().toISOString() });
+});
+
+// POST /timesheet  — Log a timesheet entry for a worker
+app.post("/timesheet", apiKeyAuth, async (req, res) => {
+  const { contractorId, jobId, projectId, workDate, startTime, endTime, breakMinutes, workDescription, billable, hourlyRate, notes } = req.body || {};
+  if (!contractorId || !workDate) return res.status(400).json({ error: "contractorId and workDate required." });
+
+  const safeCId   = sanitiseInput(String(contractorId)).slice(0, 80);
+  const safeJobId = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeProjId = projectId ? sanitiseInput(String(projectId)).slice(0, 80) : null;
+  const safeDate  = sanitiseInput(String(workDate)).slice(0, 20);
+  const safeDesc  = workDescription ? sanitiseInput(String(workDescription)).slice(0, 300) : null;
+  const safeNotes = notes ? sanitiseInput(String(notes)).slice(0, 200) : null;
+
+  const start   = startTime ? sanitiseInput(String(startTime)).slice(0, 10) : null;
+  const end     = endTime ? sanitiseInput(String(endTime)).slice(0, 10) : null;
+  const breakMins = Math.max(0, parseInt(breakMinutes) || 0);
+  const rate    = Math.max(0, parseFloat(hourlyRate) || 0);
+
+  let hoursWorked = null;
+  let grossPay    = null;
+  if (start && end) {
+    const [sh, sm] = start.split(":").map(Number);
+    const [eh, em] = end.split(":").map(Number);
+    const startMins = (sh || 0) * 60 + (sm || 0);
+    const endMins   = (eh || 0) * 60 + (em || 0);
+    const totalMins = Math.max(0, endMins - startMins - breakMins);
+    hoursWorked = parseFloat((totalMins / 60).toFixed(2));
+    if (rate > 0) grossPay = parseFloat((hoursWorked * rate).toFixed(2));
+  }
+
+  const entry = {
+    timesheetId: `TS-${safeCId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    contractorId: safeCId, jobId: safeJobId, projectId: safeProjId,
+    workDate: safeDate, startTime: start, endTime: end, breakMinutes: breakMins,
+    hoursWorked, hourlyRate: rate || null, grossPay, billable: billable !== false,
+    workDescription: safeDesc, notes: safeNotes,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("timesheets").insert({
+        timesheet_id: entry.timesheetId, contractor_id: safeCId, job_id: safeJobId, project_id: safeProjId,
+        work_date: safeDate, start_time: start, end_time: end, break_minutes: breakMins,
+        hours_worked: hoursWorked, hourly_rate: rate || null, gross_pay: grossPay,
+        billable: entry.billable, work_description: safeDesc, notes: safeNotes, created_at: entry.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...entry, saved: !!supabaseAdmin });
+});
+
+// GET /timesheet/:contractorId  — Get timesheet entries for a contractor
+app.get("/timesheet/:contractorId", apiKeyAuth, async (req, res) => {
+  const contractorId = sanitiseInput(String(req.params.contractorId || "")).slice(0, 80);
+  const fromDate     = req.query.from ? sanitiseInput(String(req.query.from)).slice(0, 20) : null;
+  const toDate       = req.query.to ? sanitiseInput(String(req.query.to)).slice(0, 20) : null;
+  if (!contractorId) return res.status(400).json({ error: "contractorId required." });
+
+  let entries = [];
+  if (supabaseAdmin) {
+    try {
+      let q = supabaseAdmin.from("timesheets").select("*").eq("contractor_id", contractorId).order("work_date", { ascending: false }).limit(200);
+      if (fromDate) q = q.gte("work_date", fromDate);
+      if (toDate)   q = q.lte("work_date", toDate);
+      const { data } = await q;
+      entries = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const totalHours = parseFloat(entries.reduce((s, e) => s + (e.hours_worked || 0), 0).toFixed(2));
+  const totalPay   = parseFloat(entries.reduce((s, e) => s + (e.gross_pay || 0), 0).toFixed(2));
+
+  return res.json({ contractorId, entryCount: entries.length, totalHoursWorked: totalHours, totalGrossPay: totalPay, dateRange: { from: fromDate || "all", to: toDate || "all" }, entries, generatedAt: new Date().toISOString() });
+});
+
+// POST /ai-invoice-description  — AI generates invoice line descriptions from work notes
+app.post("/ai-invoice-description", apiKeyAuth, async (req, res) => {
+  const { jobType, workNotes, items = [] } = req.body || {};
+  if (!jobType) return res.status(400).json({ error: "jobType required." });
+  if (!workNotes && (!Array.isArray(items) || items.length === 0)) return res.status(400).json({ error: "workNotes or items array required." });
+
+  const safeType  = sanitiseInput(String(jobType)).slice(0, 40);
+  const safeNotes = workNotes ? sanitiseInput(String(workNotes)).slice(0, 1500) : null;
+  const safeItems = Array.isArray(items) ? items.slice(0, 20).map(i => sanitiseInput(String(i)).slice(0, 200)) : [];
+
+  const input = safeNotes || safeItems.join("\n");
+
+  const prompt = `You are a trade invoice writer for ${safeType} work in Australia.
+
+Convert these work notes into professional invoice line item descriptions:
+${input}
+
+Respond with JSON:
+{
+  "lineItems": [
+    {"description": "professional line item description", "unit": "hr|ea|m|m2|lm|allow", "notes": "optional note"}
+  ],
+  "invoiceTitle": "e.g. Plumbing Services — [address/job ref]",
+  "paymentTerms": "recommended payment terms"
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 500 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      jobType: safeType,
+      invoiceTitle:   parsed.invoiceTitle || `${safeType.charAt(0).toUpperCase() + safeType.slice(1)} Services`,
+      lineItems:      Array.isArray(parsed.lineItems) ? parsed.lineItems : [],
+      paymentTerms:   parsed.paymentTerms || "14 days from invoice date",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      jobType: safeType,
+      invoiceTitle: `${safeType.charAt(0).toUpperCase() + safeType.slice(1)} Services`,
+      lineItems: safeItems.map(i => ({ description: i, unit: "allow", notes: null })),
+      paymentTerms: "14 days from invoice date",
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
