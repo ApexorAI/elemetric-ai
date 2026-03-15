@@ -20750,6 +20750,209 @@ app.get("/compliance-grades", apiKeyAuth, (req, res) => {
   });
 });
 
+// ── Round 55 ──────────────────────────────────────────────────────────────────
+
+// POST /job-timeline-report  — Generate a full timeline report for a job
+app.post("/job-timeline-report", apiKeyAuth, (req, res) => {
+  const { jobId, jobType, events } = req.body;
+
+  if (!events || !Array.isArray(events) || events.length === 0) {
+    return res.status(400).json({ error: "events array is required." });
+  }
+
+  const safeJobType = sanitiseInput(String(jobType || "general")).toLowerCase();
+
+  const EVENT_TYPES = ["quote_sent", "quote_accepted", "permit_applied", "permit_issued", "work_started", "work_completed", "inspection", "defect_found", "defect_rectified", "certificate_issued", "invoice_sent", "payment_received", "job_closed"];
+
+  const processedEvents = events.slice(0, 50)
+    .map(e => ({
+      eventType:   EVENT_TYPES.includes(sanitiseInput(String(e.eventType || "")).toLowerCase().replace(/\s/g, "_"))
+        ? sanitiseInput(String(e.eventType)).toLowerCase().replace(/\s/g, "_") : "other",
+      description: sanitiseInput(String(e.description || "")).slice(0, 200),
+      date:        e.date || null,
+      performedBy: e.performedBy ? sanitiseInput(String(e.performedBy)) : null,
+      notes:       e.notes ? sanitiseInput(String(e.notes)).slice(0, 200) : null,
+    }))
+    .sort((a, b) => {
+      if (!a.date) return 1;
+      if (!b.date) return -1;
+      return new Date(a.date) - new Date(b.date);
+    });
+
+  const startEvent = processedEvents.find(e => e.date);
+  const endEvent   = [...processedEvents].reverse().find(e => e.date);
+  let durationDays = null;
+  if (startEvent && endEvent && startEvent !== endEvent) {
+    durationDays = Math.round((new Date(endEvent.date) - new Date(startEvent.date)) / (1000 * 60 * 60 * 24));
+  }
+
+  const eventTypeCoverage = EVENT_TYPES.reduce((acc, t) => {
+    acc[t] = processedEvents.some(e => e.eventType === t);
+    return acc;
+  }, {});
+
+  const keyMilestones = ["work_started", "work_completed", "certificate_issued"];
+  const missingMilestones = keyMilestones.filter(m => !eventTypeCoverage[m]);
+
+  return res.json({
+    jobId:           jobId ? sanitiseInput(String(jobId)) : null,
+    jobType:         safeJobType,
+    eventCount:      processedEvents.length,
+    startDate:       startEvent ? startEvent.date : null,
+    endDate:         endEvent   ? endEvent.date   : null,
+    durationDays,
+    missingMilestones,
+    eventTypeCoverage,
+    timeline:        processedEvents,
+    generatedAt:     new Date().toISOString(),
+  });
+});
+
+// POST /schedule-inspection  — Schedule an inspection with date and assignment
+app.post("/schedule-inspection", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, address, requestedDate, inspectorName, inspectionType, notes } = req.body;
+
+  if (!jobId || !requestedDate) {
+    return res.status(400).json({ error: "jobId and requestedDate are required." });
+  }
+
+  const safeJobId      = sanitiseInput(String(jobId));
+  const safeJobType    = sanitiseInput(String(jobType || "general")).toLowerCase();
+  const safeAddress    = sanitiseInput(String(address || "Not specified"));
+  const safeInspector  = sanitiseInput(String(inspectorName || "TBC"));
+  const safeInspType   = sanitiseInput(String(inspectionType || "compliance")).toLowerCase();
+  const safeNotes      = sanitiseInput(String(notes || ""));
+
+  const reqDate    = new Date(requestedDate);
+  if (isNaN(reqDate.getTime())) {
+    return res.status(400).json({ error: "requestedDate is not a valid date." });
+  }
+
+  // Find the next business day on or after the requested date
+  const scheduledDate = new Date(reqDate);
+  while (scheduledDate.getDay() === 0 || scheduledDate.getDay() === 6) {
+    scheduledDate.setDate(scheduledDate.getDate() + 1);
+  }
+
+  const inspectionId = `INSP-${Date.now().toString(36).toUpperCase()}`;
+
+  const inspection = {
+    inspectionId,
+    status:          "SCHEDULED",
+    jobId:           safeJobId,
+    jobType:         safeJobType,
+    address:         safeAddress,
+    inspectionType:  safeInspType,
+    requestedDate:   reqDate.toISOString().slice(0, 10),
+    scheduledDate:   scheduledDate.toISOString().slice(0, 10),
+    inspector:       safeInspector,
+    notes:           safeNotes || null,
+    confirmationNote: "Inspection has been scheduled. Ensure all prior work is complete and the site is accessible at the scheduled time.",
+    scheduledAt:     new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("scheduled_inspections").insert({
+      inspection_id:  inspectionId,
+      job_id:         safeJobId,
+      job_type:       safeJobType,
+      inspection_type: safeInspType,
+      scheduled_date: scheduledDate.toISOString(),
+      inspector_name: safeInspector,
+      status:         "SCHEDULED",
+      created_at:     new Date().toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...inspection, saved });
+});
+
+// POST /batch-risk-assess  — Run risk assessment across multiple jobs at once
+app.post("/batch-risk-assess", apiKeyAuth, (req, res) => {
+  const { jobs } = req.body;
+
+  if (!jobs || !Array.isArray(jobs) || jobs.length === 0) {
+    return res.status(400).json({ error: "jobs array is required." });
+  }
+
+  const HIGH_RISK_TRADES = { gas: 4, electrical: 4, plumbing: 3, drainage: 2, hvac: 3, carpentry: 2 };
+
+  const results = jobs.slice(0, 50).map((j, idx) => {
+    const safeJobType = sanitiseInput(String(j.jobType || "general")).toLowerCase();
+    const score       = parseFloat(j.complianceScore) || 100;
+    const missing     = parseInt(j.missingItemCount)  || 0;
+    const daysSince   = parseInt(j.daysSinceCompletion) || 0;
+    const hasCert     = !!j.certificateFiled;
+    const hasSig      = !!j.signatureObtained;
+
+    const baseRisk    = HIGH_RISK_TRADES[safeJobType] || 2;
+    let riskPoints    = baseRisk;
+
+    if (score < 60)       riskPoints += 20;
+    else if (score < 75)  riskPoints += 10;
+    else if (score < 85)  riskPoints += 5;
+
+    if (missing > 5)      riskPoints += 15;
+    else if (missing > 2) riskPoints += 8;
+    else if (missing > 0) riskPoints += 3;
+
+    if (!hasCert)         riskPoints += 10;
+    if (!hasSig)          riskPoints += 5;
+    if (daysSince > 30)   riskPoints += 8;
+    else if (daysSince > 14) riskPoints += 4;
+
+    const riskLevel = riskPoints >= 30 ? "CRITICAL" : riskPoints >= 20 ? "HIGH" : riskPoints >= 10 ? "MEDIUM" : "LOW";
+
+    return {
+      index:     idx,
+      jobId:     j.jobId ? sanitiseInput(String(j.jobId)) : null,
+      jobType:   safeJobType,
+      riskPoints,
+      riskLevel,
+      topFactors: [
+        score < 75    ? `Low compliance (${score}/100)` : null,
+        missing > 0   ? `${missing} missing items`       : null,
+        !hasCert      ? "No certificate filed"           : null,
+        daysSince > 14? `${daysSince}d since completion` : null,
+      ].filter(Boolean).slice(0, 3),
+    };
+  });
+
+  results.sort((a, b) => b.riskPoints - a.riskPoints);
+
+  const critical = results.filter(r => r.riskLevel === "CRITICAL").length;
+  const high     = results.filter(r => r.riskLevel === "HIGH").length;
+
+  return res.json({
+    totalAssessed: results.length,
+    criticalCount: critical,
+    highCount:     high,
+    alert:         critical > 0 ? `${critical} job(s) at CRITICAL risk — review immediately` : null,
+    results,
+    assessedAt: new Date().toISOString(),
+  });
+});
+
+// GET /version  — Return API version information
+app.get("/version", (req, res) => {
+  return res.json({
+    api:          "Elemetric Trade Compliance API",
+    version:      "1.5.5",
+    build:        "2026-03-15",
+    rounds:       55,
+    totalEndpoints: "200+",
+    engine:       "GPT-4.1-mini (OpenAI)",
+    visualisation: "Stable Diffusion (Replicate)",
+    email:        "Resend",
+    database:     "Supabase (PostgreSQL)",
+    host:         "Railway",
+    node:         process.version,
+    uptime:       `${Math.round(process.uptime() / 3600 * 10) / 10} hours`,
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
