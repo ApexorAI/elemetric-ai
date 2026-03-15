@@ -12588,6 +12588,419 @@ app.post("/validate-certificate-number", (req, res) => {
   });
 });
 
+// ── GET /training-resources ───────────────────────────────────────────────────
+// Returns curated training resources for each Victorian trade type.
+// Covers CPD, licensing, standards, and free government resources.
+app.get("/training-resources", (req, res) => {
+  const { jobType } = req.query;
+
+  const RESOURCES = {
+    plumbing: [
+      { title: "VBA Plumbing CPD Portal", type: "CPD", url: "vba.vic.gov.au", description: "Complete mandatory CPD for plumbing licence renewal" },
+      { title: "AS/NZS 3500 Standard Set", type: "Standard", url: "standards.org.au", description: "The primary Australian standard for plumbing and drainage work" },
+      { title: "Master Plumbers Training", type: "Training", url: "masterplumbers.com.au", description: "Trade-specific training courses and apprenticeship resources" },
+      { title: "Plumbing Industry Climate Action Centre (PICAC)", type: "Training", url: "picac.com.au", description: "TAFE-linked training for plumbing and gas trades" },
+      { title: "VBA Plumbing Regulations Guide", type: "Reference", url: "vba.vic.gov.au", description: "Plain-language guide to Plumbing Regulations 2018 (Vic)" },
+      { title: "Water Services Association of Australia", type: "Technical", url: "wsaa.asn.au", description: "Technical publications for water supply and drainage" },
+    ],
+    gas: [
+      { title: "ESV Gas Technical Guidance", type: "Reference", url: "esv.vic.gov.au", description: "Technical guidance documents for licensed gas fitters" },
+      { title: "AS/NZS 5601.1 — Gas Installations", type: "Standard", url: "standards.org.au", description: "Primary standard for domestic and commercial gas fitting" },
+      { title: "Plumbing Industry Climate Action Centre (PICAC)", type: "Training", url: "picac.com.au", description: "Gas fitting training programs" },
+      { title: "AGA Technical Publications", type: "Technical", url: "aga.asn.au", description: "Australian Gas Association technical resources and product certification" },
+      { title: "ESV Licensed Person Resources", type: "Reference", url: "esv.vic.gov.au", description: "Gas certificate lodgement and compliance guides" },
+    ],
+    electrical: [
+      { title: "ESV Electrical Technical Library", type: "Reference", url: "esv.vic.gov.au", description: "Technical guidance for licensed electricians in Victoria" },
+      { title: "AS/NZS 3000 Wiring Rules", type: "Standard", url: "standards.org.au", description: "The Wiring Rules — foundation standard for all electrical work" },
+      { title: "National Electrical and Communications Association (NECA)", type: "Training", url: "necavic.com.au", description: "Training and CPD for Victorian electricians" },
+      { title: "Energy Safe Victoria Training", type: "CPD", url: "esv.vic.gov.au", description: "ESV-approved CPD courses for electricians" },
+      { title: "Clean Energy Council", type: "Technical", url: "cleanenergycouncil.org.au", description: "Solar PV and battery storage accreditation and resources" },
+    ],
+    drainage: [
+      { title: "VBA Drainage Compliance Guide", type: "Reference", url: "vba.vic.gov.au", description: "VBA guide to drainage compliance and CoC requirements" },
+      { title: "AS/NZS 3500.2 — Sanitary Plumbing and Drainage", type: "Standard", url: "standards.org.au", description: "Primary drainage standard" },
+      { title: "Master Plumbers Drainage Training", type: "Training", url: "masterplumbers.com.au", description: "Drainage-specific modules and refresher courses" },
+      { title: "Melbourne Water Developer Guides", type: "Reference", url: "melbournewater.com.au", description: "Connection requirements for Melbourne Water's drainage network" },
+    ],
+    carpentry: [
+      { title: "VBA Building Practitioners Portal", type: "CPD", url: "vba.vic.gov.au", description: "CPD for building practitioners and licence renewal" },
+      { title: "NCC 2022 Volume 2", type: "Standard", url: "abcb.gov.au", description: "Free download of the National Construction Code (residential)" },
+      { title: "AS 1684 Residential Timber Framing", type: "Standard", url: "standards.org.au", description: "Span tables and framing requirements for timber construction" },
+      { title: "Housing Industry Association (HIA)", type: "Training", url: "hia.com.au", description: "Building industry training, contracts, and compliance resources" },
+      { title: "Australian Building Codes Board (ABCB)", type: "Reference", url: "abcb.gov.au", description: "NCC guidance, advisory notes, and compliance tools" },
+      { title: "Master Builders Association of Victoria", type: "Training", url: "mbav.com.au", description: "Industry training, contracts, and advocacy" },
+    ],
+    hvac: [
+      { title: "AIRAH Training and CPD", type: "Training", url: "airah.org.au", description: "Australian Institute of Refrigeration, Air conditioning and Heating — industry-leading CPD" },
+      { title: "ARC Training and Licensing", type: "Licensing", url: "arclink.com.au", description: "Refrigerant handling licence training and ARC portal" },
+      { title: "AS/NZS 1668 Ventilation Standard Set", type: "Standard", url: "standards.org.au", description: "Ventilation and airconditioning standards" },
+      { title: "Air Conditioning and Mechanical Contractors Association (AMCA)", type: "Training", url: "amca.com.au", description: "HVAC industry training and contracting guidance" },
+      { title: "Clean Energy Council — HVAC Resources", type: "Technical", url: "cleanenergycouncil.org.au", description: "Heat pump and energy efficiency resources" },
+    ],
+  };
+
+  if (jobType) {
+    const lower = jobType.toLowerCase();
+    const tradeResources = RESOURCES[lower];
+    if (!tradeResources) {
+      return res.status(400).json({ error: `Unknown jobType. Available: ${Object.keys(RESOURCES).join(", ")}` });
+    }
+    return res.json({ jobType: lower, resourceCount: tradeResources.length, resources: tradeResources, retrievedAt: new Date().toISOString() });
+  }
+
+  const all = Object.entries(RESOURCES);
+  return res.json({
+    totalTrades:   all.length,
+    totalResources: all.reduce((sum, [, res]) => sum + res.length, 0),
+    resourcesByTrade: Object.fromEntries(all),
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /energy-efficiency ───────────────────────────────────────────────────
+// Assesses NCC 2022 energy efficiency compliance for a job. Returns Section J
+// requirements and recommendations for improving energy performance.
+app.post("/energy-efficiency", (req, res) => {
+  const {
+    jobType,
+    buildingClass = "1a",
+    climateZone   = 6,
+    existingBuilding = false,
+    items         = [],
+    glazingArea,
+    insulationRValue,
+    hvacCOP,
+    lightingPower,
+  } = req.body || {};
+
+  const CLIMATE_ZONE_DESCRIPTIONS = {
+    1: "Hot humid summer, warm winter (Darwin, Cairns)",
+    2: "Warm humid summer, mild winter (Brisbane, Mackay)",
+    3: "Hot dry summer, warm winter (Alice Springs, Broken Hill)",
+    4: "Hot dry summer, cold winter (Canberra, Hobart highland)",
+    5: "Warm temperate (Sydney, Perth coastal)",
+    6: "Mild temperate (Melbourne, Adelaide)",
+    7: "Cool temperate (Ballarat, Bendigo, highland VIC)",
+    8: "Alpine (Falls Creek, Mt Buller)",
+  };
+
+  const zone = Math.min(8, Math.max(1, Number(climateZone) || 6));
+
+  // NCC 2022 minimum requirements for Class 1a residential (Climate Zone 6 defaults)
+  const REQUIREMENTS = {
+    insulation: {
+      ceilingR:   zone >= 7 ? 5.1 : 4.1,
+      wallR:      zone >= 7 ? 2.8 : 2.0,
+      floorR:     zone >= 7 ? 2.5 : 1.5,
+      unit:       "R-value (m²·K/W)",
+    },
+    glazing: {
+      maxUValue:  zone >= 7 ? 2.2 : 3.4,
+      maxSHGC:    zone >= 5 ? 0.4 : 0.5,
+    },
+    lighting: {
+      maxPower:   5, // W/m² (residential lighting power density)
+    },
+    hvac: {
+      minCOP:     zone >= 7 ? 3.5 : 3.0, // HVAC heating COP
+    },
+  };
+
+  const checks = [];
+
+  if (insulationRValue !== undefined) {
+    const rVal = Number(insulationRValue);
+    checks.push({
+      item:    "Ceiling insulation R-value",
+      required: `R${REQUIREMENTS.insulation.ceilingR}`,
+      provided: `R${rVal}`,
+      pass:     rVal >= REQUIREMENTS.insulation.ceilingR,
+      standard: "NCC 2022 J2.4 (Class 1a)",
+    });
+  }
+  if (hvacCOP !== undefined) {
+    const cop = Number(hvacCOP);
+    checks.push({
+      item:    "HVAC heating COP",
+      required: `≥ ${REQUIREMENTS.hvac.minCOP}`,
+      provided: String(cop),
+      pass:     cop >= REQUIREMENTS.hvac.minCOP,
+      standard: "NCC 2022 J5.2",
+    });
+  }
+  if (lightingPower !== undefined) {
+    const lp = Number(lightingPower);
+    checks.push({
+      item:    "Lighting power density",
+      required: `≤ ${REQUIREMENTS.lighting.maxPower} W/m²`,
+      provided: `${lp} W/m²`,
+      pass:     lp <= REQUIREMENTS.lighting.maxPower,
+      standard: "NCC 2022 J6.2",
+    });
+  }
+  if (glazingArea !== undefined) {
+    checks.push({
+      item:    "Glazing area (max recommended 25% of floor area)",
+      required: "≤ 25% of floor area",
+      provided: `${glazingArea}% of floor area`,
+      pass:     Number(glazingArea) <= 25,
+      standard: "NCC 2022 J2.3",
+    });
+  }
+
+  const passCount = checks.filter(c => c.pass).length;
+  const overallPass = checks.length === 0 || passCount === checks.length;
+
+  return res.json({
+    jobType:         jobType || null,
+    buildingClass,
+    climateZone:     { zone, description: CLIMATE_ZONE_DESCRIPTIONS[zone] || "Unknown zone" },
+    existingBuilding,
+    nccVersion:      "NCC 2022",
+    applicableSection: "Section J — Energy Efficiency",
+    requirements:    REQUIREMENTS,
+    providedChecks:  checks,
+    checksPass:      passCount,
+    totalChecks:     checks.length,
+    overallPass,
+    recommendations: [
+      insulationRValue === undefined ? `Install ceiling insulation to minimum R${REQUIREMENTS.insulation.ceilingR} for Climate Zone ${zone}` : null,
+      hvacCOP        === undefined && ["hvac", "plumbing"].includes((jobType || "").toLowerCase()) ? `Select HVAC with heating COP ≥ ${REQUIREMENTS.hvac.minCOP}` : null,
+      lightingPower  === undefined ? "Use LED lighting to achieve ≤ 5 W/m² lighting power density" : null,
+    ].filter(Boolean),
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /material-substitution ───────────────────────────────────────────────
+// Suggests approved material substitutions when a specified product is
+// unavailable. Returns alternatives with compliance notes.
+app.post("/material-substitution", (req, res) => {
+  const { jobType, material, reason } = req.body || {};
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+
+  if (!jobType || !SUPPORTED.includes(jobType.toLowerCase())) {
+    return res.status(400).json({ error: `jobType required. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+  if (!material) {
+    return res.status(400).json({ error: "material is required (name of unavailable material)." });
+  }
+
+  const SUBSTITUTION_DATABASE = {
+    plumbing: [
+      { original: "copper pipe", alternatives: ["Cross-linked polyethylene (PEX) pipe — WaterMark certified", "CPVC pipe for hot water applications", "Polypropylene (PP-R) pipe for commercial applications"], notes: "All substitutes must carry WaterMark certification. Check AS/NZS 3500 for pressure/temperature ratings." },
+      { original: "brass fittings", alternatives: ["DZR brass fittings (dezincification resistant)", "Bronze fittings for marine environments", "Stainless steel fittings for corrosive environments"], notes: "Verify pressure rating matches application. Use PTFE tape or approved thread sealant." },
+      { original: "copper fittings", alternatives: ["Push-fit fittings (e.g., Plasson, Philmac) — WaterMark certified", "Compression fittings for copper or PEX"], notes: "Push-fit fittings suitable for cold water only in some applications — check manufacturer specs." },
+    ],
+    gas: [
+      { original: "steel gas pipe", alternatives: ["Copper pipe (sizes/grades per AS/NZS 5601.1)", "CSST (corrugated stainless steel tubing) — AGA certified", "PE pipe for underground service"], notes: "Material must be approved for gas use per AS/NZS 5601.1. CSST requires bonding." },
+      { original: "brass gas valve", alternatives: ["Stainless steel ball valve rated for gas", "Bronze valve for LPG applications"], notes: "All isolation valves must be rated for the gas type and working pressure." },
+    ],
+    electrical: [
+      { original: "twin and earth cable", alternatives: ["Single conductors in conduit (multicore)", "Armoured cable (TPS with armour) for external", "Flat twin — check current rating against AS/NZS 3000"], notes: "Current-carrying capacity must comply with AS/NZS 3008. De-rating factors apply in conduit." },
+      { original: "standard MCB", alternatives: ["RCBO (combined RCD + MCB) for dual protection", "GFCI breaker for wet area circuits"], notes: "RCBO provides both overcurrent and earth fault protection — compliant with AS/NZS 3000." },
+    ],
+    drainage: [
+      { original: "PVC-U drainage pipe", alternatives: ["PVC-M pipe (modified — higher impact resistance)", "HDPE pipe for aggressive conditions or thrust boring", "Fibre cement pipe for certain gravity sewer applications"], notes: "Check wall thickness class for burial depth. All substitutes must meet AS/NZS 1260 or AS/NZS 4321." },
+      { original: "cast iron drain", alternatives: ["Epoxy-lined ductile iron (noise reduction comparable)", "Heavy-duty PVC-M for commercial duty", "HDPE for chemical resistance"], notes: "Cast iron substitution must consider noise attenuation in multi-storey buildings." },
+    ],
+    carpentry: [
+      { original: "lvl beam", alternatives: ["Glulam (glued laminated timber) beam — equivalent spans", "Steel flitch beam for tighter floor depth", "Parallam PSL (parallel strand lumber)"], notes: "All substitutes require engineer certification. Do not substitute structural members without engineering sign-off." },
+      { original: "plywood", alternatives: ["Oriented Strand Board (OSB) for structural sheathing", "Structural particleboard for flooring (check joist span)", "Fibre cement sheet for wet areas"], notes: "Check the specific application — OSB and particleboard are not appropriate for external or wet applications." },
+    ],
+    hvac: [
+      { original: "r410a refrigerant", alternatives: ["R32 (lower GWP, A2L — flammability precautions required)", "R454B (A2L, very low GWP — direct replacement in some systems)", "R22 (BANNED — cannot be used as substitute)"], notes: "Refrigerant substitution must be approved by the equipment manufacturer. A2L refrigerants require additional safety precautions per AS/NZS 5149." },
+      { original: "copper refrigerant pipe", alternatives: ["ACR-grade copper (preferred — dehydrated)", "Pre-insulated refrigerant line sets for shorter runs"], notes: "Standard plumbing copper is not suitable for refrigerant — use ACR-grade dehydrated copper per AS/NZS 5149." },
+    ],
+  };
+
+  const tradeData = SUBSTITUTION_DATABASE[jobType.toLowerCase()] || [];
+  const materialLower = material.toLowerCase();
+
+  const matched = tradeData.filter(s => s.original.toLowerCase().includes(materialLower) || materialLower.includes(s.original.toLowerCase().split(" ")[0]));
+
+  return res.json({
+    jobType,
+    requestedMaterial: material,
+    reason:            reason || null,
+    matchCount:        matched.length,
+    substitutions:     matched,
+    generalGuidance: [
+      "Any material substitution must not compromise compliance with the applicable Australian Standard.",
+      "Substituted materials must carry equivalent certification (WaterMark, AGA, etc.) where required.",
+      "Document all substitutions including the reason and approval on the job record.",
+      "For structural substitutions (carpentry), obtain engineering sign-off before proceeding.",
+    ],
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /compliance-report-card ──────────────────────────────────────────────
+// Generates a clean, client-friendly compliance report card. Designed to be
+// shared with the property owner as a summary of the job's compliance result.
+app.post("/compliance-report-card", (req, res) => {
+  const {
+    jobType,
+    traderName,
+    traderLicence,
+    companyName,
+    siteAddress,
+    jobDate,
+    complianceScore,
+    confidence,
+    itemsDetected    = [],
+    itemsMissing     = [],
+    certificateNumber,
+    gpsRecorded,
+    testRecorded,
+    ownerName,
+    analysisId,
+  } = req.body || {};
+
+  if (!jobType) {
+    return res.status(400).json({ error: "jobType is required." });
+  }
+
+  const tradeLabel = {
+    plumbing: "Plumbing", gas: "Gas Fitting", electrical: "Electrical",
+    drainage: "Drainage", carpentry: "Carpentry / Building", hvac: "HVAC",
+  }[jobType?.toLowerCase()] || jobType;
+
+  const score  = complianceScore ?? confidence ?? null;
+  const grade  = score === null ? "N/A" : score >= 90 ? "A" : score >= 80 ? "B" : score >= 70 ? "C" : score >= 60 ? "D" : "F";
+  const result = score !== null ? (score >= 70 ? "COMPLIANT" : "ATTENTION REQUIRED") : "PENDING";
+
+  const LIABILITY = LIABILITY_PERIODS[jobType?.toLowerCase()] || { defects: 7 };
+
+  const RESULT_COLOURS = {
+    "COMPLIANT":           "#22c55e",
+    "ATTENTION REQUIRED":  "#f59e0b",
+    "PENDING":             "#94a3b8",
+  };
+
+  const highlight = RESULT_COLOURS[result] || "#94a3b8";
+  const dateStr   = jobDate ? new Date(jobDate).toLocaleDateString("en-AU", { day: "numeric", month: "long", year: "numeric" }) : null;
+
+  return res.json({
+    documentType:   "Compliance Report Card",
+    platform:       "Elemetric AI",
+    analysisId:     analysisId      || null,
+
+    header: {
+      ownerName:    ownerName       || null,
+      siteAddress:  siteAddress     || null,
+      jobDate:      dateStr         || null,
+      tradeType:    tradeLabel,
+    },
+
+    result: {
+      label:        result,
+      grade,
+      score,
+      colour:       highlight,
+      passOrFail:   result === "COMPLIANT" ? "PASS" : result === "ATTENTION REQUIRED" ? "FAIL" : "PENDING",
+    },
+
+    evidence: {
+      itemsVerified:    itemsDetected.length,
+      itemsMissing:     itemsMissing.length,
+      gpsRecorded:      gpsRecorded   ?? null,
+      testRecorded:     testRecorded  ?? null,
+      certificateNumber: certificateNumber || null,
+    },
+
+    tradesperson: {
+      name:         traderName      || null,
+      licence:      traderLicence   || null,
+      company:      companyName     || null,
+    },
+
+    keyItems: {
+      verified: itemsDetected.slice(0, 6),
+      missing:  itemsMissing.slice(0, 4),
+    },
+
+    liabilityNote:  `Defects liability: ${LIABILITY.defects} years from completion date.`,
+    generatedAt:    new Date().toISOString(),
+    disclaimer:     "This report card is generated by AI analysis of submitted photos. It is not a substitute for a mandatory compliance certificate.",
+  });
+});
+
+// ── POST /warranty-register ───────────────────────────────────────────────────
+// Stores product warranty details for a completed job in Supabase.
+// Returns a structured warranty register for the property owner.
+app.post("/warranty-register", async (req, res) => {
+  const {
+    analysisId,
+    userId,
+    siteAddress,
+    products = [],
+  } = req.body || {};
+
+  if (!Array.isArray(products) || products.length === 0) {
+    return res.status(400).json({ error: "products array is required (array of warranty objects)." });
+  }
+  if (products.length > 20) {
+    return res.status(400).json({ error: "Maximum 20 products per warranty register." });
+  }
+
+  const WARRANTIES_DEFAULTS = {
+    plumbing:   { years: 5,  description: "Standard trade workmanship warranty" },
+    gas:        { years: 5,  description: "Standard trade workmanship warranty" },
+    electrical: { years: 5,  description: "Standard trade workmanship warranty" },
+    drainage:   { years: 5,  description: "Standard trade workmanship warranty" },
+    carpentry:  { years: 7,  description: "Statutory defects liability period (DBCA 1995)" },
+    hvac:       { years: 2,  description: "Standard HVAC parts and labour warranty" },
+  };
+
+  const enrichedProducts = products.map((p, idx) => {
+    const installDate = p.installDate ? new Date(p.installDate) : new Date();
+    const warrantyYears = p.warrantyYears || WARRANTIES_DEFAULTS[p.tradeType?.toLowerCase()]?.years || 5;
+    const expiryDate = new Date(installDate.getTime() + warrantyYears * 365.25 * 24 * 3_600_000);
+    return {
+      lineItem:        idx + 1,
+      productName:     p.productName   || "Unnamed product",
+      manufacturer:    p.manufacturer  || null,
+      model:           p.model         || null,
+      serialNumber:    p.serialNumber  || null,
+      installDate:     installDate.toISOString().split("T")[0],
+      warrantyYears,
+      warrantyExpiry:  expiryDate.toISOString().split("T")[0],
+      registrationRef: p.registrationRef || null,
+      notes:           p.notes ? sanitiseInput(String(p.notes)).substring(0, 200) : null,
+    };
+  });
+
+  const record = {
+    analysis_id: analysisId || null,
+    user_id:     userId     || null,
+    site_address: siteAddress || null,
+    products:    enrichedProducts,
+    registered_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("warranty_registers").insert(record);
+      if (error) console.error("warranty-register insert error:", error);
+    } catch (err) {
+      console.error("warranty-register unexpected error:", err);
+    }
+  }
+
+  return res.status(201).json({
+    documentType:    "Warranty Register",
+    analysisId:      analysisId   || null,
+    siteAddress:     siteAddress  || null,
+    productCount:    enrichedProducts.length,
+    products:        enrichedProducts,
+    earliestExpiry:  enrichedProducts.sort((a, b) => a.warrantyExpiry.localeCompare(b.warrantyExpiry))[0]?.warrantyExpiry || null,
+    note: "Keep this register with your property records. Contact the manufacturer or installer if defects arise within the warranty period.",
+    registeredAt:    record.registered_at,
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
