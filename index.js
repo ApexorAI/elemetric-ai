@@ -42,6 +42,40 @@ const VICTORIAN_REGULATIONS = {
   },
 };
 
+// ── Task 1: Prompt Versioning Registry ───────────────────────────────────────
+// Metadata registry for every job-type prompt. Version numbers allow tracking
+// which prompt version generated a given result.
+
+const PROMPT_REGISTRY = {
+  plumbing:  { version: "1.1.0", description: "Strict plumbing photo validator — AS/NZS 3500 (30-example calibration set)", model: "gpt-4.1-mini", updatedAt: "2026-03-15" },
+  gas:       { version: "1.1.0", description: "Strict gas photo validator — AS/NZS 5601.1 (30-example calibration set)", model: "gpt-4.1-mini", updatedAt: "2026-03-15" },
+  electrical:{ version: "1.1.0", description: "Strict electrical photo validator — AS/NZS 3000 (30-example calibration set)", model: "gpt-4.1-mini", updatedAt: "2026-03-15" },
+  drainage:  { version: "1.0.0", description: "Strict drainage photo validator — AS/NZS 3500.2 (18-example calibration set)", model: "gpt-4.1-mini", updatedAt: "2026-03-15" },
+  carpentry: { version: "1.0.0", description: "Carpentry documentation validator — AS 1684 (15-example calibration set)", model: "gpt-4.1-mini", updatedAt: "2026-03-15" },
+  hvac:      { version: "1.0.0", description: "HVAC documentation validator — AIRAH / AS 4254.2 (15-example calibration set)", model: "gpt-4.1-mini", updatedAt: "2026-03-15" },
+};
+
+// A/B testing: 20% of requests use the v2 chain-of-thought enhanced variant.
+// v2 adds a step-by-step reasoning chain preamble before the main prompt.
+// Results are tracked separately to compare average confidence scores.
+const promptAbStats = {
+  v1: { uses: 0, totalConfidence: 0, avgConfidence: null },
+  v2: { uses: 0, totalConfidence: 0, avgConfidence: null },
+};
+
+// Chain-of-thought preamble injected for v2 variant
+const PROMPT_V2_PREAMBLE = `ANALYSIS APPROACH — follow this exact reasoning chain for each photo before assigning any result:
+
+Step 1: Read the photo label carefully. What specific item must be visible?
+Step 2: Examine what is actually visible in the photo.
+Step 3: Does the photo show the named item clearly and without ambiguity?
+Step 4: Are specific compliance markers present (AS/NZS labels, certification plates, measurement references)?
+Step 5: Make your pass/fail/unclear decision. Be conservative — when uncertain, fail.
+
+Apply this chain internally for every photo before populating your JSON output.
+
+`;
+
 // ── API usage statistics (in-memory) ─────────────────────────────────────────
 const usageStats = {
   totalRequests:   0,
@@ -1604,10 +1638,17 @@ Example response shape:
 }
 `.trim();
 
+// A/B test: 20% of requests get chain-of-thought v2 variant
+const promptVariant = Math.random() < 0.2 ? "v2" : "v1";
+const promptVersionUsed = promptVariant === "v2" ? "2.0" : "1.0";
+const finalPromptText = promptVariant === "v2"
+  ? PROMPT_V2_PREAMBLE + buildRegulationsNote(type) + promptText
+  : buildRegulationsNote(type) + promptText;
+
 const inputContent = [
 {
 type: "text",
-text: buildRegulationsNote(type) + promptText,
+text: finalPromptText,
 },
 ...analysisImages.flatMap((img) => [
 {
@@ -1717,6 +1758,14 @@ const complianceScore = calculateComplianceScore({
   complexityScore,
 });
 
+// Track A/B test results
+const variantKey = promptVariant;
+promptAbStats[variantKey].uses++;
+promptAbStats[variantKey].totalConfidence += overallConfidence;
+promptAbStats[variantKey].avgConfidence = Math.round(
+  promptAbStats[variantKey].totalConfidence / promptAbStats[variantKey].uses
+);
+
 const finalResult = {
   relevant,
   overall_confidence: overallConfidence,
@@ -1731,9 +1780,11 @@ const finalResult = {
   recommended_actions: recommendedActions,
   liability_summary: liabilitySummary,
   analysis,
-  photos_analysed:     analysisImages.length,
-  photos_submitted:    images.length,
-  photo_quality_flags: qualityFailedImages.length > 0 ? qualityFailedImages : undefined,
+  photos_analysed:        analysisImages.length,
+  photos_submitted:       images.length,
+  photo_quality_flags:    qualityFailedImages.length > 0 ? qualityFailedImages : undefined,
+  prompt_version:         promptVersionUsed,
+  prompt_registry_version: (PROMPT_REGISTRY[type] || {}).version || "1.0.0",
 };
 
 // Cache result and resolve any waiting dedup requests
@@ -3045,6 +3096,35 @@ app.get("/regulatory-updates", (req, res) => {
   });
 });
 
+// ── GET /prompts ──────────────────────────────────────────────────────────────
+// Returns prompt registry metadata — versions, descriptions, A/B test results.
+
+app.get("/prompts", (_req, res) => {
+  const abSummary = {
+    v1: {
+      ...promptAbStats.v1,
+      description: "Standard prompt (80% of traffic)",
+    },
+    v2: {
+      ...promptAbStats.v2,
+      description: "Chain-of-thought enhanced variant (20% of traffic)",
+    },
+    winningVariant: (() => {
+      const { v1, v2 } = promptAbStats;
+      if (v1.uses < 5 || v2.uses < 5) return "insufficient_data";
+      if (v1.avgConfidence > v2.avgConfidence) return "v1";
+      if (v2.avgConfidence > v1.avgConfidence) return "v2";
+      return "tied";
+    })(),
+  };
+
+  return res.json({
+    registry:    PROMPT_REGISTRY,
+    abTesting:   abSummary,
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
 // ── GET /stats ────────────────────────────────────────────────────────────────
 // Protected by API key middleware. Returns usage metrics and estimated costs.
 
@@ -3060,6 +3140,7 @@ app.get("/stats", (_req, res) => {
     uptimeSeconds:    Math.round(process.uptime()),
     cacheSize:        analysisCache.size,
     pendingAnalyses:  pendingAnalyses.size,
+    promptAbTesting:  promptAbStats,
   });
 });
 
