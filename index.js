@@ -31704,6 +31704,167 @@ app.get("/rigging-register/:siteId", apiKeyAuth, async (req, res) => {
   res.status(503).json({ error: "Database not configured." });
 });
 
+// ── Round 115: Fire safety, evacuation plan, emergency management ─────────────
+
+// POST /fire-safety-register — Record fire safety systems and equipment on a site
+app.post("/fire-safety-register", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, projectId, systemType, make, model,
+    serialNumber, location, installDate, lastServiceDate,
+    nextServiceDue, serviceContractor, serviceContactPhone,
+    testResult, testDate, notes,
+  } = req.body;
+
+  if (!siteId || !systemType) return res.status(400).json({ error: "siteId and systemType required." });
+
+  const validTypes = [
+    "EXTINGUISHER", "HOSE_REEL", "SPRINKLER_SYSTEM", "FIRE_ALARM",
+    "EMERGENCY_LIGHTING", "EXIT_SIGN", "FIRE_HYDRANT", "SMOKE_DETECTOR",
+    "HEAT_DETECTOR", "SUPPRESSION_SYSTEM", "FIRE_PANEL", "OTHER",
+  ];
+  const type = (systemType || "OTHER").toUpperCase();
+
+  const nextServiceDate = nextServiceDue || null;
+  const serviceOverdue = nextServiceDate ? new Date(nextServiceDate) < new Date() : false;
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    project_id: sanitiseInput(projectId || ""),
+    system_type: validTypes.includes(type) ? type : "OTHER",
+    make: sanitiseInput(make || ""),
+    model: sanitiseInput(model || ""),
+    serial_number: sanitiseInput(serialNumber || ""),
+    location: sanitiseInput(location || ""),
+    install_date: installDate || null,
+    last_service_date: lastServiceDate || null,
+    next_service_due: nextServiceDate,
+    service_overdue: serviceOverdue,
+    service_contractor: sanitiseInput(serviceContractor || ""),
+    service_contact_phone: sanitiseInput(serviceContactPhone || ""),
+    test_result: sanitiseInput(testResult || ""),
+    test_date: testDate || null,
+    notes: sanitiseInput(notes || ""),
+    status: serviceOverdue ? "SERVICE_OVERDUE" : "COMPLIANT",
+    registered_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("fire_safety_register")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, itemId: data.id, serviceOverdue, ...record });
+  }
+
+  res.json({ success: true, itemId: null, serviceOverdue, ...record, saved: false });
+});
+
+// POST /evacuation-plan — Store an emergency evacuation plan for a site
+app.post("/evacuation-plan", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, siteAddress, assemblyPoints = [], wardenName,
+    wardenPhone, deputyWardenName, emergencyContactList = [],
+    evacuationRoutes = [], musterProcedure,
+    disabledPersonProcedure, evacuationSignage = [],
+    lastDrillDate, nextDrillDue,
+  } = req.body;
+
+  if (!siteId || !assemblyPoints.length) return res.status(400).json({ error: "siteId and assemblyPoints required." });
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    site_address: sanitiseInput(siteAddress || ""),
+    assembly_points: assemblyPoints.map(ap => ({
+      name: sanitiseInput(ap.name || ""),
+      location: sanitiseInput(ap.location || ""),
+      mapReference: sanitiseInput(ap.mapReference || ""),
+    })),
+    warden_name: sanitiseInput(wardenName || ""),
+    warden_phone: sanitiseInput(wardenPhone || ""),
+    deputy_warden_name: sanitiseInput(deputyWardenName || ""),
+    emergency_contacts: emergencyContactList.map(ec => ({
+      role: sanitiseInput(ec.role || ""),
+      name: sanitiseInput(ec.name || ""),
+      phone: sanitiseInput(ec.phone || ""),
+    })),
+    evacuation_routes: evacuationRoutes.map(r => sanitiseInput(r)),
+    muster_procedure: sanitiseInput(musterProcedure || "All personnel must proceed to the nearest assembly point and report to the warden for headcount."),
+    disabled_person_procedure: sanitiseInput(disabledPersonProcedure || "Designated helper to assist mobility-impaired personnel. Notify emergency services of any persons requiring assistance."),
+    evacuation_signage: evacuationSignage.map(s => sanitiseInput(s)),
+    last_drill_date: lastDrillDate || null,
+    next_drill_due: nextDrillDue || null,
+    drill_overdue: nextDrillDue ? new Date(nextDrillDue) < new Date() : false,
+    status: "CURRENT",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("evacuation_plans")
+      .upsert({ ...record, site_id: record.site_id }, { onConflict: "site_id" })
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, planId: data.id, ...record });
+  }
+
+  res.json({ success: true, planId: null, ...record, saved: false });
+});
+
+// POST /emergency-drill — Record an emergency drill exercise
+app.post("/emergency-drill", apiKeyAuth, async (req, res) => {
+  const {
+    siteId, drillType, conductedBy, drillDate,
+    participantCount, evacuationTimeSeconds,
+    allPersonsAccountedFor = true, issuesIdentified = [],
+    correctiveActions = [], nextDrillDate,
+    wardenPerformance, notes,
+  } = req.body;
+
+  if (!siteId || !drillType) return res.status(400).json({ error: "siteId and drillType required." });
+
+  const validTypes = ["FIRE_EVACUATION", "CHEMICAL_SPILL", "MEDICAL_EMERGENCY", "BOMB_THREAT", "EARTHQUAKE", "GENERAL_EMERGENCY"];
+  const type = (drillType || "FIRE_EVACUATION").toUpperCase();
+
+  const evacuationMins = evacuationTimeSeconds ? Math.round(evacuationTimeSeconds / 60 * 10) / 10 : null;
+  const performanceRating = evacuationTimeSeconds
+    ? evacuationTimeSeconds <= 180 ? "EXCELLENT" : evacuationTimeSeconds <= 300 ? "SATISFACTORY" : "NEEDS_IMPROVEMENT"
+    : null;
+
+  const record = {
+    site_id: sanitiseInput(siteId),
+    drill_type: validTypes.includes(type) ? type : "FIRE_EVACUATION",
+    conducted_by: sanitiseInput(conductedBy || ""),
+    drill_date: drillDate || new Date().toISOString().split("T")[0],
+    participant_count: Number(participantCount) || null,
+    evacuation_time_seconds: Number(evacuationTimeSeconds) || null,
+    evacuation_time_minutes: evacuationMins,
+    performance_rating: performanceRating,
+    all_persons_accounted_for: Boolean(allPersonsAccountedFor),
+    issues_identified: issuesIdentified.map(i => sanitiseInput(i)),
+    corrective_actions: correctiveActions.map(c => sanitiseInput(c)),
+    next_drill_date: nextDrillDate || null,
+    warden_performance: sanitiseInput(wardenPerformance || ""),
+    notes: sanitiseInput(notes || ""),
+    outcome: allPersonsAccountedFor && !issuesIdentified.length ? "PASSED" : issuesIdentified.length > 0 ? "PASSED_WITH_ISSUES" : "FAILED",
+    conducted_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("emergency_drills")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, drillId: data.id, performanceRating, outcome: record.outcome, ...record });
+  }
+
+  res.json({ success: true, drillId: null, performanceRating, outcome: record.outcome, ...record, saved: false });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
