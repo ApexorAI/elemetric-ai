@@ -27990,6 +27990,241 @@ app.post("/project-closeout", apiKeyAuth, async (req, res) => {
   res.json({ success: true, closeoutId: null, closeoutStatus, passedCount, totalItems: checklistItems.length, checklistItems, saved: false });
 });
 
+// ── Round 96: Quote comparison, job costing, AI specification writer ──────────
+
+// POST /quote-comparison — Compare multiple contractor quotes for a job
+app.post("/quote-comparison", apiKeyAuth, async (req, res) => {
+  const { jobDescription, quotes = [] } = req.body;
+  if (!quotes.length) return res.status(400).json({ error: "At least one quote required." });
+
+  const sanitisedJob = sanitiseInput(jobDescription || "");
+
+  const processed = quotes.map((q, idx) => {
+    const labour = Number(q.labourCost) || 0;
+    const materials = Number(q.materialsCost) || 0;
+    const overhead = Number(q.overheadCost) || 0;
+    const total = labour + materials + overhead + (Number(q.gst) || (labour + materials + overhead) * 0.1);
+    return {
+      rank: idx + 1,
+      contractorName: sanitiseInput(q.contractorName || `Contractor ${idx + 1}`),
+      labourCost: labour,
+      materialsCost: materials,
+      overheadCost: overhead,
+      totalExGst: labour + materials + overhead,
+      gst: Number(q.gst) || (labour + materials + overhead) * 0.1,
+      totalIncGst: total,
+      warranty: sanitiseInput(q.warranty || "Not specified"),
+      leadTime: sanitiseInput(q.leadTime || "Not specified"),
+      inclusions: Array.isArray(q.inclusions) ? q.inclusions.map(i => sanitiseInput(i)) : [],
+      exclusions: Array.isArray(q.exclusions) ? q.exclusions.map(e => sanitiseInput(e)) : [],
+    };
+  });
+
+  const sorted = [...processed].sort((a, b) => a.totalIncGst - b.totalIncGst);
+  sorted.forEach((q, i) => { q.rank = i + 1; });
+
+  const lowestTotal = sorted[0].totalIncGst;
+  const highestTotal = sorted[sorted.length - 1].totalIncGst;
+  const averageTotal = processed.reduce((s, q) => s + q.totalIncGst, 0) / processed.length;
+
+  res.json({
+    jobDescription: sanitisedJob,
+    quoteCount: quotes.length,
+    lowestTotal,
+    highestTotal,
+    averageTotal: Math.round(averageTotal * 100) / 100,
+    spread: highestTotal - lowestTotal,
+    spreadPercent: lowestTotal > 0 ? Math.round(((highestTotal - lowestTotal) / lowestTotal) * 100) : 0,
+    rankedQuotes: sorted,
+    recommendation: sorted[0].contractorName,
+    comparedAt: new Date().toISOString(),
+  });
+});
+
+// POST /job-costing — Detailed job costing breakdown with margin analysis
+app.post("/job-costing", apiKeyAuth, async (req, res) => {
+  const {
+    jobId, jobName, jobType,
+    labourHours = 0, labourRate = 0,
+    materialsSubtotal = 0, subcontractorCost = 0,
+    plantHireCost = 0, permitCost = 0, travelCost = 0,
+    overheadPercent = 15, marginPercent = 20,
+    quoteAmount = 0,
+  } = req.body;
+
+  if (!jobName) return res.status(400).json({ error: "jobName required." });
+
+  const labourCost = Number(labourHours) * Number(labourRate);
+  const directCosts = labourCost + Number(materialsSubtotal) + Number(subcontractorCost) +
+    Number(plantHireCost) + Number(permitCost) + Number(travelCost);
+  const overhead = directCosts * (Number(overheadPercent) / 100);
+  const totalCost = directCosts + overhead;
+  const margin = totalCost * (Number(marginPercent) / 100);
+  const sellPrice = totalCost + margin;
+  const gst = sellPrice * 0.1;
+  const sellPriceIncGst = sellPrice + gst;
+
+  const quotedAmount = Number(quoteAmount) || 0;
+  const varianceToQuote = quotedAmount > 0 ? quotedAmount - sellPriceIncGst : null;
+  const variancePercent = quotedAmount > 0 && sellPriceIncGst > 0
+    ? Math.round(((quotedAmount - sellPriceIncGst) / sellPriceIncGst) * 100) : null;
+
+  const record = {
+    job_id: sanitiseInput(jobId || ""),
+    job_name: sanitiseInput(jobName),
+    job_type: sanitiseInput(jobType || ""),
+    labour_hours: Number(labourHours), labour_rate: Number(labourRate), labour_cost: labourCost,
+    materials_subtotal: Number(materialsSubtotal), subcontractor_cost: Number(subcontractorCost),
+    plant_hire_cost: Number(plantHireCost), permit_cost: Number(permitCost), travel_cost: Number(travelCost),
+    direct_costs: directCosts, overhead_percent: Number(overheadPercent), overhead,
+    total_cost: totalCost, margin_percent: Number(marginPercent), margin,
+    sell_price: sellPrice, gst, sell_price_inc_gst: sellPriceIncGst,
+    quote_amount: quotedAmount,
+    costed_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    await supabaseAdmin.from("job_costings").insert(record);
+  }
+
+  res.json({
+    jobId: jobId || null, jobName, jobType: jobType || null,
+    breakdown: {
+      labourCost: Math.round(labourCost * 100) / 100,
+      materialsSubtotal: Number(materialsSubtotal),
+      subcontractorCost: Number(subcontractorCost),
+      plantHireCost: Number(plantHireCost),
+      permitCost: Number(permitCost),
+      travelCost: Number(travelCost),
+      directCosts: Math.round(directCosts * 100) / 100,
+      overhead: Math.round(overhead * 100) / 100,
+      totalCost: Math.round(totalCost * 100) / 100,
+      margin: Math.round(margin * 100) / 100,
+      sellPriceExGst: Math.round(sellPrice * 100) / 100,
+      gst: Math.round(gst * 100) / 100,
+      sellPriceIncGst: Math.round(sellPriceIncGst * 100) / 100,
+    },
+    quoteComparison: quotedAmount > 0 ? {
+      quoteAmount: quotedAmount,
+      varianceToQuote: varianceToQuote !== null ? Math.round(varianceToQuote * 100) / 100 : null,
+      variancePercent,
+      status: variancePercent !== null ? (variancePercent > 10 ? "OVER_QUOTED" : variancePercent < -10 ? "UNDER_QUOTED" : "ON_BUDGET") : null,
+    } : null,
+    costedAt: new Date().toISOString(),
+  });
+});
+
+// POST /ai-specification-writer — AI writes a technical specification document for a trade scope of works
+app.post("/ai-specification-writer", apiKeyAuth, async (req, res) => {
+  const {
+    specType, trade, projectDescription, buildingClass,
+    state = "VIC", qualityLevel = "standard", inclusions = [],
+  } = req.body;
+
+  if (!specType || !trade) return res.status(400).json({ error: "specType and trade required." });
+
+  const sanitisedDesc = sanitiseInput(projectDescription || "");
+  const sanitisedInclusions = inclusions.map(i => sanitiseInput(i)).join(", ");
+
+  const prompt = `You are a senior Australian construction specification writer. Write a formal technical specification for the following scope of works.
+
+Specification type: ${sanitiseInput(specType)}
+Trade: ${sanitiseInput(trade)}
+Project: ${sanitisedDesc}
+Building class: ${sanitiseInput(buildingClass || "Class 1a")}
+State: ${sanitiseInput(state)}
+Quality level: ${sanitiseInput(qualityLevel)} (budget/standard/premium/luxury)
+Specific inclusions: ${sanitisedInclusions || "Standard scope"}
+
+Return a JSON object with:
+- "title": specification document title
+- "sections": array of { "heading": string, "content": string } covering: Scope of Works, Materials & Products, Workmanship Standards, Australian Standards Referenced, Testing & Commissioning, Warranty, Exclusions
+- "applicableStandards": array of relevant AS/NZS standard codes
+- "keyMaterials": array of specified materials/products
+- "qualityHold points": array of inspection hold points
+- "estimatedPages": number
+- "disclaimer": string`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 2500,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, specType, trade, state, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      title: `${trade} Specification — ${specType}`,
+      sections: [
+        { heading: "Scope of Works", content: `Supply and install all ${trade} works as described in the project documents.` },
+        { heading: "Materials & Products", content: "All materials shall be new, fit for purpose, and comply with relevant Australian Standards." },
+        { heading: "Workmanship Standards", content: "All work shall be carried out by licensed tradespeople in accordance with applicable codes and standards." },
+        { heading: "Australian Standards Referenced", content: "Refer to applicable AS/NZS standards for the specified trade." },
+        { heading: "Testing & Commissioning", content: "All systems shall be tested and commissioned prior to practical completion." },
+        { heading: "Warranty", content: "Minimum 12-month defects liability period from practical completion." },
+        { heading: "Exclusions", content: "Work not specifically described in this specification is excluded." },
+      ],
+      applicableStandards: [],
+      keyMaterials: [],
+      "qualityHold points": [],
+      estimatedPages: 4,
+      disclaimer: "This specification is a guide only. Engage a qualified professional for project-specific advice.",
+      specType, trade, state, generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /snagging-list — Record and manage final snagging/defect list items
+app.post("/snagging-list", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, inspectedBy, items = [],
+  } = req.body;
+
+  if (!projectId || !items.length) return res.status(400).json({ error: "projectId and items required." });
+
+  const processedItems = items.map((item, idx) => ({
+    itemNumber: idx + 1,
+    location: sanitiseInput(item.location || ""),
+    description: sanitiseInput(item.description || ""),
+    trade: sanitiseInput(item.trade || ""),
+    severity: ["MINOR", "MAJOR", "CRITICAL"].includes((item.severity || "").toUpperCase()) ? item.severity.toUpperCase() : "MINOR",
+    responsibleContractor: sanitiseInput(item.responsibleContractor || ""),
+    dueDate: item.dueDate || null,
+    status: "OPEN",
+  }));
+
+  const criticalCount = processedItems.filter(i => i.severity === "CRITICAL").length;
+  const majorCount = processedItems.filter(i => i.severity === "MAJOR").length;
+  const minorCount = processedItems.filter(i => i.severity === "MINOR").length;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    inspected_by: sanitiseInput(inspectedBy || ""),
+    items: processedItems,
+    total_items: processedItems.length,
+    critical_count: criticalCount,
+    major_count: majorCount,
+    minor_count: minorCount,
+    status: criticalCount > 0 ? "CRITICAL_ITEMS" : majorCount > 0 ? "MAJOR_ITEMS" : "MINOR_ITEMS_ONLY",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("snagging_lists")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, snagId: data.id, ...record });
+  }
+
+  res.json({ success: true, snagId: null, ...record, saved: false });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
