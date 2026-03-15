@@ -24785,6 +24785,210 @@ app.get("/job-summary/:jobId", apiKeyAuth, async (req, res) => {
   return res.json(summary);
 });
 
+// POST /ai-risk-register  — AI generates a risk register for a project
+app.post("/ai-risk-register", apiKeyAuth, async (req, res) => {
+  const { projectId, jobType, scope, propertyType, state = "VIC" } = req.body || {};
+  if (!projectId || !jobType || !scope) return res.status(400).json({ error: "projectId, jobType, and scope required." });
+
+  const safeProjectId = sanitiseInput(String(projectId)).slice(0, 80);
+  const safeType      = sanitiseInput(String(jobType)).slice(0, 40);
+  const safeScope     = sanitiseInput(String(scope)).slice(0, 1500);
+  const safeProp      = propertyType ? sanitiseInput(String(propertyType)).slice(0, 60) : null;
+  const safeState     = sanitiseInput(String(state)).toUpperCase().slice(0, 5);
+
+  const prompt = `You are a risk management consultant for ${safeType} construction in ${safeState}, Australia.
+
+Generate a risk register for the following project:
+Scope: ${safeScope}
+${safeProp ? `Property type: ${safeProp}` : ""}
+
+Respond with JSON:
+{
+  "risks": [
+    {
+      "id": "R01",
+      "category": "safety|compliance|financial|schedule|quality|environmental",
+      "description": "risk description",
+      "likelihood": 1-5,
+      "consequence": 1-5,
+      "riskScore": 1-25,
+      "riskLevel": "LOW|MEDIUM|HIGH|EXTREME",
+      "controls": ["control measure"],
+      "owner": "who manages this risk",
+      "residualRisk": "LOW|MEDIUM|HIGH"
+    }
+  ],
+  "summary": "1-2 sentence overview"
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 900 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    const risks = Array.isArray(parsed.risks) ? parsed.risks : [];
+    const extreme = risks.filter(r => r.riskLevel === "EXTREME").length;
+    const high    = risks.filter(r => r.riskLevel === "HIGH").length;
+    return res.json({
+      projectId: safeProjectId, jobType: safeType,
+      riskCount: risks.length, extreme, high,
+      topRisk: risks.sort((a, b) => (b.riskScore || 0) - (a.riskScore || 0))[0] || null,
+      risks, summary: parsed.summary || "",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      projectId: safeProjectId, jobType: safeType, riskCount: 0, extreme: 0, high: 0,
+      topRisk: null, risks: [], summary: "Risk register generation temporarily unavailable.",
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /inspection-report  — Generate a formatted inspection report summary
+app.post("/inspection-report", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, address, inspectorName, inspectionDate, overallResult, sections = [], notes, recommendations } = req.body || {};
+  if (!jobId || !overallResult) return res.status(400).json({ error: "jobId and overallResult required." });
+
+  const VALID_RESULTS = ["PASS", "FAIL", "CONDITIONAL", "REINSPECTION_REQUIRED"];
+  const safeJobId   = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeType    = jobType ? sanitiseInput(String(jobType)).toLowerCase().slice(0, 40) : null;
+  const safeAddress = address ? sanitiseInput(String(address)).slice(0, 200) : null;
+  const safeInspector = inspectorName ? sanitiseInput(String(inspectorName)).slice(0, 100) : null;
+  const safeDate    = inspectionDate ? sanitiseInput(String(inspectionDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeResult  = VALID_RESULTS.includes(String(overallResult).toUpperCase()) ? String(overallResult).toUpperCase() : "CONDITIONAL";
+  const safeNotes   = notes ? sanitiseInput(String(notes)).slice(0, 1000) : null;
+  const safeRecs    = recommendations ? sanitiseInput(String(recommendations)).slice(0, 1000) : null;
+
+  const safeSections = Array.isArray(sections) ? sections.slice(0, 30).map(s => ({
+    name:     sanitiseInput(String(s.name || "")).slice(0, 100),
+    result:   VALID_RESULTS.includes(String(s.result || "").toUpperCase()) ? String(s.result).toUpperCase() : "PASS",
+    findings: s.findings ? sanitiseInput(String(s.findings)).slice(0, 300) : null,
+    photos:   Array.isArray(s.photos) ? s.photos.slice(0, 10) : [],
+  })) : [];
+
+  const passCount = safeSections.filter(s => s.result === "PASS").length;
+  const failCount = safeSections.filter(s => s.result === "FAIL").length;
+
+  const report = {
+    reportId:       `IR-${safeJobId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    jobId:          safeJobId, jobType: safeType, address: safeAddress,
+    inspectorName:  safeInspector, inspectionDate: safeDate,
+    overallResult:  safeResult,
+    sectionResults: { total: safeSections.length, passed: passCount, failed: failCount },
+    sections:       safeSections, notes: safeNotes, recommendations: safeRecs,
+    generatedAt:    new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("inspection_reports").insert({
+        report_id: report.reportId, job_id: safeJobId, job_type: safeType, address: safeAddress,
+        inspector_name: safeInspector, inspection_date: safeDate, overall_result: safeResult,
+        sections: safeSections, notes: safeNotes, recommendations: safeRecs,
+        created_at: report.generatedAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...report, saved: !!supabaseAdmin });
+});
+
+// POST /pre-pour-check  — Log a pre-pour concrete inspection checklist
+app.post("/pre-pour-check", apiKeyAuth, async (req, res) => {
+  const { jobId, siteId, address, inspectedBy, reinforcementCorrect, coverCorrect, formworkSecure, trenchBottom, dampProofMembrane, penetrationsSleeves, holdDownsAnchors, engineerApproved, notes } = req.body || {};
+  if (!jobId && !siteId) return res.status(400).json({ error: "jobId or siteId required." });
+
+  const safeJobId = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeBy    = inspectedBy ? sanitiseInput(String(inspectedBy)).slice(0, 100) : null;
+  const safeNotes = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const checklist = [
+    { item: "Reinforcement type and spacing correct",   passed: reinforcementCorrect === true },
+    { item: "Concrete cover to reinforcement correct",  passed: coverCorrect === true },
+    { item: "Formwork secure and correctly dimensioned", passed: formworkSecure === true },
+    { item: "Trench bottom clean and compacted",        passed: trenchBottom === true },
+    { item: "Damp proof membrane installed",            passed: dampProofMembrane === true },
+    { item: "All penetrations/sleeves in place",        passed: penetrationsSleeves === true },
+    { item: "Hold-downs and anchor bolts positioned",   passed: holdDownsAnchors === true },
+    { item: "Engineering approval obtained",            passed: engineerApproved === true },
+  ];
+
+  const passed = checklist.filter(c => c.passed).length;
+  const approved = passed === checklist.length;
+
+  const record = {
+    checkId: `PPK-${(safeJobId || safeSiteId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    jobId: safeJobId, siteId: safeSiteId,
+    address: address ? sanitiseInput(String(address)).slice(0, 200) : null,
+    inspectedBy: safeBy, checklist, passed, total: checklist.length,
+    approvedToPour: approved,
+    result: approved ? "APPROVED" : "HOLD",
+    blockers: checklist.filter(c => !c.passed).map(c => c.item),
+    notes: safeNotes, inspectedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("pre_pour_checks").insert({
+        check_id: record.checkId, job_id: safeJobId, site_id: safeSiteId,
+        address: record.address, inspected_by: safeBy, checklist,
+        passed, approved_to_pour: approved, result: record.result, notes: safeNotes,
+        inspected_at: record.inspectedAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// POST /waterproofing-test  — Log a waterproofing flood test result
+app.post("/waterproofing-test", apiKeyAuth, async (req, res) => {
+  const { jobId, siteId, location, testDate, testDurationHours, waterDepthMm, waterLevelDropMm, leakObserved, passedTest, inspectedBy, notes } = req.body || {};
+  if (!jobId && !siteId) return res.status(400).json({ error: "jobId or siteId required." });
+
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeLoc    = location ? sanitiseInput(String(location)).slice(0, 150) : null;
+  const safeDate   = testDate ? sanitiseInput(String(testDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeBy     = inspectedBy ? sanitiseInput(String(inspectedBy)).slice(0, 100) : null;
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const duration  = Math.max(0, parseFloat(testDurationHours) || 24);
+  const depth     = Math.max(0, parseFloat(waterDepthMm) || 50);
+  const drop      = Math.max(0, parseFloat(waterLevelDropMm) || 0);
+  const leaked    = leakObserved === true;
+  const ALLOWABLE_DROP = 5; // mm
+  const passed    = passedTest !== undefined ? passedTest === true : (!leaked && drop <= ALLOWABLE_DROP);
+
+  const record = {
+    testId: `WPT-${(safeJobId || safeSiteId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    jobId: safeJobId, siteId: safeSiteId, location: safeLoc,
+    testDate: safeDate, testDurationHours: duration,
+    waterDepthMm: depth, waterLevelDropMm: drop,
+    leakObserved: leaked, passedTest: passed,
+    result: passed ? "PASS" : "FAIL",
+    failureReason: !passed ? (leaked ? "Leak observed during test" : `Water level drop (${drop}mm) exceeds allowable (${ALLOWABLE_DROP}mm)`) : null,
+    standard: "AS 3740 — Waterproofing of domestic wet areas",
+    inspectedBy: safeBy, notes: safeNotes,
+    testedAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("waterproofing_tests").insert({
+        test_id: record.testId, job_id: safeJobId, site_id: safeSiteId, location: safeLoc,
+        test_date: safeDate, test_duration_hours: duration, water_depth_mm: depth,
+        water_level_drop_mm: drop, leak_observed: leaked, passed_test: passed,
+        result: record.result, failure_reason: record.failureReason, inspected_by: safeBy,
+        notes: safeNotes, tested_at: record.testedAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
