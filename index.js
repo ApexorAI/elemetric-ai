@@ -2353,6 +2353,167 @@ app.post("/send-near-miss-alert", async (req, res) => {
   }
 });
 
+// ── Task 10: Job Risk Assessment Engine ──────────────────────────────────────
+/**
+ * assessJobRisk — comprehensive post-job risk profile.
+ *
+ * Analyses completed job data and returns a detailed risk profile including
+ * overall risk level, specific risk factors, recommended mitigation actions,
+ * and estimated liability exposure in years remaining.
+ *
+ * @param {Object} p
+ * @param {string}  p.jobType             - trade type
+ * @param {number}  p.complianceScore     - 0-100 compliance score
+ * @param {number}  p.missingItemCount    - number of failed/missing items
+ * @param {boolean} p.gpsRecorded         - GPS coordinates captured
+ * @param {boolean} p.signatureObtained   - client signature captured
+ * @param {number}  p.photosTaken         - photos actually submitted
+ * @param {number}  p.requiredPhotos      - expected minimum photo count
+ * @param {number}  p.complexityScore     - 1-10 from calculateComplexity()
+ * @param {number}  p.daysSinceCompletion - days since job was completed
+ * @returns {{ overallRisk, riskFactors, recommendedActions, liabilityYears, detail }}
+ */
+function assessJobRisk({
+  jobType, complianceScore, missingItemCount, gpsRecorded, signatureObtained,
+  photosTaken, requiredPhotos, complexityScore, daysSinceCompletion,
+}) {
+  const riskFactors     = [];
+  const recommendedActions = [];
+  let riskPoints        = 0;
+
+  // Trade type base risk
+  const tradeRisk = { gas: 4, electrical: 4, plumbing: 3, drainage: 2, hvac: 2, carpentry: 1 };
+  riskPoints += tradeRisk[jobType] ?? 2;
+
+  // Compliance score risk
+  if (complianceScore < 50) {
+    riskPoints += 5;
+    riskFactors.push({ factor: "Very low compliance score", severity: "critical", detail: `Score ${complianceScore}/100 is critically low` });
+    recommendedActions.push("Immediately retake all failed photos and resubmit for analysis before certifying.");
+  } else if (complianceScore < 70) {
+    riskPoints += 3;
+    riskFactors.push({ factor: "Below-threshold compliance score", severity: "high", detail: `Score ${complianceScore}/100 is below the 70-point pass threshold` });
+    recommendedActions.push("Retake failed photos to bring compliance score above 70 before lodging certification.");
+  } else if (complianceScore < 85) {
+    riskPoints += 1;
+    riskFactors.push({ factor: "Marginal compliance score", severity: "medium", detail: `Score ${complianceScore}/100 — consider retaking unclear photos` });
+    recommendedActions.push("Consider retaking any unclear photos to strengthen the compliance record.");
+  }
+
+  // Missing items risk
+  if (missingItemCount > 0) {
+    const missingRisk = Math.min(4, missingItemCount * 1.5);
+    riskPoints += missingRisk;
+    const sev = missingItemCount >= 3 ? "critical" : missingItemCount >= 2 ? "high" : "medium";
+    riskFactors.push({ factor: `${missingItemCount} missing compliance item${missingItemCount !== 1 ? "s" : ""}`, severity: sev, detail: `${missingItemCount} required item${missingItemCount !== 1 ? "s" : ""} not documented` });
+    recommendedActions.push(`Return to site and photograph the ${missingItemCount} missing item${missingItemCount !== 1 ? "s" : ""} before certifying.`);
+  }
+
+  // GPS not recorded
+  if (!gpsRecorded) {
+    riskPoints += 2;
+    riskFactors.push({ factor: "No GPS coordinates recorded", severity: "medium", detail: "Location cannot be independently verified — weakens evidentiary value" });
+    recommendedActions.push("Enable GPS on your device and retake the job to record location coordinates.");
+  }
+
+  // No client signature
+  if (!signatureObtained) {
+    riskPoints += 2;
+    riskFactors.push({ factor: "No client signature obtained", severity: "medium", detail: "Client acceptance not recorded — increases dispute risk" });
+    recommendedActions.push("Obtain a client signature or send the job report for digital sign-off via the app.");
+  }
+
+  // Insufficient photos
+  if (typeof photosTaken === "number" && typeof requiredPhotos === "number" && photosTaken < requiredPhotos) {
+    const shortfall = requiredPhotos - photosTaken;
+    riskPoints += Math.min(3, shortfall);
+    riskFactors.push({ factor: `Only ${photosTaken} of ${requiredPhotos} recommended photos taken`, severity: "medium", detail: `${shortfall} more photo${shortfall !== 1 ? "s" : ""} recommended for complete documentation` });
+    recommendedActions.push(`Take ${shortfall} more photo${shortfall !== 1 ? "s" : ""} to complete the recommended documentation set.`);
+  }
+
+  // High complexity with low evidence
+  if (complexityScore >= 7 && complianceScore < 80) {
+    riskPoints += 2;
+    riskFactors.push({ factor: "Complex job with incomplete evidence", severity: "high", detail: `Complexity score ${complexityScore}/10 — complex jobs require more thorough documentation` });
+    recommendedActions.push("Add additional photos covering all aspects of this complex installation.");
+  }
+
+  // Time since completion (risk of gaps being discovered later)
+  if (typeof daysSinceCompletion === "number" && daysSinceCompletion > 30 && missingItemCount > 0) {
+    riskPoints += 1;
+    riskFactors.push({ factor: "Missing items not rectified within 30 days", severity: "medium", detail: `Job completed ${daysSinceCompletion} days ago — missing items become harder to rectify over time` });
+    recommendedActions.push("Contact the client to arrange a return visit to document the missing items promptly.");
+  }
+
+  // Determine overall risk level
+  let overallRisk;
+  if (riskPoints >= 12)     overallRisk = "critical";
+  else if (riskPoints >= 8) overallRisk = "high";
+  else if (riskPoints >= 5) overallRisk = "medium";
+  else                      overallRisk = "low";
+
+  // Estimate liability exposure period
+  // High-risk trades have longer liability windows under Australian law
+  const baseLiabilityYears = { gas: 10, electrical: 7, plumbing: 7, drainage: 7, hvac: 5, carpentry: 6 };
+  const base = baseLiabilityYears[jobType] ?? 6;
+  // Missing compliance items extend liability exposure
+  const liabilityYears = base + (missingItemCount * 1.5) + (complianceScore < 70 ? 2 : 0);
+
+  return {
+    overallRisk,
+    riskPoints,
+    riskFactors,
+    recommendedActions: [...new Set(recommendedActions)], // deduplicate
+    liabilityYears: parseFloat(Math.min(15, liabilityYears).toFixed(1)),
+    detail: {
+      jobType,
+      complianceScore,
+      missingItemCount,
+      gpsRecorded:       !!gpsRecorded,
+      signatureObtained: !!signatureObtained,
+      complexityScore,
+      daysSinceCompletion: daysSinceCompletion ?? null,
+    },
+    summary: `${overallRisk.charAt(0).toUpperCase() + overallRisk.slice(1)} risk — ${riskFactors.length} risk factor${riskFactors.length !== 1 ? "s" : ""} identified. Estimated liability exposure: ${Math.min(15, liabilityYears).toFixed(1)} years.`,
+  };
+}
+
+// POST /risk-assessment — returns risk profile for a completed job
+// Body: { jobType, complianceScore, missingItemCount, gpsRecorded,
+//          signatureObtained, photosTaken, requiredPhotos,
+//          complexityScore, daysSinceCompletion }
+
+app.post("/risk-assessment", (req, res) => {
+  try {
+    const {
+      jobType, complianceScore, missingItemCount, gpsRecorded, signatureObtained,
+      photosTaken, requiredPhotos, complexityScore, daysSinceCompletion,
+    } = req.body || {};
+
+    if (!jobType || typeof jobType !== "string")
+      return res.status(400).json({ error: "Missing jobType." });
+    if (typeof complianceScore !== "number")
+      return res.status(400).json({ error: "complianceScore must be a number." });
+
+    const result = assessJobRisk({
+      jobType,
+      complianceScore: Math.max(0, Math.min(100, complianceScore)),
+      missingItemCount:    typeof missingItemCount    === "number" ? missingItemCount    : 0,
+      gpsRecorded:         !!gpsRecorded,
+      signatureObtained:   !!signatureObtained,
+      photosTaken:         typeof photosTaken         === "number" ? photosTaken         : undefined,
+      requiredPhotos:      typeof requiredPhotos      === "number" ? requiredPhotos      : undefined,
+      complexityScore:     typeof complexityScore     === "number" ? complexityScore     : 5,
+      daysSinceCompletion: typeof daysSinceCompletion === "number" ? daysSinceCompletion : undefined,
+    });
+
+    return res.json(result);
+  } catch (err) {
+    console.error("risk-assessment error:", err);
+    return res.status(500).json({ error: "Risk assessment failed. Please try again." });
+  }
+});
+
 // ── Task 9: Regulatory Change Monitoring ─────────────────────────────────────
 // Tracks known changes to Australian trade standards relevant to Elemetric users.
 
