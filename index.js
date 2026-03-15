@@ -49212,6 +49212,299 @@ app.post("/site-signage-audit", apiKeyAuth, async (req, res) => {
   });
 });
 
+// POST /mental-health-checkin — Worker wellbeing check-in
+app.post("/mental-health-checkin", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, checkinDate, anonymous,
+    workerName, workerId, role,
+    // Wellbeing scale (1–10 each)
+    overallWellbeingScore, workloadScore, relationshipsScore, sleepScore, physicalHealthScore,
+    // Risk indicators
+    feelingOverwhelmed, feelingIsolated, conflictAtWork, financialStress, bereavementOrLoss,
+    substanceConcern, thinkingAboutLeaving, needsSupport,
+    // Open response (optional)
+    openResponse,
+    // Consent for follow-up
+    consentToFollowUp, preferredContactMethod,
+  } = req.body;
+
+  if (!projectId || !checkinDate) {
+    return res.status(400).json({ error: "projectId and checkinDate are required." });
+  }
+
+  // Validate scores 1-10
+  const scores = { overallWellbeingScore, workloadScore, relationshipsScore, sleepScore, physicalHealthScore };
+  for (const [key, val] of Object.entries(scores)) {
+    if (val !== undefined && (Number(val) < 1 || Number(val) > 10)) {
+      return res.status(400).json({ error: `${key} must be between 1 and 10.` });
+    }
+  }
+
+  const overallScore = overallWellbeingScore ? Number(overallWellbeingScore) : null;
+  const avgScore = Object.values(scores).filter(s => s !== undefined).length > 0
+    ? Math.round(Object.values(scores).filter(s => s !== undefined).reduce((a, b) => a + Number(b), 0) / Object.values(scores).filter(s => s !== undefined).length * 10) / 10
+    : null;
+
+  // Risk tier scoring
+  let riskPoints = 0;
+  if (overallScore !== null && overallScore <= 3) riskPoints += 4;
+  else if (overallScore !== null && overallScore <= 5) riskPoints += 2;
+  if (feelingOverwhelmed) riskPoints += 2;
+  if (feelingIsolated) riskPoints += 2;
+  if (conflictAtWork) riskPoints += 1;
+  if (financialStress) riskPoints += 2;
+  if (bereavementOrLoss) riskPoints += 2;
+  if (substanceConcern) riskPoints += 3;
+  if (thinkingAboutLeaving) riskPoints += 1;
+  if (needsSupport) riskPoints += 3;
+
+  const riskTier = riskPoints >= 8 ? "HIGH" : riskPoints >= 4 ? "MEDIUM" : "LOW";
+
+  // Crisis resources (always include in response)
+  const supportResources = [
+    { name: "Lifeline", number: "13 11 14", description: "24/7 crisis support" },
+    { name: "Mates in Construction (MAIC)", number: "1300 642 111", description: "Dedicated construction industry support" },
+    { name: "Beyond Blue", number: "1300 22 4636", description: "Anxiety, depression and suicide prevention" },
+    { name: "Mensline", number: "1300 78 99 78", description: "Men's mental health support" },
+    { name: "EAP (if available)", number: "Check with employer", description: "Employee Assistance Program" },
+  ];
+
+  const followUpRequired = riskTier === "HIGH" || needsSupport || consentToFollowUp;
+
+  const ref = `MHC-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    checkinDate,
+    anonymous: anonymous !== false,
+    worker: anonymous !== false ? null : {
+      name: sanitiseInput(workerName || "", 120),
+      id: sanitiseInput(workerId || "", 60),
+      role: sanitiseInput(role || "", 60),
+    },
+    scores: {
+      overallWellbeing: overallScore,
+      workload: workloadScore ? Number(workloadScore) : null,
+      relationships: relationshipsScore ? Number(relationshipsScore) : null,
+      sleep: sleepScore ? Number(sleepScore) : null,
+      physicalHealth: physicalHealthScore ? Number(physicalHealthScore) : null,
+      average: avgScore,
+    },
+    riskIndicators: {
+      feelingOverwhelmed: !!feelingOverwhelmed,
+      feelingIsolated: !!feelingIsolated,
+      conflictAtWork: !!conflictAtWork,
+      financialStress: !!financialStress,
+      bereavementOrLoss: !!bereavementOrLoss,
+      substanceConcern: !!substanceConcern,
+      thinkingAboutLeaving: !!thinkingAboutLeaving,
+      needsSupport: !!needsSupport,
+    },
+    openResponse: openResponse ? sanitiseInput(openResponse, 500) : null,
+    riskTier,
+    riskPoints,
+    followUpRequired,
+    consentToFollowUp: !!consentToFollowUp,
+    preferredContactMethod: sanitiseInput(preferredContactMethod || "", 40),
+    followUpCompletedAt: null,
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("mental_health_checkins").insert(record);
+      if (error) console.error("MH check-in insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("MH check-in DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    riskTier,
+    followUpRequired,
+    supportResources,
+    message: riskTier === "HIGH"
+      ? "Thank you for checking in. Your responses suggest you may benefit from support. Please consider reaching out to one of the resources listed. If you are in crisis, call 000."
+      : riskTier === "MEDIUM"
+        ? "Thank you for checking in. Remember that support is always available — reach out if you need it."
+        : "Thank you for checking in. Great to hear you're doing well. Remember support resources are always available.",
+    crisis: "If you or someone you know is in immediate danger, call 000. For 24/7 crisis support, call Lifeline on 13 11 14.",
+    saved,
+    record: { ...record, openResponse: undefined }, // exclude free text from response for privacy
+  });
+});
+
+// GET /mental-health-checkin/:projectId/summary — Aggregated wellbeing summary for a project
+app.get("/mental-health-checkin/:projectId/summary", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { from, to } = req.query;
+
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  try {
+    let query = supabaseAdmin
+      .from("mental_health_checkins")
+      .select("riskTier, scores, riskIndicators, checkinDate, followUpRequired, followUpCompletedAt")
+      .eq("projectId", sanitiseInput(String(projectId), 80))
+      .order("checkinDate", { ascending: false });
+
+    if (from) query = query.gte("checkinDate", from);
+    if (to) query = query.lte("checkinDate", to);
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const records = data || [];
+    const highRiskCount = records.filter(r => r.riskTier === "HIGH").length;
+    const mediumRiskCount = records.filter(r => r.riskTier === "MEDIUM").length;
+    const lowRiskCount = records.filter(r => r.riskTier === "LOW").length;
+    const followUpOutstanding = records.filter(r => r.followUpRequired && !r.followUpCompletedAt).length;
+
+    const avgWellbeing = records.length > 0
+      ? Math.round(records.reduce((s, r) => s + (r.scores?.overallWellbeing || 5), 0) / records.length * 10) / 10
+      : null;
+
+    // Aggregate risk indicators (de-identified counts only)
+    const indicatorCounts = {
+      feelingOverwhelmed: records.filter(r => r.riskIndicators?.feelingOverwhelmed).length,
+      feelingIsolated: records.filter(r => r.riskIndicators?.feelingIsolated).length,
+      conflictAtWork: records.filter(r => r.riskIndicators?.conflictAtWork).length,
+      financialStress: records.filter(r => r.riskIndicators?.financialStress).length,
+      needsSupport: records.filter(r => r.riskIndicators?.needsSupport).length,
+    };
+
+    return res.json({
+      projectId,
+      totalCheckins: records.length,
+      riskDistribution: { high: highRiskCount, medium: mediumRiskCount, low: lowRiskCount },
+      averageWellbeingScore: avgWellbeing,
+      followUpOutstanding,
+      indicatorCounts,
+      wellbeingTrend: avgWellbeing !== null ? (avgWellbeing >= 7 ? "POSITIVE" : avgWellbeing >= 5 ? "NEUTRAL" : "CONCERNING") : null,
+      note: "Individual check-in details are not returned in summaries to protect worker privacy.",
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to retrieve wellbeing summary.", detail: e.message });
+  }
+});
+
+// POST /ai-wellbeing-action-plan — AI generates a team wellbeing action plan
+app.post("/ai-wellbeing-action-plan", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, teamSize, averageWellbeingScore, highRiskCount, mediumRiskCount,
+    topIndicators, workloadPressure, deadlineStress, shiftPattern,
+    existingSupport, recentIncidents, notes,
+  } = req.body;
+
+  if (!projectId) {
+    return res.status(400).json({ error: "projectId is required." });
+  }
+
+  const sanitisedIndicators = Array.isArray(topIndicators)
+    ? topIndicators.map(i => sanitiseInput(String(i), 80)).slice(0, 8)
+    : [];
+
+  const prompt = `You are an occupational health and wellbeing consultant specialising in the Australian construction industry, with expertise in the MATES in Construction and SafeWork Australia mental health frameworks.
+
+Develop a team wellbeing action plan for a Victorian construction project:
+- Team size: ${teamSize || "Unknown"}
+- Average wellbeing score: ${averageWellbeingScore ? `${averageWellbeingScore}/10` : "Not measured"}
+- High risk check-ins: ${highRiskCount || 0}
+- Medium risk check-ins: ${mediumRiskCount || 0}
+- Top risk indicators: ${sanitisedIndicators.join(", ") || "Not specified"}
+- Workload pressure: ${sanitiseInput(workloadPressure || "Standard", 60)}
+- Deadline stress: ${deadlineStress ? "Yes" : "No"}
+- Shift pattern: ${sanitiseInput(shiftPattern || "Standard hours", 60)}
+- Existing support available: ${sanitiseInput(existingSupport || "Not specified", 200)}
+- Recent incidents: ${sanitiseInput(recentIncidents || "None", 150)}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Respond ONLY with a JSON object:
+{
+  "overallWellbeingStatus": "HEALTHY|MODERATE_CONCERN|HIGH_CONCERN|CRITICAL",
+  "immediateActions": [{"action": string, "responsible": string, "timeframe": string}],
+  "shortTermStrategies": [{"strategy": string, "description": string, "timeline": string}],
+  "environmentalChanges": [string],
+  "peerSupportProgram": string,
+  "trainingRecommendations": [string],
+  "checkInFrequencyRecommendation": string,
+  "externalResourcesRequired": boolean,
+  "keyMessages": [string],
+  "successMetrics": [string],
+  "summary": string (2-3 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1000,
+      temperature: 0.3,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      projectId,
+      overallWellbeingStatus: parsed.overallWellbeingStatus || "MODERATE_CONCERN",
+      immediateActions: parsed.immediateActions || [],
+      shortTermStrategies: parsed.shortTermStrategies || [],
+      environmentalChanges: parsed.environmentalChanges || [],
+      peerSupportProgram: parsed.peerSupportProgram || "",
+      trainingRecommendations: parsed.trainingRecommendations || [],
+      checkInFrequencyRecommendation: parsed.checkInFrequencyRecommendation || "Weekly check-ins",
+      externalResourcesRequired: parsed.externalResourcesRequired ?? false,
+      keyMessages: parsed.keyMessages || [],
+      successMetrics: parsed.successMetrics || [],
+      summary: parsed.summary || "Wellbeing action plan generated.",
+      supportResources: {
+        matesInConstruction: "1300 642 111",
+        lifeline: "13 11 14",
+        beyondBlue: "1300 22 4636",
+        ewpNational: "1800 808 374",
+      },
+    });
+  } catch (e) {
+    console.error("AI wellbeing action plan error:", e.message);
+    return res.json({
+      success: true,
+      projectId,
+      overallWellbeingStatus: "MODERATE_CONCERN",
+      immediateActions: [
+        { action: "Brief site supervisors on mental health awareness and MAIC resources", responsible: "Site Manager", timeframe: "This week" },
+        { action: "Ensure Employee Assistance Program (EAP) contact details are posted on site", responsible: "HR/WHS", timeframe: "Immediately" },
+        { action: "Follow up confidentially with high-risk individuals (with consent)", responsible: "Warden/Senior Manager", timeframe: "Within 48 hours" },
+      ],
+      shortTermStrategies: [
+        { strategy: "Weekly toolbox talks on mental health", description: "Brief 5-minute conversations normalising mental health discussions", timeline: "Starting next toolbox talk" },
+        { strategy: "Peer support program", description: "Train 2 workers as MATES Connectors through MAIC", timeline: "Within 30 days" },
+      ],
+      environmentalChanges: ["Ensure adequate rest break facilities", "Review workload distribution — reduce overtime where possible", "Create a designated quiet space for private conversations"],
+      peerSupportProgram: "Engage MATES in Construction for a free site Connector training session.",
+      trainingRecommendations: ["MAIC Connector training for peer supporters", "Mental health first aid (MHFA) for supervisors"],
+      checkInFrequencyRecommendation: "Weekly check-ins for current period given concern levels",
+      externalResourcesRequired: (highRiskCount || 0) > 2,
+      keyMessages: ["It's okay not to be okay", "Help is always available", "Reaching out is a sign of strength, not weakness"],
+      successMetrics: ["Increase average wellbeing score by 1 point within 4 weeks", "Zero outstanding follow-ups > 48 hours"],
+      summary: "The team shows moderate wellbeing concerns requiring structured support. Immediate actions focus on awareness, peer support, and follow-up for high-risk individuals.",
+      supportResources: {
+        matesInConstruction: "1300 642 111",
+        lifeline: "13 11 14",
+        beyondBlue: "1300 22 4636",
+        ewpNational: "1800 808 374",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
