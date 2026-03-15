@@ -70476,6 +70476,374 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 257 ─────────────────────────────────────────────────────────────────
+
+// POST /tunnel-inspection — Record structural and safety inspection of a tunnel
+app.post("/tunnel-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, tunnelId, tunnelType, inspectionDate, inspectedBy,
+      lengthInspectedMetres, liningCondition, crackWidth, crackWidthMm,
+      waterIngressPresent, waterIngressSeverity, spallationPresent,
+      groundSettlementMm, ventilationOperational, emergencyLightingOperational,
+      fireSuppression, drainageOperational, structuralRatingPrior, structuralRatingNew,
+      defectsNoted, immediateActionRequired, notes
+    } = req.body;
+
+    if (!tunnelId || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "tunnelId, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeTunnel = sanitiseInput(String(tunnelId));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+
+    const defects = Array.isArray(defectsNoted) ? defectsNoted : [];
+    const criticalDefects = [];
+    const warnings = [];
+
+    const crackMm = parseFloat(crackWidthMm) || 0;
+    const settlementMm = parseFloat(groundSettlementMm) || 0;
+
+    // Crack width thresholds — AUSTROADS Guide to Road Tunnels / AS 4820
+    if (crackWidth === "SEVERE" || crackMm > 5) {
+      criticalDefects.push(`Severe crack width ${crackMm}mm — immediate structural assessment required (AUSTROADS Tunnel Guide).`);
+    } else if (crackWidth === "MODERATE" || crackMm > 2) {
+      warnings.push(`Moderate crack width ${crackMm}mm — monitor and schedule remediation.`);
+    }
+
+    // Ground settlement thresholds
+    if (settlementMm > 25) {
+      criticalDefects.push(`Ground settlement ${settlementMm}mm exceeds 25mm critical threshold — tunnel closure may be required.`);
+    } else if (settlementMm > 10) {
+      warnings.push(`Ground settlement ${settlementMm}mm — increased monitoring frequency required.`);
+    }
+
+    // Lining condition
+    const lining = liningCondition ? String(liningCondition).toUpperCase() : "UNKNOWN";
+    if (lining === "POOR" || lining === "CRITICAL") {
+      criticalDefects.push(`Lining condition rated ${lining} — structural engineer assessment required immediately.`);
+    } else if (lining === "FAIR") {
+      warnings.push("Lining condition FAIR — schedule maintenance inspection within 30 days.");
+    }
+
+    if (spallationPresent === true || spallationPresent === "true") {
+      criticalDefects.push("Concrete spallation detected — falling material risk, restrict access until assessed.");
+    }
+
+    // Life-safety systems
+    if (ventilationOperational === false || ventilationOperational === "false") {
+      criticalDefects.push("Ventilation system non-operational — tunnel must not be occupied (AS 1668.2).");
+    }
+    if (emergencyLightingOperational === false || emergencyLightingOperational === "false") {
+      criticalDefects.push("Emergency lighting non-operational — life safety breach (AS 2293.1).");
+    }
+    if (fireSuppression === false || fireSuppression === "false") {
+      warnings.push("Fire suppression system not confirmed operational — verify before re-opening.");
+    }
+
+    if (waterIngressPresent && waterIngressSeverity === "SEVERE") {
+      criticalDefects.push("Severe water ingress — potential lining failure, close tunnel for investigation.");
+    } else if (waterIngressPresent && waterIngressSeverity === "MODERATE") {
+      warnings.push("Moderate water ingress — investigate source and schedule waterproofing repair.");
+    }
+
+    if (immediateActionRequired === true || immediateActionRequired === "true") {
+      criticalDefects.push("Inspector flagged immediate action required.");
+    }
+
+    const overallRating = criticalDefects.length > 0 ? "CLOSE_FOR_INSPECTION" : warnings.length > 2 ? "RESTRICTED_USE" : "SERVICEABLE";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("tunnel_inspections")
+        .insert({
+          project_id: safeProject,
+          tunnel_id: safeTunnel,
+          tunnel_type: tunnelType || null,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          length_inspected_metres: lengthInspectedMetres || null,
+          lining_condition: liningCondition || null,
+          crack_width_mm: crackMm || null,
+          water_ingress_present: waterIngressPresent || false,
+          water_ingress_severity: waterIngressSeverity || null,
+          spallation_present: spallationPresent || false,
+          ground_settlement_mm: settlementMm || null,
+          ventilation_operational: ventilationOperational !== false && ventilationOperational !== "false",
+          emergency_lighting_operational: emergencyLightingOperational !== false && emergencyLightingOperational !== "false",
+          fire_suppression_operational: fireSuppression !== false && fireSuppression !== "false",
+          drainage_operational: drainageOperational !== false && drainageOperational !== "false",
+          structural_rating_prior: structuralRatingPrior || null,
+          structural_rating_new: structuralRatingNew || null,
+          defects_noted: defects,
+          overall_rating: overallRating,
+          critical_defects: criticalDefects,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalDefects.length > 0) {
+      return res.status(422).json({
+        overallRating,
+        criticalDefects,
+        warnings,
+        savedId,
+        message: "Critical defects found — tunnel must be closed or restricted pending structural assessment.",
+        standards: ["AUSTROADS Guide to Road Tunnels", "AS 2293.1", "AS 1668.2", "AS 4820"],
+      });
+    }
+
+    res.json({
+      overallRating,
+      criticalDefects,
+      warnings,
+      savedId,
+      crackWidthMm: crackMm,
+      settlementMm,
+      liningCondition: liningCondition || null,
+      standards: ["AUSTROADS Guide to Road Tunnels", "AS 4820"],
+    });
+  } catch (err) {
+    console.error("POST /tunnel-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record tunnel inspection." });
+  }
+});
+
+// POST /pump-station-inspection — Inspection record for sewage/stormwater pump stations
+app.post("/pump-station-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      stationId, projectId, inspectionDate, inspectedBy, stationType,
+      pump1Operational, pump2Operational, standbyPumpOperational,
+      wetWellLevel, wetWellCapacityPercent, alarmSystemOperational,
+      telemetryOperational, powerSupplyNormal, backupGeneratorTested,
+      inletScreenCondition, outletCheckValveCondition,
+      lastMaintenanceDate, odourControlOperational, overflowRisk, notes
+    } = req.body;
+
+    if (!stationId || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "stationId, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeStation = sanitiseInput(String(stationId));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+
+    const wetWellPct = parseFloat(wetWellCapacityPercent) || 0;
+    const criticalIssues = [];
+    const warnings = [];
+
+    // Critical operational checks
+    if (pump1Operational === false || pump1Operational === "false") {
+      criticalIssues.push("Duty pump (P1) non-operational — overflow risk. Initiate emergency maintenance.");
+    }
+    if (pump2Operational === false || pump2Operational === "false") {
+      if (pump1Operational === false || pump1Operational === "false") {
+        criticalIssues.push("Both duty pumps non-operational — imminent overflow. Notify Melbourne Water / EPA immediately (SEPP Waters 2018 Vic).");
+      } else {
+        warnings.push("Standby pump (P2) non-operational — no redundancy. Schedule urgent repair.");
+      }
+    }
+    if (standbyPumpOperational === false || standbyPumpOperational === "false") {
+      warnings.push("Standby pump non-operational — reduced redundancy.");
+    }
+
+    // Wet well level
+    if (wetWellPct >= 90) {
+      criticalIssues.push(`Wet well at ${wetWellPct}% capacity — overflow imminent. Activate emergency response.`);
+    } else if (wetWellPct >= 75) {
+      warnings.push(`Wet well at ${wetWellPct}% capacity — elevated risk, increase pump cycling.`);
+    }
+
+    // Alarm and telemetry
+    if (alarmSystemOperational === false || alarmSystemOperational === "false") {
+      criticalIssues.push("Alarm system non-operational — overflow events will not be detected (EPA compliance risk).");
+    }
+    if (telemetryOperational === false || telemetryOperational === "false") {
+      warnings.push("SCADA/telemetry non-operational — remote monitoring unavailable.");
+    }
+
+    // Power and backup
+    if (powerSupplyNormal === false || powerSupplyNormal === "false") {
+      criticalIssues.push("Mains power abnormal — verify backup generator has activated.");
+    }
+    if (backupGeneratorTested === false || backupGeneratorTested === "false") {
+      warnings.push("Backup generator not recently tested — schedule monthly load test (AS 2789).");
+    }
+
+    // Overflow risk flag
+    if (overflowRisk === true || overflowRisk === "true") {
+      criticalIssues.push("Inspector flagged overflow risk — notify asset owner and EPA (Environment Protection Act 2017 Vic).");
+    }
+
+    const screenCond = inletScreenCondition ? String(inletScreenCondition).toUpperCase() : "UNKNOWN";
+    if (screenCond === "BLOCKED" || screenCond === "FAILED") {
+      warnings.push("Inlet screen blocked/failed — clean or replace to prevent pump damage.");
+    }
+
+    const valveCond = outletCheckValveCondition ? String(outletCheckValveCondition).toUpperCase() : "UNKNOWN";
+    if (valveCond === "FAILED") {
+      criticalIssues.push("Outlet check valve failed — backflow risk to pump station.");
+    }
+
+    const overallStatus = criticalIssues.length > 0 ? "CRITICAL" : warnings.length > 0 ? "ATTENTION_REQUIRED" : "OPERATIONAL";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("pump_station_inspections")
+        .insert({
+          station_id: safeStation,
+          project_id: projectId ? sanitiseInput(String(projectId)) : null,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          station_type: stationType || null,
+          pump1_operational: pump1Operational !== false && pump1Operational !== "false",
+          pump2_operational: pump2Operational !== false && pump2Operational !== "false",
+          standby_pump_operational: standbyPumpOperational !== false && standbyPumpOperational !== "false",
+          wet_well_capacity_percent: wetWellPct || null,
+          alarm_system_operational: alarmSystemOperational !== false && alarmSystemOperational !== "false",
+          telemetry_operational: telemetryOperational !== false && telemetryOperational !== "false",
+          power_supply_normal: powerSupplyNormal !== false && powerSupplyNormal !== "false",
+          backup_generator_tested: backupGeneratorTested !== false && backupGeneratorTested !== "false",
+          inlet_screen_condition: inletScreenCondition || null,
+          outlet_check_valve_condition: outletCheckValveCondition || null,
+          last_maintenance_date: lastMaintenanceDate || null,
+          odour_control_operational: odourControlOperational !== false && odourControlOperational !== "false",
+          overflow_risk: overflowRisk || false,
+          overall_status: overallStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        overallStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Critical pump station failure — immediate intervention required.",
+        standards: ["SEPP Waters 2018 (Vic)", "Environment Protection Act 2017 (Vic)", "AS 2789"],
+      });
+    }
+
+    res.json({
+      overallStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      wetWellCapacityPercent: wetWellPct,
+      standards: ["SEPP Waters 2018 (Vic)", "Environment Protection Act 2017 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /pump-station-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record pump station inspection." });
+  }
+});
+
+// POST /ai-tunnel-risk-assessment — AI assesses structural risk and maintenance priority for a tunnel
+app.post("/ai-tunnel-risk-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      tunnelType, ageYears, lengthMetres, liningCondition, crackWidthMm,
+      groundSettlementMm, waterIngressSeverity, trafficVolume, lastMajorRehab,
+      structuralRating, knownDefects, siteContext
+    } = req.body;
+
+    if (!tunnelType) {
+      return res.status(400).json({ error: "tunnelType is required." });
+    }
+
+    const safeTunnelType = sanitiseInput(String(tunnelType));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const defects = Array.isArray(knownDefects) ? knownDefects.map(d => sanitiseInput(String(d))) : [];
+
+    const prompt = `You are a senior tunnel structural engineer assessing risk and maintenance priority for a Victorian infrastructure asset.
+
+Tunnel type: ${safeTunnelType}
+Age: ${ageYears ? ageYears + " years" : "Unknown"}
+Length: ${lengthMetres ? lengthMetres + " m" : "Unknown"}
+Lining condition: ${liningCondition || "Not stated"}
+Crack width: ${crackWidthMm ? crackWidthMm + " mm" : "Not recorded"}
+Ground settlement: ${groundSettlementMm ? groundSettlementMm + " mm" : "Not recorded"}
+Water ingress severity: ${waterIngressSeverity || "None reported"}
+Traffic volume: ${trafficVolume || "Not stated"}
+Last major rehabilitation: ${lastMajorRehab || "Unknown"}
+Current structural rating: ${structuralRating || "Not rated"}
+Known defects: ${defects.length > 0 ? defects.join("; ") : "None recorded"}
+Site context: ${safeSite}
+
+Assess for:
+1. Overall structural risk (considering age, lining, crack patterns, settlement, water ingress)
+2. Maintenance priority (immediate / within 3 months / scheduled / routine)
+3. Applicable Australian standards (AUSTROADS, AS 4820, AS 5100 series)
+4. Life-cycle considerations — time to critical failure if untreated
+5. Recommended investigation methods (GPR, CCTV, load testing, etc.)
+6. Cost risk tier — low / medium / high / very high remediation cost estimate
+
+Respond ONLY in JSON:
+{
+  "structuralRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "maintenancePriority": "IMMEDIATE|WITHIN_3_MONTHS|SCHEDULED|ROUTINE",
+  "estimatedLifeRemainingYears": number or null,
+  "primaryConcerns": ["string"],
+  "recommendedInvestigations": ["string"],
+  "recommendedRemediation": ["string"],
+  "applicableStandards": ["string"],
+  "costRiskTier": "LOW|MEDIUM|HIGH|VERY_HIGH",
+  "closureRecommended": true|false,
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        structuralRisk: "MODERATE",
+        maintenancePriority: "SCHEDULED",
+        estimatedLifeRemainingYears: null,
+        primaryConcerns: ["AI analysis unavailable — engage structural engineer for assessment"],
+        recommendedInvestigations: ["Visual inspection", "GPR scan", "Core sampling"],
+        recommendedRemediation: ["Engage geotechnical/structural engineer for full assessment"],
+        applicableStandards: ["AUSTROADS Guide to Road Tunnels", "AS 4820", "AS 5100"],
+        costRiskTier: "MEDIUM",
+        closureRecommended: false,
+        summary: "AI tunnel risk assessment unavailable. Manual structural engineering assessment required.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      tunnelType: safeTunnelType,
+      ageYears: ageYears || null,
+      standards: ["AUSTROADS Guide to Road Tunnels", "AS 4820", "AS 5100.1"],
+    });
+  } catch (err) {
+    console.error("POST /ai-tunnel-risk-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess tunnel risk." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
