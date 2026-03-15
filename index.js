@@ -35316,6 +35316,211 @@ Return a JSON object with:
   }
 });
 
+// ── Round 134: SMSF contractor, sole trader deductions, tax estimate ──────────
+
+// POST /sole-trader-tax-estimate — Estimate income tax for a sole trader contractor
+app.post("/sole-trader-tax-estimate", apiKeyAuth, (req, res) => {
+  const {
+    grossIncome, businessExpenses = 0, superContributions = 0,
+    state = "VIC", financialYear = "2024-25",
+  } = req.body;
+
+  if (grossIncome === undefined) return res.status(400).json({ error: "grossIncome required." });
+
+  const gross = Number(grossIncome);
+  const expenses = Number(businessExpenses);
+  const superContr = Number(superContributions);
+
+  // Taxable income
+  const taxableIncome = Math.max(0, gross - expenses - superContr);
+
+  // 2024-25 Australian income tax rates (individual)
+  let incomeTax = 0;
+  if (taxableIncome <= 18200) incomeTax = 0;
+  else if (taxableIncome <= 45000) incomeTax = (taxableIncome - 18200) * 0.19;
+  else if (taxableIncome <= 120000) incomeTax = 5092 + (taxableIncome - 45000) * 0.325;
+  else if (taxableIncome <= 180000) incomeTax = 29467 + (taxableIncome - 120000) * 0.37;
+  else incomeTax = 51667 + (taxableIncome - 180000) * 0.45;
+
+  // Medicare Levy (2%)
+  const medicareLevy = taxableIncome > 26000 ? taxableIncome * 0.02 : 0;
+
+  // Low Income Tax Offset (LITO)
+  let lito = 0;
+  if (taxableIncome <= 37500) lito = 700;
+  else if (taxableIncome <= 45000) lito = 700 - (taxableIncome - 37500) * 0.05;
+  else if (taxableIncome <= 66667) lito = 325 - (taxableIncome - 45000) * 0.015;
+
+  // Small Business Tax Offset (LMITO replaced from FY2024)
+  const sbto = taxableIncome < 75000 ? Math.min(1000, incomeTax * 0.16) : 0;
+
+  const totalTax = Math.max(0, incomeTax + medicareLevy - lito - sbto);
+  const effectiveRate = taxableIncome > 0 ? Math.round((totalTax / taxableIncome) * 1000) / 10 : 0;
+  const netIncome = taxableIncome - totalTax;
+
+  // Quarterly PAYG instalments (approx)
+  const quarterlyPayg = Math.round(totalTax / 4);
+
+  res.json({
+    financialYear,
+    grossIncome: gross,
+    businessExpenses: expenses,
+    superContributions: superContr,
+    taxableIncome: Math.round(taxableIncome),
+    breakdown: {
+      incomeTax: Math.round(incomeTax),
+      medicareLevy: Math.round(medicareLevy),
+      litoOffset: -Math.round(lito),
+      smallBusinessOffset: -Math.round(sbto),
+      totalTaxPayable: Math.round(totalTax),
+    },
+    effectiveRatePercent: effectiveRate,
+    netIncomeAfterTax: Math.round(netIncome),
+    quarterlyPaygInstalment: quarterlyPayg,
+    disclaimer: "This is an indicative estimate only based on standard tax rates. This is NOT financial or tax advice. Always engage a registered tax agent or accountant for your individual circumstances.",
+    calculatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /business-deductions-check — Review potential business deductions for a contractor
+app.post("/business-deductions-check", apiKeyAuth, async (req, res) => {
+  const {
+    trade, income, expenses = [], hasHomeOffice = false,
+    hasVehicle = false, vehicleBusinessPercent = 0,
+    hasTools = false, hasTraining = false, state = "VIC",
+  } = req.body;
+
+  if (!trade) return res.status(400).json({ error: "trade required." });
+
+  const prompt = `You are a registered Australian tax agent specialising in construction industry contractors. Review potential tax deductions for this sole trader.
+
+Trade: ${sanitiseInput(trade)}
+Gross income: ${income ? `AUD $${income}` : "Not provided"}
+State: ${sanitiseInput(state)}
+Has home office: ${hasHomeOffice}
+Has work vehicle: ${hasVehicle} (business use: ${vehicleBusinessPercent}%)
+Has tools/equipment: ${hasTools}
+Has training expenses: ${hasTraining}
+Expenses listed: ${expenses.map(e => `${sanitiseInput(e.description || "")}: $${e.amount || 0}`).join(", ") || "None provided"}
+
+Return a JSON object with:
+- "deductibleExpenses": array of { "category": string, "description": string, "eligibility": "FULLY_DEDUCTIBLE"|"PARTIALLY_DEDUCTIBLE"|"NOT_DEDUCTIBLE", "notes": string, "estimatedAmount": number|null }
+- "missedDeductions": array of commonly overlooked deductions for this trade
+- "homeOfficeMethod": if applicable, recommended method (fixed rate vs actual costs)
+- "vehicleMethod": if applicable, recommended method (cents per km vs logbook)
+- "totalEstimatedDeductions": rough total if amounts provided
+- "taxSavingEstimate": rough tax saving at 32.5% marginal rate
+- "recommendations": array of actions to maximise deductions legally
+- "disclaimer": mandatory disclaimer`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, trade, state, reviewedAt: new Date().toISOString() });
+  } catch (err) {
+    const commonDeductions = [
+      { category: "Tools & Equipment", description: "Work tools and equipment", eligibility: "FULLY_DEDUCTIBLE", notes: "Items under $300 can be claimed immediately; over $300 depreciated.", estimatedAmount: null },
+      { category: "Vehicle", description: "Work-related vehicle expenses", eligibility: "PARTIALLY_DEDUCTIBLE", notes: `${vehicleBusinessPercent}% business use — use logbook method or cents per km.`, estimatedAmount: null },
+      { category: "Training", description: "Work-related training and education", eligibility: "FULLY_DEDUCTIBLE", notes: "Must be directly related to current work.", estimatedAmount: null },
+      { category: "Licences", description: "Trade licences and renewals", eligibility: "FULLY_DEDUCTIBLE", notes: "Directly work-related licences are deductible.", estimatedAmount: null },
+      { category: "PPE", description: "Personal protective equipment", eligibility: "FULLY_DEDUCTIBLE", notes: "Helmets, boots, hi-vis, gloves etc.", estimatedAmount: null },
+      { category: "Insurance", description: "Public liability and other business insurance", eligibility: "FULLY_DEDUCTIBLE", notes: "Business insurance premiums.", estimatedAmount: null },
+    ];
+    return res.json({
+      deductibleExpenses: commonDeductions,
+      missedDeductions: ["Sunscreen and sun protection", "Phone and internet (work proportion)", "Superannuation contributions", "Accounting fees"],
+      homeOfficeMethod: hasHomeOffice ? "Fixed rate method (67c/hr)" : null,
+      vehicleMethod: hasVehicle ? "Logbook method for highest deduction" : null,
+      totalEstimatedDeductions: null,
+      taxSavingEstimate: null,
+      recommendations: ["Keep all receipts and records", "Use a logbook for vehicle if > $10,000 claim", "Engage a tax agent for construction industry expertise"],
+      disclaimer: "This is general information only and NOT financial or tax advice. Engage a registered tax agent for advice specific to your circumstances.",
+      trade, state, reviewedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /invoice-generator — Generate an invoice record and calculate GST
+app.post("/invoice-generator", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, businessName, abn, clientName, clientEmail,
+    invoiceNumber, invoiceDate, dueDate, paymentTerms = 30,
+    lineItems = [], notes, bankDetails = {},
+    includeGst = true,
+  } = req.body;
+
+  if (!businessName || !lineItems.length) return res.status(400).json({ error: "businessName and lineItems required." });
+
+  const processedItems = lineItems.map((item, idx) => {
+    const qty = Number(item.quantity) || 1;
+    const rate = Number(item.unitPrice) || 0;
+    const lineTotal = Math.round(qty * rate * 100) / 100;
+    return {
+      lineNumber: idx + 1,
+      description: sanitiseInput(item.description || ""),
+      quantity: qty,
+      unit: sanitiseInput(item.unit || ""),
+      unitPrice: rate,
+      lineTotal,
+      gstApplicable: item.gstApplicable !== false,
+    };
+  });
+
+  const subtotal = processedItems.reduce((s, i) => s + i.lineTotal, 0);
+  const gstableAmount = includeGst ? processedItems.filter(i => i.gstApplicable).reduce((s, i) => s + i.lineTotal, 0) : 0;
+  const gstAmount = Math.round(gstableAmount * 0.1 * 100) / 100;
+  const totalAmount = Math.round((subtotal + gstAmount) * 100) / 100;
+
+  const invNum = invoiceNumber || `INV-${Date.now().toString(36).toUpperCase().slice(-8)}`;
+  const invDate = invoiceDate || new Date().toISOString().split("T")[0];
+  const due = dueDate || (() => {
+    const d = new Date(invDate);
+    d.setDate(d.getDate() + Number(paymentTerms));
+    return d.toISOString().split("T")[0];
+  })();
+
+  const record = {
+    invoice_number: invNum,
+    contractor_id: sanitiseInput(contractorId || ""),
+    business_name: sanitiseInput(businessName),
+    abn: sanitiseInput(abn || ""),
+    client_name: sanitiseInput(clientName || ""),
+    client_email: sanitiseInput(clientEmail || ""),
+    invoice_date: invDate,
+    due_date: due,
+    payment_terms_days: Number(paymentTerms),
+    line_items: processedItems,
+    subtotal: Math.round(subtotal * 100) / 100,
+    gst_amount: gstAmount,
+    total_amount: totalAmount,
+    include_gst: Boolean(includeGst),
+    bank_bsb: sanitiseInput(bankDetails.bsb || ""),
+    bank_account: sanitiseInput(bankDetails.account || ""),
+    bank_account_name: sanitiseInput(bankDetails.accountName || ""),
+    notes: sanitiseInput(notes || ""),
+    status: "DRAFT",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("invoices")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, invoiceId: data.id, invoiceNumber: invNum, totalAmount, dueDate: due, ...record });
+  }
+
+  res.json({ success: true, invoiceId: null, invoiceNumber: invNum, totalAmount, dueDate: due, ...record, saved: false });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
