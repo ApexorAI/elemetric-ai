@@ -57562,6 +57562,287 @@ Return a JSON object with:
   }
 });
 
+// POST /variation-register — Record a construction variation / change order
+app.post("/variation-register", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      variationRef,
+      title,
+      description,
+      submittedBy,
+      submittedDate,
+      requiredBy,
+      variationType,
+      instructedBy,
+      instructionRef,
+      instructionDate,
+      originalContractSum,
+      variationAmountExGst,
+      variationAmountIncGst,
+      revisedContractSum,
+      timeImpactDays,
+      timeImpactDescription,
+      costBreakdown,
+      subcontractorVariation,
+      subcontractorRef,
+      status,
+      reviewedBy,
+      reviewDate,
+      approvedBy,
+      approvalDate,
+      disputeRaised,
+      disputeReason,
+      paymentClaimed,
+      paymentRef,
+      notes,
+    } = req.body;
+
+    if (!projectId || !variationRef || !title || !description || !submittedBy || !submittedDate) {
+      return res.status(400).json({ error: "projectId, variationRef, title, description, submittedBy, and submittedDate are required" });
+    }
+
+    const flags = [];
+    // SOPA Victoria: contractor has 10 business days from receiving instruction to submit variation claim
+    if (submittedDate && instructionDate) {
+      const instrDate = new Date(instructionDate);
+      const submitDate = new Date(submittedDate);
+      const calendarDays = Math.floor((submitDate - instrDate) / 86400000);
+      if (calendarDays > 28) flags.push(`Variation submitted ${calendarDays} calendar days after instruction — check SOPA notice period compliance`);
+    }
+    if (disputeRaised) flags.push(`Dispute raised on variation: ${sanitiseInput(disputeReason || "reason not specified")} — seek early resolution or adjudication under SOPA`);
+    if (status === "REJECTED" && !disputeRaised) flags.push("Variation rejected — consider whether to escalate under SOPA Victoria or DBI dispute resolution provisions");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      variation_ref: sanitiseInput(variationRef),
+      title: sanitiseInput(title),
+      description: sanitiseInput(description),
+      submitted_by: sanitiseInput(submittedBy),
+      submitted_date: submittedDate,
+      required_by: requiredBy || null,
+      variation_type: sanitiseInput(variationType || "client instruction"),
+      instructed_by: sanitiseInput(instructedBy || ""),
+      instruction_ref: sanitiseInput(instructionRef || ""),
+      instruction_date: instructionDate || null,
+      original_contract_sum: originalContractSum || null,
+      variation_amount_ex_gst: variationAmountExGst || null,
+      variation_amount_inc_gst: variationAmountIncGst || null,
+      revised_contract_sum: revisedContractSum || null,
+      time_impact_days: timeImpactDays || null,
+      time_impact_description: sanitiseInput(timeImpactDescription || ""),
+      cost_breakdown: sanitiseInput(costBreakdown || ""),
+      subcontractor_variation: !!subcontractorVariation,
+      subcontractor_ref: sanitiseInput(subcontractorRef || ""),
+      status: sanitiseInput(status || "PENDING"),
+      reviewed_by: sanitiseInput(reviewedBy || ""),
+      review_date: reviewDate || null,
+      approved_by: sanitiseInput(approvedBy || ""),
+      approval_date: approvalDate || null,
+      dispute_raised: !!disputeRaised,
+      dispute_reason: sanitiseInput(disputeReason || ""),
+      payment_claimed: !!paymentClaimed,
+      payment_ref: sanitiseInput(paymentRef || ""),
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("variation_register").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({ variationRef, status: record.status, flags, record, saved });
+  } catch (err) {
+    console.error("/variation-register error:", err.message);
+    res.status(500).json({ error: "Failed to register variation" });
+  }
+});
+
+// GET /variation-register/:projectId — Retrieve variations for a project
+app.get("/variation-register/:projectId", apiKeyAuth, async (req, res) => {
+  try {
+    const projectId = sanitiseInput(req.params.projectId);
+    if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured" });
+    const { data, error } = await supabaseAdmin
+      .from("variation_register")
+      .select("variation_ref, title, status, variation_amount_ex_gst, time_impact_days, submitted_date, approval_date")
+      .eq("project_id", projectId)
+      .order("submitted_date", { ascending: false });
+    if (error) return res.status(500).json({ error: "Failed to retrieve variations" });
+    const totalValue = (data || []).reduce((sum, v) => sum + (v.variation_amount_ex_gst || 0), 0);
+    res.json({ projectId, variations: data || [], count: (data || []).length, totalVariationValueExGst: totalValue });
+  } catch (err) {
+    console.error("/variation-register GET error:", err.message);
+    res.status(500).json({ error: "Failed to retrieve variations" });
+  }
+});
+
+// POST /rfi-register — Record a Request for Information
+app.post("/rfi-register", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      rfiRef,
+      subject,
+      description,
+      raisedBy,
+      raisedDate,
+      directedTo,
+      drawingRef,
+      specificationRef,
+      urgency,
+      requiredByDate,
+      impact,
+      costImpact,
+      timeImpactDays,
+      responseDate,
+      respondedBy,
+      response,
+      status,
+      closedDate,
+      relatedVariation,
+      notes,
+    } = req.body;
+
+    if (!projectId || !rfiRef || !subject || !description || !raisedBy || !raisedDate) {
+      return res.status(400).json({ error: "projectId, rfiRef, subject, description, raisedBy, and raisedDate are required" });
+    }
+
+    const flags = [];
+    if (urgency === "URGENT" && !requiredByDate) flags.push("Urgent RFI — specify required-by date to manage response timeline");
+    if (requiredByDate) {
+      const today = new Date();
+      const due = new Date(requiredByDate);
+      const daysRemaining = Math.floor((due - today) / 86400000);
+      if (daysRemaining < 0 && status === "OPEN") flags.push(`RFI ${rfiRef} is ${Math.abs(daysRemaining)} day(s) overdue — follow up with ${directedTo || "respondent"}`);
+      else if (daysRemaining <= 2 && status === "OPEN") flags.push(`RFI ${rfiRef} response due in ${daysRemaining} day(s)`);
+    }
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      rfi_ref: sanitiseInput(rfiRef),
+      subject: sanitiseInput(subject),
+      description: sanitiseInput(description),
+      raised_by: sanitiseInput(raisedBy),
+      raised_date: raisedDate,
+      directed_to: sanitiseInput(directedTo || ""),
+      drawing_ref: sanitiseInput(drawingRef || ""),
+      specification_ref: sanitiseInput(specificationRef || ""),
+      urgency: sanitiseInput(urgency || "NORMAL"),
+      required_by_date: requiredByDate || null,
+      impact: sanitiseInput(impact || ""),
+      cost_impact: costImpact || null,
+      time_impact_days: timeImpactDays || null,
+      response_date: responseDate || null,
+      responded_by: sanitiseInput(respondedBy || ""),
+      response: sanitiseInput(response || ""),
+      status: sanitiseInput(status || "OPEN"),
+      closed_date: closedDate || null,
+      related_variation: sanitiseInput(relatedVariation || ""),
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("rfi_register").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({ rfiRef, status: record.status, flags, record, saved });
+  } catch (err) {
+    console.error("/rfi-register error:", err.message);
+    res.status(500).json({ error: "Failed to register RFI" });
+  }
+});
+
+// POST /material-approval — Record a material sample or product approval
+app.post("/material-approval", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      approvalRef,
+      submittedBy,
+      submittedDate,
+      element,
+      productCategory,
+      productDescription,
+      manufacturer,
+      productCode,
+      specificationRef,
+      drawingRef,
+      substitution,
+      substitutionReason,
+      dataSheetRef,
+      complianceCertRef,
+      sampleProvided,
+      reviewedBy,
+      reviewDate,
+      approvedBy,
+      approvalDate,
+      status,
+      conditions,
+      rejectionReason,
+      resubmissionRequired,
+      notes,
+    } = req.body;
+
+    if (!projectId || !approvalRef || !productDescription || !submittedBy || !submittedDate) {
+      return res.status(400).json({ error: "projectId, approvalRef, productDescription, submittedBy, and submittedDate are required" });
+    }
+
+    const flags = [];
+    if (substitution && !substitutionReason) flags.push("Product substitution proposed without justification — engineer/consultant approval required for any substitution per contract conditions");
+    if (!complianceCertRef && !dataSheetRef) flags.push("No compliance certificate or data sheet submitted — product compliance documentation is required before approval");
+    if (status === "REJECTED") flags.push(`Material approval rejected: ${sanitiseInput(rejectionReason || "reason not specified")} — resubmission required before material is installed`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      approval_ref: sanitiseInput(approvalRef),
+      submitted_by: sanitiseInput(submittedBy),
+      submitted_date: submittedDate,
+      element: sanitiseInput(element || ""),
+      product_category: sanitiseInput(productCategory || ""),
+      product_description: sanitiseInput(productDescription),
+      manufacturer: sanitiseInput(manufacturer || ""),
+      product_code: sanitiseInput(productCode || ""),
+      specification_ref: sanitiseInput(specificationRef || ""),
+      drawing_ref: sanitiseInput(drawingRef || ""),
+      substitution: !!substitution,
+      substitution_reason: sanitiseInput(substitutionReason || ""),
+      data_sheet_ref: sanitiseInput(dataSheetRef || ""),
+      compliance_cert_ref: sanitiseInput(complianceCertRef || ""),
+      sample_provided: !!sampleProvided,
+      reviewed_by: sanitiseInput(reviewedBy || ""),
+      review_date: reviewDate || null,
+      approved_by: sanitiseInput(approvedBy || ""),
+      approval_date: approvalDate || null,
+      status: sanitiseInput(status || "PENDING"),
+      conditions: sanitiseInput(conditions || ""),
+      rejection_reason: sanitiseInput(rejectionReason || ""),
+      resubmission_required: !!resubmissionRequired,
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("material_approvals").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({ approvalRef, status: record.status, flags, record, saved });
+  } catch (err) {
+    console.error("/material-approval error:", err.message);
+    res.status(500).json({ error: "Failed to record material approval" });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
