@@ -52704,6 +52704,263 @@ Return a JSON object with:
   }
 });
 
+// POST /uv-radiation-monitoring — Record UV radiation risk monitoring for outdoor workers
+app.post("/uv-radiation-monitoring", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      monitoringRef,
+      date,
+      location,
+      uvIndex,
+      exposureStartTime,
+      exposureEndTime,
+      shadeProvided,
+      sunscreenAvailable,
+      sunscreenSPF,
+      hatProvided,
+      uvProtectiveClothingProvided,
+      sunglassesProvided,
+      workerBreakPattern,
+      highRiskWorkers,
+      controlsInPlace,
+      uvRiskLevel,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !location) {
+      return res.status(400).json({ error: "projectId, date, and location are required" });
+    }
+
+    const alerts = [];
+    // Australian UV Index guidance: UV 3–5 moderate, 6–7 high, 8–10 very high, 11+ extreme
+    if (uvIndex !== undefined) {
+      if (Number(uvIndex) >= 11) alerts.push(`UV Index ${uvIndex} — EXTREME: full sun protection mandatory, seek shade during peak hours 10am–3pm`);
+      else if (Number(uvIndex) >= 8) alerts.push(`UV Index ${uvIndex} — VERY HIGH: sun protection mandatory, limit outdoor work 10am–3pm`);
+      else if (Number(uvIndex) >= 6) alerts.push(`UV Index ${uvIndex} — HIGH: sun protection required`);
+      else if (Number(uvIndex) >= 3) alerts.push(`UV Index ${uvIndex} — MODERATE: sun protection recommended`);
+    }
+    if (!sunscreenAvailable) alerts.push("Sunscreen not available on site — employer must provide SPF50+ sunscreen per Safe Work Australia");
+    if (!hatProvided) alerts.push("No broad-brim hat provided — minimum SPF15/UPF50 hat required for outdoor workers");
+    if (uvIndex && Number(uvIndex) >= 8 && !shadeProvided) alerts.push("No shade available during very high UV conditions — covered rest area required");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      monitoring_ref: sanitiseInput(monitoringRef || `UV-${Date.now()}`),
+      date,
+      location: sanitiseInput(location),
+      uv_index: uvIndex !== undefined ? Number(uvIndex) : null,
+      exposure_start_time: sanitiseInput(exposureStartTime || ""),
+      exposure_end_time: sanitiseInput(exposureEndTime || ""),
+      shade_provided: !!shadeProvided,
+      sunscreen_available: !!sunscreenAvailable,
+      sunscreen_spf: sunscreenSPF || null,
+      hat_provided: !!hatProvided,
+      uv_protective_clothing_provided: !!uvProtectiveClothingProvided,
+      sunglasses_provided: !!sunglassesProvided,
+      worker_break_pattern: sanitiseInput(workerBreakPattern || ""),
+      high_risk_workers: sanitiseInput(highRiskWorkers || ""),
+      controls_in_place: sanitiseInput(controlsInPlace || ""),
+      uv_risk_level: sanitiseInput(uvRiskLevel || (uvIndex >= 11 ? "EXTREME" : uvIndex >= 8 ? "VERY HIGH" : uvIndex >= 6 ? "HIGH" : uvIndex >= 3 ? "MODERATE" : "LOW")),
+      alerts,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("uv_radiation_monitoring").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      alerts,
+      uvRiskLevel: record.uv_risk_level,
+      peakUvHours: "10:00 AM – 3:00 PM (AEDT)",
+      sunProtectionRequired: uvIndex !== undefined && Number(uvIndex) >= 3,
+      applicableGuidance: ["Safe Work Australia UV Radiation Code of Practice 2021", "Cancer Council Australia SunSmart guidelines", "ARPANSA UV Index classification"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/uv-radiation-monitoring error:", err.message);
+    res.status(500).json({ error: "Failed to record UV monitoring" });
+  }
+});
+
+// POST /geotechnical-bore-log — Record a geotechnical bore log (site investigation)
+app.post("/geotechnical-bore-log", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      boreRef,
+      drillDate,
+      drilledBy,
+      drillMethod,
+      gridNorthing,
+      gridEasting,
+      elevation,
+      totalDepthM,
+      groundwaterDepthM,
+      groundwaterEncountered,
+      casing,
+      samples,
+      layers,
+      rocksEncountered,
+      atterbergLimits,
+      moistureContent,
+      spnValues,
+      corrosivityAssessment,
+      groundwaterCorrosivity,
+      pileFoundationSuitable,
+      beaingCapacityKpa,
+      notes,
+    } = req.body;
+
+    if (!projectId || !boreRef || !drillDate || !totalDepthM) {
+      return res.status(400).json({ error: "projectId, boreRef, drillDate, and totalDepthM are required" });
+    }
+
+    const flags = [];
+    if (groundwaterEncountered && groundwaterDepthM !== undefined && Number(groundwaterDepthM) < 2) {
+      flags.push(`Groundwater encountered at only ${groundwaterDepthM} m depth — shallow groundwater will affect excavation and foundation design`);
+    }
+    if (groundwaterCorrosivity && ["SEVERE", "VERY SEVERE"].includes(String(groundwaterCorrosivity).toUpperCase())) {
+      flags.push(`Groundwater corrosivity: ${groundwaterCorrosivity} — corrosion protection required for buried metalwork per AS 3600/AS 2159`);
+    }
+    if (beaingCapacityKpa && Number(beaingCapacityKpa) < 100) {
+      flags.push(`Bearing capacity ${beaingCapacityKpa} kPa — low bearing capacity, specialised foundation design required`);
+    }
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      bore_ref: sanitiseInput(boreRef),
+      drill_date: drillDate,
+      drilled_by: sanitiseInput(drilledBy || ""),
+      drill_method: sanitiseInput(drillMethod || ""),
+      grid_northing: gridNorthing || null,
+      grid_easting: gridEasting || null,
+      elevation: elevation || null,
+      total_depth_m: Number(totalDepthM),
+      groundwater_depth_m: groundwaterDepthM || null,
+      groundwater_encountered: !!groundwaterEncountered,
+      casing: sanitiseInput(casing || ""),
+      samples: Array.isArray(samples) ? samples : [],
+      layers: Array.isArray(layers) ? layers : [],
+      rocks_encountered: sanitiseInput(rocksEncountered || ""),
+      atterberg_limits: atterbergLimits || null,
+      moisture_content: moistureContent || null,
+      spn_values: spnValues || null,
+      corrosivity_assessment: sanitiseInput(corrosivityAssessment || ""),
+      groundwater_corrosivity: sanitiseInput(groundwaterCorrosivity || ""),
+      pile_foundation_suitable: pileFoundationSuitable !== undefined ? !!pileFoundationSuitable : null,
+      bearing_capacity_kpa: beaingCapacityKpa || null,
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("geotechnical_bore_logs").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      boreRef,
+      totalDepthM: Number(totalDepthM),
+      flags,
+      applicableStandards: ["AS 1726 Geotechnical site investigations", "AS 2159 Piling — design and installation", "AS 3600 Concrete structures (foundation design)"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/geotechnical-bore-log error:", err.message);
+    res.status(500).json({ error: "Failed to record geotechnical bore log" });
+  }
+});
+
+// POST /ai-uv-radiation-assessment — AI assesses UV exposure risk and recommends controls for outdoor workers
+app.post("/ai-uv-radiation-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      location,
+      season,
+      typicalUvIndex,
+      outdoorHoursPerDay,
+      workType,
+      currentControls,
+      vulnerableWorkers,
+    } = req.body;
+
+    if (!location || !workType) {
+      return res.status(400).json({ error: "location and workType are required" });
+    }
+
+    const prompt = `You are an occupational health expert in UV radiation risk management for outdoor workers in Australia.
+
+Assess UV radiation risk for:
+- Location: ${sanitiseInput(location)}
+- Season: ${sanitiseInput(season || "summer")}
+- Typical UV Index: ${sanitiseInput(String(typicalUvIndex || "not provided"))}
+- Daily outdoor hours: ${sanitiseInput(String(outdoorHoursPerDay || "8"))}
+- Work type: ${sanitiseInput(workType)}
+- Current controls: ${sanitiseInput(currentControls || "none")}
+- Vulnerable workers: ${sanitiseInput(vulnerableWorkers || "unknown")}
+
+Return a JSON object with:
+{
+  "riskLevel": "LOW|MODERATE|HIGH|VERY HIGH|EXTREME",
+  "sunProtectionRequired": boolean,
+  "mandatoryPPE": [string],
+  "sunscreenRequirement": string,
+  "workSchedulingRecommendation": string,
+  "shadeRequirement": string,
+  "skinCancerRiskFactors": [string],
+  "healthSurveillanceRecommended": boolean,
+  "healthSurveillanceFrequency": string,
+  "workerEducationTopics": [string],
+  "vulnerableWorkerConsiderations": string,
+  "applicableGuidance": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ location, workType, assessment });
+  } catch (err) {
+    console.error("/ai-uv-radiation-assessment error:", err.message);
+    res.json({
+      location: req.body.location || "",
+      workType: req.body.workType || "",
+      assessment: {
+        riskLevel: "VERY HIGH",
+        sunProtectionRequired: true,
+        mandatoryPPE: ["Broad-brim hat (minimum UPF50)", "SPF50+ sunscreen applied every 2 hours", "UV-protective long-sleeve shirt (UPF50+)", "Wrap-around sunglasses (AS/NZS 1067)"],
+        sunscreenRequirement: "SPF50+ broad-spectrum sunscreen applied to all exposed skin 20 min before outdoor work, reapplied every 2 hours",
+        workSchedulingRecommendation: "Schedule heavy outdoor tasks before 10am or after 3pm. Provide covered break facilities for midday rest periods.",
+        shadeRequirement: "Covered rest area required on all outdoor construction sites. Shade cloth structures for work areas wherever practicable.",
+        skinCancerRiskFactors: ["Fair skin/red hair", "History of sunburn", "Long-term outdoor occupation", "Limited UV protection compliance"],
+        healthSurveillanceRecommended: true,
+        healthSurveillanceFrequency: "Annual skin check with GP or dermatologist for workers with > 5 years outdoor employment history",
+        workerEducationTopics: ["UV Index interpretation", "Correct sunscreen application", "Skin self-examination for early detection", "Shade use during peak UV hours"],
+        vulnerableWorkerConsiderations: "Workers with history of skin cancer, immunosuppression, or photosensitising medication require enhanced protection and more frequent monitoring.",
+        applicableGuidance: ["Safe Work Australia UV Radiation Code of Practice 2021", "Cancer Council Australia SunSmart guidelines", "ARPANSA UV Index scale"],
+        recommendation: "Implement a formal SunSmart policy. Provide all PPE free of charge. Deliver induction and annual refresher training. Encourage annual skin checks for long-term outdoor workers.",
+        summary: "Australian outdoor workers face among the world's highest UV exposure. A SunSmart policy with structured controls, PPE provision, and health surveillance is required for all Victorian outdoor construction sites.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
