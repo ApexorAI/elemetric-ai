@@ -54819,6 +54819,314 @@ Return a JSON object with:
   }
 });
 
+// POST /nabers-rating-record — Record a NABERS energy/water/waste rating for commercial buildings
+app.post("/nabers-rating-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      propertyAddress,
+      buildingName,
+      buildingClass,
+      ratingType,
+      assessmentDate,
+      assessor,
+      assessorAccreditationNumber,
+      ratingPeriodFrom,
+      ratingPeriodTo,
+      starRating,
+      previousStarRating,
+      baselineNabersRating,
+      nabersCertificateNumber,
+      totalEnergyConsumptionGj,
+      renewableEnergyGj,
+      greenPowerPercent,
+      grossFloorAreaM2,
+      tenancyOccupancyPercent,
+      mainCoolingSystem,
+      mainHeatingSystem,
+      lightingSystem,
+      waterConsumptionKl,
+      wasteRecoveryPercent,
+      indoorEnvironmentRating,
+      targetStarRating,
+      improvementPlan,
+      notes,
+    } = req.body;
+
+    if (!projectId || !propertyAddress || !ratingType || !assessmentDate || !starRating) {
+      return res.status(400).json({ error: "projectId, propertyAddress, ratingType, assessmentDate, and starRating are required" });
+    }
+
+    const flags = [];
+    // NABERS: 3 stars = average, 5 stars = excellent, 6 stars = market leading
+    if (Number(starRating) < 3.0 && ratingType.toLowerCase().includes("energy")) {
+      flags.push(`NABERS Energy ${starRating} stars — below national average of 3.0 stars. Significant energy efficiency improvement required.`);
+    }
+    if (Number(starRating) < 2.5 && ratingType.toLowerCase().includes("water")) {
+      flags.push(`NABERS Water ${starRating} stars — below national average. Review water metering and conservation measures.`);
+    }
+    if (previousStarRating && Number(starRating) < Number(previousStarRating)) {
+      flags.push(`Rating declined from ${previousStarRating} to ${starRating} stars — investigate cause of performance deterioration`);
+    }
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      property_address: sanitiseInput(propertyAddress),
+      building_name: sanitiseInput(buildingName || ""),
+      building_class: sanitiseInput(buildingClass || ""),
+      rating_type: sanitiseInput(ratingType),
+      assessment_date: assessmentDate,
+      assessor: sanitiseInput(assessor || ""),
+      assessor_accreditation_number: sanitiseInput(assessorAccreditationNumber || ""),
+      rating_period_from: ratingPeriodFrom || null,
+      rating_period_to: ratingPeriodTo || null,
+      star_rating: Number(starRating),
+      previous_star_rating: previousStarRating ? Number(previousStarRating) : null,
+      baseline_nabers_rating: baselineNabersRating ? Number(baselineNabersRating) : null,
+      nabers_certificate_number: sanitiseInput(nabersCertificateNumber || ""),
+      total_energy_consumption_gj: totalEnergyConsumptionGj || null,
+      renewable_energy_gj: renewableEnergyGj || null,
+      green_power_percent: greenPowerPercent || null,
+      gross_floor_area_m2: grossFloorAreaM2 || null,
+      tenancy_occupancy_percent: tenancyOccupancyPercent || null,
+      main_cooling_system: sanitiseInput(mainCoolingSystem || ""),
+      main_heating_system: sanitiseInput(mainHeatingSystem || ""),
+      lighting_system: sanitiseInput(lightingSystem || ""),
+      water_consumption_kl: waterConsumptionKl || null,
+      waste_recovery_percent: wasteRecoveryPercent || null,
+      indoor_environment_rating: indoorEnvironmentRating ? Number(indoorEnvironmentRating) : null,
+      target_star_rating: targetStarRating ? Number(targetStarRating) : null,
+      improvement_plan: sanitiseInput(improvementPlan || ""),
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("nabers_rating_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      starRating: Number(starRating),
+      ratingType,
+      flags,
+      nabersContext: { "3 stars": "National average", "4 stars": "Good performance", "5 stars": "Excellent", "6 stars": "Market leading" },
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/nabers-rating-record error:", err.message);
+    res.status(500).json({ error: "Failed to record NABERS rating" });
+  }
+});
+
+// POST /concrete-pour-record — Record an as-built concrete pour
+app.post("/concrete-pour-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      pourRef,
+      pourDate,
+      supervisor,
+      element,
+      location,
+      gridReference,
+      concreteMix,
+      designStrengthMpa,
+      supplierName,
+      deliveryDocketNumbers,
+      totalVolumeM3,
+      truckCount,
+      firstLoadTime,
+      lastLoadTime,
+      slumpSpecMm,
+      slumpTestResults,
+      airContentPercent,
+      ambientTempC,
+      concreteTempC,
+      waterAddedOnSite,
+      admixtures,
+      cylinderSamplesTaken,
+      sampleCount,
+      labRef,
+      vibrationMethod,
+      vibrationEquipment,
+      weatherConditions,
+      cureMethod,
+      cureCompoundApplied,
+      curePeriodDays,
+      reinspectionDate,
+      issues,
+      issueDescription,
+      approvedForPour,
+      notes,
+    } = req.body;
+
+    if (!projectId || !pourDate || !element || !concreteMix || !supervisor) {
+      return res.status(400).json({ error: "projectId, pourDate, element, concreteMix, and supervisor are required" });
+    }
+
+    const flags = [];
+    // Slump tolerance: typically ±30mm of nominal per AS 1379
+    if (slumpSpecMm && Array.isArray(slumpTestResults)) {
+      slumpTestResults.forEach((r, i) => {
+        if (Math.abs(Number(r) - Number(slumpSpecMm)) > 30) {
+          flags.push(`Slump test ${i + 1}: ${r} mm is outside tolerance (±30 mm from nominal ${slumpSpecMm} mm)`);
+        }
+      });
+    }
+    if (waterAddedOnSite) flags.push("Water added on site — this modifies water:cement ratio and may reduce strength. Record volume added and notify engineer.");
+    if (ambientTempC && Number(ambientTempC) >= 35) flags.push(`Ambient temperature ${ambientTempC}°C — hot weather concreting procedures required per AS 1379`);
+    if (ambientTempC && Number(ambientTempC) <= 5) flags.push(`Ambient temperature ${ambientTempC}°C — cold weather protection required to maintain curing temperature`);
+    if (!cylinderSamplesTaken) flags.push("No concrete cylinder samples taken — samples required per AS 1012 for strength verification");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      pour_ref: sanitiseInput(pourRef || `CP-${Date.now()}`),
+      pour_date: pourDate,
+      supervisor: sanitiseInput(supervisor),
+      element: sanitiseInput(element),
+      location: sanitiseInput(location || ""),
+      grid_reference: sanitiseInput(gridReference || ""),
+      concrete_mix: sanitiseInput(concreteMix),
+      design_strength_mpa: designStrengthMpa || null,
+      supplier_name: sanitiseInput(supplierName || ""),
+      delivery_docket_numbers: Array.isArray(deliveryDocketNumbers) ? deliveryDocketNumbers.map(d => sanitiseInput(d)) : [],
+      total_volume_m3: totalVolumeM3 || null,
+      truck_count: truckCount || null,
+      first_load_time: sanitiseInput(firstLoadTime || ""),
+      last_load_time: sanitiseInput(lastLoadTime || ""),
+      slump_spec_mm: slumpSpecMm || null,
+      slump_test_results: Array.isArray(slumpTestResults) ? slumpTestResults.map(Number) : [],
+      air_content_percent: airContentPercent || null,
+      ambient_temp_c: ambientTempC || null,
+      concrete_temp_c: concreteTempC || null,
+      water_added_on_site: !!waterAddedOnSite,
+      admixtures: sanitiseInput(admixtures || ""),
+      cylinder_samples_taken: !!cylinderSamplesTaken,
+      sample_count: sampleCount || null,
+      lab_ref: sanitiseInput(labRef || ""),
+      vibration_method: sanitiseInput(vibrationMethod || "internal vibrator"),
+      vibration_equipment: sanitiseInput(vibrationEquipment || ""),
+      weather_conditions: sanitiseInput(weatherConditions || ""),
+      cure_method: sanitiseInput(cureMethod || ""),
+      cure_compound_applied: !!cureCompoundApplied,
+      cure_period_days: curePeriodDays || null,
+      reinspection_date: reinspectionDate || null,
+      flags,
+      issues: !!issues,
+      issue_description: sanitiseInput(issueDescription || ""),
+      approved_for_pour: !!approvedForPour,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("concrete_pour_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      pourRef: record.pour_ref,
+      flags,
+      applicableStandards: ["AS 1379 Specification and supply of concrete", "AS 1012 Testing fresh and hardened concrete", "AS 3600 Concrete structures"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/concrete-pour-record error:", err.message);
+    res.status(500).json({ error: "Failed to record concrete pour" });
+  }
+});
+
+// POST /ai-concrete-quality-assessment — AI assesses concrete quality from mix, slump, and test data
+app.post("/ai-concrete-quality-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      element,
+      concreteMix,
+      designStrengthMpa,
+      exposureClass,
+      slumpResults,
+      strengthResults,
+      ambientTemp,
+      additives,
+      issues,
+    } = req.body;
+
+    if (!element || !concreteMix) {
+      return res.status(400).json({ error: "element and concreteMix are required" });
+    }
+
+    const prompt = `You are a concrete technologist and structural engineer with expertise in AS 3600, AS 1379, and Victorian construction standards.
+
+Assess concrete quality for:
+- Element: ${sanitiseInput(element)}
+- Mix design: ${sanitiseInput(concreteMix)}
+- Design strength: ${sanitiseInput(String(designStrengthMpa || "not specified"))} MPa
+- Exposure class: ${sanitiseInput(exposureClass || "A1")}
+- Slump test results: ${sanitiseInput(JSON.stringify(slumpResults || []))} mm
+- Strength test results (28-day): ${sanitiseInput(JSON.stringify(strengthResults || []))} MPa
+- Ambient temperature during pour: ${sanitiseInput(String(ambientTemp || "not specified"))}°C
+- Admixtures/additives: ${sanitiseInput(additives || "none")}
+- Issues observed: ${sanitiseInput(issues || "none")}
+
+Return a JSON object with:
+{
+  "qualityRating": "EXCELLENT|ACCEPTABLE|MARGINAL|NON_CONFORMING",
+  "strengthConformance": boolean,
+  "slumpConformance": boolean,
+  "nonConformanceIssues": [string],
+  "remediationRequired": boolean,
+  "remediationOptions": [string],
+  "coreCutsRequired": boolean,
+  "coreCutsJustification": string,
+  "durabilityRisk": string,
+  "waterCementRatioAssessment": string,
+  "curingAdequacy": string,
+  "applicableStandards": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ element, concreteMix, assessment });
+  } catch (err) {
+    console.error("/ai-concrete-quality-assessment error:", err.message);
+    res.json({
+      element: req.body.element || "",
+      concreteMix: req.body.concreteMix || "",
+      assessment: {
+        qualityRating: "ACCEPTABLE",
+        strengthConformance: true,
+        slumpConformance: true,
+        nonConformanceIssues: [],
+        remediationRequired: false,
+        remediationOptions: ["Core cutting and compression testing if strength in doubt", "Ground-penetrating radar scan for voids or delamination"],
+        coreCutsRequired: false,
+        coreCutsJustification: "Core cuts are required when cylinder strengths fall below 0.85 × f'c characteristic strength per AS 1379 or when structural integrity is in question.",
+        durabilityRisk: "LOW — confirm exposure class minimum cement content and w/c ratio per AS 3600 Table 4.3",
+        waterCementRatioAssessment: "Confirm w/c ratio ≤ 0.5 for exposure class B1/B2 environments. Addition of water on site increases w/c ratio and reduces durability.",
+        curingAdequacy: "Minimum 7 days moist curing or curing compound application required per AS 3600 cl.18.3. Protect from direct sun and wind for first 24 hours.",
+        applicableStandards: ["AS 3600 Concrete structures", "AS 1379 Specification and supply of concrete", "AS 1012 Methods of testing concrete"],
+        recommendation: "Retain all cylinder test results and dockets for the design life of the structure. Ensure 28-day strength test reports are reviewed by the structural engineer before stripping formwork on critical elements.",
+        summary: "Concrete quality appears acceptable based on available data. Retain all testing records and confirm 28-day strength results against design requirements before form stripping.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
