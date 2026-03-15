@@ -5480,6 +5480,140 @@ app.get("/server-info", (_req, res) => {
   });
 });
 
+// ── Round 2: POST /checklist — Smart dynamic checklist generator ──────────────
+// Returns a job-type-specific photo checklist with VIC regulatory requirements.
+
+const CHECKLISTS = {
+  plumbing: [
+    { item: "PTR valve installed",          required: true,  regulatoryRef: "AS/NZS 3500.4",      tip: "Shoot from 25 cm — show compliance label AND discharge pipe in one frame." },
+    { item: "Tempering valve",              required: true,  regulatoryRef: "AS/NZS 3500.4",      tip: "Show all three port connections and the 50°C temperature rating on the body." },
+    { item: "Pressure limiting valve (PLV)",required: true,  regulatoryRef: "AS 1357.2",          tip: "The rated pressure (kPa) must be legible on the valve body." },
+    { item: "Isolation valve at fixture",   required: true,  regulatoryRef: "AS/NZS 3500.1",      tip: "Show the valve handle, body, and the supply connection to the fixture." },
+    { item: "Pipe supports",                required: true,  regulatoryRef: "AS/NZS 3500.1",      tip: "Show at least 3 support clips along a horizontal run — spacing must be ≤1.2 m." },
+    { item: "No leaks or moisture",         required: true,  regulatoryRef: "AS/NZS 3500",        tip: "Show dry surfaces around all fittings and joints." },
+    { item: "Compliance plate / label",     required: true,  regulatoryRef: "Plumbing Regs 2018", tip: "The compliance plate must be physically on the appliance with legible text." },
+    { item: "Existing system (before)",     required: false, regulatoryRef: "Best practice",      tip: "Before-state record confirms original installation scope." },
+  ],
+  gas: [
+    { item: "Gastight AS/NZS 5601.1",                        required: true,  regulatoryRef: "AS/NZS 5601.1 cl.8.3.2", tip: "Gauge face must show a readable numerical value — shoot from 20 cm." },
+    { item: "Burner flames normal",                           required: true,  regulatoryRef: "AS/NZS 5601.1",          tip: "Appliance must be running — blue flames, no yellow tips." },
+    { item: "Isolation valve present",                        required: true,  regulatoryRef: "AS/NZS 5601.1 cl.5.8",   tip: "Show valve handle, body, and supply connection — all accessible." },
+    { item: "Evidence of certification",                      required: true,  regulatoryRef: "Gas Safety Act 1997",     tip: "AGA/compliance label must be physically on the appliance body." },
+    { item: "Cowl and flue terminal OK",                      required: true,  regulatoryRef: "AS/NZS 5601.1",          tip: "Show the external terminal — not the flue pipe mid-run." },
+    { item: "Gas supply and appliance operating pressures correct", required: true, regulatoryRef: "AS/NZS 5601.1",    tip: "Gauge must show legible numbers and readable needle position." },
+    { item: "Ventilation adequate",                           required: true,  regulatoryRef: "AS/NZS 5601.1 cl.6.4",  tip: "Show combustion air louvre — must be unobstructed." },
+    { item: "Clearances OK",                                  required: true,  regulatoryRef: "AS/NZS 5601.1",          tip: "Use a tape measure in frame to confirm minimum 500 mm clearance." },
+    { item: "Flue supported and sealed",                      required: false, regulatoryRef: "AS/NZS 5601.1",          tip: "Show support brackets and joint seals along the flue run." },
+  ],
+  electrical: [
+    { item: "RCD protection installed and tested",  required: true,  regulatoryRef: "AS/NZS 3000 cl.2.6.3", tip: "Show the test button AND a visible trip indicator or test result." },
+    { item: "Switchboard labelling complete",       required: true,  regulatoryRef: "AS/NZS 3000 cl.8.5.1", tip: "Shoot from 25 cm — every circuit label must be legible." },
+    { item: "Earth continuity tested",              required: true,  regulatoryRef: "AS/NZS 3000 cl.8.3.7", tip: "Green/yellow earth conductor colour must be clearly visible." },
+    { item: "Test results recorded",                required: true,  regulatoryRef: "Elec. Safety Regs",    tip: "Show the completed CES or test certificate with all fields filled." },
+    { item: "Insulation resistance tested",         required: true,  regulatoryRef: "AS/NZS 3000 cl.8.3.6", tip: "Show megohmmeter display with a readable reading." },
+    { item: "No exposed conductors",                required: true,  regulatoryRef: "AS/NZS 3000",          tip: "Show all terminations — no bare copper outside terminals." },
+    { item: "Cable support and protection adequate",required: false, regulatoryRef: "AS/NZS 3000",          tip: "Show cables clipped at regular intervals — no loose runs." },
+    { item: "Smoke alarm installed and tested where required", required: false, regulatoryRef: "Building Regs 2018 r.120", tip: "Show alarm head, mounting, and interconnect wires." },
+  ],
+  drainage: [
+    { item: "Pipe fall / gradient",         required: true,  regulatoryRef: "AS/NZS 3500.3",      tip: "Include a spirit level or visible reference datum to show downward fall." },
+    { item: "Trap installed correctly",     required: true,  regulatoryRef: "AS/NZS 3500.2",      tip: "Show the trap body, water seal, and all connections." },
+    { item: "Inspection opening",           required: true,  regulatoryRef: "AS/NZS 3500.3",      tip: "IO cover must have a legible label and 500 mm clear access around it." },
+    { item: "All joints sealed and connected", required: true, regulatoryRef: "AS/NZS 3500.3",  tip: "Show joints smooth, fully engaged, no gaps." },
+    { item: "Pipe bedding adequate",        required: true,  regulatoryRef: "AS/NZS 3500.3",      tip: "Show sand/gravel bedding in cross-section before backfill." },
+    { item: "No pooling water or moisture staining", required: true, regulatoryRef: "AS/NZS 3500.2", tip: "Show dry drainage surfaces and surrounding substrate." },
+    { item: "Vent stack / air admittance valve", required: false, regulatoryRef: "AS/NZS 3500.2", tip: "Show vent terminal or AAV — must be accessible and unobstructed." },
+  ],
+  carpentry: [
+    { item: "Structural framing connections",       required: true,  regulatoryRef: "AS 1684.2",     tip: "Show all connection hardware — bolts, hangers, and nails visible." },
+    { item: "Engineer's specification compliance",  required: true,  regulatoryRef: "Building Act 1993", tip: "Pin the engineer's detail to the framing and photograph together." },
+    { item: "Timber member sizes",                  required: true,  regulatoryRef: "AS 1684.2",     tip: "Show a tape measure or grade stamp confirming member dimensions." },
+    { item: "Frame inspection",                     required: true,  regulatoryRef: "Building Regs 2018 r.58", tip: "Photograph the inspector's certificate in situ." },
+    { item: "Moisture barrier installed",           required: false, regulatoryRef: "AS/NZS 4200.1", tip: "Show the barrier lapped and fixed correctly at all joins." },
+    { item: "Termite management system",            required: false, regulatoryRef: "AS 3660.1",     tip: "Show the barrier system label or certificate attached to the frame." },
+  ],
+  hvac: [
+    { item: "Indoor unit mounting",                  required: true,  regulatoryRef: "Manufacturer/AIRAH", tip: "Show the unit correctly mounted on the wall bracket at specified height." },
+    { item: "Refrigerant lines lagged",              required: true,  regulatoryRef: "AS 4254.2",          tip: "Show UV-resistant foam insulation along the full line set run." },
+    { item: "Condensate drain correctly terminated", required: true,  regulatoryRef: "AS/NZS 3500.2",      tip: "Show the drain running to a clear discharge point — no ponding." },
+    { item: "Outdoor unit installation",             required: true,  regulatoryRef: "Manufacturer",       tip: "Show the outdoor unit level on its base with clear service access." },
+    { item: "Commissioning sheet",                   required: true,  regulatoryRef: "AIRAH DA19",         tip: "Show the sheet with airflow measurements and refrigerant charge recorded." },
+    { item: "Electrical supply connected",           required: true,  regulatoryRef: "Electricity Safety Act", tip: "Show the dedicated circuit, isolator, and electrical connection." },
+  ],
+};
+
+app.post("/checklist", (req, res) => {
+  const { jobType, includeOptional = false, propertyAgeYears, applianceCount } = req.body || {};
+
+  if (!jobType || !CHECKLISTS[jobType]) {
+    return res.status(400).json({ error: `jobType required. Valid: ${Object.keys(CHECKLISTS).join(", ")}` });
+  }
+
+  let items = CHECKLISTS[jobType];
+  if (!includeOptional) items = items.filter(i => i.required);
+
+  // Add extra items for older properties
+  const extraItems = [];
+  if (propertyAgeYears > 30 && jobType === "plumbing") {
+    extraItems.push({ item: "Existing pipework condition assessment", required: false, regulatoryRef: "Best practice", tip: "Document condition of existing pipes — corrosion, dezincification, or lead solder if pre-1970s." });
+  }
+  if (propertyAgeYears > 25 && jobType === "electrical") {
+    extraItems.push({ item: "Existing wiring inspection (cloth/rubber)", required: false, regulatoryRef: "AS/NZS 3000", tip: "Photograph any cloth-insulated or rubber-sheathed wiring found — flagging it protects your liability." });
+  }
+
+  return res.json({
+    jobType,
+    totalItems:       items.length + extraItems.length,
+    requiredItems:    items.filter(i => i.required).length,
+    checklist:        [...items, ...extraItems],
+    regulatoryBasis:  (PROMPT_REGISTRY[jobType] || {}).description || "Victorian trade regulations",
+    generatedAt:      new Date().toISOString(),
+  });
+});
+
+// ── Round 2: POST /photo-tips — Photo tips for a specific checklist item ──────
+
+app.post("/photo-tips", (req, res) => {
+  const { jobType, checklistItem } = req.body || {};
+
+  if (!jobType || !checklistItem) {
+    return res.status(400).json({ error: "jobType and checklistItem are required." });
+  }
+
+  // Find the item in the checklist
+  const checklist = CHECKLISTS[jobType] || [];
+  const found = checklist.find(i =>
+    i.item.toLowerCase().includes((checklistItem || "").toLowerCase()) ||
+    (checklistItem || "").toLowerCase().includes(i.item.toLowerCase().split(" ")[0])
+  );
+
+  if (found) {
+    return res.json({
+      jobType,
+      checklistItem:  found.item,
+      regulatoryRef:  found.regulatoryRef,
+      quickTip:       found.tip,
+      generalTips: [
+        "Get within 20-30 cm of the subject — close photos have a much higher pass rate.",
+        "Tap your phone screen on the subject to focus before shooting.",
+        "Ensure all text (labels, markings, ratings) is legible at native photo size.",
+        "Natural light or a bright work light gives the best results.",
+      ],
+    });
+  }
+
+  return res.json({
+    jobType,
+    checklistItem,
+    quickTip:       "Get within 20-30 cm of the subject and ensure all compliance labels are legible before submitting.",
+    generalTips: [
+      "Close, well-lit, in-focus photos pass at a much higher rate.",
+      "Always include compliance labels or markings in the frame.",
+      "Take 2-3 shots and submit the clearest one.",
+    ],
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
