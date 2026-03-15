@@ -33848,6 +33848,183 @@ Return a JSON object with:
   }
 });
 
+// ── Round 126: Mobile workforce, GPS attendance, geo-fenced job tracking ──────
+
+// POST /gps-attendance — Record GPS-verified attendance at a job site
+app.post("/gps-attendance", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, jobId, latitude, longitude,
+    accuracy, action, deviceId, timestamp,
+  } = req.body;
+
+  if (!contractorId || !action || latitude === undefined || longitude === undefined)
+    return res.status(400).json({ error: "contractorId, action, latitude, longitude required." });
+
+  const validActions = ["CLOCK_IN", "CLOCK_OUT", "BREAK_START", "BREAK_END", "TRAVEL_START", "TRAVEL_END"];
+  const act = (action || "").toUpperCase();
+  if (!validActions.includes(act)) return res.status(400).json({ error: `action must be one of: ${validActions.join(", ")}` });
+
+  const lat = Number(latitude);
+  const lng = Number(longitude);
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180)
+    return res.status(400).json({ error: "Invalid GPS coordinates." });
+
+  const record = {
+    contractor_id: sanitiseInput(contractorId),
+    job_id: sanitiseInput(jobId || ""),
+    latitude: lat,
+    longitude: lng,
+    accuracy_m: Number(accuracy) || null,
+    action: act,
+    device_id: sanitiseInput(deviceId || ""),
+    timestamp: timestamp || new Date().toISOString(),
+    recorded_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("gps_attendance")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, attendanceId: data.id, action: act, coordinates: { lat, lng }, ...record });
+  }
+
+  res.json({ success: true, attendanceId: null, action: act, coordinates: { lat, lng }, ...record, saved: false });
+});
+
+// GET /gps-attendance/:contractorId — Get GPS attendance history for a contractor
+app.get("/gps-attendance/:contractorId", apiKeyAuth, async (req, res) => {
+  const { contractorId } = req.params;
+  const { date, jobId } = req.query;
+  const queryDate = date || new Date().toISOString().split("T")[0];
+
+  if (supabaseAdmin) {
+    let query = supabaseAdmin
+      .from("gps_attendance")
+      .select("*")
+      .eq("contractor_id", contractorId)
+      .gte("timestamp", `${queryDate}T00:00:00.000Z`)
+      .lte("timestamp", `${queryDate}T23:59:59.999Z`)
+      .order("timestamp", { ascending: true });
+
+    if (jobId) query = query.eq("job_id", jobId);
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "DB error." });
+
+    const records = data || [];
+    const clockIn = records.find(r => r.action === "CLOCK_IN");
+    const clockOut = records.reverse().find(r => r.action === "CLOCK_OUT");
+    const totalMinutes = clockIn && clockOut
+      ? Math.round((new Date(clockOut.timestamp) - new Date(clockIn.timestamp)) / 60000)
+      : null;
+
+    return res.json({
+      contractorId, date: queryDate,
+      records: data || [],
+      clockIn: clockIn?.timestamp || null,
+      clockOut: clockOut?.timestamp || null,
+      totalMinutesOnSite: totalMinutes,
+      totalHours: totalMinutes ? Math.round(totalMinutes / 60 * 100) / 100 : null,
+    });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /geo-fence — Define a geo-fence boundary for job site attendance validation
+app.post("/geo-fence", apiKeyAuth, async (req, res) => {
+  const {
+    jobId, siteId, siteName, centreLatitude, centreLongitude,
+    radiusMeters = 200, alertOnEntry = false, alertOnExit = false,
+    activeHoursStart = "06:00", activeHoursEnd = "18:00",
+  } = req.body;
+
+  if (!jobId || centreLatitude === undefined || centreLongitude === undefined)
+    return res.status(400).json({ error: "jobId, centreLatitude, centreLongitude required." });
+
+  const lat = Number(centreLatitude);
+  const lng = Number(centreLongitude);
+  const radius = Math.min(5000, Math.max(50, Number(radiusMeters)));
+
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180)
+    return res.status(400).json({ error: "Invalid GPS coordinates." });
+
+  const record = {
+    job_id: sanitiseInput(jobId),
+    site_id: sanitiseInput(siteId || ""),
+    site_name: sanitiseInput(siteName || ""),
+    centre_latitude: lat,
+    centre_longitude: lng,
+    radius_meters: radius,
+    alert_on_entry: Boolean(alertOnEntry),
+    alert_on_exit: Boolean(alertOnExit),
+    active_hours_start: sanitiseInput(activeHoursStart),
+    active_hours_end: sanitiseInput(activeHoursEnd),
+    status: "ACTIVE",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("geo_fences")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, fenceId: data.id, ...record });
+  }
+
+  res.json({ success: true, fenceId: null, ...record, saved: false });
+});
+
+// POST /geo-fence-check — Check if a GPS coordinate is within a job's geo-fence
+app.post("/geo-fence-check", apiKeyAuth, async (req, res) => {
+  const { jobId, latitude, longitude } = req.body;
+
+  if (!jobId || latitude === undefined || longitude === undefined)
+    return res.status(400).json({ error: "jobId, latitude, longitude required." });
+
+  const lat = Number(latitude);
+  const lng = Number(longitude);
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("geo_fences")
+      .select("*")
+      .eq("job_id", jobId)
+      .eq("status", "ACTIVE")
+      .single();
+
+    if (error || !data) return res.status(404).json({ error: "No active geo-fence found for this job." });
+
+    // Haversine distance calculation
+    const R = 6371000; // Earth radius in metres
+    const dLat = (lat - data.centre_latitude) * Math.PI / 180;
+    const dLng = (lng - data.centre_longitude) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) ** 2 + Math.cos(data.centre_latitude * Math.PI / 180) * Math.cos(lat * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+    const distanceMeters = Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+
+    const isWithinFence = distanceMeters <= data.radius_meters;
+
+    return res.json({
+      jobId,
+      latitude: lat, longitude: lng,
+      fenceId: data.id,
+      centreLat: data.centre_latitude, centreLng: data.centre_longitude,
+      radiusMeters: data.radius_meters,
+      distanceFromCentreMeters: distanceMeters,
+      isWithinFence,
+      status: isWithinFence ? "ON_SITE" : "OFF_SITE",
+      checkedAt: new Date().toISOString(),
+    });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
