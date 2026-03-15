@@ -40393,6 +40393,202 @@ Return JSON with:
   }
 });
 
+// POST /licence-renewal-reminder — Track a licence and set renewal reminder
+app.post("/licence-renewal-reminder", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, contractorName, licenceType, licenceNumber,
+    issuingAuthority, issueDate, expiryDate, state = "VIC",
+    reminderDaysBefore = 60, autoRenew = false, renewalFeeAud,
+    cpd_required = false, cpd_hours_required, notes,
+  } = req.body;
+  if (!contractorName || !licenceType || !expiryDate) {
+    return res.status(400).json({ error: "contractorName, licenceType, and expiryDate are required." });
+  }
+  const daysUntilExpiry = Math.ceil((new Date(expiryDate) - new Date()) / (1000 * 60 * 60 * 24));
+  const status = daysUntilExpiry < 0 ? "EXPIRED"
+    : daysUntilExpiry <= Number(reminderDaysBefore) ? "RENEWAL_DUE"
+    : "CURRENT";
+  const reminderDate = new Date(new Date(expiryDate).getTime() - Number(reminderDaysBefore) * 86400000).toISOString().split("T")[0];
+  const licenceRef = `LIC-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    licence_ref: licenceRef,
+    contractor_id: contractorId || null,
+    contractor_name: sanitiseInput(contractorName),
+    licence_type: sanitiseInput(licenceType),
+    licence_number: sanitiseInput(licenceNumber || ""),
+    issuing_authority: sanitiseInput(issuingAuthority || ""),
+    issue_date: issueDate || null,
+    expiry_date: expiryDate,
+    state: sanitiseInput(state),
+    reminder_days_before: Number(reminderDaysBefore),
+    reminder_date: reminderDate,
+    auto_renew: Boolean(autoRenew),
+    renewal_fee_aud: Number(renewalFeeAud) || null,
+    cpd_required: Boolean(cpd_required),
+    cpd_hours_required: Number(cpd_hours_required) || null,
+    status,
+    days_until_expiry: daysUntilExpiry,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("licence_renewals").insert(record);
+    if (error) console.error("licence-renewal-reminder DB error:", error.message);
+  }
+  res.json({
+    licenceRef, licenceType, expiryDate, daysUntilExpiry, status,
+    reminderDate, cpdRequired: cpd_required, saved: !!supabaseAdmin,
+  });
+});
+
+// GET /licence-renewal-reminder/:contractorId — Get all licences for a contractor
+app.get("/licence-renewal-reminder/:contractorId", apiKeyAuth, async (req, res) => {
+  const { contractorId } = req.params;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  const { data, error } = await supabaseAdmin
+    .from("licence_renewals")
+    .select("*")
+    .eq("contractor_id", contractorId)
+    .order("expiry_date", { ascending: true });
+  if (error) return res.status(500).json({ error: error.message });
+  const now = new Date();
+  res.json({
+    contractorId,
+    summary: {
+      total: data.length,
+      current: data.filter(l => l.status === "CURRENT").length,
+      renewalDue: data.filter(l => l.status === "RENEWAL_DUE").length,
+      expired: data.filter(l => l.status === "EXPIRED" || new Date(l.expiry_date) < now).length,
+    },
+    licences: data,
+  });
+});
+
+// POST /ai-compliance-calendar — AI generates a compliance calendar for a contractor
+app.post("/ai-compliance-calendar", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, contractorName, trade, state = "VIC",
+    licences = [], certifications = [], insurances = [],
+    projectCount = 0, employeeCount = 0, hasApprentice = false,
+    lookAheadMonths = 12,
+  } = req.body;
+  if (!contractorName || !trade) {
+    return res.status(400).json({ error: "contractorName and trade are required." });
+  }
+  const sanitisedName = sanitiseInput(contractorName);
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian trade compliance specialist. Generate comprehensive compliance calendars for tradespeople.`;
+  const userPrompt = `Generate a ${lookAheadMonths}-month compliance calendar for:
+Contractor: ${sanitisedName}
+Trade: ${sanitisedTrade}
+State: ${sanitisedState}
+Licences: ${licences.map(l => `${sanitiseInput(l.type)} (expires ${l.expiry || "unknown"})`).join(", ") || "Not listed"}
+Certifications: ${certifications.map(c => sanitiseInput(c)).join(", ") || "Not listed"}
+Insurances: ${insurances.map(i => `${sanitiseInput(i.type)} (expires ${i.expiry || "unknown"})`).join(", ") || "Not listed"}
+Active projects: ${projectCount}
+Employees: ${employeeCount}
+Apprentice: ${hasApprentice}
+Period: ${new Date().toISOString().slice(0, 7)} to ${new Date(Date.now() + lookAheadMonths * 30 * 86400000).toISOString().slice(0, 7)}
+
+Return JSON with:
+{
+  "calendarItems": [
+    {
+      "dueDate": "2026-04",
+      "category": "LICENCE|INSURANCE|CERTIFICATION|TAX|PAYROLL|SAFETY|TRAINING|REPORTING",
+      "title": "...",
+      "description": "...",
+      "priority": "CRITICAL|HIGH|MEDIUM|LOW",
+      "consequenceIfMissed": "...",
+      "actionRequired": "...",
+      "estimatedCost": "...",
+      "leadTimeWeeks": 4
+    }
+  ],
+  "annualObligations": ["...", "..."],
+  "upcomingDeadlines": ["...", "..."],
+  "recommendations": ["...", "..."],
+  "summary": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 3000,
+    });
+    usageStats.openaiCalls++;
+    const calendar = JSON.parse(aiRes.choices[0].message.content);
+    const calRef = `CAL-${Date.now().toString(36).toUpperCase()}`;
+    res.json({ calRef, contractorId, contractorName: sanitisedName, trade: sanitisedTrade, state: sanitisedState, lookAheadMonths, calendar });
+  } catch (err) {
+    console.error("ai-compliance-calendar error:", err.message);
+    const calRef = `CAL-FALLBACK`;
+    const now = new Date();
+    const currentMonth = now.toISOString().slice(0, 7);
+    res.json({
+      calRef, contractorId, contractorName: sanitisedName, trade: sanitisedTrade, state: sanitisedState, lookAheadMonths,
+      calendar: {
+        calendarItems: [
+          { dueDate: currentMonth, category: "TAX", title: "BAS lodgement", description: "Quarterly Business Activity Statement due", priority: "CRITICAL", consequenceIfMissed: "ATO penalties and interest", actionRequired: "Lodge BAS with ATO or through accountant", estimatedCost: "$0 self-lodge or accountant fee", leadTimeWeeks: 2 },
+          { dueDate: currentMonth, category: "PAYROLL", title: "Superannuation payment", description: "SG contributions due quarterly", priority: "CRITICAL", consequenceIfMissed: "Superannuation Guarantee Charge applies", actionRequired: "Pay SG contributions by due date", estimatedCost: "11% of gross wages", leadTimeWeeks: 1 },
+          { dueDate: currentMonth, category: "SAFETY", title: "WHS review", description: "Review and update WHS documentation", priority: "HIGH", consequenceIfMissed: "Non-compliance with WHS legislation", actionRequired: "Review SWMS, risk register, and safety records", estimatedCost: "Staff time", leadTimeWeeks: 4 },
+        ],
+        annualObligations: ["Income tax return", "Workers compensation renewal", "Public liability renewal", "Licence renewal (check individual dates)", "Annual TPAR report if applicable"],
+        upcomingDeadlines: licences.filter(l => l.expiry).map(l => `${sanitiseInput(l.type)} expires ${l.expiry}`),
+        recommendations: ["Set calendar reminders 60 days before all licence and insurance expirations", "Use Elemetric compliance tracking to automate reminders"],
+        summary: `${sanitisedTrade} contractor compliance calendar generated. ${licences.length} licences and ${insurances.length} insurance policies tracked.`,
+      },
+    });
+  }
+});
+
+// GET /contractor-dashboard/:contractorId — Comprehensive contractor compliance dashboard
+app.get("/contractor-dashboard/:contractorId", apiKeyAuth, async (req, res) => {
+  const { contractorId } = req.params;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  const now = new Date().toISOString();
+  const [licencesRes, prequalRes, surveysRes, cocRes] = await Promise.all([
+    supabaseAdmin.from("licence_renewals").select("status, licence_type, expiry_date").eq("contractor_id", contractorId),
+    supabaseAdmin.from("prequalifications").select("status, score, trade").eq("contractor_id", contractorId).order("created_at", { ascending: false }).limit(1),
+    supabaseAdmin.from("client_surveys").select("avg_rating, sentiment").eq("job_id", contractorId).limit(50),
+    supabaseAdmin.from("certificates_of_currency").select("expiry_status, policy_type").eq("contractor_id", contractorId),
+  ]);
+  const licences = licencesRes.data || [];
+  const preqal = prequalRes.data?.[0] || null;
+  const surveys = surveysRes.data || [];
+  const cocs = cocRes.data || [];
+  const avgRating = surveys.length > 0 ? surveys.reduce((s, r) => s + (r.avg_rating || 0), 0) / surveys.length : null;
+  const expiredCocs = cocs.filter(c => c.expiry_status === "EXPIRED").length;
+  const expiredLicences = licences.filter(l => l.status === "EXPIRED").length;
+  const overallStatus = (expiredLicences > 0 || expiredCocs > 0) ? "ACTION_REQUIRED"
+    : licences.filter(l => l.status === "RENEWAL_DUE").length > 0 ? "ATTENTION_NEEDED"
+    : "COMPLIANT";
+  res.json({
+    contractorId,
+    overallStatus,
+    licences: {
+      total: licences.length,
+      current: licences.filter(l => l.status === "CURRENT").length,
+      renewalDue: licences.filter(l => l.status === "RENEWAL_DUE").length,
+      expired: expiredLicences,
+    },
+    insurance: {
+      total: cocs.length,
+      current: cocs.filter(c => c.expiry_status === "CURRENT").length,
+      expiringSoon: cocs.filter(c => c.expiry_status === "EXPIRING_SOON").length,
+      expired: expiredCocs,
+    },
+    prequalification: preqal ? { status: preqal.status, score: preqal.score } : null,
+    clientSatisfaction: surveys.length > 0 ? { avgRating: +avgRating.toFixed(2), surveyCount: surveys.length } : null,
+    generatedAt: now,
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
