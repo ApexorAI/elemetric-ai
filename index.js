@@ -60898,6 +60898,409 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /formwork-inspection — Record formwork and falsework inspection per AS 3610 / AS 3610.1
+app.post("/formwork-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    location,
+    inspectionStage,      // pre-concrete | during-pour | post-strip
+    inspectionDate,
+    inspector,
+    formworkType,         // slab | beam | column | wall | stair | soffit | bridge-deck
+    designEngineer,
+    designApproved,
+    loadCapacityKPa,
+    actualLoadKPa,
+    soffit_height,        // metres
+    shorePropSpacing,     // metres
+    reshoreInstalled,
+    reshoreSpacing,       // metres
+    plywoodCondition,     // good | fair | poor | damaged
+    ledgerBeamCondition,
+    standardsCondition,
+    baseJackCondition,
+    headJackCondition,
+    bracing_adequate,
+    upliftRestraint,
+    lateralBracing,
+    tiesToStructure,
+    camberSet,            // mm
+    jointsSealed,
+    releasingAgentApplied,
+    previousSlabStripped,
+    concreteStrength_MPa, // at time of stripping (if post-strip stage)
+    strippingStrength_MPa,
+    criticalObservations, // array of strings
+    failures,             // array of critical defects
+    photos,               // array of URLs
+    notes,
+  } = req.body;
+
+  const criticalIssues = [];
+
+  // Load check
+  const actualLoad = parseFloat(actualLoadKPa) || 0;
+  const allowedLoad = parseFloat(loadCapacityKPa) || 0;
+  if (allowedLoad > 0 && actualLoad > allowedLoad) {
+    criticalIssues.push(`Actual load ${actualLoad} kPa exceeds design capacity ${allowedLoad} kPa — UNSAFE`);
+  }
+
+  // Stripping strength check
+  if (inspectionStage === "post-strip") {
+    const actualStr = parseFloat(concreteStrength_MPa) || 0;
+    const requiredStr = parseFloat(strippingStrength_MPa) || 0;
+    if (requiredStr > 0 && actualStr < requiredStr) {
+      criticalIssues.push(
+        `Concrete strength ${actualStr} MPa is below required stripping strength ${requiredStr} MPa — DO NOT STRIP`
+      );
+    }
+  }
+
+  // Component condition failures
+  if (plywoodCondition === "damaged") criticalIssues.push("Damaged plywood deck — replace before pouring");
+  if (baseJackCondition === "poor" || baseJackCondition === "damaged")
+    criticalIssues.push("Base jacks in poor/damaged condition — risk of settlement");
+
+  // High soffit — additional bracing scrutiny
+  const soffitH = parseFloat(soffit_height) || 0;
+  if (soffitH > 4 && !bracing_adequate) {
+    criticalIssues.push(`Soffit height ${soffitH} m — inadequate lateral bracing identified for high-rise falsework`);
+  }
+
+  const passed = criticalIssues.length === 0;
+
+  if (!passed) {
+    return res.status(422).json({
+      error: "Formwork inspection identifies critical defects — do not proceed with concrete pour",
+      criticalIssues,
+      immediateActions: [
+        "Stop all work in the vicinity",
+        "Notify formwork engineer and site supervisor immediately",
+        "Rectify all critical defects before pouring",
+        "Re-inspect and obtain engineer sign-off before proceeding",
+      ],
+      applicableStandards: ["AS 3610", "AS 3610.1", "AS 3600", "OHS Regulations 2017 (Vic)"],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    location: sanitiseInput(location),
+    inspection_stage: sanitiseInput(inspectionStage),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    formwork_type: sanitiseInput(formworkType),
+    design_engineer: sanitiseInput(designEngineer),
+    design_approved: designApproved,
+    load_capacity_kpa: loadCapacityKPa,
+    actual_load_kpa: actualLoadKPa,
+    soffit_height,
+    shore_prop_spacing: shorePropSpacing,
+    reshore_installed: reshoreInstalled,
+    reshore_spacing: reshoreSpacing,
+    plywood_condition: sanitiseInput(plywoodCondition),
+    ledger_beam_condition: sanitiseInput(ledgerBeamCondition),
+    standards_condition: sanitiseInput(standardsCondition),
+    base_jack_condition: sanitiseInput(baseJackCondition),
+    head_jack_condition: sanitiseInput(headJackCondition),
+    bracing_adequate: bracing_adequate,
+    uplift_restraint: upliftRestraint,
+    lateral_bracing: lateralBracing,
+    ties_to_structure: tiesToStructure,
+    camber_set: camberSet,
+    joints_sealed: jointsSealed,
+    releasing_agent_applied: releasingAgentApplied,
+    previous_slab_stripped: previousSlabStripped,
+    concrete_strength_mpa: concreteStrength_MPa,
+    stripping_strength_mpa: strippingStrength_MPa,
+    critical_observations: criticalObservations || [],
+    failures: failures || [],
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    result: "PASSED",
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("formwork_inspections")
+      .insert(record);
+    if (dbErr) console.error("DB error /formwork-inspection:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Formwork inspection recorded — cleared to proceed",
+    inspectionStage,
+    loadUtilisation: allowedLoad > 0 ? `${Math.round((actualLoad / allowedLoad) * 100)}%` : "N/A",
+    soffitHeight: soffit_height,
+    reshoreInstalled,
+    result: "PASSED",
+    applicableStandards: ["AS 3610", "AS 3610.1", "AS 3600"],
+    saved,
+  });
+});
+
+// POST /precast-installation-record — Record precast concrete element installation and connection inspection
+app.post("/precast-installation-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    elementId,
+    elementType,          // panel | beam | column | hollow-core | double-tee | stair | pit | box-culvert
+    manufacturer,
+    castDate,
+    deliveryDate,
+    installDate,
+    inspector,
+    designStrength_MPa,
+    actualStrength_MPa,   // from delivery docket
+    elementWeight_kg,
+    liftingInserts,       // array of { id, type, swl_kN, inspected, condition }
+    liftingScheme,        // single-point | two-point | four-point | spreader-bar
+    cranageCapacity_t,
+    positionGrid,         // e.g. "A3"
+    levelSetMM,           // deviation from design level in mm
+    plumbMM,              // deviation from plumb in mm
+    alignmentMM,          // deviation from horizontal alignment in mm
+    levelTolerance_MM,    // design tolerance
+    connectionType,       // grout | weld | bolt | resin-anchor | cast-in | pin
+    connectionInspected,
+    groutMix,
+    groutStrength_MPa,
+    groutPoured,
+    temporaryPropsInstalled,
+    propLoadKN,
+    finalFixingComplete,
+    criticalConnections,  // array of { location, type, status }
+    photos,
+    notes,
+  } = req.body;
+
+  const issues = [];
+
+  // Strength check
+  const designStr = parseFloat(designStrength_MPa) || 0;
+  const actualStr = parseFloat(actualStrength_MPa) || 0;
+  if (designStr > 0 && actualStr < designStr) {
+    issues.push(`Element strength ${actualStr} MPa below design ${designStr} MPa`);
+  }
+
+  // Tolerance checks per AS 3850 table
+  const levelTol = parseFloat(levelTolerance_MM) || 10;
+  const levelDev = Math.abs(parseFloat(levelSetMM) || 0);
+  const plumbDev = Math.abs(parseFloat(plumbMM) || 0);
+  const alignDev = Math.abs(parseFloat(alignmentMM) || 0);
+  if (levelDev > levelTol) issues.push(`Level deviation ${levelDev} mm exceeds tolerance ${levelTol} mm`);
+  if (plumbDev > 15) issues.push(`Plumb deviation ${plumbDev} mm exceeds AS 3850 limit of 15 mm`);
+  if (alignDev > 15) issues.push(`Horizontal alignment deviation ${alignDev} mm exceeds AS 3850 limit of 15 mm`);
+
+  // Lifting insert inspection
+  const failedInserts = Array.isArray(liftingInserts)
+    ? liftingInserts.filter((i) => i.inspected === false || i.condition === "damaged")
+    : [];
+  if (failedInserts.length > 0) {
+    issues.push(`${failedInserts.length} lifting insert(s) not inspected or damaged — do not lift`);
+  }
+
+  const passed = issues.length === 0;
+
+  if (!passed) {
+    return res.status(422).json({
+      error: "Precast installation issues identified",
+      issues,
+      immediateActions: [
+        "Do not proceed with installation until issues resolved",
+        "Notify structural engineer",
+        "Confirm lifting inserts rated and inspected before lift",
+      ],
+      applicableStandards: ["AS 3850", "AS 3600", "AS 4100", "OHS Regulations 2017 (Vic)"],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    element_id: sanitiseInput(elementId),
+    element_type: sanitiseInput(elementType),
+    manufacturer: sanitiseInput(manufacturer),
+    cast_date: castDate,
+    delivery_date: deliveryDate,
+    install_date: installDate,
+    inspector: sanitiseInput(inspector),
+    design_strength_mpa: designStrength_MPa,
+    actual_strength_mpa: actualStrength_MPa,
+    element_weight_kg: elementWeight_kg,
+    lifting_inserts: liftingInserts || [],
+    lifting_scheme: sanitiseInput(liftingScheme),
+    cranage_capacity_t: cranageCapacity_t,
+    position_grid: sanitiseInput(positionGrid),
+    level_set_mm: levelSetMM,
+    plumb_mm: plumbMM,
+    alignment_mm: alignmentMM,
+    level_tolerance_mm: levelTolerance_MM,
+    connection_type: sanitiseInput(connectionType),
+    connection_inspected: connectionInspected,
+    grout_mix: sanitiseInput(groutMix),
+    grout_strength_mpa: groutStrength_MPa,
+    grout_poured: groutPoured,
+    temporary_props_installed: temporaryPropsInstalled,
+    prop_load_kn: propLoadKN,
+    final_fixing_complete: finalFixingComplete,
+    critical_connections: criticalConnections || [],
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    result: "PASSED",
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("precast_installation_records")
+      .insert(record);
+    if (dbErr) console.error("DB error /precast-installation-record:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Precast installation record saved",
+    elementId: sanitiseInput(elementId),
+    levelDeviationMM: levelDev,
+    plumbDeviationMM: plumbDev,
+    alignmentDeviationMM: alignDev,
+    tolerancesPass: passed,
+    result: "PASSED",
+    applicableStandards: ["AS 3850", "AS 3600", "AS 4100"],
+    saved,
+  });
+});
+
+// POST /ai-formwork-risk-assessment — AI assesses formwork loads, propping adequacy, and collapse risk
+app.post("/ai-formwork-risk-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    formworkType,
+    soffitHeight,
+    loadCapacityKPa,
+    actualLoadKPa,
+    concreteDepth_mm,
+    shorePropSpacing,
+    reshoreInstalled,
+    previousSlabAge_days,
+    designEngineerApproved,
+    criticalObservations,
+    inspectionStage,
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are a structural engineer specialising in formwork and falsework with 25 years experience on Australian construction projects. You are an expert in AS 3610, AS 3610.1, and OHS Regulations 2017 (Vic) formwork requirements.
+
+Assess formwork and falsework risk considering:
+1. Load path integrity — is the load transfer chain continuous to foundations?
+2. Progressive collapse potential — does failure of one shore propagate?
+3. Lateral stability — are bracing and ties adequate for concrete placement forces?
+4. Multi-storey reshoring adequacy — is load distributed across sufficient floors?
+5. Stripping criteria — minimum concrete strength before soffit stripping
+6. Notifiable work triggers — formwork >4 m soffit height is notifiable per OHS Regulations 2017 (Vic)
+7. Weather considerations — wind on wall forms, temperature on concrete maturity
+
+Respond with JSON: { "collapseRisk": "low|medium|high|critical", "criticalRiskFactors": [], "loadPathConcerns": [], "lateralStabilityConcerns": [], "notifiableWork": boolean, "notifiableReason": "string", "strippingGuidance": "string", "minimumStrippingStrength_MPa": number, "reshoreRecommendation": "string", "immediateActions": [], "engineerSignOffRequired": boolean, "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Formwork type: ${formworkType || "slab"}
+Soffit height: ${soffitHeight || "not specified"} m
+Design load capacity: ${loadCapacityKPa || "not specified"} kPa
+Actual pour load: ${actualLoadKPa || "not specified"} kPa
+Concrete slab depth: ${concreteDepth_mm || "not specified"} mm
+Shore/prop spacing: ${shorePropSpacing || "not specified"} m
+Reshoring installed: ${reshoreInstalled || "not specified"}
+Previous slab age: ${previousSlabAge_days || "not specified"} days
+Design engineer approved: ${designEngineerApproved || "not specified"}
+Inspection stage: ${inspectionStage || "not specified"}
+Critical observations: ${Array.isArray(criticalObservations) ? criticalObservations.join("; ") : (criticalObservations || "none")}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-formwork-risk-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        collapseRisk: "medium",
+        criticalRiskFactors: [
+          "Multi-storey load redistribution — confirm shore loads do not exceed lower slab capacity",
+          "Verify load-bearing capacity of ground/slab beneath base plates",
+        ],
+        loadPathConcerns: [
+          "Ensure continuous load path from formwork through shores to founding level",
+          "Confirm base plates sized to distribute load within safe bearing pressure",
+        ],
+        lateralStabilityConcerns: [
+          "Diagonal bracing required in both directions for falsework >3 m height",
+          "Lateral ties to permanent structure where available",
+        ],
+        notifiableWork: parseFloat(soffitHeight) > 4,
+        notifiableReason:
+          "Formwork with soffit height >4 m is notifiable under OHS Regulations 2017 (Vic) r.292",
+        strippingGuidance:
+          "Do not strip soffit until concrete reaches minimum 75% of 28-day design strength per AS 3610",
+        minimumStrippingStrength_MPa: 25,
+        reshoreRecommendation:
+          "Install reshores on floor below immediately after stripping to prevent overload of young concrete",
+        immediateActions: [
+          "Obtain engineer sign-off on formwork design before first pour",
+          "Inspect all base jacks and head jacks before pour",
+          "Confirm prop plumbness within AS 3610 tolerances",
+        ],
+        engineerSignOffRequired: true,
+        applicableStandards: [
+          "AS 3610",
+          "AS 3610.1",
+          "AS 3600",
+          "OHS Regulations 2017 (Vic) r.292",
+          "WorkSafe Victoria — Formwork Code of Practice",
+        ],
+        recommendation:
+          "Engage a structural engineer to design and sign off the formwork scheme. Conduct pre-pour inspection checklist per AS 3610. Notifiable work obligations apply for soffit heights >4 m.",
+        summary:
+          "Formwork is a high-risk activity with collapse potential if loads, shore spacing, or stripping criteria are not properly managed. Engineer design and pre-pour inspection are mandatory for safe concrete placement.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
