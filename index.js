@@ -26344,6 +26344,188 @@ app.post("/dewatering-log", apiKeyAuth, async (req, res) => {
   return res.status(201).json({ ...record, saved: !!supabaseAdmin });
 });
 
+// POST /excavation-permit  — Log an excavation/Dial Before You Dig permit record
+app.post("/excavation-permit", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, address, dbydEnquiryNumber, excavationDate, excavationDepthM, excavationArea, servicesLocated, utilityCompanies = [], safeExcavationZone, supervisor, notes } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+  if (!dbydEnquiryNumber) return res.status(400).json({ error: "dbydEnquiryNumber required." });
+
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeEnquiry = sanitiseInput(String(dbydEnquiryNumber)).slice(0, 40);
+  const safeDate   = excavationDate ? sanitiseInput(String(excavationDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeDepth  = excavationDepthM ? Math.max(0, parseFloat(excavationDepthM) || 0) : null;
+  const safeArea   = excavationArea ? sanitiseInput(String(excavationArea)).slice(0, 100) : null;
+  const safeSup    = supervisor ? sanitiseInput(String(supervisor)).slice(0, 100) : null;
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+  const safeUtils  = Array.isArray(utilityCompanies) ? utilityCompanies.slice(0, 20).map(u => sanitiseInput(String(u)).slice(0, 80)) : [];
+  const safeZone   = safeExcavationZone ? sanitiseInput(String(safeExcavationZone)).slice(0, 200) : null;
+
+  const requirements = [];
+  if (safeDepth && safeDepth > 0.3) requirements.push("Manual potholing required within safe excavation zone (SZ)");
+  if (safeDepth && safeDepth > 1.5)  requirements.push("Shoring/batter required for excavation >1.5m deep");
+  if (safeDepth && safeDepth > 2.0)  requirements.push("WorkSafe notification may be required for excavation >2m");
+  requirements.push("Maintain 500mm exclusion zone around all located services");
+  requirements.push("Do not use mechanical excavation within SZ without approval from service owner");
+
+  const record = {
+    permitId: `EXC-${(safeSiteId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId, jobId: safeJobId,
+    address: address ? sanitiseInput(String(address)).slice(0, 200) : null,
+    dbydEnquiryNumber: safeEnquiry, excavationDate: safeDate,
+    excavationDepthM: safeDepth, excavationArea: safeArea,
+    servicesLocated: servicesLocated === true, utilityCompanies: safeUtils,
+    safeExcavationZone: safeZone, supervisor: safeSup,
+    requirements, notes: safeNotes, status: "ACTIVE",
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("excavation_permits").insert({
+        permit_id: record.permitId, site_id: safeSiteId, job_id: safeJobId, address: record.address,
+        dbyd_enquiry_number: safeEnquiry, excavation_date: safeDate, excavation_depth_m: safeDepth,
+        services_located: record.servicesLocated, utility_companies: safeUtils,
+        supervisor: safeSup, notes: safeNotes, status: "ACTIVE", created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
+// POST /underground-services  — Log underground service locations from DBYD results
+app.post("/underground-services", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, address, services = [] } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+
+  const SERVICE_TYPES = ["gas", "water", "sewer", "electrical", "telecommunications", "stormwater", "traffic-signals", "other"];
+  const ACCURACY_TYPES = ["located-marked", "approximate", "unknown", "no-assets"];
+
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeAddress = address ? sanitiseInput(String(address)).slice(0, 200) : null;
+
+  const logged = services.slice(0, 30).map(s => ({
+    serviceType: SERVICE_TYPES.includes(String(s.serviceType || "").toLowerCase().replace(/ /g, "-")) ? String(s.serviceType).toLowerCase().replace(/ /g, "-") : "other",
+    owner:       s.owner ? sanitiseInput(String(s.owner)).slice(0, 100) : null,
+    depth:       s.depthM ? Math.max(0, parseFloat(s.depthM) || 0) : null,
+    accuracy:    ACCURACY_TYPES.includes(String(s.accuracy || "").toLowerCase().replace(/ /g, "-")) ? String(s.accuracy).toLowerCase().replace(/ /g, "-") : "approximate",
+    location:    s.location ? sanitiseInput(String(s.location)).slice(0, 200) : null,
+    notes:       s.notes ? sanitiseInput(String(s.notes)).slice(0, 150) : null,
+  }));
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("underground_services").upsert(
+        logged.map(s => ({ site_id: safeSiteId, job_id: safeJobId, address: safeAddress, ...s, updated_at: new Date().toISOString() })),
+        { onConflict: "site_id,service_type,owner" }
+      );
+    } catch (_) { /* non-critical */ }
+  }
+
+  const hasGas  = logged.some(s => s.serviceType === "gas");
+  const hasElec = logged.some(s => s.serviceType === "electrical");
+  const warnings = [];
+  if (hasGas)  warnings.push("Gas service present — maintain 500mm exclusion zone, contact ATCO/AGN before any excavation");
+  if (hasElec) warnings.push("Electrical service present — do not excavate within 600mm without DNSPs approval");
+
+  return res.json({ siteId: safeSiteId, jobId: safeJobId, address: safeAddress, serviceCount: logged.length, warnings, services: logged, savedAt: new Date().toISOString() });
+});
+
+// POST /tree-protection  — Log tree protection zones for a site
+app.post("/tree-protection", apiKeyAuth, async (req, res) => {
+  const { siteId, address, trees = [], counciApprovalRequired, tppRequired, notes } = req.body || {};
+  if (!siteId) return res.status(400).json({ error: "siteId required." });
+
+  const safeSiteId = sanitiseInput(String(siteId)).slice(0, 80);
+  const safeAddress = address ? sanitiseInput(String(address)).slice(0, 200) : null;
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const treeData = trees.slice(0, 50).map(t => {
+    const trunk    = Math.max(0, parseFloat(t.trunkDiameterMm) || 0);
+    const tpzM     = parseFloat((trunk / 1000 * 12).toFixed(1)); // TPZ radius = 12 × diameter (m)
+    const srpM     = parseFloat((trunk / 1000 * 8).toFixed(1));  // SRP radius = 8 × diameter (m)
+    return {
+      species:          t.species ? sanitiseInput(String(t.species)).slice(0, 100) : "Unknown",
+      trunkDiameterMm:  trunk,
+      tpzRadiusM:       tpzM,   // Tree Protection Zone
+      srpRadiusM:       srpM,   // Structural Root Zone
+      significant:      trunk >= 300 || t.significant === true,
+      notes:            t.notes ? sanitiseInput(String(t.notes)).slice(0, 150) : null,
+    };
+  });
+
+  const significantCount = treeData.filter(t => t.significant).length;
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("tree_protection").insert({
+        site_id: safeSiteId, address: safeAddress, trees: treeData,
+        significant_count: significantCount, council_approval_required: counciApprovalRequired === true,
+        tpp_required: tppRequired === true, notes: safeNotes, created_at: new Date().toISOString(),
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.json({
+    siteId: safeSiteId, address: safeAddress, treeCount: treeData.length, significantCount,
+    councilApprovalRequired: counciApprovalRequired === true, tppRequired: tppRequired === true,
+    trees: treeData, notes: safeNotes,
+    reminder: "Do not undertake works within TPZ without council arborist approval.",
+    savedAt: new Date().toISOString(),
+  });
+});
+
+// POST /site-clean-checklist  — Log a site cleanliness and housekeeping checklist
+app.post("/site-clean-checklist", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, inspectedBy, inspectionDate, items = [], overallRating, notes } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+
+  const DEFAULT_ITEMS = [
+    "Walkways clear of debris and trip hazards", "Materials stored in designated areas",
+    "Waste disposed of in bins (not scattered on site)", "Hazardous materials secured and labelled",
+    "Tools stored safely when not in use", "Site entrance clean and clearly marked",
+    "First aid kit accessible and stocked", "No standing water or mud hazards",
+    "Portable toilets serviced and clean", "Security fencing intact",
+  ];
+  const VALID_RATINGS = ["EXCELLENT", "GOOD", "FAIR", "POOR", "UNACCEPTABLE"];
+
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeBy     = inspectedBy ? sanitiseInput(String(inspectedBy)).slice(0, 100) : null;
+  const safeDate   = inspectionDate ? sanitiseInput(String(inspectionDate)).slice(0, 20) : new Date().toISOString().split("T")[0];
+  const safeNotes  = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+  const safeRating = VALID_RATINGS.includes(String(overallRating || "").toUpperCase()) ? String(overallRating).toUpperCase() : null;
+
+  const checkItems = (Array.isArray(items) && items.length > 0)
+    ? items.slice(0, 30).map(i => ({ item: sanitiseInput(String(i.item || i)).slice(0, 150), passed: i.passed !== false }))
+    : DEFAULT_ITEMS.map(i => ({ item: i, passed: true }));
+
+  const passCount = checkItems.filter(c => c.passed).length;
+  const pct       = Math.round((passCount / checkItems.length) * 100);
+  const autoRating = pct >= 90 ? "EXCELLENT" : pct >= 75 ? "GOOD" : pct >= 60 ? "FAIR" : pct >= 40 ? "POOR" : "UNACCEPTABLE";
+
+  const record = {
+    checkId: `SCC-${(safeSiteId || safeJobId).slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    siteId: safeSiteId, jobId: safeJobId, inspectedBy: safeBy, inspectionDate: safeDate,
+    items: checkItems, passCount, totalItems: checkItems.length, passPercent: pct,
+    rating: safeRating || autoRating, notes: safeNotes,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("site_clean_checklists").insert({
+        check_id: record.checkId, site_id: safeSiteId, job_id: safeJobId, inspected_by: safeBy,
+        inspection_date: safeDate, items: checkItems, pass_count: passCount,
+        rating: record.rating, notes: safeNotes, created_at: record.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...record, saved: !!supabaseAdmin });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
