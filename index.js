@@ -74710,6 +74710,372 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 268 ─────────────────────────────────────────────────────────────────
+
+// POST /material-test-certificate — Record material test certificates and verify compliance
+app.post("/material-test-certificate", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, materialType, supplier, heatNumber, batchNumber,
+      certDate, certIssuedBy, certReference,
+      specifiedGrade, certifiedGrade,
+      yieldStrengthMpa, specifiedYieldMpa,
+      tensileStrengthMpa, specifiedTensileMpa,
+      elongationPercent, specifiedElongationPercent,
+      carbonEquivalent, specifiedMaxCarbonEquivalent,
+      charpyImpactJ, specifiedMinCharpyJ,
+      certifiedToStandard, requiredStandard,
+      thirdPartyVerified, defectsOnCert, notes
+    } = req.body;
+
+    if (!projectId || !materialType || !certReference || !certIssuedBy) {
+      return res.status(400).json({ error: "projectId, materialType, certReference, certIssuedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeMaterial = sanitiseInput(String(materialType));
+    const safeSupplier = supplier ? sanitiseInput(String(supplier)) : null;
+    const safeCertRef = sanitiseInput(String(certReference));
+    const safeIssuedBy = sanitiseInput(String(certIssuedBy));
+
+    const criticalIssues = [];
+    const warnings = [];
+
+    // Grade mismatch
+    if (specifiedGrade && certifiedGrade && String(specifiedGrade).toUpperCase() !== String(certifiedGrade).toUpperCase()) {
+      criticalIssues.push(`Material grade mismatch: specified ${specifiedGrade} but certificate states ${certifiedGrade} — do not use until resolved.`);
+    }
+
+    // Yield strength
+    const yieldMpa = parseFloat(yieldStrengthMpa) || null;
+    const specYieldMpa = parseFloat(specifiedYieldMpa) || null;
+    if (yieldMpa !== null && specYieldMpa !== null && yieldMpa < specYieldMpa) {
+      criticalIssues.push(`Yield strength ${yieldMpa} MPa below specified ${specYieldMpa} MPa — material does not meet specification (AS/NZS 3678).`);
+    }
+
+    // Tensile strength
+    const tensileMpa = parseFloat(tensileStrengthMpa) || null;
+    const specTensileMpa = parseFloat(specifiedTensileMpa) || null;
+    if (tensileMpa !== null && specTensileMpa !== null && tensileMpa < specTensileMpa) {
+      criticalIssues.push(`Tensile strength ${tensileMpa} MPa below specified ${specTensileMpa} MPa — reject material.`);
+    }
+
+    // Elongation
+    const elongation = parseFloat(elongationPercent) || null;
+    const specElongation = parseFloat(specifiedElongationPercent) || null;
+    if (elongation !== null && specElongation !== null && elongation < specElongation) {
+      warnings.push(`Elongation ${elongation}% below specified ${specElongation}% — ductility concern. Structural engineer to review.`);
+    }
+
+    // Carbon equivalent — weldability
+    const ce = parseFloat(carbonEquivalent) || null;
+    const specMaxCe = parseFloat(specifiedMaxCarbonEquivalent) || null;
+    if (ce !== null && specMaxCe !== null && ce > specMaxCe) {
+      criticalIssues.push(`Carbon equivalent ${ce} exceeds maximum ${specMaxCe} — weldability compromised. Pre-heat requirements may apply (AS/NZS 2980).`);
+    }
+
+    // Charpy impact
+    const charpy = parseFloat(charpyImpactJ) || null;
+    const specCharpy = parseFloat(specifiedMinCharpyJ) || null;
+    if (charpy !== null && specCharpy !== null && charpy < specCharpy) {
+      criticalIssues.push(`Charpy impact ${charpy}J below specified minimum ${specCharpy}J — insufficient toughness for design temperature.`);
+    }
+
+    // Standard compliance
+    if (certifiedToStandard && requiredStandard && certifiedToStandard !== requiredStandard) {
+      criticalIssues.push(`Material certified to ${certifiedToStandard} but ${requiredStandard} is required — verify equivalence with structural engineer.`);
+    }
+
+    if (!thirdPartyVerified) {
+      warnings.push("MTC not third-party verified — consider independent verification for critical structural elements.");
+    }
+
+    if (defectsOnCert === true || defectsOnCert === "true") {
+      warnings.push("Defects noted on material test certificate — review with structural engineer.");
+    }
+
+    const certStatus = criticalIssues.length > 0 ? "REJECT" : warnings.length > 0 ? "CONDITIONAL_ACCEPT" : "ACCEPT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("material_test_certificates")
+        .insert({
+          project_id: safeProject,
+          material_type: safeMaterial,
+          supplier: safeSupplier,
+          heat_number: heatNumber ? sanitiseInput(String(heatNumber)) : null,
+          batch_number: batchNumber ? sanitiseInput(String(batchNumber)) : null,
+          cert_date: certDate || null,
+          cert_issued_by: safeIssuedBy,
+          cert_reference: safeCertRef,
+          specified_grade: specifiedGrade || null,
+          certified_grade: certifiedGrade || null,
+          yield_strength_mpa: yieldMpa,
+          specified_yield_mpa: specYieldMpa,
+          tensile_strength_mpa: tensileMpa,
+          elongation_percent: elongation,
+          carbon_equivalent: ce,
+          charpy_impact_j: charpy,
+          certified_to_standard: certifiedToStandard || null,
+          required_standard: requiredStandard || null,
+          third_party_verified: thirdPartyVerified || false,
+          cert_status: certStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        certStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Material test certificate REJECTED — material does not meet specification.",
+        standards: ["AS/NZS 3678", "AS/NZS 3679.1", "AS/NZS 3679.2", "AS/NZS 1163"],
+      });
+    }
+
+    res.json({
+      certStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      materialType: safeMaterial,
+      certifiedGrade: certifiedGrade || null,
+      standards: ["AS/NZS 3678", "AS/NZS 3679.1", "AS/NZS 3679.2"],
+    });
+  } catch (err) {
+    console.error("POST /material-test-certificate error:", err.message);
+    res.status(500).json({ error: "Failed to record material test certificate." });
+  }
+});
+
+// POST /non-conformance-report — Record and track non-conformances on construction projects
+app.post("/non-conformance-report", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, ncrNumber, raisedDate, raisedBy, description,
+      location, tradeCategory, severity, requirementRef,
+      rootCauseCategory, rootCause,
+      correctiveAction, correctiveActionDueDate, responsibleParty,
+      verificationRequired, closedDate, closedBy, closureVerified,
+      preventiveAction, riskOfRecurrence, notes
+    } = req.body;
+
+    if (!projectId || !description || !raisedDate || !raisedBy) {
+      return res.status(400).json({ error: "projectId, description, raisedDate, raisedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeDescription = sanitiseInput(String(description));
+    const safeRaisedBy = sanitiseInput(String(raisedBy));
+    const safeNcrNum = ncrNumber ? sanitiseInput(String(ncrNumber)) : null;
+
+    const criticalIssues = [];
+    const warnings = [];
+
+    const sev = String(severity || "").toUpperCase();
+    const isLifeSafety = sev === "CRITICAL" || sev === "MAJOR" ||
+      /structural|fire|electrical|gas|fall|scaffold|asbestos|water ingress/i.test(safeDescription);
+
+    if (isLifeSafety && sev === "CRITICAL") {
+      criticalIssues.push("CRITICAL non-conformance — work must stop in affected area until NCR is resolved and re-inspection passed.");
+    } else if (sev === "MAJOR") {
+      warnings.push("Major non-conformance — schedule corrective action within 5 working days.");
+    }
+
+    if (!correctiveAction) {
+      warnings.push("Corrective action not specified — required for all non-conformances.");
+    }
+
+    if (!correctiveActionDueDate) {
+      warnings.push("Corrective action due date not set — assign deadline to ensure timely closure.");
+    } else {
+      const due = new Date(correctiveActionDueDate);
+      const now = new Date();
+      const daysOverdue = Math.floor((now - due) / (1000 * 60 * 60 * 24));
+      if (!closedDate && daysOverdue > 0) {
+        warnings.push(`NCR corrective action overdue by ${daysOverdue} days — escalate to project manager.`);
+      }
+    }
+
+    if (!responsibleParty) {
+      warnings.push("Responsible party for corrective action not assigned.");
+    }
+
+    const isClosed = !!closedDate;
+    if (isClosed && !closureVerified) {
+      warnings.push("NCR closed but closure verification not recorded — independent verification required for major/critical NCRs.");
+    }
+
+    const ncrStatus = isClosed ? "CLOSED" : sev === "CRITICAL" ? "STOP_WORK" : "OPEN";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("non_conformance_reports")
+        .insert({
+          project_id: safeProject,
+          ncr_number: safeNcrNum,
+          raised_date: raisedDate,
+          raised_by: safeRaisedBy,
+          description: safeDescription,
+          location: location ? sanitiseInput(String(location)) : null,
+          trade_category: tradeCategory ? sanitiseInput(String(tradeCategory)) : null,
+          severity: sev || null,
+          requirement_ref: requirementRef ? sanitiseInput(String(requirementRef)) : null,
+          root_cause_category: rootCauseCategory ? sanitiseInput(String(rootCauseCategory)) : null,
+          root_cause: rootCause ? sanitiseInput(String(rootCause)) : null,
+          corrective_action: correctiveAction ? sanitiseInput(String(correctiveAction)) : null,
+          corrective_action_due_date: correctiveActionDueDate || null,
+          responsible_party: responsibleParty ? sanitiseInput(String(responsibleParty)) : null,
+          verification_required: verificationRequired !== false && verificationRequired !== "false",
+          closed_date: closedDate || null,
+          closed_by: closedBy ? sanitiseInput(String(closedBy)) : null,
+          closure_verified: closureVerified || false,
+          preventive_action: preventiveAction ? sanitiseInput(String(preventiveAction)) : null,
+          risk_of_recurrence: riskOfRecurrence || null,
+          ncr_status: ncrStatus,
+          is_life_safety: isLifeSafety,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        ncrStatus,
+        isLifeSafety,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Critical NCR — stop work in affected area pending resolution.",
+        standards: ["AS/NZS ISO 9001:2016", "ISO 21500", "NCC 2022"],
+      });
+    }
+
+    res.json({
+      ncrStatus,
+      isLifeSafety,
+      criticalIssues,
+      warnings,
+      savedId,
+      severity: sev || null,
+      standards: ["AS/NZS ISO 9001:2016", "ISO 21500"],
+    });
+  } catch (err) {
+    console.error("POST /non-conformance-report error:", err.message);
+    res.status(500).json({ error: "Failed to record non-conformance report." });
+  }
+});
+
+// POST /ai-quality-audit-assessment — AI assesses quality management system compliance and project quality risk
+app.post("/ai-quality-audit-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectType, contractValue, openNcrCount, closedNcrCount,
+      criticalNcrCount, itp_completion_percent, holdPointsCleared,
+      rfiCount, rfiAvgResponseDays, subcontractorQualityIssues,
+      defectRatePercent, projectPhase, siteContext
+    } = req.body;
+
+    if (!projectType) {
+      return res.status(400).json({ error: "projectType is required." });
+    }
+
+    const safeProjectType = sanitiseInput(String(projectType));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+
+    const prompt = `You are a quality assurance auditor assessing the quality management performance of a Victorian construction project.
+
+Project type: ${safeProjectType}
+Contract value: ${contractValue ? "$" + contractValue : "Not stated"}
+Project phase: ${projectPhase || "Not stated"}
+Open NCRs: ${openNcrCount || 0}
+Closed NCRs: ${closedNcrCount || 0}
+Critical NCRs: ${criticalNcrCount || 0}
+ITP completion: ${itp_completion_percent != null ? itp_completion_percent + "%" : "Not stated"}
+Hold points cleared: ${holdPointsCleared || "Unknown"}
+RFIs raised: ${rfiCount || 0}
+Average RFI response time: ${rfiAvgResponseDays ? rfiAvgResponseDays + " days" : "Unknown"}
+Subcontractor quality issues: ${subcontractorQualityIssues || "None reported"}
+Defect rate: ${defectRatePercent != null ? defectRatePercent + "%" : "Not measured"}
+Location: ${safeSite}
+
+Assess quality management performance under AS/NZS ISO 9001:2016 and construction industry practice:
+1. Overall quality risk rating
+2. Key quality management gaps
+3. Systemic issues vs isolated defects
+4. Risk to project completion and client acceptance
+5. Recommended improvement actions
+6. Whether quality plan is adequate
+
+Respond ONLY in JSON:
+{
+  "qualityRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "systemicIssuesPresent": true|false,
+  "keyGaps": ["string"],
+  "riskToCompletion": "string",
+  "improvementActions": ["string"],
+  "qualityPlanAdequate": true|false|null,
+  "auditRecommendations": ["string"],
+  "applicableStandards": ["string"],
+  "kpiAssessment": {"ncr_rate": "string", "itp_compliance": "string", "rfi_responsiveness": "string"},
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        qualityRisk: "MODERATE",
+        systemicIssuesPresent: null,
+        keyGaps: ["AI assessment unavailable — conduct manual quality audit"],
+        riskToCompletion: "Cannot assess without AI — review open NCRs and ITP compliance manually.",
+        improvementActions: [
+          "Review and close all open NCRs",
+          "Verify ITP hold points are cleared before proceeding",
+          "Conduct subcontractor quality inductions",
+        ],
+        qualityPlanAdequate: null,
+        auditRecommendations: ["Schedule formal AS/NZS ISO 9001 quality audit"],
+        applicableStandards: ["AS/NZS ISO 9001:2016", "ISO 21500", "NCC 2022"],
+        kpiAssessment: { ncr_rate: "Unknown", itp_compliance: "Unknown", rfi_responsiveness: "Unknown" },
+        summary: "AI quality audit assessment unavailable. Conduct manual quality audit.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      projectType: safeProjectType,
+      standards: ["AS/NZS ISO 9001:2016", "ISO 21500"],
+    });
+  } catch (err) {
+    console.error("POST /ai-quality-audit-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess quality audit." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
