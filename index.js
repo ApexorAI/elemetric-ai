@@ -75076,6 +75076,380 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 269 ─────────────────────────────────────────────────────────────────
+
+// POST /pipeline-pressure-test — Record pipeline hydrostatic or pneumatic pressure test results
+app.post("/pipeline-pressure-test", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, pipelineId, location, testDate, testedBy,
+      pipelineMaterial, pipelineDiameterMm, pipelineLengthM,
+      testMedium, testPressureKpa, designPressureKpa,
+      holdPeriodMinutes, pressureAtEndKpa, pressureDropKpa,
+      leaksDetected, leakLocations,
+      testGaugeCalibrated, testGaugeCalibrationRef,
+      ambientTempDegC, testResult, testStandard, notes
+    } = req.body;
+
+    if (!pipelineId || !testDate || !testedBy || !testPressureKpa) {
+      return res.status(400).json({ error: "pipelineId, testDate, testedBy, testPressureKpa are required." });
+    }
+
+    const safePipelineId = sanitiseInput(String(pipelineId));
+    const safeTestedBy = sanitiseInput(String(testedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const safeLocation = location ? sanitiseInput(String(location)) : null;
+
+    const testPressure = parseFloat(testPressureKpa) || 0;
+    const designPressure = parseFloat(designPressureKpa) || null;
+    const pressureAtEnd = parseFloat(pressureAtEndKpa) || null;
+    const pressureDrop = parseFloat(pressureDropKpa) || (pressureAtEnd !== null ? testPressure - pressureAtEnd : null);
+    const holdMinutes = parseInt(holdPeriodMinutes) || 0;
+
+    const criticalIssues = [];
+    const warnings = [];
+
+    // AS 4041 — Pressure piping, AS/NZS 3500 — plumbing, AS 2885 — pipelines for gas
+    // Test pressure must be ≥ 1.25× MAWP typically
+    if (designPressure !== null && testPressure < designPressure * 1.25) {
+      warnings.push(`Test pressure ${testPressure}kPa is less than 1.25× design pressure ${designPressure}kPa (${designPressure * 1.25}kPa) — verify test standard requirements.`);
+    }
+
+    if (testPressure > designPressure * 2 && designPressure !== null) {
+      warnings.push(`Test pressure ${testPressure}kPa exceeds 2× design pressure — ensure pipeline and fittings are rated for test pressure.`);
+    }
+
+    if (leaksDetected === true || leaksDetected === "true") {
+      const locations = Array.isArray(leakLocations) ? leakLocations.map(l => sanitiseInput(String(l))) : [];
+      criticalIssues.push(`Leaks detected during pressure test${locations.length > 0 ? " at: " + locations.join(", ") : ""} — pipeline FAILED test. Locate, repair and retest.`);
+    }
+
+    if (pressureDrop !== null && holdMinutes > 0) {
+      const dropPctPerHour = (pressureDrop / testPressure) * 100 * (60 / holdMinutes);
+      if (pressureDrop > testPressure * 0.02) {
+        criticalIssues.push(`Pressure drop ${pressureDrop}kPa (${((pressureDrop / testPressure) * 100).toFixed(1)}%) exceeds 2% — pipeline FAILED test.`);
+      } else if (pressureDrop > testPressure * 0.01) {
+        warnings.push(`Pressure drop ${pressureDrop}kPa — marginal. Inspect for minor leaks.`);
+      }
+    }
+
+    if (holdMinutes < 30) {
+      warnings.push(`Hold period ${holdMinutes} minutes — minimum 30 minutes typically required (AS 4041 / AS/NZS 3500).`);
+    }
+
+    if (!testGaugeCalibrated) {
+      criticalIssues.push("Test gauge not confirmed calibrated — pressure readings unreliable. Retest with calibrated equipment.");
+    }
+
+    // Gas pipelines — pneumatic testing requires additional precautions
+    const medium = String(testMedium || "").toUpperCase();
+    if (medium === "PNEUMATIC" || medium === "AIR" || medium === "NITROGEN") {
+      warnings.push("Pneumatic pressure test — ensure all personnel are clear of exclusion zone. Pneumatic tests carry stored energy risk (AS 4041).");
+    }
+
+    const passed = criticalIssues.length === 0 && (testResult === "PASS" || testResult === "pass");
+    const testStatus = criticalIssues.length > 0 ? "FAIL" : warnings.length > 0 ? "MARGINAL_PASS" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("pipeline_pressure_tests")
+        .insert({
+          project_id: safeProject,
+          pipeline_id: safePipelineId,
+          location: safeLocation,
+          test_date: testDate,
+          tested_by: safeTestedBy,
+          pipeline_material: pipelineMaterial ? sanitiseInput(String(pipelineMaterial)) : null,
+          pipeline_diameter_mm: pipelineDiameterMm || null,
+          pipeline_length_m: pipelineLengthM || null,
+          test_medium: testMedium || null,
+          test_pressure_kpa: testPressure,
+          design_pressure_kpa: designPressure,
+          hold_period_minutes: holdMinutes,
+          pressure_at_end_kpa: pressureAtEnd,
+          pressure_drop_kpa: pressureDrop,
+          leaks_detected: leaksDetected || false,
+          test_gauge_calibrated: testGaugeCalibrated !== false && testGaugeCalibrated !== "false",
+          test_gauge_calibration_ref: testGaugeCalibrationRef ? sanitiseInput(String(testGaugeCalibrationRef)) : null,
+          ambient_temp_deg_c: ambientTempDegC || null,
+          test_standard: testStandard ? sanitiseInput(String(testStandard)) : null,
+          test_status: testStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        testStatus,
+        passed: false,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Pipeline pressure test FAILED — repair and retest required before commissioning.",
+        standards: ["AS 4041", "AS/NZS 3500", "AS 2885"],
+      });
+    }
+
+    res.json({
+      testStatus,
+      passed,
+      criticalIssues,
+      warnings,
+      savedId,
+      testPressureKpa: testPressure,
+      pressureDropKpa: pressureDrop,
+      standards: ["AS 4041", "AS/NZS 3500"],
+    });
+  } catch (err) {
+    console.error("POST /pipeline-pressure-test error:", err.message);
+    res.status(500).json({ error: "Failed to record pipeline pressure test." });
+  }
+});
+
+// POST /electrical-test-record — Record electrical installation testing and inspection results
+app.post("/electrical-test-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, circuitId, location, testDate, testedBy, licenceNumber,
+      circuitType, ratedCurrentA, nominalVoltageV,
+      insulationResistanceMOhm, specifiedMinInsulationMOhm,
+      earthContinuityOhm, specifiedMaxEarthOhm,
+      polarityCorrect, rcdPresent, rcdTripTimeMs, rcdMaxTripTimeMs,
+      rcdTripCurrentMA, voltageDropPercent, maxVoltageDropPercent,
+      loopImpedanceOhm, openCircuitVoltageV, shortCircuitCurrentKA,
+      visualInspectionPassed, wiring_method,
+      complianceCertificateIssued, certRef, notes
+    } = req.body;
+
+    if (!circuitId || !testDate || !testedBy) {
+      return res.status(400).json({ error: "circuitId, testDate, testedBy are required." });
+    }
+
+    const safeCircuit = sanitiseInput(String(circuitId));
+    const safeTestedBy = sanitiseInput(String(testedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const safeLocation = location ? sanitiseInput(String(location)) : null;
+
+    const criticalIssues = [];
+    const warnings = [];
+
+    const insResist = parseFloat(insulationResistanceMOhm) || null;
+    const specMinInsist = parseFloat(specifiedMinInsulationMOhm) || 1.0; // AS/NZS 3000 minimum 1 MΩ
+    const earthOhm = parseFloat(earthContinuityOhm) || null;
+    const specMaxEarth = parseFloat(specifiedMaxEarthOhm) || 1.0; // AS/NZS 3000 maximum 1 Ω
+    const rcdTrip = parseFloat(rcdTripTimeMs) || null;
+    const rcdMaxTrip = parseFloat(rcdMaxTripTimeMs) || 300; // AS/NZS 3000 — 300ms max for general outlets
+    const voltageDrop = parseFloat(voltageDropPercent) || null;
+    const maxVoltageDrop = parseFloat(maxVoltageDropPercent) || 5; // AS/NZS 3000 maximum 5%
+
+    // AS/NZS 3000 — Wiring rules
+    if (!polarityCorrect) {
+      criticalIssues.push("Polarity incorrect — live safety hazard. Do not energise until wiring is corrected (AS/NZS 3000 cl.8.3.6).");
+    }
+
+    if (insResist !== null && insResist < specMinInsist) {
+      criticalIssues.push(`Insulation resistance ${insResist} MΩ below minimum ${specMinInsist} MΩ — wiring fault or deterioration. Do not energise (AS/NZS 3000 cl.8.3.3).`);
+    } else if (insResist !== null && insResist < specMinInsist * 2) {
+      warnings.push(`Insulation resistance ${insResist} MΩ — marginal. Monitor and investigate any deterioration.`);
+    }
+
+    if (earthOhm !== null && earthOhm > specMaxEarth) {
+      criticalIssues.push(`Earth continuity ${earthOhm} Ω exceeds maximum ${specMaxEarth} Ω — earthing defective. Inspect before energising.`);
+    }
+
+    if (rcdPresent === false || rcdPresent === "false") {
+      const circuit = String(circuitType || "").toLowerCase();
+      if (circuit.includes("outlet") || circuit.includes("socket") || circuit.includes("power")) {
+        criticalIssues.push("No RCD protection on power outlet circuit — mandatory per AS/NZS 3000 cl.2.6.");
+      } else {
+        warnings.push("RCD not fitted — verify if mandatory for this circuit type under AS/NZS 3000.");
+      }
+    }
+
+    if (rcdTrip !== null && rcdTrip > rcdMaxTrip) {
+      criticalIssues.push(`RCD trip time ${rcdTrip}ms exceeds maximum ${rcdMaxTrip}ms — RCD defective. Replace before occupation.`);
+    }
+
+    if (voltageDrop !== null && voltageDrop > maxVoltageDrop) {
+      warnings.push(`Voltage drop ${voltageDrop}% exceeds ${maxVoltageDrop}% maximum — cable sizing may be inadequate (AS/NZS 3000 cl.3.6).`);
+    }
+
+    if (!visualInspectionPassed) {
+      criticalIssues.push("Visual inspection failed — wiring installation does not meet AS/NZS 3000 installation requirements.");
+    }
+
+    if (!licenceNumber) {
+      warnings.push("Tester licence number not recorded — all electrical testing must be performed by a licensed electrician (Electricity Safety Act 1998 Vic).");
+    }
+
+    if (!complianceCertificateIssued) {
+      warnings.push("Compliance certificate not yet issued — required before connection to supply (Electricity Safety Act 1998 Vic).");
+    }
+
+    const testStatus = criticalIssues.length > 0 ? "FAIL" : warnings.length > 0 ? "CONDITIONAL_PASS" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("electrical_test_records")
+        .insert({
+          project_id: safeProject,
+          circuit_id: safeCircuit,
+          location: safeLocation,
+          test_date: testDate,
+          tested_by: safeTestedBy,
+          licence_number: licenceNumber ? sanitiseInput(String(licenceNumber)) : null,
+          circuit_type: circuitType ? sanitiseInput(String(circuitType)) : null,
+          rated_current_a: ratedCurrentA || null,
+          nominal_voltage_v: nominalVoltageV || null,
+          insulation_resistance_mohm: insResist,
+          earth_continuity_ohm: earthOhm,
+          polarity_correct: polarityCorrect !== false && polarityCorrect !== "false",
+          rcd_present: rcdPresent !== false && rcdPresent !== "false",
+          rcd_trip_time_ms: rcdTrip,
+          voltage_drop_percent: voltageDrop,
+          visual_inspection_passed: visualInspectionPassed !== false && visualInspectionPassed !== "false",
+          compliance_certificate_issued: complianceCertificateIssued || false,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          test_status: testStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        testStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Electrical test FAILED — do not energise until all critical issues resolved.",
+        standards: ["AS/NZS 3000", "Electricity Safety Act 1998 (Vic)"],
+      });
+    }
+
+    res.json({
+      testStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      circuitId: safeCircuit,
+      insulationResistanceMOhm: insResist,
+      earthContinuityOhm: earthOhm,
+      standards: ["AS/NZS 3000", "Electricity Safety Act 1998 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /electrical-test-record error:", err.message);
+    res.status(500).json({ error: "Failed to record electrical test." });
+  }
+});
+
+// POST /ai-mep-coordination-assessment — AI assesses MEP coordination clashes and buildability
+app.post("/ai-mep-coordination-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectType, clashesDetected, clashDetails, coordinationSoftware,
+      designPhase, criticalServices, floorHeightMm, serviceCorridorMm,
+      hvacDuctsRouted, electricalCableTraysRouted, plumbingRouted,
+      fireServicesRouted, itServicesRouted, sprinklerRouted,
+      buildabilityIssues, siteContext
+    } = req.body;
+
+    if (!projectType) {
+      return res.status(400).json({ error: "projectType is required." });
+    }
+
+    const safeProjectType = sanitiseInput(String(projectType));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const clashes = Array.isArray(clashDetails) ? clashDetails.map(c => sanitiseInput(String(c))) : [];
+    const buildability = Array.isArray(buildabilityIssues) ? buildabilityIssues.map(b => sanitiseInput(String(b))) : [];
+    const critical = Array.isArray(criticalServices) ? criticalServices.map(s => sanitiseInput(String(s))) : [];
+
+    const prompt = `You are an MEP (Mechanical, Electrical, Plumbing) coordination engineer assessing service installation coordination for a Victorian construction project.
+
+Project type: ${safeProjectType}
+Design phase: ${designPhase || "Not stated"}
+Floor-to-ceiling height: ${floorHeightMm ? floorHeightMm + " mm" : "Unknown"}
+Service corridor height: ${serviceCorridorMm ? serviceCorridorMm + " mm" : "Unknown"}
+Coordination software: ${coordinationSoftware || "Not stated"}
+Clashes detected: ${clashesDetected || 0}
+Clash details: ${clashes.join("; ") || "None recorded"}
+Critical services: ${critical.join(", ") || "Not specified"}
+Services routed: HVAC ducts: ${hvacDuctsRouted ? "Yes" : "No"}, Electrical cable trays: ${electricalCableTraysRouted ? "Yes" : "No"}, Plumbing: ${plumbingRouted ? "Yes" : "No"}, Fire: ${fireServicesRouted ? "Yes" : "No"}, IT: ${itServicesRouted ? "Yes" : "No"}, Sprinklers: ${sprinklerRouted ? "Yes" : "No"}
+Buildability issues: ${buildability.join("; ") || "None recorded"}
+Location: ${safeSite}
+
+Assess:
+1. MEP coordination risk — will detected clashes delay construction?
+2. Routing priority order for services (typically: structure > gravity drainage > ventilation ductwork > sprinklers > electrical > data/comms)
+3. Clearance requirements between services (fire rating, maintenance, access)
+4. Clash resolution strategy
+5. Which clashes need structural engineer involvement
+6. Impact on programme
+
+Respond ONLY in JSON:
+{
+  "coordinationRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "clashResolutionPriority": ["string"],
+  "routingPriorityOrder": ["string"],
+  "clearanceRequirements": ["string"],
+  "structuralEngineerRequired": true|false,
+  "structuralClashes": ["string"],
+  "programmImpact": "string",
+  "recommendedActions": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        coordinationRisk: "MODERATE",
+        clashResolutionPriority: ["Resolve structural clashes first", "Then gravity drainage", "Then HVAC ductwork"],
+        routingPriorityOrder: ["Structure", "Gravity drainage", "Ventilation ductwork", "Sprinkler mains", "Electrical cable trays", "Data/communications"],
+        clearanceRequirements: ["Minimum 25mm clearance between services", "150mm maintenance access to valves and dampers"],
+        structuralEngineerRequired: false,
+        structuralClashes: [],
+        programmImpact: "AI analysis unavailable — assess manually based on clash count and severity.",
+        recommendedActions: ["Complete BIM clash detection", "Hold MEP coordination meeting with all subcontractors"],
+        applicableStandards: ["AS 1668.1", "AS 1668.2", "AS/NZS 3000", "AS 2118.1", "NCC 2022"],
+        summary: "AI MEP coordination assessment unavailable. Conduct BIM clash detection and coordination meeting.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      projectType: safeProjectType,
+      clashCount: clashesDetected || 0,
+      standards: ["AS 1668.1", "AS 1668.2", "AS/NZS 3000", "NCC 2022"],
+    });
+  } catch (err) {
+    console.error("POST /ai-mep-coordination-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess MEP coordination." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
