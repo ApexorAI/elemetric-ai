@@ -19500,6 +19500,198 @@ app.get("/api-changelog", apiKeyAuth, (req, res) => {
   });
 });
 
+// ── Round 49 ──────────────────────────────────────────────────────────────────
+
+// POST /supplier-order  — Create a material supplier order record
+app.post("/supplier-order", apiKeyAuth, async (req, res) => {
+  const { jobId, jobType, contractorId, supplierName, items, expectedDelivery, notes } = req.body;
+
+  if (!supplierName || !items || !Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: "supplierName and items array are required." });
+  }
+
+  const safeSuppName  = sanitiseInput(String(supplierName));
+  const safeJobType   = sanitiseInput(String(jobType || "general")).toLowerCase();
+  const safeNotes     = sanitiseInput(String(notes || ""));
+
+  const processedItems = items.slice(0, 50).map((item, i) => {
+    const desc  = sanitiseInput(String(item.description || `Item ${i + 1}`));
+    const qty   = parseFloat(item.quantity) || 1;
+    const unit  = sanitiseInput(String(item.unit || "each"));
+    const price = parseFloat(item.unitPrice) || 0;
+    return { description: desc, quantity: qty, unit, unitPrice: price, lineTotal: Math.round(qty * price * 100) / 100 };
+  });
+
+  const subtotal   = Math.round(processedItems.reduce((s, i) => s + i.lineTotal, 0) * 100) / 100;
+  const gst        = Math.round(subtotal * 0.1 * 100) / 100;
+  const total      = Math.round((subtotal + gst) * 100) / 100;
+  const orderId    = `ORD-${Date.now().toString(36).toUpperCase()}`;
+
+  const order = {
+    orderId,
+    status:        "PENDING",
+    jobId:         jobId ? sanitiseInput(String(jobId)) : null,
+    jobType:       safeJobType,
+    supplierName:  safeSuppName,
+    items:         processedItems,
+    totals:        { subtotal, gst, total },
+    itemCount:     processedItems.length,
+    expectedDelivery: expectedDelivery ? sanitiseInput(String(expectedDelivery)) : null,
+    notes:         safeNotes || null,
+    createdAt:     new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin && jobId) {
+    const { error } = await supabaseAdmin.from("supplier_orders").insert({
+      order_id:         orderId,
+      job_id:           String(jobId),
+      job_type:         safeJobType,
+      contractor_id:    contractorId ? sanitiseInput(String(contractorId)) : null,
+      supplier_name:    safeSuppName,
+      total_incl_gst:   total,
+      status:           "PENDING",
+      expected_delivery: expectedDelivery || null,
+      created_at:       new Date().toISOString(),
+    });
+    saved = !error;
+  }
+
+  return res.status(201).json({ ...order, saved });
+});
+
+// POST /ai-code-lookup  — Look up a product code or AS/NZS standard reference using AI
+app.post("/ai-code-lookup", apiKeyAuth, async (req, res) => {
+  const { query, jobType } = req.body;
+
+  if (!query) return res.status(400).json({ error: "query is required." });
+
+  const safeQuery   = sanitiseInput(String(query)).slice(0, 200);
+  const safeJobType = sanitiseInput(String(jobType || "general")).toLowerCase();
+
+  const systemPrompt = `You are an Australian trade standards and product code reference assistant for Victoria. Answer lookups about AS/NZS standards, product codes, regulatory references, and trade terminology. Return JSON with: "found" (boolean), "reference" (string — the code or standard name), "description" (string), "scope" (string), "currentEdition" (string or null), "purchaseFrom" (string or null), "notes" (string or null).`;
+
+  let result;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: `Trade: ${safeJobType}\nLookup query: ${safeQuery}` },
+      ],
+      max_tokens: 300,
+      response_format: { type: "json_object" },
+    });
+    result = JSON.parse(aiRes.choices[0].message.content);
+    result.reference    = result.reference    ? sanitiseInput(String(result.reference)).slice(0, 100)    : null;
+    result.description  = result.description  ? sanitiseInput(String(result.description)).slice(0, 500)  : null;
+    result.scope        = result.scope        ? sanitiseInput(String(result.scope)).slice(0, 300)        : null;
+    result.currentEdition = result.currentEdition ? sanitiseInput(String(result.currentEdition)).slice(0, 50) : null;
+    result.purchaseFrom = result.purchaseFrom ? sanitiseInput(String(result.purchaseFrom)).slice(0, 100) : null;
+    result.notes        = result.notes        ? sanitiseInput(String(result.notes)).slice(0, 300)        : null;
+  } catch {
+    result = { found: false, reference: null, description: "Lookup failed — AI unavailable", scope: null, currentEdition: null, purchaseFrom: "standards.org.au", notes: null };
+  }
+
+  return res.json({
+    query:      safeQuery,
+    jobType:    safeJobType,
+    ...result,
+    lookedUpAt: new Date().toISOString(),
+  });
+});
+
+// POST /compliance-matrix-check  — Check a job against the full compliance matrix
+app.post("/compliance-matrix-check", apiKeyAuth, (req, res) => {
+  const { jobType, certificateFiled, permitObtained, asBuiltProvided,
+          testReportRetained, photosTaken, licenceOnInvoice, sdsSheetsOnSite,
+          arctickCertificate, nccStatement, swmsCompleted, buildingClass } = req.body;
+
+  if (!jobType) return res.status(400).json({ error: "jobType is required." });
+
+  const safeJobType = sanitiseInput(String(jobType)).toLowerCase();
+  const safeBldgClass = sanitiseInput(String(buildingClass || "Class 1"));
+
+  const MATRIX_REQUIREMENTS = [
+    { requirement: "Certificate of Compliance",     applies: ["plumbing", "gas", "electrical", "drainage"], value: certificateFiled,   critical: true },
+    { requirement: "Permit obtained",               applies: ["plumbing", "gas", "electrical", "drainage", "carpentry"], value: permitObtained, critical: true },
+    { requirement: "As-built drawings",             applies: ["plumbing", "drainage", "carpentry"],          value: asBuiltProvided,    critical: false },
+    { requirement: "Test report retained",          applies: ["plumbing", "gas", "electrical"],              value: testReportRetained, critical: true },
+    { requirement: "Photo documentation",           applies: ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"], value: photosTaken, critical: true },
+    { requirement: "Licence on invoice",            applies: ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"], value: licenceOnInvoice, critical: false },
+    { requirement: "Safety data sheets on site",    applies: ["gas", "hvac"],                               value: sdsSheetsOnSite,    critical: false },
+    { requirement: "ARCtick certificate",           applies: ["hvac"],                                      value: arctickCertificate, critical: true },
+    { requirement: "NCC compliance statement",      applies: ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"], value: nccStatement, critical: false },
+    { requirement: "SWMS completed",                applies: ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"], value: swmsCompleted, critical: false },
+  ];
+
+  const applicable = MATRIX_REQUIREMENTS.filter(r => r.applies.includes(safeJobType));
+  const results = applicable.map(r => ({
+    requirement: r.requirement,
+    critical:    r.critical,
+    status:      r.value === true ? "PASS" : r.value === false ? "FAIL" : "NOT_ASSESSED",
+  }));
+
+  const failed         = results.filter(r => r.status === "FAIL");
+  const criticalFailed = results.filter(r => r.critical && r.status === "FAIL");
+  const passed         = results.filter(r => r.status === "PASS");
+  const score          = results.length > 0 ? Math.round((passed.length / results.length) * 100) : 0;
+
+  return res.json({
+    jobType:          safeJobType,
+    buildingClass:    safeBldgClass,
+    overallStatus:    criticalFailed.length > 0 ? "FAIL" : failed.length > 0 ? "PARTIAL" : "PASS",
+    score:            `${score}%`,
+    totalRequirements: results.length,
+    passed:           passed.length,
+    failed:           failed.length,
+    criticalFailures: criticalFailed.map(r => r.requirement),
+    results,
+    checkedAt:        new Date().toISOString(),
+  });
+});
+
+// POST /photo-hash  — Generate a hash identifier for a set of photos (for deduplication)
+app.post("/photo-hash", apiKeyAuth, async (req, res) => {
+  const { photos, jobType } = req.body;
+
+  if (!photos || !Array.isArray(photos) || photos.length === 0) {
+    return res.status(400).json({ error: "photos array is required." });
+  }
+
+  const safeJobType = sanitiseInput(String(jobType || "general")).toLowerCase();
+  const crypto      = require("crypto");
+
+  const hashes = photos.slice(0, 20).map((p, i) => {
+    // Hash based on dataUrl/url content or metadata
+    const source    = p.dataUrl || p.url || "";
+    const metadata  = JSON.stringify({ filename: p.filename, size: p.size, timestamp: p.timestamp });
+    const combined  = source.slice(0, 1000) + metadata;
+    const hash      = crypto.createHash("sha256").update(combined).digest("hex").slice(0, 16);
+    return {
+      photoIndex: i + 1,
+      filename:   p.filename ? sanitiseInput(String(p.filename)) : null,
+      hash,
+      sourceType: source ? "data" : "metadata_only",
+    };
+  });
+
+  const setHash = crypto
+    .createHash("sha256")
+    .update(hashes.map(h => h.hash).join("|"))
+    .digest("hex")
+    .slice(0, 32);
+
+  return res.json({
+    jobType:    safeJobType,
+    photoCount: hashes.length,
+    setHash,
+    photos:     hashes,
+    note:       "Hashes are deterministic for identical inputs. Use setHash to detect duplicate submissions.",
+    hashedAt:   new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
