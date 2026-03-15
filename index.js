@@ -1111,6 +1111,45 @@ const isGeneralDoc = isHvac || isCarpentry;
 
 const tradeLabel = isHvac ? "HVAC" : type;
 
+// ── Task 25: Comprehensive AI Prompt Optimisation ─────────────────────────────
+// Shared optimisation block prepended to every prompt for chain-of-thought
+// reasoning, confidence calibration, and Victorian regulatory grounding.
+
+const PROMPT_OPTIMISATION_HEADER = `REASONING APPROACH — apply chain-of-thought analysis for each photo:
+1. Read the label: what specific item must be visible for this to pass?
+2. Assess photo quality: is lighting adequate? Is the subject in focus? Is distance appropriate?
+3. Identify what IS visible: describe the main subject to yourself.
+4. Match to requirement: does what is visible satisfy the label requirement completely?
+5. Check compliance markers: are AS/NZS labels, certification plates, measurements, or test results visible and legible?
+6. Make your decision: PASS, FAIL, or UNCLEAR — be conservative. When in doubt, fail.
+
+CONFIDENCE CALIBRATION PRINCIPLES:
+- overall_confidence must reflect the FRACTION of photos that pass, not your subjective certainty
+- Do NOT inflate confidence because the job "seems complete" — only count photos that explicitly pass
+- A job with 3 passing and 3 failing photos has overall_confidence = 50, not 75 or 80
+- High confidence (>80) requires clear evidence for MOST submitted items, not just absence of obvious failures
+- You must be conservative: a real VBA inspector would fail this job if photos are ambiguous
+
+PHOTO QUALITY SCORING:
+- Poor photo quality (blur, darkness, distance, angle) is itself a failure reason
+- Do not guess at content in blurry or dark photos — classify as FAIL
+- Photos taken from >1 m away for small components (valves, labels, connections) almost always fail
+- Compliance labels must be legible at native photo resolution — if text is not readable, the photo fails
+
+VICTORIAN REGULATORY CONTEXT:
+- All analysis must be grounded in Victorian requirements: AS/NZS 3500 (plumbing), AS/NZS 5601.1 (gas), AS/NZS 3000 (electrical), AS/NZS 3500.2 (drainage), AS 1684 (carpentry), AS 4254.2 (HVAC)
+- Victorian Building Authority (VBA) and Energy Safe Victoria (ESV) have strict evidence requirements
+- A missing compliance label or unverifiable test result is a genuine liability exposure — treat it as such
+- When a photo would fail a VBA site inspection, it must fail in your analysis
+
+DOCUMENTATION COMPLETENESS:
+- Evaluate the overall job documentation holistically at the end
+- If key safety items (PTR, RCD, gas pressure test, earth continuity) are missing or unclear, elevate risk_rating
+- The liability_summary must directly address what the tradesperson is liable for if work is uncertified
+- recommended_actions must be specific and actionable — not generic advice
+
+`;
+
 // Shared output format instruction appended to every prompt
 const outputFormatInstruction = `
 PHOTO QUALITY GATE — evaluate this BEFORE anything else:
@@ -1778,12 +1817,13 @@ Example response shape:
 }
 `.trim();
 
-// A/B test: 20% of requests get chain-of-thought v2 variant
-const promptVariant = Math.random() < 0.2 ? "v2" : "v1";
+// Task 25: All requests now include the comprehensive optimisation header.
+// A/B test: 20% of requests ALSO get the v2 chain-of-thought preamble.
+const promptVariant     = Math.random() < 0.2 ? "v2" : "v1";
 const promptVersionUsed = promptVariant === "v2" ? "2.0" : "1.0";
-const finalPromptText = promptVariant === "v2"
-  ? PROMPT_V2_PREAMBLE + buildRegulationsNote(type) + promptText
-  : buildRegulationsNote(type) + promptText;
+const finalPromptText   = promptVariant === "v2"
+  ? PROMPT_OPTIMISATION_HEADER + PROMPT_V2_PREAMBLE + buildRegulationsNote(type) + promptText
+  : PROMPT_OPTIMISATION_HEADER + buildRegulationsNote(type) + promptText;
 
 const inputContent = [
 {
