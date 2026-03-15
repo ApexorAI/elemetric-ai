@@ -43524,6 +43524,249 @@ app.post("/tactile-indicator-register", apiKeyAuth, async (req, res) => {
   res.json({ tgiRef, location, indicatorType, condition, compliesAS1428, saved: !!supabaseAdmin });
 });
 
+// POST /chemical-register — Register a chemical on site (SDS management)
+app.post("/chemical-register", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, chemicalName, tradeName, manufacturer, casNumber,
+    hazardClass, signalWord = "WARNING",
+    quantityOnSite, unit = "L",
+    storageLocation, sdsAvailable = true, sdsVersion, sdsDate,
+    ppe_required = [], exposure_controls = [],
+    flashpointC, isFlammable = false, isCorrosive = false,
+    isToxic = false, isEnvironmentalHazard = false,
+    maxStorageQuantity, notes,
+  } = req.body;
+  if (!chemicalName || !hazardClass) {
+    return res.status(400).json({ error: "chemicalName and hazardClass are required." });
+  }
+  const validSignalWords = ["DANGER", "WARNING", "NONE"];
+  if (!validSignalWords.includes(signalWord)) {
+    return res.status(400).json({ error: `signalWord must be one of: ${validSignalWords.join(", ")}` });
+  }
+  const chemRef = `CHM-${Date.now().toString(36).toUpperCase()}`;
+  const storedQty = Number(quantityOnSite) || 0;
+  const maxQty = Number(maxStorageQuantity) || null;
+  const storageAlert = maxQty !== null && storedQty > maxQty;
+  const record = {
+    chem_ref: chemRef,
+    project_id: projectId || null,
+    chemical_name: sanitiseInput(chemicalName),
+    trade_name: sanitiseInput(tradeName || ""),
+    manufacturer: sanitiseInput(manufacturer || ""),
+    cas_number: sanitiseInput(casNumber || ""),
+    hazard_class: sanitiseInput(hazardClass),
+    signal_word: signalWord,
+    quantity_on_site: storedQty,
+    unit: sanitiseInput(unit),
+    storage_location: sanitiseInput(storageLocation || ""),
+    sds_available: Boolean(sdsAvailable),
+    sds_version: sanitiseInput(sdsVersion || ""),
+    sds_date: sdsDate || null,
+    ppe_required: Array.isArray(ppe_required) ? ppe_required.map(p => sanitiseInput(p)) : [],
+    exposure_controls: Array.isArray(exposure_controls) ? exposure_controls.map(e => sanitiseInput(e)) : [],
+    flashpoint_c: Number(flashpointC) || null,
+    is_flammable: Boolean(isFlammable),
+    is_corrosive: Boolean(isCorrosive),
+    is_toxic: Boolean(isToxic),
+    is_environmental_hazard: Boolean(isEnvironmentalHazard),
+    max_storage_quantity: maxQty,
+    storage_alert: storageAlert,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("chemical_register").insert(record);
+    if (error) console.error("chemical-register DB error:", error.message);
+  }
+  res.json({
+    chemRef, chemicalName, hazardClass, signalWord, quantityOnSite: storedQty,
+    storageAlert, sdsAvailable, saved: !!supabaseAdmin,
+  });
+});
+
+// GET /chemical-register — List chemicals for a project
+app.get("/chemical-register", apiKeyAuth, async (req, res) => {
+  const { projectId, signalWord, hazardClass } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("chemical_register").select("*").order("chemical_name", { ascending: true });
+  if (projectId) query = query.eq("project_id", projectId);
+  if (signalWord) query = query.eq("signal_word", signalWord);
+  if (hazardClass) query = query.ilike("hazard_class", `%${hazardClass}%`);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({
+    count: data.length,
+    dangerCount: data.filter(c => c.signal_word === "DANGER").length,
+    storageAlerts: data.filter(c => c.storage_alert).length,
+    missingSDSCount: data.filter(c => !c.sds_available).length,
+    chemicals: data,
+  });
+});
+
+// POST /ai-sds-summary — AI summarises a Safety Data Sheet for a chemical
+app.post("/ai-sds-summary", apiKeyAuth, async (req, res) => {
+  const {
+    chemicalName, tradeName, manufacturer, casNumber,
+    hazardClass, workerRole = "tradesperson", state = "VIC",
+  } = req.body;
+  if (!chemicalName) {
+    return res.status(400).json({ error: "chemicalName is required." });
+  }
+  const sanitisedChem = sanitiseInput(chemicalName);
+  const sanitisedTrade = sanitiseInput(tradeName || "");
+  const sanitisedRole = sanitiseInput(workerRole);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian WHS chemical safety specialist. Provide clear, practical safety information about chemicals used in construction.`;
+  const userPrompt = `Summarise safety information for a ${sanitisedRole} working with:
+Chemical: ${sanitisedChem} ${sanitisedTrade ? `(${sanitisedTrade})` : ""}
+CAS: ${sanitiseInput(casNumber || "Not specified")}
+Manufacturer: ${sanitiseInput(manufacturer || "Not specified")}
+Hazard class: ${sanitiseInput(hazardClass || "Not specified")}
+State: ${sanitisedState}
+
+Return JSON with:
+{
+  "chemicalSummary": "...",
+  "mainHazards": ["...", "..."],
+  "signalWord": "DANGER|WARNING|NONE",
+  "ghs_pictograms": ["...", "..."],
+  "hazardStatements": ["H...", "..."],
+  "precautionaryStatements": ["P...", "..."],
+  "ppeRequired": ["...", "..."],
+  "storageRequirements": "...",
+  "firstAid": {"eyes": "...", "skin": "...", "inhalation": "...", "ingestion": "..."},
+  "spillResponse": "...",
+  "fireHazard": "...",
+  "disposalRequirements": "...",
+  "workerSafetyTips": ["...", "..."],
+  "exposure_limit_OES": "...",
+  "sdsRequired": true,
+  "disclaimer": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const summary = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ chemicalName: sanitisedChem, tradeName: sanitisedTrade, workerRole: sanitisedRole, state: sanitisedState, summary });
+  } catch (err) {
+    console.error("ai-sds-summary error:", err.message);
+    res.json({
+      chemicalName: sanitisedChem, tradeName: sanitisedTrade, workerRole: sanitisedRole, state: sanitisedState,
+      summary: {
+        chemicalSummary: `Safety information for ${sanitisedChem} — obtain manufacturer's Safety Data Sheet.`,
+        mainHazards: ["Refer to Safety Data Sheet for hazard information"],
+        signalWord: "WARNING",
+        ghs_pictograms: [],
+        hazardStatements: [],
+        precautionaryStatements: [],
+        ppeRequired: ["Wear appropriate PPE as per Safety Data Sheet"],
+        storageRequirements: "Store as per Safety Data Sheet instructions",
+        firstAid: { eyes: "Flush with water for 15 minutes, seek medical attention", skin: "Wash with soap and water", inhalation: "Remove to fresh air, seek medical attention if symptoms persist", ingestion: "Do not induce vomiting, seek medical attention immediately" },
+        spillResponse: "Contain spill, prevent entry to drains, dispose of as per local regulations",
+        fireHazard: "Refer to Safety Data Sheet",
+        disposalRequirements: "Dispose of as hazardous waste per local regulations",
+        workerSafetyTips: ["Always obtain and read the Safety Data Sheet before use", "Store chemicals in approved containers", "Never mix chemicals without checking compatibility"],
+        exposure_limit_OES: "Refer to Safe Work Australia OES for this substance",
+        sdsRequired: true,
+        disclaimer: "This is AI-generated guidance only. Always refer to the manufacturer's current Safety Data Sheet.",
+      },
+    });
+  }
+});
+
+// POST /ai-site-hazard-map — AI generates a site hazard register from site description
+app.post("/ai-site-hazard-map", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, siteDescription, trade, state = "VIC",
+    projectType = "residential", siteConditions = [], adjacentProperties = [],
+    utilities = [], activities = [],
+  } = req.body;
+  if (!siteDescription || !trade) {
+    return res.status(400).json({ error: "siteDescription and trade are required." });
+  }
+  const sanitisedDesc = sanitiseInput(siteDescription);
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian WHS risk specialist. Generate comprehensive site hazard registers for construction projects.`;
+  const userPrompt = `Generate a site hazard register for:
+Project: ${sanitiseInput(projectName || "Construction project")}
+Trade: ${sanitisedTrade}
+Site: ${sanitisedDesc}
+Type: ${sanitiseInput(projectType)}
+State: ${sanitisedState}
+Site conditions: ${siteConditions.map(s => sanitiseInput(s)).join(", ")}
+Adjacent properties: ${adjacentProperties.map(p => sanitiseInput(p)).join(", ")}
+Utilities on site: ${utilities.map(u => sanitiseInput(u)).join(", ")}
+Planned activities: ${activities.map(a => sanitiseInput(a)).join(", ")}
+
+Return JSON with:
+{
+  "siteHazardSummary": "...",
+  "hazards": [
+    {
+      "hazardId": "H001",
+      "category": "PHYSICAL|CHEMICAL|BIOLOGICAL|ERGONOMIC|PSYCHOSOCIAL|ENVIRONMENTAL",
+      "hazard": "...",
+      "cause": "...",
+      "potentialConsequence": "...",
+      "inherentRisk": "HIGH|MEDIUM|LOW",
+      "controlMeasures": [{"type": "ELIMINATION|SUBSTITUTION|ENGINEERING|ADMIN|PPE", "measure": "..."}],
+      "residualRisk": "MEDIUM|LOW",
+      "responsible": "..."
+    }
+  ],
+  "highRiskActivities": ["...", "..."],
+  "environmentalHazards": ["...", "..."],
+  "communityHazards": ["...", "..."],
+  "emergencyConsiderations": ["...", "..."],
+  "reviewFrequency": "...",
+  "summary": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 4000,
+    });
+    usageStats.openaiCalls++;
+    const hazardMap = JSON.parse(aiRes.choices[0].message.content);
+    const mapRef = `HZM-${Date.now().toString(36).toUpperCase()}`;
+    res.json({ mapRef, projectId, trade: sanitisedTrade, state: sanitisedState, hazardMap });
+  } catch (err) {
+    console.error("ai-site-hazard-map error:", err.message);
+    const mapRef = `HZM-FALLBACK`;
+    res.json({
+      mapRef, projectId, trade: sanitisedTrade, state: sanitisedState,
+      hazardMap: {
+        siteHazardSummary: `Site hazard register for ${sanitisedTrade} works.`,
+        hazards: [
+          { hazardId: "H001", category: "PHYSICAL", hazard: "Falls from height", cause: "Working at elevation", potentialConsequence: "Serious injury or fatality", inherentRisk: "HIGH", controlMeasures: [{ type: "ENGINEERING", measure: "Install edge protection and fall arrest systems" }, { type: "ADMIN", measure: "Prepare SWMS for working at height" }], residualRisk: "LOW", responsible: "Site supervisor" },
+          { hazardId: "H002", category: "PHYSICAL", hazard: "Being struck by moving plant", cause: "Plant operating near workers", potentialConsequence: "Serious injury", inherentRisk: "HIGH", controlMeasures: [{ type: "ENGINEERING", measure: "Exclusion zones around operating plant" }, { type: "ADMIN", measure: "Traffic management plan" }], residualRisk: "MEDIUM", responsible: "Site supervisor" },
+          { hazardId: "H003", category: "PHYSICAL", hazard: "Manual handling injuries", cause: "Lifting heavy materials", potentialConsequence: "Musculoskeletal injury", inherentRisk: "MEDIUM", controlMeasures: [{ type: "ENGINEERING", measure: "Use mechanical aids where possible" }, { type: "ADMIN", measure: "Manual handling training" }], residualRisk: "LOW", responsible: "All workers" },
+        ],
+        highRiskActivities: activities.length > 0 ? activities : ["Working at height", "Excavation work", "Lifting operations"],
+        environmentalHazards: [],
+        communityHazards: adjacentProperties.length > 0 ? ["Noise impact on neighbours", "Dust generation"] : [],
+        emergencyConsiderations: ["Muster point to be established", "First aid kit on site", "Emergency contact list to be posted"],
+        reviewFrequency: "Review after any incident, change in scope, or monthly",
+        summary: `Site hazard register for ${sanitisedTrade} project. ${activities.length} activities identified.`,
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
