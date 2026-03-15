@@ -58410,6 +58410,315 @@ Return a JSON object with:
   }
 });
 
+// POST /hvac-commissioning-record — Record HVAC system commissioning and air balancing per AS 1668 / AIRAH
+app.post("/hvac-commissioning-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      commissioningRef,
+      date,
+      contractor,
+      technician,
+      technicianLicenceNumber,
+      buildingAddress,
+      buildingClass,
+      systemType,
+      systemTag,
+      designSupplyAirflowLs,
+      measuredSupplyAirflowLs,
+      designReturnAirflowLs,
+      measuredReturnAirflowLs,
+      designOutsideAirflowLs,
+      measuredOutsideAirflowLs,
+      staticPressurePa,
+      fanSpeed,
+      supplyAirTempC,
+      returnAirTempC,
+      condensingUnitPressureOk,
+      refrigerantType,
+      refrigerantChargeKg,
+      refrigerantLeakTestOk,
+      filterCondition,
+      drainPanClear,
+      co2SensorCalibrated,
+      controlSequenceVerified,
+      bmsIntegrated,
+      thermostatSetPoints,
+      noiseLevel,
+      vibrationOk,
+      overallResult,
+      defects,
+      certificateIssued,
+      nextServiceDate,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !contractor || !systemType || !overallResult) {
+      return res.status(400).json({ error: "projectId, date, contractor, systemType, and overallResult are required" });
+    }
+
+    const failures = [];
+    const airflowTolerance = 0.1; // AS 1668.2: ±10% tolerance on design airflow
+    if (designSupplyAirflowLs && measuredSupplyAirflowLs) {
+      const deviation = Math.abs(Number(measuredSupplyAirflowLs) - Number(designSupplyAirflowLs)) / Number(designSupplyAirflowLs);
+      if (deviation > airflowTolerance) failures.push(`Supply airflow ${measuredSupplyAirflowLs} L/s deviates ${(deviation * 100).toFixed(1)}% from design ${designSupplyAirflowLs} L/s — exceeds AS 1668.2 ±10% tolerance`);
+    }
+    if (designOutsideAirflowLs && measuredOutsideAirflowLs) {
+      const ouAirDev = Math.abs(Number(measuredOutsideAirflowLs) - Number(designOutsideAirflowLs)) / Number(designOutsideAirflowLs);
+      if (ouAirDev > 0.15) failures.push(`Outside air ${measuredOutsideAirflowLs} L/s is ${(ouAirDev * 100).toFixed(1)}% from design — IAQ/ventilation compliance risk`);
+    }
+    if (!refrigerantLeakTestOk && refrigerantType) failures.push("Refrigerant leak test failed or not completed — mandatory for all refrigerant systems under Australian Refrigeration Council regulations");
+    if (!controlSequenceVerified) failures.push("Control sequence not verified — all control interlocks and sequences must be tested per AS 1668.1 commissioning requirements");
+    if (overallResult === "FAIL") failures.push("HVAC commissioning FAILED — system must not be accepted until defects are rectified");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      commissioning_ref: sanitiseInput(commissioningRef || `HVAC-${Date.now()}`),
+      date,
+      contractor: sanitiseInput(contractor),
+      technician: sanitiseInput(technician || ""),
+      technician_licence_number: sanitiseInput(technicianLicenceNumber || ""),
+      building_address: sanitiseInput(buildingAddress || ""),
+      building_class: sanitiseInput(buildingClass || ""),
+      system_type: sanitiseInput(systemType),
+      system_tag: sanitiseInput(systemTag || ""),
+      design_supply_airflow_ls: designSupplyAirflowLs || null,
+      measured_supply_airflow_ls: measuredSupplyAirflowLs || null,
+      design_return_airflow_ls: designReturnAirflowLs || null,
+      measured_return_airflow_ls: measuredReturnAirflowLs || null,
+      design_outside_airflow_ls: designOutsideAirflowLs || null,
+      measured_outside_airflow_ls: measuredOutsideAirflowLs || null,
+      static_pressure_pa: staticPressurePa || null,
+      fan_speed: sanitiseInput(fanSpeed || ""),
+      supply_air_temp_c: supplyAirTempC || null,
+      return_air_temp_c: returnAirTempC || null,
+      condensing_unit_pressure_ok: !!condensingUnitPressureOk,
+      refrigerant_type: sanitiseInput(refrigerantType || ""),
+      refrigerant_charge_kg: refrigerantChargeKg || null,
+      refrigerant_leak_test_ok: !!refrigerantLeakTestOk,
+      filter_condition: sanitiseInput(filterCondition || ""),
+      drain_pan_clear: !!drainPanClear,
+      co2_sensor_calibrated: !!co2SensorCalibrated,
+      control_sequence_verified: !!controlSequenceVerified,
+      bms_integrated: !!bmsIntegrated,
+      thermostat_set_points: sanitiseInput(thermostatSetPoints || ""),
+      noise_level: sanitiseInput(noiseLevel || ""),
+      vibration_ok: !!vibrationOk,
+      overall_result: sanitiseInput(overallResult),
+      defects: Array.isArray(defects) ? defects.map(d => sanitiseInput(d)) : [],
+      failures,
+      certificate_issued: !!certificateIssued,
+      next_service_date: nextServiceDate || null,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("hvac_commissioning_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (failures.length > 0) {
+      return res.status(422).json({ commissioned: false, failures, message: "HVAC commissioning failed. Rectify all defects and re-commission before handover.", record, saved });
+    }
+
+    res.json({
+      commissioned: true,
+      commissioningRef: record.commissioning_ref,
+      failures: [],
+      applicableStandards: ["AS 1668.1 The use of ventilation and air conditioning in buildings — fire and smoke control", "AS 1668.2 Ventilation design for indoor air contaminant control", "AIRAH DA19 Commissioning of HVAC systems"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/hvac-commissioning-record error:", err.message);
+    res.status(500).json({ error: "Failed to record HVAC commissioning" });
+  }
+});
+
+// POST /acoustic-assessment — Record an acoustic/noise impact assessment
+app.post("/acoustic-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      assessmentRef,
+      assessmentDate,
+      assessor,
+      assessorCompany,
+      assessmentType,
+      location,
+      receiverType,
+      noiseSource,
+      measuredLaeqDb,
+      measuredLaMaxDb,
+      measuredL90Db,
+      backgroundLevelDb,
+      measurementPeriod,
+      timeOfDay,
+      dayNightIndicator,
+      epaNoiseLimit,
+      localCouncilLimit,
+      exceedanceOccurred,
+      exceedanceAmount,
+      constructionNoiseCriteria,
+      musicOrLowFrequency,
+      vibrationIncluded,
+      vibrationalVelocityMms,
+      impactAssessmentResult,
+      mitigationMeasures,
+      complianceConclusion,
+      notes,
+    } = req.body;
+
+    if (!projectId || !assessmentDate || !assessor || !assessmentType || !noiseSource) {
+      return res.status(400).json({ error: "projectId, assessmentDate, assessor, assessmentType, and noiseSource are required" });
+    }
+
+    const flags = [];
+    if (exceedanceOccurred) flags.push(`Noise exceedance: ${exceedanceAmount || "amount not specified"} dB above limit — noise mitigation measures required`);
+    // EPA Victoria construction noise: residential 65 dB(A) LAeq (7am-6pm Mon-Fri), 65 dB(A) (7am-1pm Sat)
+    if (measuredLaeqDb && epaNoiseLimit && Number(measuredLaeqDb) > Number(epaNoiseLimit)) {
+      flags.push(`Measured LAeq ${measuredLaeqDb} dB(A) exceeds EPA limit ${epaNoiseLimit} dB(A)`);
+    }
+    if (musicOrLowFrequency) flags.push("Music or low-frequency noise present — additional assessment under EPA Victoria music noise criteria may be required");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      assessment_ref: sanitiseInput(assessmentRef || `AC-${Date.now()}`),
+      assessment_date: assessmentDate,
+      assessor: sanitiseInput(assessor),
+      assessor_company: sanitiseInput(assessorCompany || ""),
+      assessment_type: sanitiseInput(assessmentType),
+      location: sanitiseInput(location || ""),
+      receiver_type: sanitiseInput(receiverType || "residential"),
+      noise_source: sanitiseInput(noiseSource),
+      measured_laeq_db: measuredLaeqDb || null,
+      measured_la_max_db: measuredLaMaxDb || null,
+      measured_l90_db: measuredL90Db || null,
+      background_level_db: backgroundLevelDb || null,
+      measurement_period: sanitiseInput(measurementPeriod || ""),
+      time_of_day: sanitiseInput(timeOfDay || ""),
+      day_night_indicator: sanitiseInput(dayNightIndicator || "day"),
+      epa_noise_limit: epaNoiseLimit || null,
+      local_council_limit: localCouncilLimit || null,
+      exceedance_occurred: !!exceedanceOccurred,
+      exceedance_amount: exceedanceAmount || null,
+      construction_noise_criteria: sanitiseInput(constructionNoiseCriteria || ""),
+      music_or_low_frequency: !!musicOrLowFrequency,
+      vibration_included: !!vibrationIncluded,
+      vibrational_velocity_mms: vibrationalVelocityMms || null,
+      impact_assessment_result: sanitiseInput(impactAssessmentResult || ""),
+      mitigation_measures: sanitiseInput(mitigationMeasures || ""),
+      compliance_conclusion: sanitiseInput(complianceConclusion || ""),
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("acoustic_assessments").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      exceedanceOccurred: !!exceedanceOccurred,
+      flags,
+      constructionNoiseLimits: { weekday: "65 dB(A) LAeq 7am–6pm", saturday: "65 dB(A) LAeq 7am–1pm" },
+      applicableGuidance: ["EPA Victoria Construction Noise Limit — Noise from Premises", "AS/NZS 1269 Occupational noise management", "EPA Victoria Noise Protocol 2021", "State Environment Protection Policy (Control of Noise from Commerce, Industry and Trade) N-1"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/acoustic-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to record acoustic assessment" });
+  }
+});
+
+// POST /ai-hvac-compliance-report — AI assesses HVAC system compliance and efficiency
+app.post("/ai-hvac-compliance-report", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      buildingClass,
+      occupancyType,
+      systemType,
+      buildingArea,
+      ageYears,
+      observedIssues,
+      refrigerantType,
+      lastMaintenanceDate,
+      iaqComplaints,
+    } = req.body;
+
+    if (!buildingClass || !systemType) {
+      return res.status(400).json({ error: "buildingClass and systemType are required" });
+    }
+
+    const prompt = `You are an HVAC engineer and building compliance specialist with expertise in AS 1668, AS 3666, NCC 2022 Section J, and Victorian building regulations.
+
+Assess HVAC compliance for:
+- Building class: ${sanitiseInput(buildingClass)}
+- Occupancy type: ${sanitiseInput(occupancyType || "commercial office")}
+- HVAC system type: ${sanitiseInput(systemType)}
+- Building area: ${sanitiseInput(String(buildingArea || "not specified"))} m²
+- System age: ${sanitiseInput(String(ageYears || "unknown"))} years
+- Observed issues: ${sanitiseInput(observedIssues || "none")}
+- Refrigerant type: ${sanitiseInput(refrigerantType || "not specified")}
+- Last maintenance: ${sanitiseInput(lastMaintenanceDate || "unknown")}
+- IAQ complaints: ${sanitiseInput(iaqComplaints || "none")}
+
+Return a JSON object with:
+{
+  "complianceRating": "COMPLIANT|MINOR_ISSUES|MAJOR_ISSUES|NON_COMPLIANT",
+  "ventilationCompliance": string,
+  "outsideAirRequirement": string,
+  "maintenanceRequirements": [string],
+  "legionellaRisk": string,
+  "refrigerantCompliance": string,
+  "energyEfficiencyRating": string,
+  "iaqConcerns": string,
+  "upgradeRecommendations": [string],
+  "annualServiceRequirements": [string],
+  "applicableStandards": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+    });
+    usageStats.openaiCalls++;
+    const report = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ buildingClass, systemType, report });
+  } catch (err) {
+    console.error("/ai-hvac-compliance-report error:", err.message);
+    res.json({
+      buildingClass: req.body.buildingClass || "",
+      systemType: req.body.systemType || "",
+      report: {
+        complianceRating: "MINOR_ISSUES",
+        ventilationCompliance: "Verify outside air rates meet AS 1668.2 Table 4 minimum — typically 10 L/s/person for office occupancy",
+        outsideAirRequirement: "Minimum 10 L/s per person for office; 7.5 L/s for retail; 15 L/s for classrooms. CO2 monitoring recommended to verify IAQ.",
+        maintenanceRequirements: ["Filter replacement every 3–6 months", "Coil cleaning annually", "Drain pan inspection and cleaning bi-annually", "Full AS 1668 commissioning verification every 5 years"],
+        legionellaRisk: "Cooling towers and evaporative systems require a Water Treatment Programme per AS 3666 and Vic Public Health Regulations. Register with council if cooling tower is present.",
+        refrigerantCompliance: "Systems with > 3 kg of refrigerant require an ARCtick licence holder for all refrigerant work. HCFCs (R22) must be replaced — ban on import/manufacture from 2016.",
+        energyEfficiencyRating: "HVAC systems represent 40–60% of commercial building energy use. BMS optimisation, variable speed drives, and demand-controlled ventilation can reduce energy by 20–40%.",
+        iaqConcerns: "IAQ complaints may indicate inadequate outside air, filter failure, duct contamination, or moisture/mould issues. Conduct IAQ survey per AS 1668.2 if complaints persist.",
+        upgradeRecommendations: ["Install variable speed drives on fans and pumps", "Add CO2 demand-controlled ventilation", "Upgrade to high-efficiency filters (MERV 11+)", "Consider refrigerant upgrade from R22 or R410A to lower GWP alternative"],
+        annualServiceRequirements: ["Full system service and airflow balance per AIRAH DA19", "Legionella risk assessment and water treatment review", "Refrigerant leak check for systems > 3 kg charge", "Controls calibration and sequence verification"],
+        applicableStandards: ["AS 1668.1 Ventilation — fire and smoke control", "AS 1668.2 Ventilation — indoor air contaminant control", "AS 3666 Air-handling and water systems — control of Legionella", "NCC 2022 Section J — energy efficiency"],
+        recommendation: "Commission a full HVAC compliance inspection and performance test against AS 1668.2 design criteria. Address any IAQ complaints promptly. Establish preventive maintenance schedule.",
+        summary: "HVAC compliance requires adequate outside air rates, regular maintenance, Legionella management, and ARCtick-licensed refrigerant handling. Commission a specialist to verify compliance with AS 1668 and NCC 2022.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
