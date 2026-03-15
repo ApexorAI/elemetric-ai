@@ -77190,6 +77190,354 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 275 ─────────────────────────────────────────────────────────────────
+
+// POST /heritage-impact-assessment — Record heritage impact assessment for works near heritage places
+app.post("/heritage-impact-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, siteAddress, assessmentDate, assessedBy,
+      heritageOverlayNumber, victorianHeritageRegister, heritageListingType,
+      significanceLevel, proposedWorks, settingImpact,
+      fabricImpact, archaeologicalRisk, existingCondition,
+      heritagePermitRequired, heritagePermitNumber,
+      chsPermitRequired, chsPermitNumber,
+      conservationPlanRequired, conservationPlanRef,
+      hermonentThirdPartyConsultation, worksApproved,
+      unexpectedFindsProtocol, notes
+    } = req.body;
+
+    if (!projectId || !siteAddress || !assessmentDate || !assessedBy) {
+      return res.status(400).json({ error: "projectId, siteAddress, assessmentDate, assessedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeSite = sanitiseInput(String(siteAddress));
+    const safeAssessedBy = sanitiseInput(String(assessedBy));
+
+    const criticalIssues = [];
+    const warnings = [];
+
+    const sigLevel = String(significanceLevel || "").toUpperCase();
+
+    // Heritage Act 2017 (Vic) and Heritage Overlay (Planning and Environment Act 1987 Vic)
+    if (heritagePermitRequired === true || heritagePermitRequired === "true") {
+      if (!heritagePermitNumber) {
+        criticalIssues.push("Heritage permit required but not obtained — works must not commence without Heritage Victoria permit (Heritage Act 2017 Vic s.71).");
+      }
+    }
+
+    if (chsPermitRequired === true || chsPermitRequired === "true") {
+      if (!chsPermitNumber) {
+        criticalIssues.push("Heritage overlay permit (CHS) required but not obtained — apply for permit before commencing works (Planning and Environment Act 1987 Vic).");
+      }
+    }
+
+    if (victorianHeritageRegister === true || victorianHeritageRegister === "true") {
+      if (sigLevel === "STATE" || sigLevel === "OUTSTANDING") {
+        criticalIssues.push("Victorian Heritage Register place of State/Outstanding significance — any works affecting heritage fabric require Heritage Victoria approval.");
+      } else {
+        warnings.push("VHR-listed place — ensure Heritage Victoria is consulted for all proposed works.");
+      }
+    }
+
+    if (archaeologicalRisk === "HIGH" || archaeologicalRisk === "MEDIUM") {
+      warnings.push(`Archaeological risk rated ${archaeologicalRisk} — unexpected finds protocol must be prepared and all workers briefed before ground disturbance.`);
+    }
+
+    if (!unexpectedFindsProtocol) {
+      warnings.push("Unexpected finds protocol not documented — required for any site with heritage overlay or known archaeological risk (Heritage Act 2017 Vic s.53).");
+    }
+
+    if (fabricImpact === "SUBSTANTIAL" || fabricImpact === "SEVERE") {
+      criticalIssues.push(`Proposed works have ${fabricImpact} fabric impact — conservation architect or heritage consultant must develop mitigation measures.`);
+    }
+
+    if (!conservationPlanRequired === false && conservationPlanRequired && !conservationPlanRef) {
+      warnings.push("Conservation plan required but reference not recorded — obtain conservation plan per Heritage Act 2017 (Vic) requirements.");
+    }
+
+    if (!worksApproved) {
+      warnings.push("Works not confirmed approved by relevant heritage authority — confirm approval before commencing.");
+    }
+
+    const assessmentStatus = criticalIssues.length > 0 ? "WORKS_PROHIBITED_PENDING_APPROVAL" : warnings.length > 0 ? "CONDITIONAL_APPROVAL" : "APPROVED_TO_PROCEED";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("heritage_impact_assessments")
+        .insert({
+          project_id: safeProject,
+          site_address: safeSite,
+          assessment_date: assessmentDate,
+          assessed_by: safeAssessedBy,
+          heritage_overlay_number: heritageOverlayNumber ? sanitiseInput(String(heritageOverlayNumber)) : null,
+          victorian_heritage_register: victorianHeritageRegister || false,
+          heritage_listing_type: heritageListingType ? sanitiseInput(String(heritageListingType)) : null,
+          significance_level: sigLevel || null,
+          proposed_works: proposedWorks ? sanitiseInput(String(proposedWorks)) : null,
+          setting_impact: settingImpact || null,
+          fabric_impact: fabricImpact || null,
+          archaeological_risk: archaeologicalRisk || null,
+          heritage_permit_required: heritagePermitRequired || false,
+          heritage_permit_number: heritagePermitNumber ? sanitiseInput(String(heritagePermitNumber)) : null,
+          chs_permit_required: chsPermitRequired || false,
+          chs_permit_number: chsPermitNumber ? sanitiseInput(String(chsPermitNumber)) : null,
+          unexpected_finds_protocol: unexpectedFindsProtocol || false,
+          works_approved: worksApproved || false,
+          assessment_status: assessmentStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        assessmentStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Heritage works not approved — obtain required permits before commencing.",
+        standards: ["Heritage Act 2017 (Vic)", "Planning and Environment Act 1987 (Vic)", "Burra Charter"],
+      });
+    }
+
+    res.json({
+      assessmentStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      significanceLevel: sigLevel || null,
+      standards: ["Heritage Act 2017 (Vic)", "Planning and Environment Act 1987 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /heritage-impact-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to record heritage impact assessment." });
+  }
+});
+
+// POST /planning-permit-record — Track planning permit conditions and compliance
+app.post("/planning-permit-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, siteAddress, permitNumber, issueDate, expiryDate,
+      responsibleAuthority, zoning, overlay,
+      permitConditions, conditionsCompleted, conditionsOutstanding,
+      endorsedPlans, endorsedPlanDate, buildingPermitTied,
+      developmentContributions, openSpaceLevy, sustainabilityConditions,
+      neighbourNotificationCompleted, neighbourObjections,
+      vcat, vcatRef, notes
+    } = req.body;
+
+    if (!projectId || !siteAddress || !permitNumber) {
+      return res.status(400).json({ error: "projectId, siteAddress, permitNumber are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeSite = sanitiseInput(String(siteAddress));
+    const safePermitNum = sanitiseInput(String(permitNumber));
+
+    const conditions = Array.isArray(permitConditions) ? permitConditions : [];
+    const outstanding = Array.isArray(conditionsOutstanding) ? conditionsOutstanding : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    // Planning and Environment Act 1987 (Vic)
+    if (expiryDate) {
+      const expiry = new Date(expiryDate);
+      const now = new Date();
+      const daysToExpiry = Math.floor((expiry - now) / (1000 * 60 * 60 * 24));
+      if (daysToExpiry < 0) {
+        criticalIssues.push(`Planning permit expired ${Math.abs(daysToExpiry)} days ago — works may not lawfully proceed. Apply for extension (Planning and Environment Act 1987 Vic s.69).`);
+      } else if (daysToExpiry < 60) {
+        warnings.push(`Planning permit expires in ${daysToExpiry} days — apply for extension before expiry if works not complete.`);
+      }
+    }
+
+    if (!endorsedPlans) {
+      criticalIssues.push("Endorsed plans not confirmed — all works must be carried out in accordance with endorsed plans (Planning and Environment Act 1987 Vic s.62).");
+    }
+
+    if (outstanding.length > 0) {
+      const critConditions = outstanding.filter(c => /before development commence|drainage|vegetation|cultural heritage|traffic/i.test(String(c)));
+      if (critConditions.length > 0) {
+        criticalIssues.push(`Critical permit conditions outstanding: ${critConditions.map(c => sanitiseInput(String(c))).join("; ")}`);
+      } else {
+        warnings.push(`${outstanding.length} permit condition(s) outstanding: ${outstanding.map(c => sanitiseInput(String(c))).join("; ")}`);
+      }
+    }
+
+    if (vcat === true || vcat === "true") {
+      warnings.push(`VCAT proceedings reference ${vcatRef ? sanitiseInput(String(vcatRef)) : "not recorded"} — confirm permit status is valid during proceedings.`);
+    }
+
+    if (neighbourObjections === true || neighbourObjections === "true") {
+      warnings.push("Neighbour objections noted — ensure VCAT consideration periods have elapsed before commencing.");
+    }
+
+    const permitStatus = criticalIssues.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "REVIEW_REQUIRED" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("planning_permit_records")
+        .insert({
+          project_id: safeProject,
+          site_address: safeSite,
+          permit_number: safePermitNum,
+          issue_date: issueDate || null,
+          expiry_date: expiryDate || null,
+          responsible_authority: responsibleAuthority ? sanitiseInput(String(responsibleAuthority)) : null,
+          zoning: zoning ? sanitiseInput(String(zoning)) : null,
+          overlay: overlay ? sanitiseInput(String(overlay)) : null,
+          permit_conditions: conditions,
+          conditions_completed: conditionsCompleted || false,
+          conditions_outstanding: outstanding,
+          endorsed_plans: endorsedPlans || false,
+          endorsed_plan_date: endorsedPlanDate || null,
+          building_permit_tied: buildingPermitTied || false,
+          vcat: vcat || false,
+          vcat_ref: vcatRef ? sanitiseInput(String(vcatRef)) : null,
+          permit_status: permitStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        permitStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Planning permit non-compliance — works may not lawfully proceed.",
+        standards: ["Planning and Environment Act 1987 (Vic)", "Building Act 1993 (Vic)"],
+      });
+    }
+
+    res.json({
+      permitStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      permitNumber: safePermitNum,
+      standards: ["Planning and Environment Act 1987 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /planning-permit-record error:", err.message);
+    res.status(500).json({ error: "Failed to record planning permit." });
+  }
+});
+
+// POST /ai-planning-compliance-assessment — AI assesses planning permit compliance risk
+app.post("/ai-planning-compliance-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectType, zoning, overlays, proposedUse, proposedHeight,
+      siteAreaM2, setbacks, carSpaces, designObjectives,
+      localPolicies, heritageOverlay, floodOverlay, bushfireOverlay,
+      siteContext
+    } = req.body;
+
+    if (!projectType || !zoning) {
+      return res.status(400).json({ error: "projectType and zoning are required." });
+    }
+
+    const safeProjectType = sanitiseInput(String(projectType));
+    const safeZoning = sanitiseInput(String(zoning));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const overlayList = Array.isArray(overlays) ? overlays.map(o => sanitiseInput(String(o))) : [];
+    const policies = Array.isArray(localPolicies) ? localPolicies.map(p => sanitiseInput(String(p))) : [];
+
+    const prompt = `You are a town planning consultant assessing planning compliance risk for a Victorian development proposal.
+
+Project type: ${safeProjectType}
+Zoning: ${safeZoning}
+Overlays: ${overlayList.join(", ") || "None"}
+Proposed use: ${proposedUse || "Not stated"}
+Proposed height: ${proposedHeight ? proposedHeight + "m/storeys" : "Not stated"}
+Site area: ${siteAreaM2 ? siteAreaM2 + " m²" : "Not stated"}
+Setbacks: ${setbacks || "Not stated"}
+Car spaces: ${carSpaces || "Not stated"}
+Design objectives: ${designObjectives || "Not stated"}
+Local policies: ${policies.join(", ") || "Not specified"}
+Heritage overlay: ${heritageOverlay ? "Yes" : "No"}
+Flood overlay: ${floodOverlay ? "Yes" : "No"}
+Bushfire overlay: ${bushfireOverlay ? "Yes" : "No"}
+Location: ${safeSite}
+
+Assess planning compliance under Planning and Environment Act 1987 (Vic) and Victorian Planning Provisions:
+1. Permit-requiring use/development under zoning
+2. Overlay trigger assessment
+3. Key ResCode/design standard compliance risks
+4. Likely objection grounds from neighbours/council
+5. Referral requirements (VicRoads, Melbourne Water, Heritage Victoria, CFA, etc.)
+6. Rescode compliance (if residential)
+
+Respond ONLY in JSON:
+{
+  "planningRisk": "LOW|MODERATE|HIGH|EXTREME",
+  "permitRequired": true|false|null,
+  "overlayTriggers": ["string"],
+  "keyComplianceRisks": ["string"],
+  "likelyObjectionGrounds": ["string"],
+  "referralsRequired": ["string"],
+  "rescodeIssues": ["string"],
+  "designRecommendations": ["string"],
+  "applicableStandards": ["string"],
+  "approvalsPathway": "string",
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        planningRisk: "MODERATE",
+        permitRequired: null,
+        overlayTriggers: ["Confirm overlay requirements with responsible authority"],
+        keyComplianceRisks: ["AI assessment unavailable — engage town planner"],
+        likelyObjectionGrounds: ["Amenity impact", "Neighbourhood character"],
+        referralsRequired: ["Check with council for required referrals"],
+        rescodeIssues: ["Review ResCode compliance for residential development"],
+        designRecommendations: ["Engage town planner for pre-application meeting with council"],
+        applicableStandards: ["Planning and Environment Act 1987 (Vic)", "Victorian Planning Provisions", "ResCode"],
+        approvalsPathway: "Standard planning permit application — consult responsible authority.",
+        summary: "AI planning assessment unavailable. Engage registered town planner for formal assessment.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      projectType: safeProjectType,
+      zoning: safeZoning,
+      standards: ["Planning and Environment Act 1987 (Vic)", "Victorian Planning Provisions"],
+    });
+  } catch (err) {
+    console.error("POST /ai-planning-compliance-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess planning compliance." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
