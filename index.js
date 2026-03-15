@@ -54185,6 +54185,314 @@ Return a JSON object with:
   }
 });
 
+// POST /temporary-works-inspection — Record a temporary works inspection (falsework, propping, shoring)
+app.post("/temporary-works-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      inspectionRef,
+      date,
+      inspector,
+      inspectorCompany,
+      temporaryWorksType,
+      location,
+      designRef,
+      designerName,
+      designerRegistration,
+      maxAllowableLoadKpa,
+      actualLoadKpa,
+      systemBrand,
+      heightM,
+      spanM,
+      baseCondition,
+      soleboardsUsed,
+      verticalAlignmentOk,
+      bracingAdequate,
+      connectionsPinsOk,
+      loadsDistributedEvenly,
+      surchargePresent,
+      surchargeDescription,
+      concreteSlumpOk,
+      vibrationEquipmentBraced,
+      strippingScheduleAgreed,
+      minimumCuringDaysBeforeStrip,
+      overallResult,
+      rectificationsRequired,
+      rectificationDetails,
+      approvedForPour,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !inspector || !temporaryWorksType || !overallResult) {
+      return res.status(400).json({ error: "projectId, date, inspector, temporaryWorksType, and overallResult are required" });
+    }
+
+    const failures = [];
+    if (!baseCondition || String(baseCondition).toLowerCase().includes("soft") || String(baseCondition).toLowerCase().includes("unstable")) {
+      failures.push("Unstable base condition — falsework must be founded on soleboards or adequate bearing surface");
+    }
+    if (!verticalAlignmentOk) failures.push("Vertical alignment of props/frames out of tolerance — structural capacity compromised");
+    if (!bracingAdequate) failures.push("Bracing inadequate — lateral instability risk during concrete pour");
+    if (!connectionsPinsOk) failures.push("Connections, pins, or locking devices missing or improperly installed");
+    if (maxAllowableLoadKpa && actualLoadKpa && Number(actualLoadKpa) > Number(maxAllowableLoadKpa)) {
+      failures.push(`Actual load ${actualLoadKpa} kPa exceeds design maximum ${maxAllowableLoadKpa} kPa — do not proceed`);
+    }
+    if (overallResult === "FAIL") failures.push("Temporary works inspection FAILED — pour must not proceed until rectified");
+
+    if (failures.length > 0) console.warn(`[TEMP WORKS] ${temporaryWorksType} at ${projectId} — ${failures.join("; ")}`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      inspection_ref: sanitiseInput(inspectionRef || `TW-${Date.now()}`),
+      date,
+      inspector: sanitiseInput(inspector),
+      inspector_company: sanitiseInput(inspectorCompany || ""),
+      temporary_works_type: sanitiseInput(temporaryWorksType),
+      location: sanitiseInput(location || ""),
+      design_ref: sanitiseInput(designRef || ""),
+      designer_name: sanitiseInput(designerName || ""),
+      designer_registration: sanitiseInput(designerRegistration || ""),
+      max_allowable_load_kpa: maxAllowableLoadKpa || null,
+      actual_load_kpa: actualLoadKpa || null,
+      system_brand: sanitiseInput(systemBrand || ""),
+      height_m: heightM || null,
+      span_m: spanM || null,
+      base_condition: sanitiseInput(baseCondition || ""),
+      soleboards_used: !!soleboardsUsed,
+      vertical_alignment_ok: !!verticalAlignmentOk,
+      bracing_adequate: !!bracingAdequate,
+      connections_pins_ok: !!connectionsPinsOk,
+      loads_distributed_evenly: !!loadsDistributedEvenly,
+      surcharge_present: !!surchargePresent,
+      surcharge_description: sanitiseInput(surchargeDescription || ""),
+      concrete_slump_ok: !!concreteSlumpOk,
+      vibration_equipment_braced: !!vibrationEquipmentBraced,
+      stripping_schedule_agreed: !!strippingScheduleAgreed,
+      minimum_curing_days_before_strip: minimumCuringDaysBeforeStrip || null,
+      overall_result: sanitiseInput(overallResult),
+      rectifications_required: !!rectificationsRequired,
+      rectification_details: sanitiseInput(rectificationDetails || ""),
+      failures,
+      approved_for_pour: !!approvedForPour && failures.length === 0,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("temporary_works_inspections").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (failures.length > 0 || !approvedForPour) {
+      return res.status(422).json({
+        approvedForPour: false,
+        failures,
+        message: "Pour must not proceed. Rectify all failures and obtain re-inspection approval before commencing concrete placement.",
+        record,
+        saved,
+      });
+    }
+
+    res.json({
+      approvedForPour: true,
+      failures: [],
+      minimumCuringDaysBeforeStrip: minimumCuringDaysBeforeStrip || null,
+      applicableStandards: ["AS 3610 Formwork for concrete", "AS 3610.1 Formwork inspection", "AS 3600 Concrete structures", "SafeWork Victoria: Formwork Code of Practice"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/temporary-works-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record temporary works inspection" });
+  }
+});
+
+// POST /occupation-certificate-tracker — Track occupation certificates and building permit milestones
+app.post("/occupation-certificate-tracker", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      permitNumber,
+      permitDate,
+      buildingClass,
+      buildingSurveyorName,
+      buildingSurveyorRegistration,
+      bsClass,
+      certifierType,
+      propertyAddress,
+      ownerName,
+      builderName,
+      builderRegistrationNumber,
+      contractValue,
+      mandatoryInspections,
+      inspectionsCompleted,
+      outstandingInspections,
+      occupancyPermitApplied,
+      occupancyPermitApplicationDate,
+      occupancyPermitIssued,
+      occupancyPermitNumber,
+      occupancyPermitDate,
+      certificateOfFinalInspectionIssued,
+      finalInspectionDate,
+      finalInspectionOutcome,
+      openItems,
+      notes,
+    } = req.body;
+
+    if (!projectId || !permitNumber || !propertyAddress || !builderName) {
+      return res.status(400).json({ error: "projectId, permitNumber, propertyAddress, and builderName are required" });
+    }
+
+    const flags = [];
+    // Check mandatory inspection completion
+    if (mandatoryInspections && inspectionsCompleted && Array.isArray(mandatoryInspections) && Array.isArray(inspectionsCompleted)) {
+      const outstanding = mandatoryInspections.filter(i => !inspectionsCompleted.includes(i));
+      if (outstanding.length > 0) flags.push(`Outstanding mandatory inspections: ${outstanding.join(", ")} — occupancy permit cannot be issued until complete`);
+    }
+    if (Array.isArray(outstandingInspections) && outstandingInspections.length > 0) {
+      flags.push(`${outstandingInspections.length} outstanding inspection(s): ${outstandingInspections.join(", ")}`);
+    }
+    if (occupancyPermitApplied && !occupancyPermitIssued) flags.push("Occupancy permit applied but not yet issued — follow up with building surveyor");
+    if (Array.isArray(openItems) && openItems.length > 0) flags.push(`${openItems.length} open item(s) to resolve before final certificate`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      permit_number: sanitiseInput(permitNumber),
+      permit_date: permitDate || null,
+      building_class: sanitiseInput(buildingClass || ""),
+      building_surveyor_name: sanitiseInput(buildingSurveyorName || ""),
+      building_surveyor_registration: sanitiseInput(buildingSurveyorRegistration || ""),
+      bs_class: sanitiseInput(bsClass || ""),
+      certifier_type: sanitiseInput(certifierType || "private"),
+      property_address: sanitiseInput(propertyAddress),
+      owner_name: sanitiseInput(ownerName || ""),
+      builder_name: sanitiseInput(builderName),
+      builder_registration_number: sanitiseInput(builderRegistrationNumber || ""),
+      contract_value: contractValue || null,
+      mandatory_inspections: Array.isArray(mandatoryInspections) ? mandatoryInspections : [],
+      inspections_completed: Array.isArray(inspectionsCompleted) ? inspectionsCompleted : [],
+      outstanding_inspections: Array.isArray(outstandingInspections) ? outstandingInspections : [],
+      occupancy_permit_applied: !!occupancyPermitApplied,
+      occupancy_permit_application_date: occupancyPermitApplicationDate || null,
+      occupancy_permit_issued: !!occupancyPermitIssued,
+      occupancy_permit_number: sanitiseInput(occupancyPermitNumber || ""),
+      occupancy_permit_date: occupancyPermitDate || null,
+      certificate_of_final_inspection_issued: !!certificateOfFinalInspectionIssued,
+      final_inspection_date: finalInspectionDate || null,
+      final_inspection_outcome: sanitiseInput(finalInspectionOutcome || ""),
+      open_items: Array.isArray(openItems) ? openItems.map(i => sanitiseInput(i)) : [],
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("occupation_certificate_tracker").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      permitNumber,
+      occupancyPermitIssued: !!occupancyPermitIssued,
+      certificateOfFinalInspectionIssued: !!certificateOfFinalInspectionIssued,
+      flags,
+      applicableActs: ["Building Act 1993 (Vic)", "Building Regulations 2018 (Vic)", "Domestic Building Contracts Act 1995 (Vic)"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/occupation-certificate-tracker error:", err.message);
+    res.status(500).json({ error: "Failed to record occupation certificate tracking" });
+  }
+});
+
+// POST /ai-temporary-works-risk — AI assesses temporary works structural risk and design requirements
+app.post("/ai-temporary-works-risk", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      temporaryWorksType,
+      heightM,
+      spanM,
+      estimatedLoadKpa,
+      slabThicknessM,
+      concreteGradeMpa,
+      pourSequence,
+      siteConditions,
+      adjacentActivities,
+    } = req.body;
+
+    if (!temporaryWorksType || !heightM) {
+      return res.status(400).json({ error: "temporaryWorksType and heightM are required" });
+    }
+
+    const prompt = `You are a structural engineer specialising in temporary works design under AS 3610 and Victorian construction safety requirements.
+
+Assess the structural risk and design requirements for the following temporary works:
+- Type: ${sanitiseInput(temporaryWorksType)}
+- Height: ${sanitiseInput(String(heightM))} m
+- Span: ${sanitiseInput(String(spanM || "not specified"))} m
+- Estimated load: ${sanitiseInput(String(estimatedLoadKpa || "not specified"))} kPa
+- Slab thickness: ${sanitiseInput(String(slabThicknessM || "not specified"))} m
+- Concrete grade: ${sanitiseInput(String(concreteGradeMpa || "not specified"))} MPa
+- Pour sequence: ${sanitiseInput(pourSequence || "not specified")}
+- Site conditions: ${sanitiseInput(siteConditions || "not specified")}
+- Adjacent activities: ${sanitiseInput(adjacentActivities || "none")}
+
+Return a JSON object with:
+{
+  "riskLevel": "LOW|MEDIUM|HIGH|CRITICAL",
+  "engineeredDesignRequired": boolean,
+  "designerRegistrationRequired": boolean,
+  "keyStructuralRisks": [string],
+  "designConsiderations": [string],
+  "inspectionRequirements": [string],
+  "loadPath": string,
+  "deflectionLimits": string,
+  "strikingRequirements": string,
+  "reshoreRequired": boolean,
+  "reshoreJustification": string,
+  "applicableStandards": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ temporaryWorksType, heightM, assessment });
+  } catch (err) {
+    console.error("/ai-temporary-works-risk error:", err.message);
+    res.json({
+      temporaryWorksType: req.body.temporaryWorksType || "",
+      heightM: req.body.heightM || null,
+      assessment: {
+        riskLevel: "HIGH",
+        engineeredDesignRequired: true,
+        designerRegistrationRequired: true,
+        keyStructuralRisks: ["Overloading from concrete self-weight + live load", "Eccentricity and lateral forces during vibration", "Differential settlement of shores", "Progressive collapse if single shore fails"],
+        designConsiderations: ["Design for self-weight of concrete (24 kN/m³), formwork, live loads, and impact", "Provide minimum 2.4 kPa live load per AS 3610", "Check bearing capacity of ground below shores", "Design bracing for horizontal loads including wind and vibration"],
+        inspectionRequirements: ["Engineer inspection before initial load application", "Visual inspection by site supervisor before every concrete pour", "Post-pour inspection before stripping", "Structural engineer sign-off for systems > 3 m height or > 5 kPa design load"],
+        loadPath: "Loads transfer from fresh concrete through formwork deck, to secondary bearers, to primary bearers, to props/shores, to soleboards, to ground.",
+        deflectionLimits: "Maximum span/360 during pour; check cumulative deflection does not cause concrete to pull away from form faces.",
+        strikingRequirements: "Minimum 28 days for slabs unless early-age cube strength confirms 75% of characteristic strength per AS 3600 cl.19.1.2",
+        reshoreRequired: false,
+        reshoreJustification: "Reshoring typically required when multiple levels of fresh concrete above or when structural design requires it — confirm with structural engineer",
+        applicableStandards: ["AS 3610 Formwork for concrete", "AS 3610.1 Formwork — comment and inspection", "AS 3600 Concrete structures cl.19", "Safe Work Australia Formwork Code of Practice"],
+        recommendation: "All temporary works > 3 m high or > 5 kPa design load must be designed by a registered structural engineer. Obtain stamped drawings and method statement before erection.",
+        summary: "Temporary works for elevated concrete pours represent a high-risk activity. Engineered design, pre-pour inspection, and minimum curing periods before striking are mandatory.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
