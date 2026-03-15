@@ -275,13 +275,19 @@ error: "No images provided",
 const isGas = type === "gas";
 const isElectrical = type === "electrical";
 const isDrainage = type === "drainage";
-const isGeneralDoc = type === "hvac" || type === "carpentry";
+const isHvac = type === "hvac";
+const isCarpentry = type === "carpentry";
+const isGeneralDoc = isHvac || isCarpentry;
 
-const tradeLabel = type === "hvac" ? "HVAC" : type;
+const tradeLabel = isHvac ? "HVAC" : type;
 
 // Shared output format instruction appended to every prompt
 const outputFormatInstruction = `
-CONFIDENCE BREAKDOWN — return ALL of the following fields in your JSON response:
+PHOTO QUALITY GATE — evaluate this BEFORE anything else:
+Count how many submitted photos are completely unrecognisable — meaning they are totally blurry, pitch black, blank, or show nothing that could be identified as any object. If MORE THAN 3 photos are completely unrecognisable, stop all analysis and return ONLY this JSON with no other fields:
+{"photo_quality_error": true}
+
+CONFIDENCE BREAKDOWN — if the quality gate is not triggered, return ALL of the following fields:
 - relevant: true if at least one photo passes and shows genuine trade work, false otherwise
 - overall_confidence: integer 0–100 — round((passing photos / total photos submitted) * 100)
 - items_detected: array of labels that clearly PASS
@@ -334,6 +340,18 @@ RISK RATING CRITERIA:
 - "medium": switchboard labelling, cable support, or test records fail
 - "low": all safety-critical items pass, minor documentation gaps only
 
+FEW-SHOT EXAMPLES — use these to calibrate your pass/fail decisions:
+
+PASSING photo descriptions (these would receive a PASS):
+1. "Safety switch with the 'TEST' button, a green LED trip indicator, and the circuit label 'Safety Switch — Circuits 1–6' all clearly legible in the switchboard interior."
+2. "Open switchboard showing twelve circuit breakers each with a handwritten label and amperage (e.g. '10A Lights Bed 1') — all labels filled, none blank, directory fully completed."
+3. "Close-up of earth bar showing four green/yellow striped conductors correctly terminated with visible screw heads — conductor insulation colour is unambiguous."
+
+FAILING photo descriptions (these would receive a FAIL):
+1. "Blurry switchboard photo taken from 1.5 m away — individual circuit labels, amperage markings, and RCD test button cannot be read."
+2. "Closed grey switchboard door with no internal components visible — the photo only shows the outside of the board."
+3. "Earthing conductor visible but it has grey insulation — the green/yellow colour coding required by AS/NZS 3000 cannot be confirmed."
+
 ${outputFormatInstruction}
 
 Example response shape:
@@ -385,6 +403,18 @@ RISK RATING CRITERIA:
 - "medium": bedding, IO labelling, or moisture items fail
 - "low": all critical drainage items pass, minor documentation gaps only
 
+FEW-SHOT EXAMPLES — use these to calibrate your pass/fail decisions:
+
+PASSING photo descriptions (these would receive a PASS):
+1. "P-trap clearly shown with a visible water seal in the trap body, correct push-fit connection to the basin waste outlet above and drain pipe below, no cracks or deformation visible on the trap body."
+2. "Open drainage trench showing 100 mm PVC pipe fully surrounded by clean washed sand bedding to the correct depth, pipe is uniformly supported with no visible voids or soft spots under the barrel."
+3. "Inspection opening cover with the letters 'IO' embossed and legible on the cap surface, 600 mm of clear unobstructed ground around it, and the access shaft visible below the removed cap."
+
+FAILING photo descriptions (these would receive a FAIL):
+1. "Photo of backfilled trench — surface is flat compacted soil with no visible pipe, fittings, or bedding material. No drainage components can be assessed."
+2. "Overhead photo of a wet bathroom floor drain surrounded by moisture staining and a small puddle of standing water on the tiles — fails the no-pooling moisture check."
+3. "Drainage pipe photographed from directly above at a flat angle — no reference datum, no spirit level, and fall direction cannot be determined from this view."
+
 ${outputFormatInstruction}
 
 Example response shape:
@@ -402,28 +432,40 @@ Example response shape:
   "liability_summary": "Without documented evidence of correct pipe fall and an accessible labelled inspection opening, compliance cannot be confirmed. The plumber is liable if blockages or drainage failures occur on an unverified installation.",
   "analysis": "2 of 5 photos pass validation. 1 is unclear. 2 photos do not show the required drainage item."
 }
-`.trim() : isGeneralDoc ? `
+`.trim() : isHvac ? `
 You are a trade documentation photo validator for Australian construction documentation records.
 
-Job type: ${tradeLabel}
+Job type: HVAC
 
-Each photo below has been submitted with a label describing what it is SUPPOSED to show. Validate each photo individually and determine whether it shows genuine trade work relevant to the label.
+Each photo below has been submitted with a label describing what it is SUPPOSED to show. Validate each photo individually and determine whether it shows genuine HVAC installation work relevant to the label.
 
 VALIDATION RULES — apply without exception:
-- A photo PASSES if it clearly shows work, equipment, materials, or a site area relevant to ${tradeLabel} work and matches the intent of its label.
-- A photo FAILS if it shows a person, animal, unrelated object, food, or anything clearly unrelated to ${tradeLabel} work.
+- A photo PASSES if it clearly shows HVAC equipment, installation work, refrigerant lines, ductwork, or site conditions relevant to the label.
+- A photo FAILS if it shows a person, animal, unrelated object, food, or anything clearly unrelated to HVAC work.
 - A photo FAILS if it is blurry, too dark, or shows nothing recognisable.
-- This is a documentation record — not a compliance check. You are not verifying code compliance, only that the photos show genuine ${tradeLabel} trade work.
+- This is a documentation record — not a compliance check. You are verifying that photos show genuine HVAC trade work.
 
 SCORING:
 - overall_confidence = round((passing photos / total photos submitted) * 100)
 - If zero photos pass: overall_confidence = 0, relevant = false
-- relevant = true only if at least one photo passes and shows genuine ${tradeLabel} work
+- relevant = true only if at least one photo passes and shows genuine HVAC work
 
 RISK RATING CRITERIA:
 - "high": more than half the photos fail or show unrelated content
 - "medium": some photos fail or are unclear
-- "low": all or nearly all photos show genuine trade work
+- "low": all or nearly all photos show genuine HVAC work
+
+FEW-SHOT EXAMPLES — use these to calibrate your pass/fail decisions:
+
+PASSING photo descriptions (these would receive a PASS):
+1. "Indoor split-system unit mounted on a wall bracket at the correct height, refrigerant lines correctly lagged with UV-resistant foam insulation, condensate drain line visible running to the nearest drain point."
+2. "Outdoor condenser unit sitting level on a concrete pad with visible clearance space to the adjacent fence — service access path to the unit is clear and unobstructed."
+3. "Commissioning sheet on a clipboard showing the model number, serial number, refrigerant type, charge weight in grams, and measured suction/discharge pressures — all fields completed and legible."
+
+FAILING photo descriptions (these would receive a FAIL):
+1. "Photo of a blank plasterboard wall with no HVAC equipment, ductwork, or installation work visible anywhere in the frame."
+2. "Indoor unit photo where the refrigerant line connections are completely obscured by unsecured lagging hanging loose — connections and line run cannot be assessed."
+3. "Photo of a person standing next to the outdoor condenser unit — the person occupies most of the frame and the unit itself is partially out of shot, making the installation detail unassessable."
 
 ${outputFormatInstruction}
 
@@ -431,15 +473,67 @@ Example response shape:
 {
   "relevant": true,
   "overall_confidence": 80,
-  "items_detected": ["Site Overview", "Completed Work"],
-  "items_missing": ["Labels / Documentation"],
-  "items_unclear": ["Equipment / Materials"],
+  "items_detected": ["Indoor unit installation", "Outdoor unit placement"],
+  "items_missing": ["Commissioning sheet"],
+  "items_unclear": ["Refrigerant line connections"],
+  "risk_rating": "medium",
+  "recommended_actions": [
+    "Retake the commissioning sheet photo — all fields including charge weight and pressures must be legible.",
+    "Retake the refrigerant line connection photo — remove loose lagging so connections are fully visible."
+  ],
+  "liability_summary": "Installation documentation is mostly complete but the missing commissioning record means the refrigerant charge and operating pressures are unverified. Retake before lodging the job.",
+  "analysis": "2 of 4 photos pass validation. 1 is unclear. 1 does not show relevant HVAC work."
+}
+`.trim() : isCarpentry ? `
+You are a trade documentation photo validator for Australian construction documentation records.
+
+Job type: carpentry
+
+Each photo below has been submitted with a label describing what it is SUPPOSED to show. Validate each photo individually and determine whether it shows genuine carpentry work relevant to the label.
+
+VALIDATION RULES — apply without exception:
+- A photo PASSES if it clearly shows timber framing, joinery, fixtures, or finished carpentry work relevant to the label.
+- A photo FAILS if it shows a person, animal, unrelated object, food, or anything clearly unrelated to carpentry work.
+- A photo FAILS if it is blurry, too dark, or shows nothing recognisable.
+- This is a documentation record — not a compliance check. You are verifying that photos show genuine carpentry trade work.
+
+SCORING:
+- overall_confidence = round((passing photos / total photos submitted) * 100)
+- If zero photos pass: overall_confidence = 0, relevant = false
+- relevant = true only if at least one photo passes and shows genuine carpentry work
+
+RISK RATING CRITERIA:
+- "high": more than half the photos fail or show unrelated content
+- "medium": some photos fail or are unclear
+- "low": all or nearly all photos show genuine carpentry work
+
+FEW-SHOT EXAMPLES — use these to calibrate your pass/fail decisions:
+
+PASSING photo descriptions (these would receive a PASS):
+1. "Timber stud wall frame showing studs at uniform 450 mm centres with a full-height nogging at mid-span — stud spacing can be visually confirmed and all members are plumb and straight."
+2. "Completed door frame with reveals set at consistent depth, architrave nailed to the lining with no visible gaps at mitred corners, and the door hanging level with even margins on all three sides."
+3. "Finished deck surface showing uniform 6 mm board spacing, all screws correctly countersunk flush with the decking face, and straight board lines from end to end."
+
+FAILING photo descriptions (these would receive a FAIL):
+1. "Completely blurry photo of a room interior — no framing, joinery, or carpentry components can be identified."
+2. "Photo of an outdoor garden path and plants — no carpentry work of any kind is visible."
+3. "Wide-angle room photo where a door frame is just visible at the edge — too far away to assess the quality, reveal depth, or architrave fit."
+
+${outputFormatInstruction}
+
+Example response shape:
+{
+  "relevant": true,
+  "overall_confidence": 75,
+  "items_detected": ["Stud framing", "Door frame"],
+  "items_missing": ["Completed decking"],
+  "items_unclear": ["Nogging placement"],
   "risk_rating": "low",
   "recommended_actions": [
-    "Retake the labels photo — current photo does not show trade documentation or equipment markings."
+    "Retake the decking photo — show the full deck surface so board spacing and screw countersinking can be assessed."
   ],
-  "liability_summary": "Documentation is mostly complete. The missing labels photo is a minor gap — retake before submitting the final job record.",
-  "analysis": "2 of 4 photos pass validation. 1 is unclear. 1 does not show relevant work."
+  "liability_summary": "Framing documentation is adequate. The missing decking photo should be retaken before submitting the final job record.",
+  "analysis": "2 of 4 photos pass validation. 1 is unclear. 1 does not show relevant carpentry work."
 }
 `.trim() : isGas ? `
 You are a strict gas compliance photo validator for Victorian gas regulations under AS/NZS 5601.1:2013 and AS 4575:2019.
@@ -486,6 +580,18 @@ RISK RATING CRITERIA:
 - "high": gastightness, burner flames, appliance certification, isolation valve, or flue terminal items fail
 - "medium": ventilation, clearances, scorching check, or support items fail
 - "low": all critical gas safety items pass, minor documentation gaps only
+
+FEW-SHOT EXAMPLES — use these to calibrate your pass/fail decisions:
+
+PASSING photo descriptions (these would receive a PASS):
+1. "Close-up of a Bourdon pressure gauge in sharp focus, the dial face fully in frame, needle pointing clearly to 1.5 kPa with the numerals 0, 1, 2, 3 legible on the scale — confirming operating pressure during commissioning."
+2. "Active burner showing eight individual flame cones that are predominantly blue with only slight blue inner cones — no yellow tipping, no orange colouring, no lifting or blowing off the ports."
+3. "Gas isolation valve with a yellow lever handle perpendicular to the pipe (closed position) on the supply line directly behind the appliance — the handle, body, and pipe connections are all fully visible and accessible without tools."
+
+FAILING photo descriptions (these would receive a FAIL):
+1. "Wide shot of the entire plant room from 3 m away — a pressure gauge is visible in the background but the dial face is only 5 mm across in the photo and the needle position cannot be determined."
+2. "Photo of the burner compartment with the burner switched off — burner ports are visible but completely cold and dark with no flames present."
+3. "Appliance certification label visible on the front panel but the label has been painted over with white paint — text and certification markings are completely illegible."
 
 ${outputFormatInstruction}
 
@@ -538,6 +644,18 @@ RISK RATING CRITERIA:
 - "high": PTR valve, tempering valve, or PLV items are missing or failed — direct hot water scalding or pressure risk
 - "medium": pipe supports, isolation valves, or moisture items fail
 - "low": all critical safety items pass, minor documentation gaps only
+
+FEW-SHOT EXAMPLES — use these to calibrate your pass/fail decisions:
+
+PASSING photo descriptions (these would receive a PASS):
+1. "PTR valve clearly visible mounted on the hot water unit outlet with the AS 1357 compliance label legible on the valve body and a copper discharge pipe running from the valve outlet down to a floor waste grate below."
+2. "Tempering valve body in sharp focus showing all three connections — hot supply, cold supply, and mixed outlet — with the AS 3500.4 temperature rating of 50°C printed on the valve body and legible."
+3. "Copper pipework on wall showing four saddle clamps evenly spaced at approximately 1.2 m intervals along a 5 m horizontal run — all clamps correctly sized and screwed to timber nogging."
+
+FAILING photo descriptions (these would receive a FAIL):
+1. "Blurry close-up of the PTR valve — the valve body is in frame but the compliance label is a white smear with no legible text, and the discharge pipe is not visible."
+2. "Photo taken from 2 m away showing the entire hot water cupboard — the tempering valve is a small object in the background, too small to read any markings or confirm connections."
+3. "Wide photo of the ceiling space showing a long run of copper pipe — no pipe support clips are visible anywhere in the 4 m span shown, indicating unsupported pipework."
 
 ${outputFormatInstruction}
 
@@ -599,6 +717,13 @@ return res.status(500).json({
 error: "AI returned invalid JSON",
 raw,
 });
+}
+
+// Quality gate — AI signals that too many photos are unrecognisable
+if (parsed.photo_quality_error === true) {
+  return res.status(422).json({
+    error: "Photos are too blurry or unclear. Please retake in better lighting.",
+  });
 }
 
 const relevant = !!parsed.relevant;
