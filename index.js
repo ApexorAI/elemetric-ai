@@ -27766,6 +27766,230 @@ Analyse in JSON:
   }
 });
 
+// ── Round 95: Subcontractor management, leave records, AI onboarding ──────────
+
+// POST /subcontractor-register — Register or update a subcontractor on the platform
+app.post("/subcontractor-register", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, companyName, abn, licenceNumber, licenceExpiry,
+    trades = [], insuranceExpiry, contactName, contactEmail, contactPhone,
+    address, bankDetails,
+  } = req.body;
+
+  if (!companyName || !abn) return res.status(400).json({ error: "companyName and abn required." });
+
+  const record = {
+    contractor_id: sanitiseInput(contractorId || ""),
+    company_name: sanitiseInput(companyName),
+    abn: sanitiseInput(abn),
+    licence_number: sanitiseInput(licenceNumber || ""),
+    licence_expiry: licenceExpiry || null,
+    trades: Array.isArray(trades) ? trades.map(t => sanitiseInput(t)) : [],
+    insurance_expiry: insuranceExpiry || null,
+    contact_name: sanitiseInput(contactName || ""),
+    contact_email: sanitiseInput(contactEmail || ""),
+    contact_phone: sanitiseInput(contactPhone || ""),
+    address: sanitiseInput(address || ""),
+    status: "ACTIVE",
+    registered_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("subcontractor_register")
+      .upsert({ ...record, abn: record.abn }, { onConflict: "abn" })
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, subcontractorId: data.id, status: record.status });
+  }
+
+  res.json({ success: true, subcontractorId: null, status: record.status, saved: false });
+});
+
+// GET /subcontractor/:abn — Retrieve subcontractor record by ABN
+app.get("/subcontractor/:abn", apiKeyAuth, async (req, res) => {
+  const { abn } = req.params;
+  if (!abn) return res.status(400).json({ error: "ABN required." });
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("subcontractor_register")
+      .select("*")
+      .eq("abn", abn)
+      .single();
+    if (error) return res.status(404).json({ error: "Subcontractor not found." });
+    return res.json(data);
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /leave-record — Log a contractor leave request or absence
+app.post("/leave-record", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, leaveType, startDate, endDate, reason, approvedBy,
+  } = req.body;
+
+  if (!contractorId || !leaveType || !startDate || !endDate)
+    return res.status(400).json({ error: "contractorId, leaveType, startDate, endDate required." });
+
+  const validTypes = ["ANNUAL", "SICK", "PERSONAL", "LONG_SERVICE", "UNPAID", "OTHER"];
+  const type = (leaveType || "").toUpperCase();
+  if (!validTypes.includes(type))
+    return res.status(400).json({ error: `leaveType must be one of: ${validTypes.join(", ")}` });
+
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  if (isNaN(start) || isNaN(end) || end < start)
+    return res.status(400).json({ error: "Invalid date range." });
+
+  const days = Math.ceil((end - start) / (1000 * 60 * 60 * 24)) + 1;
+
+  const record = {
+    contractor_id: sanitiseInput(contractorId),
+    leave_type: type,
+    start_date: startDate,
+    end_date: endDate,
+    days,
+    reason: sanitiseInput(reason || ""),
+    approved_by: sanitiseInput(approvedBy || ""),
+    status: approvedBy ? "APPROVED" : "PENDING",
+    recorded_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("leave_records")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, recordId: data.id, days, status: record.status });
+  }
+
+  res.json({ success: true, recordId: null, days, status: record.status, saved: false });
+});
+
+// GET /leave-records/:contractorId — List leave records for a contractor
+app.get("/leave-records/:contractorId", apiKeyAuth, async (req, res) => {
+  const { contractorId } = req.params;
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("leave_records")
+      .select("*")
+      .eq("contractor_id", contractorId)
+      .order("start_date", { ascending: false });
+    if (error) return res.status(500).json({ error: "DB error." });
+    return res.json({ contractorId, records: data || [] });
+  }
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /ai-onboarding-checklist — AI generates a personalised onboarding checklist for a new contractor
+app.post("/ai-onboarding-checklist", apiKeyAuth, async (req, res) => {
+  const { trades = [], state = "VIC", licenceTypes = [], companySize = "sole-trader" } = req.body;
+  if (!trades.length) return res.status(400).json({ error: "At least one trade required." });
+
+  const sanitisedTrades = trades.map(t => sanitiseInput(t)).join(", ");
+  const sanitisedLicences = licenceTypes.map(l => sanitiseInput(l)).join(", ");
+
+  const prompt = `You are an Australian construction compliance expert. Generate a comprehensive onboarding checklist for a new contractor with the following profile:
+
+Trades: ${sanitisedTrades}
+State: ${sanitiseInput(state)}
+Licence types: ${sanitisedLicences || "Not specified"}
+Company size: ${sanitiseInput(companySize)}
+
+Return a JSON object with:
+- "checklist": array of objects with { "category": string, "item": string, "priority": "CRITICAL"|"HIGH"|"MEDIUM"|"LOW", "dueWithin": string, "notes": string }
+- "categories": array of category names used
+- "criticalCount": number of CRITICAL items
+- "estimatedSetupDays": number
+- "summary": string overview
+
+Categories should include: Licences & Registrations, Insurance, Safety & WHS, Tax & Finance, Tools & Equipment, Documentation, Platform Setup, Site Access.`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, trades, state, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      checklist: [
+        { category: "Licences & Registrations", item: "Obtain relevant trade licence", priority: "CRITICAL", dueWithin: "Before commencing work", notes: "Contact VBA or relevant authority." },
+        { category: "Insurance", item: "Public liability insurance (min $10M)", priority: "CRITICAL", dueWithin: "Before first job", notes: "Required for all contractors." },
+        { category: "Safety & WHS", item: "Complete White Card / general induction", priority: "CRITICAL", dueWithin: "Before site access", notes: "CPCCOHS2001A or equivalent." },
+        { category: "Tax & Finance", item: "Register ABN", priority: "HIGH", dueWithin: "Week 1", notes: "Required for invoicing." },
+      ],
+      categories: ["Licences & Registrations", "Insurance", "Safety & WHS", "Tax & Finance"],
+      criticalCount: 3, estimatedSetupDays: 14,
+      summary: "Standard contractor onboarding checklist. Verify all items before commencing work.",
+      trades, state, generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /project-closeout — Record formal project closeout with final checklist
+app.post("/project-closeout", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, contractorId, completionDate,
+    defectsRectified = false, finalInspectionPassed = false,
+    retentionReleased = false, asBuiltsProvided = false,
+    manualProvided = false, wasteDisposed = false,
+    siteCleared = false, clientSignedOff = false,
+    finalAmount, notes,
+  } = req.body;
+
+  if (!projectId || !projectName) return res.status(400).json({ error: "projectId and projectName required." });
+
+  const checklistItems = [
+    { item: "All defects rectified", passed: defectsRectified },
+    { item: "Final inspection passed", passed: finalInspectionPassed },
+    { item: "Retention money released", passed: retentionReleased },
+    { item: "As-built drawings provided", passed: asBuiltsProvided },
+    { item: "Operation & maintenance manual provided", passed: manualProvided },
+    { item: "Waste disposed of correctly", passed: wasteDisposed },
+    { item: "Site cleared and restored", passed: siteCleared },
+    { item: "Client signed off", passed: clientSignedOff },
+  ];
+
+  const passedCount = checklistItems.filter(i => i.passed).length;
+  const closeoutStatus = passedCount === checklistItems.length ? "COMPLETE" : passedCount >= 6 ? "SUBSTANTIALLY_COMPLETE" : "INCOMPLETE";
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    contractor_id: sanitiseInput(contractorId || ""),
+    completion_date: completionDate || new Date().toISOString().split("T")[0],
+    checklist: checklistItems,
+    passed_count: passedCount,
+    total_items: checklistItems.length,
+    closeout_status: closeoutStatus,
+    final_amount: finalAmount || null,
+    notes: sanitiseInput(notes || ""),
+    closed_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("project_closeouts")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, closeoutId: data.id, closeoutStatus, passedCount, totalItems: checklistItems.length, checklistItems });
+  }
+
+  res.json({ success: true, closeoutId: null, closeoutStatus, passedCount, totalItems: checklistItems.length, checklistItems, saved: false });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
