@@ -5328,6 +5328,158 @@ app.post("/analyse-cost", (req, res) => {
   });
 });
 
+// ── Round 2: Improvement — POST /before-after enhancement ────────────────────
+// Before/after comparison with detailed change analysis using GPT-4o.
+// (Augments any existing /before-after endpoint in the file with a smarter version)
+
+app.post("/compare-changes", async (req, res) => {
+  const { beforeImage, afterImage, mime = "image/jpeg", jobType, jobDescription } = req.body || {};
+
+  if (!beforeImage || !afterImage) {
+    return res.status(400).json({ error: "Both beforeImage and afterImage (base64) are required." });
+  }
+  if (!client) {
+    return res.status(503).json({ error: "AI service not configured." });
+  }
+
+  const prompt = `You are a trade compliance analyst comparing a before and after photo for a ${jobType || "trade"} job.
+
+${jobDescription ? `Job description: ${jobDescription}` : ""}
+
+Analyse both photos and return strict JSON with these fields:
+{
+  "changesIdentified": ["array of specific changes visible"],
+  "complianceImprovements": ["compliance items that were remediated"],
+  "remainingConcerns": ["items still visible that may need attention"],
+  "overallAssessment": "one sentence — does the after photo show a compliant outcome?",
+  "confidenceInChange": <integer 0-100>,
+  "beforeCondition": "brief description of the before state",
+  "afterCondition": "brief description of the after state",
+  "workQuality": "excellent|good|adequate|poor"
+}
+
+Return STRICT JSON only.`;
+
+  try {
+    usageStats.openaiCalls++;
+    const response = await callOpenAIWithRetry({
+      model:           "gpt-4o",
+      response_format: { type: "json_object" },
+      messages: [{
+        role:    "user",
+        content: [
+          { type: "text",      text: prompt },
+          { type: "text",      text: "BEFORE photo:" },
+          { type: "image_url", image_url: { url: `data:${mime};base64,${beforeImage}` } },
+          { type: "text",      text: "AFTER photo:" },
+          { type: "image_url", image_url: { url: `data:${mime};base64,${afterImage}` } },
+        ],
+      }],
+      temperature: 0.2,
+      max_tokens:  600,
+    });
+
+    const raw    = response.choices?.[0]?.message?.content || "{}";
+    const result = JSON.parse(raw);
+
+    return res.json({
+      jobType: jobType || null,
+      comparison: result,
+      model:       "gpt-4o",
+      analysedAt:  new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("compare-changes error:", err);
+    return res.status(500).json({ error: "Change comparison failed. Please try again." });
+  }
+});
+
+// ── Round 2: Improvement — POST /job-summary ──────────────────────────────────
+// Lightweight job summary endpoint that doesn't require GPT-4o — uses rule-based logic.
+
+app.post("/job-summary", (req, res) => {
+  const {
+    jobType,
+    overallConfidence,
+    adjustedConfidence,
+    complianceScore,
+    itemsDetected = [],
+    itemsMissing  = [],
+    itemsUnclear  = [],
+    riskRating    = "medium",
+    photosSubmitted,
+    photosAnalysed,
+    complexityBand,
+    plumberName,
+    address,
+    completedAt,
+  } = req.body || {};
+
+  if (!jobType) {
+    return res.status(400).json({ error: "jobType is required." });
+  }
+
+  const score  = complianceScore?.score ?? overallConfidence ?? adjustedConfidence ?? 0;
+  const grade  = complianceScore?.grade ?? (score >= 90 ? "A+" : score >= 80 ? "A" : score >= 70 ? "B" : score >= 60 ? "C" : "D");
+  const passed = score >= 70;
+
+  // Build a structured summary without AI
+  const outcomeLabel = passed ? "COMPLIANT" : "REQUIRES ATTENTION";
+  const dateStr      = completedAt ? new Date(completedAt).toLocaleDateString("en-AU") : new Date().toLocaleDateString("en-AU");
+
+  const summaryLines = [
+    `${plumberName || "Tradesperson"} completed a ${jobType} job${address ? ` at ${address}` : ""} on ${dateStr}.`,
+    `Documentation score: ${score}/100 (Grade ${grade}) — ${outcomeLabel}.`,
+    itemsDetected.length > 0 ? `${itemsDetected.length} item${itemsDetected.length !== 1 ? "s" : ""} verified: ${itemsDetected.slice(0, 3).join(", ")}${itemsDetected.length > 3 ? ` and ${itemsDetected.length - 3} more` : ""}.` : null,
+    itemsMissing.length > 0  ? `${itemsMissing.length} item${itemsMissing.length !== 1 ? "s" : ""} require attention: ${itemsMissing.slice(0, 2).join(", ")}${itemsMissing.length > 2 ? " and others" : ""}.` : null,
+    riskRating === "high"    ? `Risk level: HIGH — critical safety items are unverified.` : null,
+  ].filter(Boolean);
+
+  return res.json({
+    jobType,
+    outcome:       outcomeLabel,
+    score,
+    grade,
+    passed,
+    riskRating,
+    summary:       summaryLines.join(" "),
+    keyStats: {
+      itemsVerified:   itemsDetected.length,
+      itemsMissing:    itemsMissing.length,
+      itemsUnclear:    itemsUnclear.length,
+      photosSubmitted: photosSubmitted || null,
+      photosAnalysed:  photosAnalysed  || null,
+      complexity:      complexityBand  || null,
+    },
+    generatedAt:   new Date().toISOString(),
+  });
+});
+
+// ── Round 2: Improvement — GET /server-info ───────────────────────────────────
+// Public endpoint returning non-sensitive server capabilities (for client feature detection).
+
+app.get("/server-info", (_req, res) => {
+  return res.json({
+    version:        "2.0.0",
+    apiVersion:     "2026-03",
+    capabilities:   [
+      "compliance-review", "visualise", "stamp-photo", "property-passport",
+      "recommendations", "benchmark", "weather-impact", "materials-estimate",
+      "generate-description", "validate-certificate", "predict-performance",
+      "compliance-heatmap", "predict-complexity", "summarise-report",
+      "training-mode", "translations", "industry-insights", "notifications",
+      "check-integrity", "analyse-trends", "fraud-check", "compliance-calendar",
+      "analyse-cost", "compare-changes", "job-summary", "risk-assessment",
+      "compliance-check", "regulatory-updates",
+    ],
+    supportedJobTypes:   ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"],
+    supportedLanguages:  Object.keys(TRANSLATIONS),
+    aiModels:            ["gpt-4.1-mini", "gpt-4o"],
+    jurisdiction:        "Victoria, Australia",
+    regulatoryFramework: ["AS/NZS 3500", "AS/NZS 5601.1", "AS/NZS 3000", "AS/NZS 3500.2", "AS 1684", "AS 4254.2"],
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
