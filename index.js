@@ -25645,6 +25645,148 @@ app.post("/heat-load", apiKeyAuth, (req, res) => {
   });
 });
 
+// POST /pipe-sizing  — Calculate recommended pipe size for water supply
+app.post("/pipe-sizing", apiKeyAuth, (req, res) => {
+  const { jobId, fixtures = [], materialType = "copper", pressureKpa = 250 } = req.body || {};
+  if (!Array.isArray(fixtures) || fixtures.length === 0) return res.status(400).json({ error: "fixtures array required." });
+
+  // Loading units per fixture (AS/NZS 3500.1 Table 3.2 simplified)
+  const LOADING_UNITS = {
+    "wc": 5, "basin": 1, "bath": 3, "shower": 3, "laundry-tub": 3,
+    "kitchen-sink": 3, "dishwasher": 2, "washing-machine": 4,
+    "hose-tap": 3, "urinal": 3, "other": 2,
+  };
+  // Flow rate (L/s) by loading units for copper/CPVC (simplified)
+  const FLOW_RATES = [[1, 0.1], [2, 0.13], [5, 0.2], [10, 0.27], [20, 0.4], [40, 0.6], [80, 0.9], [160, 1.3], [320, 1.9]];
+
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeMat    = ["copper", "pex", "pprc", "cpvc", "stainless"].includes(String(materialType).toLowerCase()) ? String(materialType).toLowerCase() : "copper";
+  const pressure   = Math.max(100, Math.min(500, parseFloat(pressureKpa) || 250));
+  const safeFixtures = fixtures.slice(0, 100).map(f => {
+    const type = Object.keys(LOADING_UNITS).includes(String(f.type || "").toLowerCase().replace(/ /g, "-")) ? String(f.type).toLowerCase().replace(/ /g, "-") : "other";
+    return { type, count: Math.max(1, parseInt(f.count) || 1), hot: f.hot !== false, cold: f.cold !== false };
+  });
+
+  const totalLU = safeFixtures.reduce((s, f) => s + (LOADING_UNITS[f.type] || 2) * f.count, 0);
+
+  // Interpolate flow rate from table
+  let flowRate = FLOW_RATES[0][1];
+  for (let i = 0; i < FLOW_RATES.length - 1; i++) {
+    if (totalLU >= FLOW_RATES[i][0] && totalLU < FLOW_RATES[i + 1][0]) {
+      const t = (totalLU - FLOW_RATES[i][0]) / (FLOW_RATES[i + 1][0] - FLOW_RATES[i][0]);
+      flowRate = parseFloat((FLOW_RATES[i][1] + t * (FLOW_RATES[i + 1][1] - FLOW_RATES[i][1])).toFixed(3));
+    } else if (totalLU >= FLOW_RATES[FLOW_RATES.length - 1][0]) {
+      flowRate = FLOW_RATES[FLOW_RATES.length - 1][1];
+    }
+  }
+
+  // Pipe size recommendation (velocity 1-2 m/s target)
+  const MIN_SIZE = flowRate <= 0.15 ? 15 : flowRate <= 0.25 ? 20 : flowRate <= 0.5 ? 25 : flowRate <= 0.9 ? 32 : flowRate <= 1.5 ? 40 : 50;
+
+  return res.json({
+    jobId: safeJobId, materialType: safeMat, supplyPressureKpa: pressure,
+    fixtures: safeFixtures, totalFixtures: safeFixtures.reduce((s, f) => s + f.count, 0),
+    totalLoadingUnits: totalLU, designFlowRateLps: flowRate,
+    recommendedMainPipeSizeMm: MIN_SIZE,
+    notes: "Based on AS/NZS 3500.1 loading unit method. Verify with hydraulic engineer for large projects.",
+    calculatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /cable-sizing  — Calculate electrical cable size for a circuit
+app.post("/cable-sizing", apiKeyAuth, (req, res) => {
+  const { jobId, loadWatts, distanceM, voltageV = 230, phaseType = "single", ambientTemp = 30, installation = "conduit" } = req.body || {};
+  if (!loadWatts || !distanceM) return res.status(400).json({ error: "loadWatts and distanceM required." });
+
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const load       = Math.max(0, parseFloat(loadWatts) || 0);
+  const dist       = Math.max(0, parseFloat(distanceM) || 0);
+  const voltage    = Math.max(1, parseFloat(voltageV) || 230);
+  const isThree    = String(phaseType).includes("3") || String(phaseType).toLowerCase().includes("three");
+  const temp       = Math.max(20, parseFloat(ambientTemp) || 30);
+  const inst       = ["conduit", "surface", "buried", "open-air"].includes(String(installation).toLowerCase()) ? String(installation).toLowerCase() : "conduit";
+
+  const current    = isThree ? parseFloat((load / (Math.sqrt(3) * voltage * 0.95)).toFixed(2)) : parseFloat((load / (voltage * 0.95)).toFixed(2));
+  const tempFactor = temp <= 30 ? 1.0 : temp <= 35 ? 0.94 : temp <= 40 ? 0.87 : temp <= 45 ? 0.79 : 0.71;
+  const instFactor = inst === "buried" ? 0.75 : inst === "conduit" ? 0.80 : 1.0;
+  const derating   = tempFactor * instFactor;
+  const designCurrent = parseFloat((current / derating).toFixed(2));
+
+  // Voltage drop check (max 5% = 11.5V for 230V)
+  // Resistance of copper: ~0.0175 Ω·mm²/m
+  const CABLE_SIZES = [1.5, 2.5, 4, 6, 10, 16, 25, 35, 50];
+  const CURRENT_RATINGS = { conduit: [13, 17, 24, 31, 44, 59, 79, 97, 115], surface: [15, 21, 28, 37, 53, 71, 94, 115, 138], "open-air": [18, 25, 34, 44, 62, 82, 107, 133, 160], buried: [20, 27, 35, 46, 65, 87, 110, 134, 162] };
+  const ratings = CURRENT_RATINGS[inst] || CURRENT_RATINGS.conduit;
+
+  let recommendedMm2 = CABLE_SIZES[CABLE_SIZES.length - 1];
+  for (let i = 0; i < CABLE_SIZES.length; i++) {
+    if (ratings[i] >= designCurrent) {
+      // Check voltage drop
+      const R  = 0.0175 / CABLE_SIZES[i];
+      const Vd = isThree ? Math.sqrt(3) * current * R * dist : 2 * current * R * dist;
+      if (Vd <= voltage * 0.05) { recommendedMm2 = CABLE_SIZES[i]; break; }
+    }
+  }
+
+  return res.json({
+    jobId: safeJobId, loadWatts: load, distanceM: dist, voltageV: voltage,
+    phaseType: isThree ? "3-phase" : "single-phase",
+    currentA: current, derating, designCurrentA: designCurrent,
+    installation: inst, ambientTempC: temp,
+    recommendedCableSizeMm2: recommendedMm2,
+    notes: "Based on AS/NZS 3008.1. Have a licensed electrician verify all cable sizing.",
+    calculatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /ventilation-check  — Check minimum ventilation requirements for a space
+app.post("/ventilation-check", apiKeyAuth, (req, res) => {
+  const { jobId, spaceType, floorAreaM2, ceilingHeightM = 2.7, occupants, openableWindows, mechanicalVentilation, exhaustFanLps } = req.body || {};
+  if (!spaceType || !floorAreaM2) return res.status(400).json({ error: "spaceType and floorAreaM2 required." });
+
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+  const safeType   = sanitiseInput(String(spaceType)).toLowerCase().slice(0, 50);
+  const area       = Math.max(1, parseFloat(floorAreaM2) || 0);
+  const height     = Math.max(2, parseFloat(ceilingHeightM) || 2.7);
+  const people     = occupants ? Math.max(0, parseInt(occupants) || 0) : Math.ceil(area / 10);
+  const volume     = area * height;
+
+  // NCC 2022 / AS 1668.2 minimum ventilation
+  const REQUIREMENTS = {
+    "habitable-room":   { openableArea: area * 0.05, airChanges: 8,  exhaust: 25  },
+    "bedroom":          { openableArea: area * 0.05, airChanges: 8,  exhaust: 25  },
+    "bathroom":         { openableArea: area * 0.05, airChanges: 10, exhaust: 25  },
+    "kitchen":          { openableArea: area * 0.05, airChanges: 10, exhaust: 40  },
+    "toilet":           { openableArea: null,         airChanges: 10, exhaust: 25  },
+    "laundry":          { openableArea: area * 0.05, airChanges: 8,  exhaust: 25  },
+    "garage":           { openableArea: null,         airChanges: 6,  exhaust: null },
+    "office":           { openableArea: area * 0.05, airChanges: 8,  exhaust: null },
+  };
+
+  const req_key = Object.keys(REQUIREMENTS).find(k => safeType.includes(k.replace(/-/g, " ").split("-")[0])) || "habitable-room";
+  const req_vals = REQUIREMENTS[req_key];
+  const reqExhaust = req_vals.exhaust;
+  const reqAirChanges = req_vals.airChanges;
+  const minExhaustLps = reqExhaust;
+
+  const results = [
+    { check: "Openable window area", required: req_vals.openableArea ? `${req_vals.openableArea.toFixed(2)} m²` : "N/A", provided: openableWindows ? `${openableWindows} m²` : "Not specified", passed: !req_vals.openableArea || (openableWindows && parseFloat(openableWindows) >= req_vals.openableArea) },
+    { check: "Exhaust capacity", required: minExhaustLps ? `${minExhaustLps} L/s` : "N/A", provided: exhaustFanLps ? `${exhaustFanLps} L/s` : "Not specified", passed: !minExhaustLps || (exhaustFanLps && parseFloat(exhaustFanLps) >= minExhaustLps) },
+    { check: "Mechanical ventilation provided", required: mechanicalVentilation ? "Yes" : "Openable windows required", provided: (mechanicalVentilation || openableWindows) ? "Yes" : "No", passed: !!(mechanicalVentilation || openableWindows) },
+  ];
+
+  const passed = results.every(r => r.passed !== false);
+  return res.json({
+    jobId: safeJobId, spaceType: safeType, floorAreaM2: area, ceilingHeightM: height,
+    volumeM3: parseFloat(volume.toFixed(1)), estimatedOccupants: people,
+    applicableStandard: req_key,
+    results, compliant: passed,
+    recommendations: results.filter(r => !r.passed).map(r => `Increase ${r.check.toLowerCase()} to meet requirement of ${r.required}`),
+    standard: "NCC 2022 / AS 1668.2",
+    calculatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
