@@ -28617,6 +28617,204 @@ Return a JSON object with:
   }
 });
 
+// ── Round 99: RFI system, tender register, AI quantity takeoff ────────────────
+
+// POST /rfi — Submit a Request for Information (RFI)
+app.post("/rfi", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, rfiNumber, submittedBy, assignedTo,
+    subject, question, priority = "NORMAL",
+    drawingReference, specReference, requiredBy,
+  } = req.body;
+
+  if (!projectId || !rfiNumber || !subject || !question)
+    return res.status(400).json({ error: "projectId, rfiNumber, subject, question required." });
+
+  const validPriorities = ["LOW", "NORMAL", "HIGH", "URGENT"];
+  const pri = (priority || "NORMAL").toUpperCase();
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    rfi_number: sanitiseInput(String(rfiNumber)),
+    submitted_by: sanitiseInput(submittedBy || ""),
+    assigned_to: sanitiseInput(assignedTo || ""),
+    subject: sanitiseInput(subject),
+    question: sanitiseInput(question),
+    priority: validPriorities.includes(pri) ? pri : "NORMAL",
+    drawing_reference: sanitiseInput(drawingReference || ""),
+    spec_reference: sanitiseInput(specReference || ""),
+    required_by: requiredBy || null,
+    status: "OPEN",
+    submitted_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("rfi_register")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, rfiId: data.id, ...record });
+  }
+
+  res.json({ success: true, rfiId: null, ...record, saved: false });
+});
+
+// PATCH /rfi/:rfiId/respond — Record a response to an RFI
+app.patch("/rfi/:rfiId/respond", apiKeyAuth, async (req, res) => {
+  const { rfiId } = req.params;
+  const { respondedBy, response, drawingRevision, hasVariation = false, estimatedVariationCost } = req.body;
+
+  if (!respondedBy || !response) return res.status(400).json({ error: "respondedBy and response required." });
+
+  const update = {
+    responded_by: sanitiseInput(respondedBy),
+    response: sanitiseInput(response),
+    drawing_revision: sanitiseInput(drawingRevision || ""),
+    has_variation: Boolean(hasVariation),
+    estimated_variation_cost: estimatedVariationCost ? Number(estimatedVariationCost) : null,
+    status: "RESPONDED",
+    responded_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("rfi_register")
+      .update(update)
+      .eq("id", rfiId)
+      .select()
+      .single();
+    if (error) return res.status(404).json({ error: "RFI not found." });
+    return res.json({ success: true, rfiId, ...update });
+  }
+
+  res.json({ success: true, rfiId, ...update, saved: false });
+});
+
+// GET /rfis/:projectId — List RFIs for a project
+app.get("/rfis/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { status, priority } = req.query;
+
+  if (supabaseAdmin) {
+    let query = supabaseAdmin
+      .from("rfi_register")
+      .select("*")
+      .eq("project_id", projectId)
+      .order("submitted_at", { ascending: false });
+
+    if (status) query = query.eq("status", status.toUpperCase());
+    if (priority) query = query.eq("priority", priority.toUpperCase());
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "DB error." });
+    return res.json({ projectId, rfis: data || [], count: (data || []).length });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /tender-register — Record a tender submission or award
+app.post("/tender-register", apiKeyAuth, async (req, res) => {
+  const {
+    projectName, clientName, tenderNumber, tenderType,
+    submissionDate, dueDate, estimatedValue, submittedBy,
+    trades = [], bondRequired = false, bondAmount,
+    status = "PREPARING", competitors = [], notes,
+  } = req.body;
+
+  if (!projectName || !tenderNumber) return res.status(400).json({ error: "projectName and tenderNumber required." });
+
+  const validTypes = ["OPEN", "SELECT", "INVITED", "NEGOTIATED", "DESIGN_BUILD"];
+  const validStatuses = ["PREPARING", "SUBMITTED", "AWARDED", "UNSUCCESSFUL", "WITHDRAWN", "PENDING"];
+
+  const record = {
+    project_name: sanitiseInput(projectName),
+    client_name: sanitiseInput(clientName || ""),
+    tender_number: sanitiseInput(String(tenderNumber)),
+    tender_type: validTypes.includes((tenderType || "").toUpperCase()) ? tenderType.toUpperCase() : "OPEN",
+    submission_date: submissionDate || null,
+    due_date: dueDate || null,
+    estimated_value: Number(estimatedValue) || null,
+    submitted_by: sanitiseInput(submittedBy || ""),
+    trades: Array.isArray(trades) ? trades.map(t => sanitiseInput(t)) : [],
+    bond_required: Boolean(bondRequired),
+    bond_amount: bondAmount ? Number(bondAmount) : null,
+    status: validStatuses.includes((status || "").toUpperCase()) ? status.toUpperCase() : "PREPARING",
+    competitors: Array.isArray(competitors) ? competitors.map(c => sanitiseInput(c)) : [],
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("tender_register")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, tenderId: data.id, ...record });
+  }
+
+  res.json({ success: true, tenderId: null, ...record, saved: false });
+});
+
+// POST /ai-quantity-takeoff — AI estimates quantities and materials from a scope description
+app.post("/ai-quantity-takeoff", apiKeyAuth, async (req, res) => {
+  const {
+    trade, scopeDescription, floorArea, levels = 1,
+    buildingType = "residential", units = "metric",
+  } = req.body;
+
+  if (!trade || !scopeDescription) return res.status(400).json({ error: "trade and scopeDescription required." });
+
+  const sanitisedScope = sanitiseInput(scopeDescription);
+
+  const prompt = `You are an experienced Australian construction estimator specialising in quantity surveying. Perform a preliminary quantity takeoff based on the following information.
+
+Trade: ${sanitiseInput(trade)}
+Scope: ${sanitisedScope}
+Floor area: ${floorArea ? `${floorArea} m²` : "Not specified"}
+Levels: ${levels}
+Building type: ${sanitiseInput(buildingType)}
+Units: ${units}
+
+Return a JSON object with:
+- "quantities": array of { "item": string, "description": string, "quantity": number, "unit": string, "unitRate": number, "totalCost": number, "notes": string }
+- "laborHours": estimated total labour hours
+- "totalMaterialCost": number
+- "totalLaborCost": number (assume $95/hr average)
+- "totalEstimate": number
+- "contingency10Percent": number
+- "totalWithContingency": number
+- "assumptions": array of assumption strings made
+- "exclusions": array of excluded items
+- "accuracy": "±10%"|"±20%"|"±30%" depending on information provided`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, trade, buildingType, floorArea: floorArea || null, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      quantities: [],
+      laborHours: null, totalMaterialCost: null, totalLaborCost: null, totalEstimate: null,
+      contingency10Percent: null, totalWithContingency: null,
+      assumptions: ["Quantity takeoff temporarily unavailable — contact estimator"],
+      exclusions: [],
+      accuracy: "±30%",
+      trade, buildingType, floorArea: floorArea || null, generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
