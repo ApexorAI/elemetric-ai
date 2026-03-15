@@ -11971,6 +11971,332 @@ app.post("/batch-score", (req, res) => {
   });
 });
 
+// ── GET /audit-trail/:analysisId ─────────────────────────────────────────────
+// Aggregates all events for a job from Supabase: notes, tags, resolved items,
+// and AI feedback. Returns a complete chronological audit trail.
+app.get("/audit-trail/:analysisId", async (req, res) => {
+  const { analysisId } = req.params;
+
+  if (!analysisId) return res.status(400).json({ error: "analysisId is required." });
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  try {
+    const [notesResult, tagsResult, resolvedResult, feedbackResult] = await Promise.allSettled([
+      supabaseAdmin.from("job_notes").select("*").eq("analysis_id", analysisId).order("created_at", { ascending: true }),
+      supabaseAdmin.from("job_tags").select("*").eq("analysis_id", analysisId),
+      supabaseAdmin.from("resolved_items").select("*").eq("analysis_id", analysisId).order("resolved_at", { ascending: true }),
+      supabaseAdmin.from("ai_feedback").select("*").eq("analysis_id", analysisId).order("submitted_at", { ascending: true }),
+    ]);
+
+    const notes    = notesResult.status    === "fulfilled" ? notesResult.value.data    || [] : [];
+    const tags     = tagsResult.status     === "fulfilled" ? tagsResult.value.data     || [] : [];
+    const resolved = resolvedResult.status === "fulfilled" ? resolvedResult.value.data || [] : [];
+    const feedback = feedbackResult.status === "fulfilled" ? feedbackResult.value.data || [] : [];
+
+    // Merge into chronological event stream
+    const events = [
+      ...notes.map(n    => ({ timestamp: n.created_at,   type: "note",     data: n })),
+      ...resolved.map(r => ({ timestamp: r.resolved_at,  type: "resolved", data: r })),
+      ...feedback.map(f => ({ timestamp: f.submitted_at, type: "feedback", data: f })),
+    ].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+    return res.json({
+      analysisId,
+      eventCount:      events.length,
+      noteCount:       notes.length,
+      resolvedCount:   resolved.length,
+      feedbackCount:   feedback.length,
+      tags:            tags.flatMap(t => t.tags || []),
+      events,
+      retrievedAt:     new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("audit-trail error:", err);
+    return res.status(500).json({ error: "Failed to retrieve audit trail." });
+  }
+});
+
+// ── GET /tech-glossary ────────────────────────────────────────────────────────
+// Returns a glossary of technical terms used in Victorian trade compliance.
+// Useful for apprentices and non-technical stakeholders.
+app.get("/tech-glossary", (req, res) => {
+  const { jobType, query: searchQuery } = req.query;
+
+  const GLOSSARY = [
+    // Universal
+    { term: "CoC", definition: "Certificate of Compliance — a document confirming plumbing, drainage, or gas work meets regulatory standards.", trades: ["plumbing", "gas", "drainage"] },
+    { term: "CoES", definition: "Certificate of Electrical Safety — lodged with ESV after electrical work in Victoria.", trades: ["electrical"] },
+    { term: "VBA", definition: "Victorian Building Authority — regulates plumbing, drainage, building, and carpentry work in Victoria.", trades: ["all"] },
+    { term: "ESV", definition: "Energy Safe Victoria — regulates electrical, gas, and pipeline safety in Victoria.", trades: ["electrical", "gas"] },
+    { term: "ARC", definition: "Australian Refrigeration Council — administers refrigerant handling licences in Australia.", trades: ["hvac"] },
+    { term: "SWMS", definition: "Safe Work Method Statement — a document identifying high-risk construction activities, hazards, and controls.", trades: ["all"] },
+    { term: "BAL", definition: "Bushfire Attack Level — a classification of bushfire risk used to determine construction requirements under the NCC.", trades: ["carpentry"] },
+    { term: "NCC", definition: "National Construction Code — the building code that applies to all construction work in Australia.", trades: ["all"] },
+    { term: "RBS", definition: "Registered Building Surveyor — an independent professional who issues building permits and conducts mandatory inspections.", trades: ["carpentry"] },
+    { term: "LOTO", definition: "Lock-Out/Tag-Out — an isolation and safety procedure that prevents the unexpected energisation of electrical or mechanical equipment.", trades: ["electrical", "hvac"] },
+    // Plumbing
+    { term: "PTR Valve", definition: "Pressure Temperature Relief valve — a safety device on hot water systems that relieves excess pressure or temperature.", trades: ["plumbing"] },
+    { term: "Backflow", definition: "The reversal of water flow that can contaminate potable water with non-potable water or other substances.", trades: ["plumbing"] },
+    { term: "WaterMark", definition: "Australian product certification scheme for plumbing products — all fittings must carry WaterMark approval.", trades: ["plumbing"] },
+    { term: "TMV", definition: "Thermostatic Mixing Valve — a valve that blends hot and cold water to a safe temperature to prevent scalding.", trades: ["plumbing"] },
+    // Gas
+    { term: "Working Pressure Test", definition: "A test of the gas installation at normal supply pressure to confirm there are no leaks.", trades: ["gas"] },
+    { term: "Tightness Test", definition: "A pressure test above normal working pressure to confirm gas pipework is leak-free before commissioning.", trades: ["gas"] },
+    { term: "AGA", definition: "Australian Gas Association — its certification mark confirms a gas appliance meets safety standards.", trades: ["gas"] },
+    { term: "Flue", definition: "A duct that carries combustion products (exhaust gases) from a gas appliance to the outside.", trades: ["gas"] },
+    // Electrical
+    { term: "RCD", definition: "Residual Current Device — a safety switch that detects earth leakage and disconnects power in milliseconds.", trades: ["electrical"] },
+    { term: "MCB", definition: "Miniature Circuit Breaker — overcurrent protection device that trips on overload or short circuit.", trades: ["electrical"] },
+    { term: "IR Test", definition: "Insulation Resistance test — measures resistance between conductors to verify insulation integrity.", trades: ["electrical"] },
+    { term: "Earth Continuity Test", definition: "Measures continuity of the earthing conductor to verify the protective earth circuit is intact.", trades: ["electrical"] },
+    // Drainage
+    { term: "IO", definition: "Inspection Opening — an access point installed at changes of direction in drainage pipework for clearing and inspection.", trades: ["drainage"] },
+    { term: "Hydraulic Test", definition: "A pressure test of drainage using water to verify watertightness before backfilling.", trades: ["drainage"] },
+    { term: "Grade / Fall", definition: "The slope of a drain pipe, expressed as a ratio (e.g., 1:40 means 1 mm drop per 40 mm run).", trades: ["drainage"] },
+    { term: "Bedding", definition: "The material (typically sand) placed around and under drainage pipes to support and protect them.", trades: ["drainage"] },
+    // Carpentry
+    { term: "LVL", definition: "Laminated Veneer Lumber — an engineered structural timber product used as beams, lintels, and joists.", trades: ["carpentry"] },
+    { term: "Bracing", definition: "Structural elements that resist racking forces in a wall frame, required at specific spacings per AS 1684.", trades: ["carpentry"] },
+    { term: "Lintel", definition: "A structural beam spanning an opening (door, window) that transfers loads above the opening to the sides.", trades: ["carpentry"] },
+    { term: "Tie-Down", definition: "Mechanical fixings that connect roof framing to wall framing to resist wind uplift forces.", trades: ["carpentry"] },
+    // HVAC
+    { term: "GWP", definition: "Global Warming Potential — a measure of a refrigerant's contribution to climate change relative to CO₂.", trades: ["hvac"] },
+    { term: "Delta-T", definition: "Temperature differential between supply and return air — used to verify HVAC system performance.", trades: ["hvac"] },
+    { term: "Superheat", definition: "The temperature above the saturation point of a refrigerant at a given pressure — used to verify correct refrigerant charge.", trades: ["hvac"] },
+    { term: "Subcooling", definition: "The temperature below saturation of liquid refrigerant — also used to verify correct charge level.", trades: ["hvac"] },
+  ];
+
+  let filtered = GLOSSARY;
+
+  if (jobType) {
+    const type = jobType.toLowerCase();
+    filtered = GLOSSARY.filter(g => g.trades.includes(type) || g.trades.includes("all"));
+  }
+  if (searchQuery) {
+    const lower = searchQuery.toLowerCase();
+    filtered = filtered.filter(g => g.term.toLowerCase().includes(lower) || g.definition.toLowerCase().includes(lower));
+  }
+
+  return res.json({
+    totalTerms:  GLOSSARY.length,
+    filteredCount: filtered.length,
+    jobType:     jobType    || null,
+    searchQuery: searchQuery || null,
+    glossary:    filtered.sort((a, b) => a.term.localeCompare(b.term)),
+    retrievedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /photo-compliance-map ────────────────────────────────────────────────
+// Maps each submitted photo label to specific checklist items it covers.
+// Returns a compliance coverage map and identifies uncovered required items.
+app.post("/photo-compliance-map", (req, res) => {
+  const { jobType, photos = [] } = req.body || {};
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+
+  if (!jobType || !SUPPORTED.includes(jobType.toLowerCase())) {
+    return res.status(400).json({ error: `jobType required. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+  if (!Array.isArray(photos) || photos.length === 0) {
+    return res.status(400).json({ error: "photos array is required." });
+  }
+
+  const checklist   = CHECKLISTS[jobType.toLowerCase()] || [];
+  const photoLabels = photos.map(p => (typeof p === "string" ? p : p.label || "").toLowerCase());
+
+  // For each checklist item, find which photos cover it
+  const checklistMap = checklist.map(item => {
+    const itemLower   = item.item.toLowerCase();
+    const keywords    = itemLower.split(/\s+/).filter(w => w.length > 3);
+    const coveringPhotos = photos
+      .map((p, idx) => ({ label: typeof p === "string" ? p : p.label || "", idx }))
+      .filter(p => keywords.some(kw => p.label.toLowerCase().includes(kw)));
+
+    return {
+      checklistItem: item.item,
+      required:      item.required ?? true,
+      covered:       coveringPhotos.length > 0,
+      coveringPhotos: coveringPhotos.map(p => ({ photoIndex: p.idx, photoLabel: p.label })),
+      regulatoryRef: item.regulatoryRef || null,
+    };
+  });
+
+  // For each photo, list which checklist items it covers
+  const photoMap = photos.map((p, idx) => {
+    const label    = (typeof p === "string" ? p : p.label || "").toLowerCase();
+    const covering = checklistMap.filter(c => c.coveringPhotos.some(cp => cp.photoIndex === idx));
+    return {
+      photoIndex:     idx,
+      photoLabel:     typeof p === "string" ? p : p.label || "unlabelled",
+      checklistItems: covering.map(c => c.checklistItem),
+      coverCount:     covering.length,
+      unmapped:       covering.length === 0,
+    };
+  });
+
+  const covered       = checklistMap.filter(c => c.covered).length;
+  const uncoveredReq  = checklistMap.filter(c => c.required && !c.covered);
+  const unmappedPhotos = photoMap.filter(p => p.unmapped).length;
+
+  return res.json({
+    jobType,
+    photoCount:          photos.length,
+    checklistItemCount:  checklist.length,
+    coveredItems:        covered,
+    coveragePercent:     checklist.length > 0 ? Math.round((covered / checklist.length) * 100) : 0,
+    uncoveredRequired:   uncoveredReq.map(c => c.checklistItem),
+    unmappedPhotoCount:  unmappedPhotos,
+    checklistMap,
+    photoMap,
+    recommendation: uncoveredReq.length === 0
+      ? "All required checklist items are covered by submitted photos."
+      : `Add photos for: ${uncoveredReq.map(c => c.checklistItem).join(", ")}`,
+    mappedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /job-rating ──────────────────────────────────────────────────────────
+// Allows a tradesperson to self-rate their job performance across 5 dimensions.
+// Stores ratings in Supabase for personal development tracking.
+app.post("/job-rating", async (req, res) => {
+  const {
+    analysisId,
+    userId,
+    photoQuality,
+    documentationThoroughness,
+    complianceConfidence,
+    timeManagement,
+    overallSatisfaction,
+    notes,
+  } = req.body || {};
+
+  if (!analysisId) {
+    return res.status(400).json({ error: "analysisId is required." });
+  }
+
+  const validateRating = (val, field) => {
+    if (val === undefined || val === null) return null;
+    const n = Number(val);
+    if (isNaN(n) || n < 1 || n > 5) throw new Error(`${field} must be between 1 and 5.`);
+    return Math.round(n);
+  };
+
+  let ratings;
+  try {
+    ratings = {
+      photo_quality:               validateRating(photoQuality,                "photoQuality"),
+      documentation_thoroughness:  validateRating(documentationThoroughness,   "documentationThoroughness"),
+      compliance_confidence:       validateRating(complianceConfidence,         "complianceConfidence"),
+      time_management:             validateRating(timeManagement,               "timeManagement"),
+      overall_satisfaction:        validateRating(overallSatisfaction,          "overallSatisfaction"),
+    };
+  } catch (validationErr) {
+    return res.status(400).json({ error: validationErr.message });
+  }
+
+  const providedRatings = Object.values(ratings).filter(v => v !== null);
+  const avgRating = providedRatings.length > 0
+    ? Math.round(providedRatings.reduce((a, b) => a + b, 0) / providedRatings.length * 10) / 10
+    : null;
+
+  const record = {
+    analysis_id: analysisId,
+    user_id:     userId || null,
+    ...ratings,
+    notes:       notes ? sanitiseInput(String(notes)).substring(0, 500) : null,
+    avg_rating:  avgRating,
+    rated_at:    new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("job_ratings").upsert(record, { onConflict: "analysis_id" });
+      if (error) {
+        console.error("job-rating upsert error:", error);
+        return res.status(500).json({ error: "Failed to save rating." });
+      }
+    } catch (err) {
+      console.error("job-rating unexpected error:", err);
+    }
+  }
+
+  const feedbackMsg = avgRating === null ? null
+    : avgRating >= 4.5 ? "Excellent work — this is top-tier job documentation."
+    : avgRating >= 3.5 ? "Good job. A couple of areas to polish next time."
+    : avgRating >= 2.5 ? "Room for improvement. Review the lower-rated dimensions."
+    : "Needs significant improvement. Focus on documentation and photo quality.";
+
+  return res.json({
+    analysisId,
+    ratings,
+    avgRating,
+    feedback: feedbackMsg,
+    saved:    !!supabaseAdmin,
+    ratedAt:  record.rated_at,
+  });
+});
+
+// ── POST /bulk-validate-request ───────────────────────────────────────────────
+// Validates multiple /review request bodies at once. Returns per-request
+// validation results so errors can be fixed before submitting to /review.
+app.post("/bulk-validate-request", (req, res) => {
+  const { requests = [] } = req.body || {};
+
+  if (!Array.isArray(requests) || requests.length === 0) {
+    return res.status(400).json({ error: "requests array is required." });
+  }
+  if (requests.length > 10) {
+    return res.status(400).json({ error: "Maximum 10 requests per bulk validation." });
+  }
+
+  const VALID_TYPES      = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+  const REQUIRED_COUNTS  = { plumbing: 8, gas: 8, electrical: 8, drainage: 6, carpentry: 6, hvac: 6 };
+
+  const results = requests.map((req_body, idx) => {
+    const errors   = [];
+    const warnings = [];
+    const { type, photos = [] } = req_body || {};
+
+    if (!type)                                           errors.push({ field: "type",   message: "Job type is required." });
+    else if (!VALID_TYPES.includes(type.toLowerCase())) errors.push({ field: "type",   message: `Invalid job type "${type}".` });
+
+    if (!Array.isArray(photos) || photos.length === 0) {
+      errors.push({ field: "photos", message: "At least one photo is required." });
+    } else {
+      const required = REQUIRED_COUNTS[String(type).toLowerCase()] || 6;
+      if (photos.length < required) {
+        warnings.push({ field: "photos", message: `Only ${photos.length} photos — ${required} required for ${type}.` });
+      }
+      photos.forEach((p, pIdx) => {
+        if (!p.data && !p.url) errors.push({ field: `photos[${pIdx}]`, message: "Photo requires data or url field." });
+        if (!p.label) warnings.push({ field: `photos[${pIdx}]`, message: `Photo ${pIdx + 1} has no label.` });
+      });
+    }
+
+    return {
+      requestIndex: idx,
+      requestLabel: req_body.label || `Request ${idx + 1}`,
+      valid:        errors.length === 0,
+      errorCount:   errors.length,
+      warningCount: warnings.length,
+      errors,
+      warnings,
+    };
+  });
+
+  const allValid    = results.every(r => r.valid);
+  const totalErrors = results.reduce((sum, r) => sum + r.errorCount, 0);
+
+  return res.json({
+    batchSize:   requests.length,
+    allValid,
+    totalErrors,
+    totalWarnings: results.reduce((sum, r) => sum + r.warningCount, 0),
+    results,
+    validatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
