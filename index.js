@@ -71656,6 +71656,370 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 260 ─────────────────────────────────────────────────────────────────
+
+// POST /noise-exposure-assessment — Record occupational noise monitoring per AS/NZS 1269
+app.post("/noise-exposure-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, location, assessmentDate, assessedBy, workerRole,
+      taskDurationHours, measuredLaeqDB, measuredLpeakDB,
+      exposureLimitLaeqDB, peakLimitDB,
+      noiseSources, hearingProtectionType, hearingProtectionNRR,
+      engineeringControlsInPlace, adminControlsInPlace,
+      hearingConservationProgramEnrolled, audiometryDue, notes
+    } = req.body;
+
+    if (!location || !assessmentDate || !assessedBy) {
+      return res.status(400).json({ error: "location, assessmentDate, assessedBy are required." });
+    }
+
+    const safeLocation = sanitiseInput(String(location));
+    const safeAssessedBy = sanitiseInput(String(assessedBy));
+    const safeRole = workerRole ? sanitiseInput(String(workerRole)) : null;
+
+    const laeq = parseFloat(measuredLaeqDB) || null;
+    const lpeak = parseFloat(measuredLpeakDB) || null;
+    const exposureLimit = parseFloat(exposureLimitLaeqDB) || 85; // AS/NZS 1269 default TWA limit
+    const peakLimit = parseFloat(peakLimitDB) || 140;            // AS/NZS 1269 peak limit
+    const sources = Array.isArray(noiseSources) ? noiseSources : [];
+
+    const violations = [];
+    const warnings = [];
+
+    // AS/NZS 1269.0 — 85 dB(A) 8-hour TWA, 140 dB(C) peak
+    if (laeq !== null) {
+      if (laeq >= exposureLimit) {
+        violations.push(`Measured LAeq ${laeq} dB(A) meets or exceeds ${exposureLimit} dB(A) exposure standard — hearing protection mandatory and engineering controls required (AS/NZS 1269.1).`);
+      } else if (laeq >= exposureLimit - 5) {
+        warnings.push(`LAeq ${laeq} dB(A) within 5 dB of exposure limit — action level reached. Hearing conservation program required (AS/NZS 1269.0).`);
+      }
+    }
+
+    if (lpeak !== null) {
+      if (lpeak >= peakLimit) {
+        violations.push(`Peak noise ${lpeak} dB(C) meets or exceeds ${peakLimit} dB(C) peak limit — immediate engineering controls required.`);
+      } else if (lpeak >= 130) {
+        warnings.push(`Peak noise ${lpeak} dB(C) — high impulse level. Review control measures.`);
+      }
+    }
+
+    if (laeq !== null && laeq >= 85 && !hearingProtectionType) {
+      violations.push("Hearing protection not provided despite noise at or above 85 dB(A) — mandatory under OHS Regulations 2017 (Vic) reg 3.5.");
+    }
+
+    if (!engineeringControlsInPlace && laeq !== null && laeq >= 90) {
+      warnings.push("Engineering noise controls not confirmed at exposure ≥90 dB(A) — hierarchy of controls requires engineering measures first.");
+    }
+
+    if (!hearingConservationProgramEnrolled && laeq !== null && laeq >= 80) {
+      warnings.push("Worker not enrolled in hearing conservation program — required at or above action level 80 dB(A) (AS/NZS 1269.3).");
+    }
+
+    if (audiometryDue === true || audiometryDue === "true") {
+      warnings.push("Audiometry overdue — schedule baseline or annual hearing test (AS/NZS 1269.4).");
+    }
+
+    const complianceStatus = violations.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "ACTION_LEVEL_REACHED" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("noise_exposure_assessments")
+        .insert({
+          project_id: projectId ? sanitiseInput(String(projectId)) : null,
+          location: safeLocation,
+          assessment_date: assessmentDate,
+          assessed_by: safeAssessedBy,
+          worker_role: safeRole,
+          task_duration_hours: taskDurationHours || null,
+          measured_laeq_db: laeq,
+          measured_lpeak_db: lpeak,
+          exposure_limit_laeq_db: exposureLimit,
+          peak_limit_db: peakLimit,
+          noise_sources: sources,
+          hearing_protection_type: hearingProtectionType ? sanitiseInput(String(hearingProtectionType)) : null,
+          hearing_protection_nrr: hearingProtectionNRR || null,
+          engineering_controls_in_place: engineeringControlsInPlace || false,
+          admin_controls_in_place: adminControlsInPlace || false,
+          hearing_conservation_program_enrolled: hearingConservationProgramEnrolled || false,
+          compliance_status: complianceStatus,
+          violations,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (violations.length > 0) {
+      return res.status(422).json({
+        complianceStatus,
+        violations,
+        warnings,
+        savedId,
+        message: "Noise exposure non-compliant — implement controls immediately.",
+        standards: ["AS/NZS 1269.0", "AS/NZS 1269.1", "OHS Regulations 2017 (Vic) reg 3.5"],
+      });
+    }
+
+    res.json({
+      complianceStatus,
+      violations,
+      warnings,
+      savedId,
+      measuredLaeqDB: laeq,
+      measuredLpeakDB: lpeak,
+      standards: ["AS/NZS 1269.0", "AS/NZS 1269.1", "AS/NZS 1269.3", "AS/NZS 1269.4"],
+    });
+  } catch (err) {
+    console.error("POST /noise-exposure-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to record noise exposure assessment." });
+  }
+});
+
+// POST /vibration-exposure-assessment — Record hand-arm or whole-body vibration exposure
+app.post("/vibration-exposure-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, location, assessmentDate, assessedBy, workerRole,
+      vibrationSource, exposureType, dailyExposureDuration,
+      measuredVibrationAhwMs2, measuredVibrationAwMs2,
+      havLimitMs2, wbvLimitMs2,
+      engineeringControlsInPlace, antiVibrationGlovesProvided,
+      toolMaintenanceCurrent, medicalSurveillanceEnrolled, notes
+    } = req.body;
+
+    if (!location || !assessmentDate || !assessedBy || !exposureType) {
+      return res.status(400).json({ error: "location, assessmentDate, assessedBy, exposureType are required." });
+    }
+
+    const safeLocation = sanitiseInput(String(location));
+    const safeAssessedBy = sanitiseInput(String(assessedBy));
+    const safeExposureType = sanitiseInput(String(exposureType)).toUpperCase();
+    const safeSource = vibrationSource ? sanitiseInput(String(vibrationSource)) : null;
+
+    // AS 2670.1 (HAV) and AS 2670.2 (WBV) exposure action/limit values
+    // EU Physical Agents Directive values widely adopted in Australia
+    const ahwMeasured = parseFloat(measuredVibrationAhwMs2) || null; // HAV
+    const awMeasured = parseFloat(measuredVibrationAwMs2) || null;   // WBV
+    const havLimit = parseFloat(havLimitMs2) || 5.0;                 // m/s² daily ELV
+    const wbvLimit = parseFloat(wbvLimitMs2) || 1.15;               // m/s² daily ELV
+    const HAV_ACTION = 2.5;
+    const WBV_ACTION = 0.5;
+
+    const violations = [];
+    const warnings = [];
+
+    if (safeExposureType === "HAV" || safeExposureType === "HAND_ARM") {
+      if (ahwMeasured !== null) {
+        if (ahwMeasured >= havLimit) {
+          violations.push(`HAV A(8) ${ahwMeasured} m/s² meets or exceeds ELV ${havLimit} m/s² — HAVS risk. Reduce exposure immediately (AS 2670.1).`);
+        } else if (ahwMeasured >= HAV_ACTION) {
+          warnings.push(`HAV A(8) ${ahwMeasured} m/s² exceeds action value ${HAV_ACTION} m/s² — health surveillance and engineering controls required.`);
+        }
+      }
+      if (!antiVibrationGlovesProvided && ahwMeasured !== null && ahwMeasured >= HAV_ACTION) {
+        warnings.push("Anti-vibration gloves not confirmed — required when HAV action value exceeded.");
+      }
+    }
+
+    if (safeExposureType === "WBV" || safeExposureType === "WHOLE_BODY") {
+      if (awMeasured !== null) {
+        if (awMeasured >= wbvLimit) {
+          violations.push(`WBV A(8) ${awMeasured} m/s² meets or exceeds ELV ${wbvLimit} m/s² — musculoskeletal risk. Reduce exposure immediately (AS 2670.2).`);
+        } else if (awMeasured >= WBV_ACTION) {
+          warnings.push(`WBV A(8) ${awMeasured} m/s² exceeds action value ${WBV_ACTION} m/s² — health surveillance required.`);
+        }
+      }
+    }
+
+    if (!engineeringControlsInPlace) {
+      if (ahwMeasured !== null && ahwMeasured >= HAV_ACTION) {
+        warnings.push("Engineering vibration controls not in place — consider low-vibration tools, suspension mounts.");
+      }
+    }
+    if (!toolMaintenanceCurrent) {
+      warnings.push("Tool maintenance status unknown — worn tools generate higher vibration levels.");
+    }
+    if (!medicalSurveillanceEnrolled) {
+      const threshold = safeExposureType.includes("WBV") ? WBV_ACTION : HAV_ACTION;
+      const measured = safeExposureType.includes("WBV") ? awMeasured : ahwMeasured;
+      if (measured !== null && measured >= threshold) {
+        warnings.push("Worker not enrolled in medical surveillance — required when action value exceeded (OHS Regs 2017 Vic).");
+      }
+    }
+
+    const complianceStatus = violations.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "ACTION_LEVEL_REACHED" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("vibration_exposure_assessments")
+        .insert({
+          project_id: projectId ? sanitiseInput(String(projectId)) : null,
+          location: safeLocation,
+          assessment_date: assessmentDate,
+          assessed_by: safeAssessedBy,
+          worker_role: workerRole ? sanitiseInput(String(workerRole)) : null,
+          vibration_source: safeSource,
+          exposure_type: safeExposureType,
+          daily_exposure_duration: dailyExposureDuration || null,
+          measured_ahw_ms2: ahwMeasured,
+          measured_aw_ms2: awMeasured,
+          hav_limit_ms2: havLimit,
+          wbv_limit_ms2: wbvLimit,
+          engineering_controls_in_place: engineeringControlsInPlace || false,
+          anti_vibration_gloves_provided: antiVibrationGlovesProvided || false,
+          tool_maintenance_current: toolMaintenanceCurrent || false,
+          medical_surveillance_enrolled: medicalSurveillanceEnrolled || false,
+          compliance_status: complianceStatus,
+          violations,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (violations.length > 0) {
+      return res.status(422).json({
+        complianceStatus,
+        violations,
+        warnings,
+        savedId,
+        message: "Vibration exposure limit exceeded — implement controls immediately.",
+        standards: ["AS 2670.1", "AS 2670.2", "OHS Regulations 2017 (Vic)"],
+      });
+    }
+
+    res.json({
+      complianceStatus,
+      violations,
+      warnings,
+      savedId,
+      exposureType: safeExposureType,
+      measuredVibrationMs2: safeExposureType.includes("WBV") ? awMeasured : ahwMeasured,
+      standards: ["AS 2670.1", "AS 2670.2"],
+    });
+  } catch (err) {
+    console.error("POST /vibration-exposure-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to record vibration exposure assessment." });
+  }
+});
+
+// POST /ai-noise-vibration-control-plan — AI recommends noise and vibration control strategy
+app.post("/ai-noise-vibration-control-plan", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectType, noiseSensitiveReceivers, predictedConstructionNoise,
+      vibrationSensitiveReceivers, predictedVibrationPPV,
+      workHours, duration, primaryNoiseSources, siteContext
+    } = req.body;
+
+    if (!projectType) {
+      return res.status(400).json({ error: "projectType is required." });
+    }
+
+    const safeProjectType = sanitiseInput(String(projectType));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const noiseSources = Array.isArray(primaryNoiseSources) ? primaryNoiseSources.map(s => sanitiseInput(String(s))) : [];
+
+    const prompt = `You are an acoustic and vibration engineer developing a construction noise and vibration management plan for a Victorian project.
+
+Project type: ${safeProjectType}
+Site context: ${safeSite}
+Predicted construction noise at receiver: ${predictedConstructionNoise ? predictedConstructionNoise + " dB(A)" : "Not stated"}
+Noise-sensitive receivers: ${noiseSensitiveReceivers || "Unknown"}
+Predicted vibration PPV: ${predictedVibrationPPV ? predictedVibrationPPV + " mm/s" : "Not stated"}
+Vibration-sensitive receivers: ${vibrationSensitiveReceivers || "Unknown"}
+Work hours: ${workHours || "Standard construction hours"}
+Project duration: ${duration || "Not stated"}
+Primary noise sources: ${noiseSources.length > 0 ? noiseSources.join(", ") : "Not specified"}
+
+Develop control recommendations under:
+- EPA Publication 1254 (Noise from Construction)
+- AS/NZS 1269 (Occupational Noise)
+- AS 2670 (Vibration)
+- OHS Regulations 2017 (Vic)
+- Environment Protection Act 2017 (Vic)
+- Construction hours: EPA Victoria standard 7am–6pm Mon–Fri, 7am–1pm Sat
+
+Provide:
+1. Hierarchy of noise controls for each source
+2. Vibration control measures
+3. Community noise limit compliance assessment
+4. Required monitoring program
+5. Out-of-hours approval requirements
+6. Communication plan for affected receivers
+
+Respond ONLY in JSON:
+{
+  "noiseRiskLevel": "LOW|MODERATE|HIGH|EXTREME",
+  "vibrationRiskLevel": "LOW|MODERATE|HIGH|EXTREME",
+  "noiseControls": ["string"],
+  "vibrationControls": ["string"],
+  "communityLimitsCompliant": true|false|null,
+  "monitoringProgram": ["string"],
+  "outOfHoursApprovalRequired": true|false,
+  "communityNotificationRequired": true|false,
+  "regulatoryNotifications": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        noiseRiskLevel: "MODERATE",
+        vibrationRiskLevel: "MODERATE",
+        noiseControls: [
+          "Use low-noise plant and equipment",
+          "Install acoustic barriers where feasible",
+          "Schedule high-noise activities within standard construction hours",
+          "Maintain equipment in good working order",
+        ],
+        vibrationControls: [
+          "Use vibration-dampened equipment",
+          "Monitor PPV at sensitive receivers",
+          "Schedule percussive works for daytime only",
+        ],
+        communityLimitsCompliant: null,
+        monitoringProgram: ["Continuous noise monitoring at nearest sensitive receiver", "Weekly vibration spot checks"],
+        outOfHoursApprovalRequired: false,
+        communityNotificationRequired: true,
+        regulatoryNotifications: ["Notify EPA Victoria if noise exceedances occur"],
+        applicableStandards: ["EPA Publication 1254", "AS/NZS 1269", "AS 2670", "Environment Protection Act 2017 (Vic)"],
+        summary: "AI analysis unavailable. Engage acoustic engineer for site-specific noise and vibration management plan.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      projectType: safeProjectType,
+      predictedConstructionNoise: predictedConstructionNoise || null,
+      predictedVibrationPPV: predictedVibrationPPV || null,
+      standards: ["EPA Publication 1254", "AS/NZS 1269", "AS 2670", "Environment Protection Act 2017 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /ai-noise-vibration-control-plan error:", err.message);
+    res.status(500).json({ error: "Failed to generate noise/vibration control plan." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
