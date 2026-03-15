@@ -79435,6 +79435,395 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 281 ─────────────────────────────────────────────────────────────────
+
+// POST /fire-sprinkler-inspection — Record fire sprinkler system inspection per AS 1851
+app.post("/fire-sprinkler-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, systemId, location, inspectionDate, inspectedBy,
+      licenceNumber, inspectionType,
+      controlValveOpen, alarmValveCondition,
+      sprinklerHeadsInspected, headsDamaged, headsObstructed,
+      pipingCondition, pipingLeaks, hangersOk,
+      pressureAtTestPoint, designPressure,
+      flowTestConducted, flowTestPassed,
+      alarmTest, alarmSounded, panelAnnunciated,
+      antifreezeLevelOk, waterSupplyAdequate,
+      mainDrainTestConducted, mainDrainPressure,
+      defectsFound, defectDetails,
+      nextInspectionDue, certRef, notes
+    } = req.body;
+
+    if (!systemId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "systemId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeSystem = sanitiseInput(String(systemId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+    const defects = Array.isArray(defectDetails) ? defectDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const pressureAtTest = parseFloat(pressureAtTestPoint) || null;
+    const designPressureVal = parseFloat(designPressure) || null;
+
+    // AS 1851 — Maintenance of fire protection systems and equipment
+    if (controlValveOpen === false || controlValveOpen === "false") {
+      criticalIssues.push("Control valve NOT open — system is impaired. Open valve immediately and investigate why it was closed (AS 1851 Sect 6).");
+    }
+
+    if (pipingLeaks === true || pipingLeaks === "true") {
+      criticalIssues.push("Piping leaks detected — system pressure affected. Repair immediately and re-test (AS 1851 cl.6.2).");
+    }
+
+    if (headsDamaged === true || headsDamaged === "true") {
+      const defectCount = defects.filter(d => /damaged|corroded|painted|obstructed/i.test(String(d))).length;
+      criticalIssues.push(`Damaged sprinkler head(s) detected — system reliability compromised. Replace immediately (AS 1851 cl.6.1.2).`);
+    }
+    if (headsObstructed === true || headsObstructed === "true") {
+      criticalIssues.push("Sprinkler heads obstructed — storage/shelving must maintain 500mm clearance below heads (AS 2118.1 cl.9.5).");
+    }
+
+    if (pressureAtTest !== null && designPressureVal !== null && pressureAtTest < designPressureVal * 0.9) {
+      criticalIssues.push(`Test point pressure ${pressureAtTest}kPa below 90% of design ${designPressureVal}kPa — inadequate water supply pressure.`);
+    }
+
+    if (flowTestConducted === true || flowTestConducted === "true") {
+      if (flowTestPassed === false || flowTestPassed === "false") {
+        criticalIssues.push("Flow test FAILED — water supply insufficient for design demand. Notify fire engineer and building owner immediately.");
+      }
+    }
+
+    if (!waterSupplyAdequate) {
+      criticalIssues.push("Water supply not confirmed adequate — verify pump/reservoir capacity meets design requirements.");
+    }
+
+    if (alarmTest === true || alarmTest === "true") {
+      if (!alarmSounded) {
+        criticalIssues.push("Alarm test conducted but alarm did not sound — alarm system failure. Repair immediately (AS 1851).");
+      }
+      if (!panelAnnunciated) {
+        warnings.push("Fire panel did not annunciate during alarm test — check panel connection.");
+      }
+    }
+
+    if (!mainDrainTestConducted) {
+      warnings.push("Main drain test not conducted — required quarterly per AS 1851 to verify water supply.");
+    }
+
+    const maint = String(inspectionType || "").toUpperCase();
+    if (maint === "ANNUAL" && !certRef) {
+      warnings.push("Annual inspection without certificate reference — AS 1851 annual certificate required for ESM compliance.");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "SYSTEM_IMPAIRED" : warnings.length > 0 ? "ATTENTION_REQUIRED" : "SERVICEABLE";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("fire_sprinkler_inspections")
+        .insert({
+          project_id: safeProject || null,
+          system_id: safeSystem,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          licence_number: licenceNumber ? sanitiseInput(String(licenceNumber)) : null,
+          inspection_type: inspectionType || null,
+          control_valve_open: controlValveOpen !== false && controlValveOpen !== "false",
+          piping_leaks: pipingLeaks || false,
+          heads_damaged: headsDamaged || false,
+          heads_obstructed: headsObstructed || false,
+          pressure_at_test_kpa: pressureAtTest,
+          design_pressure_kpa: designPressureVal,
+          flow_test_conducted: flowTestConducted || false,
+          flow_test_passed: flowTestPassed !== false && flowTestPassed !== "false",
+          alarm_sounded: alarmSounded !== false && alarmSounded !== "false",
+          panel_annunciated: panelAnnunciated !== false && panelAnnunciated !== "false",
+          water_supply_adequate: waterSupplyAdequate !== false && waterSupplyAdequate !== "false",
+          defects_found: defectsFound || false,
+          defect_details: defects,
+          next_inspection_due: nextInspectionDue || null,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Fire sprinkler system impaired — notify building owner and fire authority immediately.",
+        standards: ["AS 1851", "AS 2118.1", "Building Regulations 2018 (Vic) reg 229"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      systemId: safeSystem,
+      nextInspectionDue: nextInspectionDue || null,
+      standards: ["AS 1851", "AS 2118.1"],
+    });
+  } catch (err) {
+    console.error("POST /fire-sprinkler-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record fire sprinkler inspection." });
+  }
+});
+
+// POST /electrical-switchboard-inspection — Record LV switchboard inspection
+app.post("/electrical-switchboard-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, boardId, location, inspectionDate, inspectedBy,
+      licenceNumber, boardType, ratedCurrentA,
+      doorLockingOk, enclosureIntegrityOk,
+      busbarsCondition, insulationCondition,
+      circuitBreakersOk, rcdsTested, rcdCount, rcdTestPassed,
+      earthBusTight, mainSwitchOk, neutralLinked,
+      thermalImageConducted, hotSpotsDetected, hotSpotDetails,
+      labellingComplete, singleLineDiagramPresent,
+      clearanceM, specifiedClearanceMm,
+      defectsFound, defectDetails, notes
+    } = req.body;
+
+    if (!boardId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "boardId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeBoardId = sanitiseInput(String(boardId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const defects = Array.isArray(defectDetails) ? defectDetails : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const clearMm = parseFloat(clearanceM) * 1000 || parseFloat(clearanceM) || null;
+    const specClearanceMm = parseFloat(specifiedClearanceMm) || 600; // AS/NZS 3000 cl.2.12 minimum 600mm
+
+    // AS/NZS 3000 — Wiring rules, AS/NZS 3439.1 — LV switchgear
+    if (!enclosureIntegrityOk) {
+      criticalIssues.push("Switchboard enclosure not intact — live parts accessible. Immediate rectification required (AS/NZS 3000 cl.2.12).");
+    }
+
+    if (hotSpotsDetected === true || hotSpotsDetected === "true") {
+      const hotSpotInfo = hotSpotDetails ? sanitiseInput(String(hotSpotDetails)) : "location not recorded";
+      criticalIssues.push(`Thermal hot spots detected (${hotSpotInfo}) — loose connections or overloaded circuit. Investigate immediately (fire risk).`);
+    }
+
+    if (rcdsTested === true || rcdsTested === "true") {
+      if (rcdTestPassed === false || rcdTestPassed === "false") {
+        criticalIssues.push("RCD test FAILED — life safety device non-functional. Replace RCD(s) before re-energising (AS/NZS 3000 cl.2.6).");
+      }
+    }
+
+    if (!earthBusTight) {
+      criticalIssues.push("Earth bus connections not confirmed tight — loose earthing is a safety and fire risk.");
+    }
+
+    const ins = String(insulationCondition || "").toUpperCase();
+    if (ins === "POOR" || ins === "FAILED") {
+      criticalIssues.push(`Insulation condition ${insulationCondition} — risk of arcing and fire. De-energise and repair.`);
+    }
+
+    if (clearMm !== null && clearMm < specClearanceMm) {
+      criticalIssues.push(`Working clearance in front of switchboard ${clearMm}mm below minimum ${specClearanceMm}mm — AS/NZS 3000 cl.2.12 compliance required.`);
+    }
+
+    if (!labellingComplete) {
+      warnings.push("Circuit labelling not complete — AS/NZS 3000 cl.2.12 requires all circuits labelled.");
+    }
+    if (!singleLineDiagramPresent) {
+      warnings.push("Single-line diagram not present — required inside or adjacent to all distribution boards (AS/NZS 3000).");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "FAIL" : warnings.length > 0 ? "CONDITIONAL_PASS" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("electrical_switchboard_inspections")
+        .insert({
+          project_id: projectId ? sanitiseInput(String(projectId)) : null,
+          board_id: safeBoardId,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          licence_number: licenceNumber ? sanitiseInput(String(licenceNumber)) : null,
+          board_type: boardType ? sanitiseInput(String(boardType)) : null,
+          rated_current_a: ratedCurrentA || null,
+          enclosure_integrity_ok: enclosureIntegrityOk !== false && enclosureIntegrityOk !== "false",
+          hot_spots_detected: hotSpotsDetected || false,
+          rcds_tested: rcdsTested || false,
+          rcd_count: rcdCount || null,
+          rcd_test_passed: rcdTestPassed !== false && rcdTestPassed !== "false",
+          earth_bus_tight: earthBusTight !== false && earthBusTight !== "false",
+          insulation_condition: insulationCondition || null,
+          working_clearance_mm: clearMm,
+          labelling_complete: labellingComplete || false,
+          single_line_diagram_present: singleLineDiagramPresent || false,
+          defects_found: defectsFound || false,
+          defect_details: defects,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Switchboard critical defects — de-energise if safe to do so and rectify immediately.",
+        standards: ["AS/NZS 3000", "AS/NZS 3439.1", "Electricity Safety Act 1998 (Vic)"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      boardId: safeBoardId,
+      standards: ["AS/NZS 3000", "AS/NZS 3439.1"],
+    });
+  } catch (err) {
+    console.error("POST /electrical-switchboard-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record switchboard inspection." });
+  }
+});
+
+// POST /ai-building-services-risk-profile — AI generates integrated building services risk profile
+app.post("/ai-building-services-risk-profile", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      buildingType, buildingClass, ageYears, occupantLoad,
+      servicesIncluded, maintenanceGaps, openDefects,
+      lastAuditDate, esmCompliant, fireSafetyIssues,
+      electricalIssues, hvacIssues, plumbingIssues,
+      liftIssues, siteContext
+    } = req.body;
+
+    if (!buildingType) {
+      return res.status(400).json({ error: "buildingType is required." });
+    }
+
+    const safeBuildingType = sanitiseInput(String(buildingType));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const services = Array.isArray(servicesIncluded) ? services.map(s => sanitiseInput(String(s))) : (servicesIncluded ? [sanitiseInput(String(servicesIncluded))] : []);
+    const maintGaps = Array.isArray(maintenanceGaps) ? maintenanceGaps.map(g => sanitiseInput(String(g))) : [];
+    const openDefectList = Array.isArray(openDefects) ? openDefects.map(d => sanitiseInput(String(d))) : [];
+
+    const prompt = `You are a building services facilities manager assessing the integrated risk profile of a Victorian building's mechanical and electrical services.
+
+Building type: ${safeBuildingType}
+Building class: ${buildingClass || "Unknown"}
+Age: ${ageYears ? ageYears + " years" : "Unknown"}
+Occupant load: ${occupantLoad || "Unknown"}
+Services: ${services.join(", ") || "All building services"}
+ESM compliant: ${esmCompliant ? "Yes" : "No/Unknown"}
+Maintenance gaps: ${maintGaps.join("; ") || "None identified"}
+Open defects: ${openDefectList.join("; ") || "None"}
+Last audit: ${lastAuditDate || "Unknown"}
+Fire safety issues: ${fireSafetyIssues || "None noted"}
+Electrical issues: ${electricalIssues || "None noted"}
+HVAC issues: ${hvacIssues || "None noted"}
+Plumbing issues: ${plumbingIssues || "None noted"}
+Lift issues: ${liftIssues || "None noted"}
+Location: ${safeSite}
+
+Develop an integrated building services risk profile covering:
+1. Life safety risk (fire, electrical, structural)
+2. Business continuity risk (HVAC failure, lift failure, power)
+3. Regulatory compliance risk (ESM, Building Regulations, AS 1851)
+4. Financial risk (deferred maintenance, reactive cost)
+5. Priority order for addressing outstanding issues
+6. 12-month maintenance action plan
+
+Respond ONLY in JSON:
+{
+  "overallRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "lifeSafetyRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "businessContinuityRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "regulatoryRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "financialRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "priorityActions": [{"priority": number, "action": "string", "urgency": "IMMEDIATE|SHORT_TERM|PLANNED"}],
+  "twelveMonthMaintenancePlan": ["string"],
+  "complianceObligations": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 900,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallRisk: "MODERATE",
+        lifeSafetyRisk: "MODERATE",
+        businessContinuityRisk: "MODERATE",
+        regulatoryRisk: "MODERATE",
+        financialRisk: "MODERATE",
+        priorityActions: [
+          { priority: 1, action: "Ensure ESM annual statement is current", urgency: "IMMEDIATE" },
+          { priority: 2, action: "Complete AS 1851 fire services maintenance", urgency: "SHORT_TERM" },
+          { priority: 3, action: "Address all open defects", urgency: "SHORT_TERM" },
+        ],
+        twelveMonthMaintenancePlan: [
+          "Q1: Fire services inspection and certification",
+          "Q2: HVAC seasonal service",
+          "Q3: Electrical thermography survey",
+          "Q4: Annual ESM statement",
+        ],
+        complianceObligations: [
+          "Annual ESM statement per Building Regulations 2018 (Vic) reg 229",
+          "AS 1851 fire services maintenance",
+          "Lift annual certificate per AS 1418.1",
+        ],
+        applicableStandards: ["AS 1851", "AS 1668.2", "AS 1418.1", "AS/NZS 3000", "Building Regulations 2018 (Vic)"],
+        summary: "AI building services risk profile unavailable. Engage facilities manager for comprehensive assessment.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      buildingType: safeBuildingType,
+      standards: ["AS 1851", "AS 1668.2", "AS 1418.1", "AS/NZS 3000"],
+    });
+  } catch (err) {
+    console.error("POST /ai-building-services-risk-profile error:", err.message);
+    res.status(500).json({ error: "Failed to generate building services risk profile." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
