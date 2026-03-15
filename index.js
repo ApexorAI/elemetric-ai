@@ -33615,6 +33615,239 @@ app.post("/tiling-compliance", apiKeyAuth, async (req, res) => {
   res.json({ success: true, recordId: null, compliancePercent, status: record.status, ...record, saved: false });
 });
 
+// ── Round 125: AI regulation lookup, plain-english explainer, trade classifier
+
+// POST /ai-regulation-lookup — AI looks up and explains a specific regulation or standard
+app.post("/ai-regulation-lookup", apiKeyAuth, async (req, res) => {
+  const {
+    regulationCode, topic, trade, state = "VIC", jurisdiction = "Australia",
+    plainEnglish = true,
+  } = req.body;
+
+  if (!regulationCode && !topic) return res.status(400).json({ error: "regulationCode or topic required." });
+
+  const query = regulationCode ? `Regulation/Standard: ${sanitiseInput(regulationCode)}` : `Topic: ${sanitiseInput(topic)}`;
+
+  const prompt = `You are an expert in Australian construction law, building codes, and trade regulations. Provide a detailed explanation of the following.
+
+${query}
+Trade: ${sanitiseInput(trade || "General construction")}
+State: ${sanitiseInput(state)}
+Jurisdiction: ${sanitiseInput(jurisdiction)}
+Plain English required: ${plainEnglish}
+
+Return a JSON object with:
+- "regulationName": full official name
+- "authority": issuing body (e.g., VBA, Safe Work Australia, Standards Australia)
+- "currentVersion": current version/year
+- "summary": ${plainEnglish ? "plain English 2-3 sentence summary" : "technical summary"}
+- "keyRequirements": array of specific requirements
+- "whoMustComply": who this regulation applies to
+- "penalties": penalties for non-compliance if applicable
+- "relatedRegulations": array of related codes/standards
+- "practicalTips": array of practical tips for compliance
+- "commonMistakes": common compliance mistakes to avoid
+- "moreInfoUrl": official source URL if known (do not fabricate)
+- "lastUpdated": last updated date if known
+- "disclaimer": standard disclaimer`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, query: regulationCode || topic, trade, state, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      regulationName: regulationCode || topic,
+      authority: "Refer to relevant authority",
+      currentVersion: "Check official source",
+      summary: "Regulation lookup temporarily unavailable. Please refer to official government sources.",
+      keyRequirements: [],
+      whoMustComply: "Industry professionals in relevant trade",
+      penalties: "Refer to official source",
+      relatedRegulations: [],
+      practicalTips: ["Always verify with the relevant authority"],
+      commonMistakes: [],
+      moreInfoUrl: null,
+      lastUpdated: null,
+      disclaimer: "This is not legal or professional advice. Always consult the official regulation and seek qualified advice.",
+      query: regulationCode || topic, trade, state, generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /ai-plain-english — AI translates complex construction/legal text into plain English
+app.post("/ai-plain-english", apiKeyAuth, async (req, res) => {
+  const {
+    text, context, audience = "tradesperson", outputFormat = "bullet",
+  } = req.body;
+
+  if (!text) return res.status(400).json({ error: "text required." });
+
+  const sanitisedText = sanitiseInput(text.slice(0, 4000));
+  const validAudience = ["tradesperson", "homeowner", "project_manager", "apprentice", "inspector"];
+  const validFormat = ["bullet", "paragraph", "numbered", "qa"];
+  const aud = validAudience.includes(audience) ? audience : "tradesperson";
+  const fmt = validFormat.includes(outputFormat) ? outputFormat : "bullet";
+
+  const prompt = `You are an expert at translating complex construction, legal, and regulatory text into plain English. Your goal is clarity and accuracy — never simplify in a way that changes the meaning.
+
+Target audience: ${aud}
+Output format: ${fmt} (bullet points / paragraph / numbered list / Q&A format)
+Context: ${sanitiseInput(context || "Construction compliance document")}
+
+ORIGINAL TEXT:
+${sanitisedText}
+
+Return a JSON object with:
+- "plainEnglishExplanation": the translated text in the requested format
+- "keyTakeaways": array of 3-5 most important points
+- "whatThisMeans": practical implication for the target audience
+- "whatYouNeedToDo": specific actions the reader should take
+- "wordsExplained": array of { "term": string, "definition": string } for any technical terms used
+- "readingLevel": "BASIC"|"INTERMEDIATE"|"ADVANCED" — estimated complexity of original
+- "disclaimer": reminder that this is a simplified version only`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, audience: aud, outputFormat: fmt, translatedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      plainEnglishExplanation: "Plain English translation temporarily unavailable.",
+      keyTakeaways: ["Review the original document with your supervisor or qualified professional."],
+      whatThisMeans: "Manual interpretation required.",
+      whatYouNeedToDo: "Seek clarification from a qualified professional.",
+      wordsExplained: [],
+      readingLevel: "ADVANCED",
+      disclaimer: "This is a simplified interpretation only. Always refer to the original document.",
+      audience: aud, outputFormat: fmt, translatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /ai-trade-classifier — AI identifies the trade(s) required to complete a described scope of works
+app.post("/ai-trade-classifier", apiKeyAuth, async (req, res) => {
+  const {
+    scopeDescription, projectType, state = "VIC", includeSubtrades = true,
+  } = req.body;
+
+  if (!scopeDescription) return res.status(400).json({ error: "scopeDescription required." });
+
+  const sanitisedScope = sanitiseInput(scopeDescription);
+
+  const prompt = `You are an experienced Australian construction project manager. Identify all trades required to complete the following scope of works.
+
+Scope: ${sanitisedScope}
+Project type: ${sanitiseInput(projectType || "General construction")}
+State: ${sanitiseInput(state)}
+Include subtrades: ${includeSubtrades}
+
+Return a JSON object with:
+- "primaryTrades": array of { "trade": string, "licenceRequired": boolean, "licenceType": string, "estimatedDays": number, "sequenceOrder": number }
+- "subtrades": array of { "trade": string, "parentTrade": string, "licenceRequired": boolean }
+- "tradeCount": total number of trades
+- "licencedTradeCount": number requiring a licence
+- "sequenceSuggestion": array of trade names in recommended sequencing order
+- "coordinationNotes": string describing key trade coordination requirements
+- "regulatoryChecks": array of specific regulatory checks needed for listed trades
+- "estimatedTotalTradeDays": rough total trade days
+- "disclaimer": "Estimates are indicative only"`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, scopeDescription: sanitisedScope, projectType, state, classifiedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      primaryTrades: [],
+      subtrades: [],
+      tradeCount: 0,
+      licencedTradeCount: 0,
+      sequenceSuggestion: [],
+      coordinationNotes: "Trade classification temporarily unavailable. Review scope with project manager.",
+      regulatoryChecks: [],
+      estimatedTotalTradeDays: null,
+      disclaimer: "Estimates are indicative only. Engage a qualified estimator.",
+      scopeDescription: sanitisedScope, projectType, state, classifiedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /ai-hazard-register — AI generates a site-specific hazard register from a project description
+app.post("/ai-hazard-register", apiKeyAuth, async (req, res) => {
+  const {
+    projectType, trades = [], siteDescription, height,
+    hasAsbestos = false, nearTraffic = false, publicAccess = false,
+    state = "VIC",
+  } = req.body;
+
+  if (!projectType) return res.status(400).json({ error: "projectType required." });
+
+  const tradeList = trades.map(t => sanitiseInput(t)).join(", ");
+
+  const prompt = `You are a WHS expert creating a site-specific hazard register for an Australian construction project.
+
+Project type: ${sanitiseInput(projectType)}
+Trades involved: ${tradeList || "General construction"}
+Site description: ${sanitiseInput(siteDescription || "Not provided")}
+Maximum working height: ${height ? `${height}m` : "Unknown"}
+Asbestos present: ${hasAsbestos}
+Near traffic: ${nearTraffic}
+Public access nearby: ${publicAccess}
+State: ${sanitiseInput(state)}
+
+Return a JSON object with:
+- "hazards": array of { "hazardId": string, "category": string, "hazard": string, "risk": string, "likelihood": "RARE"|"UNLIKELY"|"POSSIBLE"|"LIKELY"|"ALMOST_CERTAIN", "consequence": "INSIGNIFICANT"|"MINOR"|"MODERATE"|"MAJOR"|"CATASTROPHIC", "riskRating": "LOW"|"MEDIUM"|"HIGH"|"EXTREME", "controlMeasures": string[], "residualRisk": "LOW"|"MEDIUM"|"HIGH", "responsiblePerson": string, "legislation": string }
+- "totalHazards": number
+- "extremeRiskHazards": array of extreme risk hazard IDs
+- "criticalControlMeasures": array of must-implement controls
+- "reviewFrequency": recommended register review frequency
+- "disclaimer": standard disclaimer`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 2500,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, projectType, trades, state, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      hazards: [
+        { hazardId: "HAZ-001", category: "Working at Height", hazard: "Falls from height", risk: "Serious injury or death", likelihood: "POSSIBLE", consequence: "CATASTROPHIC", riskRating: "EXTREME", controlMeasures: ["Edge protection", "Safety harness", "Exclusion zones"], residualRisk: "MEDIUM", responsiblePerson: "Site Supervisor", legislation: "WHS Regulations — Part 4.4" },
+        { hazardId: "HAZ-002", category: "Manual Handling", hazard: "Musculoskeletal injury from manual handling", risk: "Sprain/strain", likelihood: "LIKELY", consequence: "MODERATE", riskRating: "HIGH", controlMeasures: ["Mechanical aids", "Team lifts", "Training"], residualRisk: "LOW", responsiblePerson: "Crew Leader", legislation: "WHS Regulations — Part 4.2" },
+      ],
+      totalHazards: 2,
+      extremeRiskHazards: ["HAZ-001"],
+      criticalControlMeasures: ["Fall protection for all work at height > 2m"],
+      reviewFrequency: "Monthly or after any incident",
+      disclaimer: "Hazard register is indicative only. Site-specific assessment by qualified WHS professional required.",
+      projectType, trades, state, generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
