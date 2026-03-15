@@ -59939,6 +59939,271 @@ Return a JSON object with:
   }
 });
 
+// POST /ground-anchor-inspection — Record a ground anchor or rock bolt inspection per AS 4678 / AS 4650
+app.post("/ground-anchor-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      inspectionRef,
+      date,
+      inspector,
+      anchorType,
+      anchorRef,
+      location,
+      gridReference,
+      designLoadKn,
+      designAngleDegrees,
+      boreHoleDiameterMm,
+      boreHoleDepthM,
+      fixedLengthM,
+      freeLength,
+      groutType,
+      groutStrengthMpa,
+      groutingCompleted,
+      strandDiameterMm,
+      strandCount,
+      corrosionProtection,
+      trumpetSealOk,
+      headDetailsOk,
+      stressedToDesignLoad,
+      lockOffLoadKn,
+      liftOffTestLoadKn,
+      liftOffTestPassed,
+      proofTestConducted,
+      proofTestResult,
+      worksafeAcceptanceRequired,
+      overallResult,
+      defects,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !inspector || !anchorType || !anchorRef || !overallResult) {
+      return res.status(400).json({ error: "projectId, date, inspector, anchorType, anchorRef, and overallResult are required" });
+    }
+
+    const failures = [];
+    if (!groutingCompleted) failures.push("Grouting not complete — anchor must be fully grouted before stressing");
+    if (!trumpetSealOk) failures.push("Trumpet/grout cap seal defective — corrosion protection compromised");
+    if (!headDetailsOk) failures.push("Anchor head details non-compliant — check against structural drawing");
+    if (liftOffTestPassed === false) failures.push("Lift-off test failed — anchor may have lost prestress. Structural engineer review required.");
+    if (proofTestConducted && proofTestResult && proofTestResult.toUpperCase() === "FAIL") failures.push(`Proof test failed — anchor ${anchorRef} does not meet design load requirements`);
+    if (lockOffLoadKn && designLoadKn && Number(lockOffLoadKn) < Number(designLoadKn) * 0.9) {
+      failures.push(`Lock-off load ${lockOffLoadKn} kN is more than 10% below design load ${designLoadKn} kN — re-stress required`);
+    }
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      inspection_ref: sanitiseInput(inspectionRef || `GA-${Date.now()}`),
+      date,
+      inspector: sanitiseInput(inspector),
+      anchor_type: sanitiseInput(anchorType),
+      anchor_ref: sanitiseInput(anchorRef),
+      location: sanitiseInput(location || ""),
+      grid_reference: sanitiseInput(gridReference || ""),
+      design_load_kn: designLoadKn || null,
+      design_angle_degrees: designAngleDegrees || null,
+      bore_hole_diameter_mm: boreHoleDiameterMm || null,
+      bore_hole_depth_m: boreHoleDepthM || null,
+      fixed_length_m: fixedLengthM || null,
+      free_length: freeLength || null,
+      grout_type: sanitiseInput(groutType || ""),
+      grout_strength_mpa: groutStrengthMpa || null,
+      grouting_completed: !!groutingCompleted,
+      strand_diameter_mm: strandDiameterMm || null,
+      strand_count: strandCount || null,
+      corrosion_protection: sanitiseInput(corrosionProtection || ""),
+      trumpet_seal_ok: !!trumpetSealOk,
+      head_details_ok: !!headDetailsOk,
+      stressed_to_design_load: !!stressedToDesignLoad,
+      lock_off_load_kn: lockOffLoadKn || null,
+      lift_off_test_load_kn: liftOffTestLoadKn || null,
+      lift_off_test_passed: liftOffTestPassed !== undefined ? !!liftOffTestPassed : null,
+      proof_test_conducted: !!proofTestConducted,
+      proof_test_result: sanitiseInput(proofTestResult || ""),
+      worksafe_acceptance_required: !!worksafeAcceptanceRequired,
+      overall_result: sanitiseInput(overallResult),
+      defects: Array.isArray(defects) ? defects.map(d => sanitiseInput(d)) : [],
+      failures,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("ground_anchor_inspections").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (failures.length > 0) {
+      return res.status(422).json({ passed: false, failures, message: "Ground anchor inspection failed. Notify structural engineer and do not load structure until rectified.", record, saved });
+    }
+
+    res.json({
+      passed: true,
+      inspectionRef: record.inspection_ref,
+      failures: [],
+      applicableStandards: ["AS 4678 Earth-retaining structures", "AS 4650 Unbonded mono-strand tendons", "AS/NZS 3600 Concrete structures — post-tensioning"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/ground-anchor-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record ground anchor inspection" });
+  }
+});
+
+// POST /ppe-register — Record PPE issue and condition inspection
+app.post("/ppe-register", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      transactionRef,
+      transactionDate,
+      transactionType,
+      workerName,
+      workerCompany,
+      workerRole,
+      ppeItems,
+      issuedBy,
+      receivedByWorker,
+      inspectionDate,
+      inspectedBy,
+      conditionNotes,
+      defectiveItems,
+      replacementRequired,
+      replacementReason,
+      disposalMethod,
+      notes,
+    } = req.body;
+
+    if (!projectId || !transactionDate || !transactionType || !workerName || !ppeItems) {
+      return res.status(400).json({ error: "projectId, transactionDate, transactionType, workerName, and ppeItems are required" });
+    }
+
+    const flags = [];
+    if (Array.isArray(defectiveItems) && defectiveItems.length > 0) {
+      flags.push(`Defective PPE items: ${defectiveItems.map(i => sanitiseInput(i)).join(", ")} — must be replaced immediately and removed from service`);
+    }
+    if (!receivedByWorker && transactionType === "ISSUE") flags.push("Worker acknowledgment of PPE receipt not recorded — signature required for OHS compliance");
+    if (replacementRequired) flags.push(`PPE replacement required: ${sanitiseInput(replacementReason || "reason not specified")}`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      transaction_ref: sanitiseInput(transactionRef || `PPE-${Date.now()}`),
+      transaction_date: transactionDate,
+      transaction_type: sanitiseInput(transactionType),
+      worker_name: sanitiseInput(workerName),
+      worker_company: sanitiseInput(workerCompany || ""),
+      worker_role: sanitiseInput(workerRole || ""),
+      ppe_items: Array.isArray(ppeItems) ? ppeItems.map(p => (typeof p === "string" ? sanitiseInput(p) : p)) : [sanitiseInput(String(ppeItems))],
+      issued_by: sanitiseInput(issuedBy || ""),
+      received_by_worker: !!receivedByWorker,
+      inspection_date: inspectionDate || null,
+      inspected_by: sanitiseInput(inspectedBy || ""),
+      condition_notes: sanitiseInput(conditionNotes || ""),
+      defective_items: Array.isArray(defectiveItems) ? defectiveItems.map(i => sanitiseInput(i)) : [],
+      replacement_required: !!replacementRequired,
+      replacement_reason: sanitiseInput(replacementReason || ""),
+      disposal_method: sanitiseInput(disposalMethod || ""),
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("ppe_register").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({ transactionRef: record.transaction_ref, transactionType, flags, record, saved });
+  } catch (err) {
+    console.error("/ppe-register error:", err.message);
+    res.status(500).json({ error: "Failed to record PPE transaction" });
+  }
+});
+
+// POST /ai-ground-anchor-risk — AI assesses ground anchor compliance and risk
+app.post("/ai-ground-anchor-risk", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      anchorType,
+      applicationDescription,
+      designLoad,
+      soilRockType,
+      groundwaterPresent,
+      corrosivityClass,
+      serviceLife,
+      existingInspectionFrequency,
+      knownIssues,
+    } = req.body;
+
+    if (!anchorType || !applicationDescription) {
+      return res.status(400).json({ error: "anchorType and applicationDescription are required" });
+    }
+
+    const prompt = `You are a geotechnical engineer with expertise in ground anchor design, AS 4678, AS 4650, and Victorian construction regulations.
+
+Assess compliance risk for ground anchors / rock bolts:
+- Anchor type: ${sanitiseInput(anchorType)}
+- Application: ${sanitiseInput(applicationDescription)}
+- Design load: ${sanitiseInput(String(designLoad || "not specified"))} kN
+- Soil/rock type: ${sanitiseInput(soilRockType || "not specified")}
+- Groundwater present: ${sanitiseInput(String(groundwaterPresent || false))}
+- Corrosivity class: ${sanitiseInput(corrosivityClass || "not specified")}
+- Service life: ${sanitiseInput(serviceLife || "permanent")}
+- Inspection frequency: ${sanitiseInput(existingInspectionFrequency || "not specified")}
+- Known issues: ${sanitiseInput(knownIssues || "none")}
+
+Return a JSON object with:
+{
+  "riskLevel": "LOW|MEDIUM|HIGH|CRITICAL",
+  "corrosionRisk": string,
+  "designConsiderations": [string],
+  "proofTestingRequirements": string,
+  "monitoringRequirements": string,
+  "inspectionFrequency": string,
+  "failureModes": [string],
+  "groundwaterConsiderations": string,
+  "worksafeNotificationThreshold": string,
+  "applicableStandards": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ anchorType, applicationDescription, assessment });
+  } catch (err) {
+    console.error("/ai-ground-anchor-risk error:", err.message);
+    res.json({
+      anchorType: req.body.anchorType || "",
+      applicationDescription: req.body.applicationDescription || "",
+      assessment: {
+        riskLevel: "HIGH",
+        corrosionRisk: "Ground anchors in corrosive soils or with groundwater require Class 2 double corrosion protection per AS 4678. Rock bolts in exposed conditions require hot-dip galvanising or epoxy-coated options.",
+        designConsiderations: ["Fixed length must develop full bond in competent material", "Free length must be outside potential failure zone", "Stressing and lock-off documentation required for all prestressed anchors", "Engineer must certify anchor design before installation"],
+        proofTestingRequirements: "Minimum 2% or 3 anchors (whichever is greater) must be proof tested to 133% of design load. All temporary anchors should be acceptance tested per AS 4678.",
+        monitoringRequirements: "Permanent anchors require load monitoring cells on minimum 10% of anchors. Review load at 6 months, 1 year, then annually for service life.",
+        inspectionFrequency: "Annual visual inspection of anchor heads and corrosion protection. Load monitoring review annually. Engineer inspection after significant rainfall, seismic events, or evidence of movement.",
+        failureModes: ["Loss of prestress due to creep or relaxation", "Corrosion of strand/bar in fixed length", "Bond failure at grout-tendon or grout-ground interface", "Head/trumpet seal failure allowing water ingress"],
+        groundwaterConsiderations: "Groundwater increases corrosion risk and reduces effective bond strength. Consider sacrificial corrosion allowance or enhanced protection. Monitor piezometric levels near anchor field.",
+        worksafeNotificationThreshold: "Anchor failure causing ground movement or structural distress is notifiable. Install trigger/alarm monitoring levels and alert structural engineer at alarm level. Suspend works at action level.",
+        applicableStandards: ["AS 4678 Earth-retaining structures", "AS 4650 Unbonded mono-strand tendons", "AS/NZS 3600 Concrete structures", "Worksafe Victoria — registered plant (if applicable)"],
+        recommendation: "Engage a geotechnical engineer to design anchor system and specify proof testing programme. Install load cells on critical anchors. Establish monitoring plan with trigger, alarm, and action levels.",
+        summary: "Ground anchors in permanent retaining structures are high-risk elements requiring engineered design, proof testing, corrosion protection, and long-term monitoring. Engage a specialist geotechnical engineer for all permanent anchor works.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
