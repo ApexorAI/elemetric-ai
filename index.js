@@ -29037,6 +29037,201 @@ app.post("/transmittal", apiKeyAuth, async (req, res) => {
   res.json({ success: true, transmittalId: null, ...record, saved: false });
 });
 
+// ── Round 101: Variation management, EOT claims, AI scope gap analysis ────────
+
+// POST /variation — Submit a contract variation claim
+app.post("/variation", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, variationNumber, submittedBy, description,
+    reason, trade, labourCost = 0, materialsCost = 0,
+    plantCost = 0, subcontractorCost = 0, overheadPercent = 15,
+    marginPercent = 10, dayImpact = 0, attachmentUrl,
+  } = req.body;
+
+  if (!projectId || !variationNumber || !description)
+    return res.status(400).json({ error: "projectId, variationNumber, description required." });
+
+  const validReasons = ["OWNER_DIRECTED", "DESIGN_CHANGE", "LATENT_CONDITIONS", "SCOPE_OMISSION", "REGULATORY", "WEATHER", "OTHER"];
+
+  const directCost = Number(labourCost) + Number(materialsCost) + Number(plantCost) + Number(subcontractorCost);
+  const overhead = directCost * (Number(overheadPercent) / 100);
+  const subtotal = directCost + overhead;
+  const margin = subtotal * (Number(marginPercent) / 100);
+  const netClaim = subtotal + margin;
+  const gst = netClaim * 0.1;
+  const totalClaim = netClaim + gst;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    variation_number: sanitiseInput(String(variationNumber)),
+    submitted_by: sanitiseInput(submittedBy || ""),
+    description: sanitiseInput(description),
+    reason: validReasons.includes((reason || "").toUpperCase()) ? reason.toUpperCase() : "OTHER",
+    trade: sanitiseInput(trade || ""),
+    labour_cost: Number(labourCost), materials_cost: Number(materialsCost),
+    plant_cost: Number(plantCost), subcontractor_cost: Number(subcontractorCost),
+    overhead_percent: Number(overheadPercent), overhead,
+    margin_percent: Number(marginPercent), margin,
+    net_claim: netClaim, gst, total_claim: totalClaim,
+    day_impact: Number(dayImpact),
+    attachment_url: attachmentUrl && isSafeUrl(attachmentUrl) ? attachmentUrl : null,
+    status: "SUBMITTED",
+    submitted_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("variations")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, variationId: data.id, ...record });
+  }
+
+  res.json({ success: true, variationId: null, ...record, saved: false });
+});
+
+// PATCH /variation/:variationId — Approve, reject, or partially approve a variation
+app.patch("/variation/:variationId", apiKeyAuth, async (req, res) => {
+  const { variationId } = req.params;
+  const { status, approvedBy, approvedAmount, rejectionReason, comments } = req.body;
+
+  const validStatuses = ["APPROVED", "REJECTED", "PARTIALLY_APPROVED", "UNDER_REVIEW"];
+  const st = (status || "").toUpperCase();
+  if (!validStatuses.includes(st)) return res.status(400).json({ error: `status must be one of: ${validStatuses.join(", ")}` });
+
+  const update = {
+    status: st,
+    approved_by: sanitiseInput(approvedBy || ""),
+    approved_amount: approvedAmount !== undefined ? Number(approvedAmount) : null,
+    rejection_reason: sanitiseInput(rejectionReason || ""),
+    comments: sanitiseInput(comments || ""),
+    reviewed_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("variations")
+      .update(update)
+      .eq("id", variationId)
+      .select()
+      .single();
+    if (error) return res.status(404).json({ error: "Variation not found." });
+    return res.json({ success: true, variationId, ...update });
+  }
+
+  res.json({ success: true, variationId, ...update, saved: false });
+});
+
+// POST /eot-claim — Submit an Extension of Time (EOT) claim
+app.post("/eot-claim", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, eotNumber, submittedBy, causeDescription,
+    causeCategory, delayStartDate, delayEndDate,
+    daysClaimedFloat = 0, daysClaimedExtension,
+    isExcusable = false, isCompensable = false,
+    evidence = [], concurrentDelay = false,
+  } = req.body;
+
+  if (!projectId || !eotNumber || !causeDescription)
+    return res.status(400).json({ error: "projectId, eotNumber, causeDescription required." });
+
+  const validCategories = ["OWNER_CAUSED", "FORCE_MAJEURE", "WEATHER", "REGULATORY", "LATENT_CONDITIONS", "DESIGN_CHANGE", "STRIKES", "OTHER"];
+  const cat = (causeCategory || "OTHER").toUpperCase();
+
+  let calendarDays = 0;
+  if (delayStartDate && delayEndDate) {
+    const s = new Date(delayStartDate), e = new Date(delayEndDate);
+    if (!isNaN(s) && !isNaN(e) && e >= s) calendarDays = Math.ceil((e - s) / (1000 * 60 * 60 * 24)) + 1;
+  }
+
+  const netExtension = Math.max(0, calendarDays - Number(daysClaimedFloat));
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    eot_number: sanitiseInput(String(eotNumber)),
+    submitted_by: sanitiseInput(submittedBy || ""),
+    cause_description: sanitiseInput(causeDescription),
+    cause_category: validCategories.includes(cat) ? cat : "OTHER",
+    delay_start_date: delayStartDate || null,
+    delay_end_date: delayEndDate || null,
+    calendar_days: calendarDays,
+    days_claimed_float: Number(daysClaimedFloat),
+    days_claimed_extension: daysClaimedExtension !== undefined ? Number(daysClaimedExtension) : netExtension,
+    is_excusable: Boolean(isExcusable),
+    is_compensable: Boolean(isCompensable),
+    evidence: Array.isArray(evidence) ? evidence.map(e => sanitiseInput(e)) : [],
+    concurrent_delay: Boolean(concurrentDelay),
+    status: "SUBMITTED",
+    submitted_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("eot_claims")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, eotId: data.id, ...record });
+  }
+
+  res.json({ success: true, eotId: null, ...record, saved: false });
+});
+
+// POST /ai-scope-gap-analysis — AI identifies gaps between the contract scope and what has been quoted
+app.post("/ai-scope-gap-analysis", apiKeyAuth, async (req, res) => {
+  const {
+    contractScope, quotedScope, trade, projectType, contractValue,
+  } = req.body;
+
+  if (!contractScope || !quotedScope) return res.status(400).json({ error: "contractScope and quotedScope required." });
+
+  const prompt = `You are a senior Australian construction contracts manager. Perform a scope gap analysis comparing the contract scope of works against what has been priced/quoted.
+
+Trade: ${sanitiseInput(trade || "General")}
+Project type: ${sanitiseInput(projectType || "Not specified")}
+Contract value: ${contractValue ? `AUD $${contractValue}` : "Not specified"}
+
+CONTRACT SCOPE:
+${sanitiseInput(contractScope)}
+
+QUOTED/PRICED SCOPE:
+${sanitiseInput(quotedScope)}
+
+Identify gaps, overlaps, and ambiguities. Return a JSON object with:
+- "gapSummary": brief overall summary
+- "gaps": array of { "item": string, "inContract": boolean, "inQuote": boolean, "type": "MISSING_FROM_QUOTE"|"MISSING_FROM_CONTRACT"|"AMBIGUOUS"|"OVERLAP", "riskLevel": "LOW"|"MEDIUM"|"HIGH", "estimatedImpact": string }
+- "missingFromQuote": number of items not priced
+- "ambiguousItems": number of unclear items
+- "variationRisk": "LOW"|"MEDIUM"|"HIGH"|"VERY_HIGH"
+- "estimatedVariationExposure": rough dollar range string
+- "recommendations": array of action items
+- "contractAmendments": array of suggested contract clarifications`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, trade, projectType, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      gapSummary: "Automated scope gap analysis temporarily unavailable.",
+      gaps: [], missingFromQuote: 0, ambiguousItems: 0,
+      variationRisk: "MEDIUM", estimatedVariationExposure: "Unable to calculate",
+      recommendations: ["Perform manual scope review with contracts manager"],
+      contractAmendments: [],
+      trade, projectType, generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
