@@ -42362,6 +42362,204 @@ app.post("/planning-permit-checklist", apiKeyAuth, async (req, res) => {
   });
 });
 
+// POST /concrete-pour-record — Record a concrete pour event
+app.post("/concrete-pour-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, pourDate, element, concreteGrade,
+    supplier, batchNumbers = [], quantityM3,
+    slumpTestMm, slumpTestResult, cylindersSampled = 0,
+    cylinderRefs = [], waterCementRatio, admixtures = [],
+    pourTemperatureC, ambientTempC, pourMethod,
+    curingMethod, inspectorName, holdPointReleased = false,
+    specimenBreakSchedule = "7_28_DAY", status = "PLACED", notes,
+  } = req.body;
+  if (!projectId || !pourDate || !element || !concreteGrade) {
+    return res.status(400).json({ error: "projectId, pourDate, element, and concreteGrade are required." });
+  }
+  const validStatuses = ["PLACED", "CURING", "RELEASED", "FAILED", "REMEDIATED"];
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${validStatuses.join(", ")}` });
+  }
+  const pourRef = `CPR-${Date.now().toString(36).toUpperCase()}`;
+  const slumpPass = slumpTestMm !== undefined ? (Number(slumpTestMm) <= 150 && Number(slumpTestMm) >= 50) : null;
+  // Schedule break test dates
+  const pourDateObj = new Date(pourDate);
+  const breakSchedule = {
+    "7_DAY": new Date(pourDateObj.getTime() + 7 * 86400000).toISOString().split("T")[0],
+    "28_DAY": new Date(pourDateObj.getTime() + 28 * 86400000).toISOString().split("T")[0],
+    "56_DAY": new Date(pourDateObj.getTime() + 56 * 86400000).toISOString().split("T")[0],
+  };
+  const record = {
+    pour_ref: pourRef,
+    project_id: projectId,
+    pour_date: pourDate,
+    element: sanitiseInput(element),
+    concrete_grade: sanitiseInput(concreteGrade),
+    supplier: sanitiseInput(supplier || ""),
+    batch_numbers: Array.isArray(batchNumbers) ? batchNumbers.map(b => sanitiseInput(b)) : [],
+    quantity_m3: Number(quantityM3) || null,
+    slump_test_mm: Number(slumpTestMm) || null,
+    slump_test_result: slumpTestResult || (slumpPass === null ? null : slumpPass ? "PASS" : "FAIL"),
+    cylinders_sampled: Number(cylindersSampled),
+    cylinder_refs: Array.isArray(cylinderRefs) ? cylinderRefs.map(r => sanitiseInput(r)) : [],
+    water_cement_ratio: Number(waterCementRatio) || null,
+    admixtures: Array.isArray(admixtures) ? admixtures.map(a => sanitiseInput(a)) : [],
+    pour_temperature_c: Number(pourTemperatureC) || null,
+    ambient_temp_c: Number(ambientTempC) || null,
+    pour_method: sanitiseInput(pourMethod || ""),
+    curing_method: sanitiseInput(curingMethod || ""),
+    inspector_name: sanitiseInput(inspectorName || ""),
+    hold_point_released: Boolean(holdPointReleased),
+    specimen_break_schedule: specimenBreakSchedule,
+    break_test_dates: breakSchedule,
+    status,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("concrete_pour_records").insert(record);
+    if (error) console.error("concrete-pour-record DB error:", error.message);
+  }
+  res.json({
+    pourRef, element, concreteGrade, quantityM3: Number(quantityM3) || null,
+    slumpTestMm: Number(slumpTestMm) || null, slumpPass,
+    cylindersSampled: Number(cylindersSampled), breakTestDates: breakSchedule,
+    status, saved: !!supabaseAdmin,
+  });
+});
+
+// POST /concrete-test-result — Record concrete cylinder break test results
+app.post("/concrete-test-result", apiKeyAuth, async (req, res) => {
+  const {
+    pourRef, cylinderRef, testDate, testAge_days,
+    compressiveStrength_mpa, specifiedStrength_mpa,
+    cylinderDiameterMm = 100, testLab, labReportNumber, notes,
+  } = req.body;
+  if (!pourRef || !compressiveStrength_mpa || !testDate) {
+    return res.status(400).json({ error: "pourRef, compressiveStrength_mpa, and testDate are required." });
+  }
+  const cs = Number(compressiveStrength_mpa);
+  const specified = Number(specifiedStrength_mpa) || 0;
+  // At 28 days, strength must be ≥ specified characteristic strength
+  const passes28day = testAge_days === 28 ? cs >= specified : null;
+  // At 7 days, typically 60-70% of 28-day strength
+  const passes7day = testAge_days === 7 ? cs >= specified * 0.6 : null;
+  const passes = passes28day !== null ? passes28day : passes7day !== null ? passes7day : cs >= specified;
+  const result = passes ? "PASS" : "FAIL";
+  const resultRef = `CTR-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    result_ref: resultRef,
+    pour_ref: sanitiseInput(pourRef),
+    cylinder_ref: sanitiseInput(cylinderRef || ""),
+    test_date: testDate,
+    test_age_days: Number(testAge_days) || 28,
+    compressive_strength_mpa: cs,
+    specified_strength_mpa: specified || null,
+    strength_ratio: specified > 0 ? +(cs / specified).toFixed(3) : null,
+    result,
+    cylinder_diameter_mm: Number(cylinderDiameterMm),
+    test_lab: sanitiseInput(testLab || ""),
+    lab_report_number: sanitiseInput(labReportNumber || ""),
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("concrete_test_results").insert(record);
+    if (error) console.error("concrete-test-result DB error:", error.message);
+    // Update pour status if 28-day test fails
+    if (result === "FAIL" && Number(testAge_days) === 28) {
+      await supabaseAdmin.from("concrete_pour_records").update({ status: "FAILED" }).eq("pour_ref", pourRef);
+    }
+  }
+  res.json({
+    resultRef, pourRef, testAge_days: Number(testAge_days) || 28,
+    compressiveStrength_mpa: cs, specifiedStrength_mpa: specified || null,
+    result, saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-concrete-quality-check — AI assesses concrete quality from test data
+app.post("/ai-concrete-quality-check", apiKeyAuth, async (req, res) => {
+  const {
+    concreteGrade, pourElement, slumpTestMm, specifiedSlump,
+    cylinder7day_mpa, cylinder28day_mpa, specifiedStrength_mpa,
+    waterCementRatio, maxWaterCementRatio, airContentPercent,
+    chlorideContent, carbonationDepthMm, coreStrength_mpa,
+    visualObservations = [], honeycombing = false, cracking = false,
+  } = req.body;
+  if (!concreteGrade) {
+    return res.status(400).json({ error: "concreteGrade is required." });
+  }
+  const sanitisedGrade = sanitiseInput(concreteGrade);
+  const sanitisedElement = sanitiseInput(pourElement || "");
+  // Quick parametric checks
+  const slumpOk = slumpTestMm !== undefined ? (Number(slumpTestMm) >= 50 && Number(slumpTestMm) <= 150) : null;
+  const strength28Ok = cylinder28day_mpa && specifiedStrength_mpa ? Number(cylinder28day_mpa) >= Number(specifiedStrength_mpa) : null;
+  const wcRatioOk = waterCementRatio && maxWaterCementRatio ? Number(waterCementRatio) <= Number(maxWaterCementRatio) : null;
+  const systemPrompt = `You are an Australian concrete quality engineer. Assess concrete quality from test data and visual observations.`;
+  const userPrompt = `Assess concrete quality:
+Grade: ${sanitisedGrade}
+Element: ${sanitisedElement || "Not specified"}
+Slump: ${slumpTestMm || "Not tested"} mm (specified: ${specifiedSlump || "N/A"} mm) — ${slumpOk === true ? "PASS" : slumpOk === false ? "FAIL" : "UNTESTED"}
+7-day strength: ${cylinder7day_mpa || "N/A"} MPa
+28-day strength: ${cylinder28day_mpa || "N/A"} MPa (specified: ${specifiedStrength_mpa || "N/A"} MPa) — ${strength28Ok === true ? "PASS" : strength28Ok === false ? "FAIL" : "UNTESTED"}
+W/C ratio: ${waterCementRatio || "N/A"} (max: ${maxWaterCementRatio || "N/A"}) — ${wcRatioOk === true ? "PASS" : wcRatioOk === false ? "FAIL" : "UNTESTED"}
+Air content: ${airContentPercent || "N/A"}%
+Chloride content: ${chlorideContent || "N/A"}
+Carbonation depth: ${carbonationDepthMm || "N/A"} mm
+Core strength: ${coreStrength_mpa || "N/A"} MPa
+Visual observations: ${visualObservations.map(o => sanitiseInput(o)).join("; ")}
+Honeycombing: ${honeycombing} | Cracking: ${cracking}
+
+Return JSON with:
+{
+  "overallResult": "ACCEPTABLE|MARGINAL|UNACCEPTABLE",
+  "strengthAssessment": "...",
+  "durabilityAssessment": "...",
+  "defectsAssessment": "...",
+  "remediationRequired": false,
+  "remediationOptions": ["...", "..."],
+  "testingGaps": ["...", "..."],
+  "applicableStandards": ["AS 1012", "AS 3600", "..."],
+  "recommendation": "...",
+  "engineerReferralRequired": false,
+  "notes": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ concreteGrade: sanitisedGrade, pourElement: sanitisedElement, slumpOk, strength28Ok, wcRatioOk, assessment });
+  } catch (err) {
+    console.error("ai-concrete-quality-check error:", err.message);
+    const hasFailures = slumpOk === false || strength28Ok === false || wcRatioOk === false || honeycombing || cracking;
+    res.json({
+      concreteGrade: sanitisedGrade, pourElement: sanitisedElement, slumpOk, strength28Ok, wcRatioOk,
+      assessment: {
+        overallResult: hasFailures ? "MARGINAL" : "ACCEPTABLE",
+        strengthAssessment: strength28Ok === false ? "28-day strength below specified — requires engineer review" : "Strength data acceptable or not tested",
+        durabilityAssessment: "Durability assessment requires full test suite",
+        defectsAssessment: honeycombing ? "Honeycombing present — assess extent and remediation options" : cracking ? "Cracking present — classify crack width and cause" : "No visible defects reported",
+        remediationRequired: hasFailures,
+        remediationOptions: hasFailures ? ["Core testing to confirm in-situ strength", "Engineer assessment of structural adequacy", "Epoxy injection or surface treatment for defects"] : [],
+        testingGaps: ["Confirm all required test cylinders broken at 28 days", "Review chloride and cover depth for durability"],
+        applicableStandards: ["AS 1012 (Testing concrete)", "AS 3600 (Concrete structures)", "NCC 2022"],
+        recommendation: hasFailures ? "Engage structural engineer for assessment before releasing hold point." : "Concrete quality appears acceptable based on available data.",
+        engineerReferralRequired: strength28Ok === false || honeycombing,
+        notes: "AI assessment is indicative only. Engage a concrete technologist for formal assessment.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
