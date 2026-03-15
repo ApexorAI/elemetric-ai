@@ -68972,6 +68972,391 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /rigging-inspection — Rigging equipment inspection per AS 3569 / AS 1353 / AS 2227 / AS 2626
+app.post("/rigging-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    inspectionDate,
+    inspector,
+    riggerLicence,
+    liftId,
+    rigItems,             // array of { type, id, wll_t, condition, annualTestDate, testTag }
+    loadWeight_t,
+    liftingMethod,        // single-leg | two-leg | four-leg | bridle | choker | basket | spreader-bar
+    liftingAngle_deg,     // angle between legs — affects load in each leg
+    swl_at_angle_t,       // reduced SWL at hook angle
+    wirerope_items,       // array inspected
+    chain_items,
+    sling_items,
+    shackles,
+    swivel_hooks,
+    spreaderBar,
+    masterLink,
+    workingLoadLimit_t,   // total WLL of rigging assembly
+    // Condition checks
+    wirerope_broken_wires,     // per lay — AS 3569: 6 or more in 1 lay = replace
+    wirerope_kinks,
+    wirerope_core_protrusion,
+    chain_deformed,
+    chain_link_wear_pct,       // >10% wear = replace
+    sling_cuts,
+    sling_heat_damage,
+    sling_chemical_damage,
+    hook_deformation,
+    hook_latch_working,
+    shackle_pin_secured,
+    criticalDefects,
+    overallResult,        // FIT-FOR-LIFT | TAKE-OUT-OF-SERVICE
+    photos,
+    notes,
+  } = req.body;
+
+  const failures = [];
+
+  // Wire rope broken wires
+  if (parseInt(wirerope_broken_wires, 10) >= 6) {
+    failures.push(`${wirerope_broken_wires} broken wires in one lay — replace wire rope immediately per AS 3569`);
+  }
+  if (wirerope_kinks) failures.push("Wire rope kinking identified — replace immediately (kink causes permanent damage)");
+  if (wirerope_core_protrusion) failures.push("Wire rope core protrusion — replace immediately");
+
+  // Chain wear
+  const chainWear = parseFloat(chain_link_wear_pct) || 0;
+  if (chainWear > 10) failures.push(`Chain link wear ${chainWear}% exceeds 10% replacement threshold per AS 2227`);
+  if (chain_deformed) failures.push("Chain deformation detected — replace immediately");
+
+  // Sling damage
+  if (sling_cuts) failures.push("Sling cuts detected — do not use until inspected and replaced if required");
+  if (sling_heat_damage) failures.push("Sling heat/UV damage detected — replace");
+  if (sling_chemical_damage) failures.push("Sling chemical damage detected — replace");
+
+  // Hook
+  if (hook_deformation) failures.push("Hook deformed — replace immediately");
+  if (!hook_latch_working) failures.push("Hook safety latch not working — replace or repair before use");
+
+  // Shackle pin
+  if (!shackle_pin_secured) failures.push("Shackle pin not secured with mousing wire — pin can unscrew under vibration");
+
+  // Load vs WLL check
+  const load = parseFloat(loadWeight_t) || 0;
+  const wll = parseFloat(workingLoadLimit_t) || 0;
+  if (wll > 0 && load > wll) {
+    failures.push(`Load ${load} t exceeds rigging assembly WLL ${wll} t — do not proceed`);
+  }
+
+  // Custom critical defects
+  if (Array.isArray(criticalDefects)) criticalDefects.forEach((d) => failures.push(d));
+
+  const result = failures.length > 0 ? "TAKE-OUT-OF-SERVICE" : (overallResult || "FIT-FOR-LIFT");
+
+  if (result === "TAKE-OUT-OF-SERVICE") {
+    return res.status(422).json({
+      error: "Rigging inspection — defective equipment found — do not proceed with lift",
+      failures,
+      immediateActions: [
+        "Tag and remove defective rigging from service immediately",
+        "Do not attempt lift until compliant rigging is sourced",
+        "Notify rigging supervisor and principal contractor",
+      ],
+      applicableStandards: [
+        "AS 3569",
+        "AS 2227",
+        "AS 1353.2",
+        "AS 2626",
+        "OHS Regulations 2017 (Vic) Part 3.2",
+      ],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    rigger_licence: sanitiseInput(riggerLicence),
+    lift_id: sanitiseInput(liftId),
+    rig_items: rigItems || [],
+    load_weight_t: loadWeight_t,
+    lifting_method: sanitiseInput(liftingMethod),
+    lifting_angle_deg: liftingAngle_deg,
+    swl_at_angle_t,
+    working_load_limit_t: workingLoadLimit_t,
+    wirerope_broken_wires,
+    wirerope_kinks,
+    chain_deformed,
+    chain_link_wear_pct,
+    sling_cuts,
+    sling_heat_damage,
+    hook_deformation,
+    hook_latch_working,
+    shackle_pin_secured,
+    overall_result: result,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("rigging_inspections")
+      .insert(record);
+    if (dbErr) console.error("DB error /rigging-inspection:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Rigging inspection completed — fit for lift",
+    liftId: sanitiseInput(liftId),
+    overallResult: result,
+    loadVsWLL: wll > 0 ? `${Math.round((load / wll) * 100)}%` : "N/A",
+    applicableStandards: ["AS 3569", "AS 2227", "AS 1353.2", "AS 2626"],
+    saved,
+  });
+});
+
+// POST /emergency-lighting-test — Emergency lighting test record per AS 2293 / Essential Safety Measures (VIC)
+app.post("/emergency-lighting-test", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    buildingName,
+    buildingAddress,
+    testDate,
+    tester,
+    testType,             // monthly-function | six-monthly-duration | annual | commissioning
+    totalLuminaires,
+    luminairesTested,
+    luminairesPassed,
+    luminairesFailed,     // array of { id, location, failureMode }
+    batteryCapacityTestMinutes, // 90-min test per AS 2293.2
+    requiredCapacityMinutes,    // 90 minutes per AS 2293.2
+    exitSignsInspected,
+    exitSignsFailed,      // array of { id, location, issue }
+    emergencyPathwayIlluminance_lux, // min 10 lux measured at 0% charge
+    requiredIlluminance_lux,         // AS 2293.1 minimum 10 lux on escape route
+    testInstrumentCalDate,
+    faultSignalAudible,
+    monitoringSystemWorking,
+    overallResult,        // PASS | FAIL
+    defects,              // array
+    photos,
+    notes,
+  } = req.body;
+
+  const failures = [];
+
+  // Failed luminaires
+  const failedCount = Array.isArray(luminairesFailed) ? luminairesFailed.length : (parseInt(luminairesFailed, 10) || 0);
+  if (failedCount > 0) {
+    failures.push(`${failedCount} luminaire(s) failed testing`);
+  }
+
+  // Battery capacity
+  const batteryMins = parseFloat(batteryCapacityTestMinutes) || 0;
+  const requiredMins = parseFloat(requiredCapacityMinutes) || 90;
+  if (batteryMins > 0 && batteryMins < requiredMins) {
+    failures.push(`Battery capacity ${batteryMins} minutes is below required ${requiredMins} minutes per AS 2293.2`);
+  }
+
+  // Illuminance check
+  const measuredLux = parseFloat(emergencyPathwayIlluminance_lux) || 0;
+  const requiredLux = parseFloat(requiredIlluminance_lux) || 10;
+  if (measuredLux > 0 && measuredLux < requiredLux) {
+    failures.push(`Emergency pathway illuminance ${measuredLux} lux is below minimum ${requiredLux} lux per AS 2293.1`);
+  }
+
+  // Exit signs
+  const exitFailed = Array.isArray(exitSignsFailed) ? exitSignsFailed.length : 0;
+  if (exitFailed > 0) {
+    failures.push(`${exitFailed} exit sign(s) failed inspection`);
+  }
+
+  const result = failures.length === 0 ? "PASS" : "FAIL";
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    building_name: sanitiseInput(buildingName),
+    building_address: sanitiseInput(buildingAddress),
+    test_date: testDate,
+    tester: sanitiseInput(tester),
+    test_type: sanitiseInput(testType),
+    total_luminaires: totalLuminaires,
+    luminaires_tested: luminairesTested,
+    luminaires_passed: luminairesPassed,
+    failed_luminaires: Array.isArray(luminairesFailed) ? luminairesFailed : [],
+    battery_capacity_test_minutes: batteryCapacityTestMinutes,
+    required_capacity_minutes: requiredCapacityMinutes || 90,
+    exit_signs_inspected: exitSignsInspected,
+    exit_signs_failed: Array.isArray(exitSignsFailed) ? exitSignsFailed : [],
+    emergency_pathway_illuminance_lux: emergencyPathwayIlluminance_lux,
+    required_illuminance_lux: requiredIlluminance_lux || 10,
+    fault_signal_audible: faultSignalAudible,
+    monitoring_system_working: monitoringSystemWorking,
+    failures,
+    overall_result: result,
+    defects: defects || [],
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("emergency_lighting_tests")
+      .insert(record);
+    if (dbErr) console.error("DB error /emergency-lighting-test:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  if (result === "FAIL") {
+    return res.status(422).json({
+      error: "Emergency lighting test FAILED — life safety non-compliance",
+      failures,
+      overallResult: result,
+      immediateActions: [
+        "Replace failed luminaires and batteries within 30 days",
+        "Log defects in Essential Safety Measures (ESM) annual report",
+        "Notify building owner — ESM obligations under Building Act 1993 (Vic)",
+        "Re-test all replaced luminaires after repair",
+      ],
+      applicableStandards: [
+        "AS 2293.1",
+        "AS 2293.2",
+        "Building Act 1993 (Vic) — Essential Safety Measures",
+        "NCC 2022 Part E4",
+      ],
+      saved,
+    });
+  }
+
+  res.json({
+    message: "Emergency lighting test PASSED",
+    overallResult: result,
+    luminairesTested,
+    failedCount,
+    batteryCapacity_minutes: batteryMins,
+    applicableStandards: ["AS 2293.1", "AS 2293.2", "NCC 2022 Part E4"],
+    saved,
+  });
+});
+
+// POST /ai-rigging-risk-assessment — AI assesses rigging configuration, load path, and safety factors
+app.post("/ai-rigging-risk-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    liftType,             // routine | critical | complex | tandem
+    loadWeight_t,
+    liftingMethod,
+    liftingAngle_deg,
+    loadCOG,              // centre of gravity known | unknown | estimated
+    riggerExperience,     // experienced | limited | trainee
+    environmentalConditions, // wind, rain, visibility
+    cranageType,
+    nearbyHazards,        // power lines, structures, people
+    workingAbovePeople,
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are a rigging and lift planning engineer with 20 years experience on Australian construction and industrial projects. Assess rigging configuration, dynamic load effects, and safety factors per AS 1418, AS 2550, AS 3569, and OHS Regulations 2017 (Vic).
+
+Assess:
+1. Static and dynamic load factors — AS 2550 dynamic multipliers for lift type
+2. Multi-leg sling load distribution — load increases with sling angle
+3. Centre of gravity implications for stability and hook point selection
+4. Critical lift classification — loads >75% crane capacity, personnel above, over structures
+5. Rigging assembly WLL calculation including sling angle reduction
+6. Control measures for tandem lifts, complex lifts, lifts over people
+7. Exclusion zone sizing per AS 2550
+
+Respond with JSON: { "liftRiskLevel": "routine|elevated|critical|extreme", "dynamicFactor": number, "slingAngleMultiplier": number, "effectiveWLL_t": number, "criticalLiftFlag": boolean, "criticalLiftReason": "string", "exclusionZone_m": number, "keyRisks": [], "requiredControls": [], "liftPlanRequired": boolean, "engineerSignOffRequired": boolean, "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Lift type: ${liftType || "routine"}
+Load weight: ${loadWeight_t || "not specified"} tonnes
+Lifting method: ${liftingMethod || "two-leg-bridle"}
+Sling angle: ${liftingAngle_deg || "45"}°
+Load COG: ${loadCOG || "known"}
+Rigger experience: ${riggerExperience || "experienced"}
+Environmental conditions: ${environmentalConditions || "fair"}
+Cranage: ${cranageType || "mobile crane"}
+Nearby hazards: ${Array.isArray(nearbyHazards) ? nearbyHazards.join(", ") : (nearbyHazards || "none")}
+Working above people: ${workingAbovePeople || "no"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-rigging-risk-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        liftRiskLevel: "elevated",
+        dynamicFactor: 1.25,
+        slingAngleMultiplier: 1.41,
+        effectiveWLL_t: parseFloat(loadWeight_t) * 1.41 * 1.25 || 5,
+        criticalLiftFlag: workingAbovePeople === "yes" || workingAbovePeople === true,
+        criticalLiftReason: workingAbovePeople ? "Lifting above personnel — critical lift per AS 2550" : "N/A",
+        exclusionZone_m: 5,
+        keyRisks: [
+          "Sling angle loading increases leg forces significantly above 60°",
+          "Dynamic amplification from crane acceleration/deceleration",
+          "Load instability if COG not accurately located",
+          "Tag line management in wind",
+        ],
+        requiredControls: [
+          "Verify COG before lifting — test weigh or calculate from drawings",
+          "Use tag lines to control load swing",
+          "Establish exclusion zone of minimum 5 m radius under load",
+          "Pre-lift meeting with crane operator, rigger, and dogger",
+          "Stop if wind exceeds crane manufacturer limit",
+        ],
+        liftPlanRequired: true,
+        engineerSignOffRequired: workingAbovePeople === "yes" || workingAbovePeople === true,
+        applicableStandards: [
+          "AS 2550",
+          "AS 1418.1",
+          "AS 3569",
+          "OHS Regulations 2017 (Vic) Part 3.2",
+          "Rigging Handbook (RIIHAN301F)",
+        ],
+        recommendation:
+          "Prepare lift plan including rigging configuration, WLL calculation with sling angle factor, exclusion zone, and contingency. Pre-lift briefing required.",
+        summary:
+          "Lift presents elevated risk from sling angle load multiplication and dynamic effects. Accurate COG location and sling angle selection are critical. Establish exclusion zone and conduct pre-lift safety briefing.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
