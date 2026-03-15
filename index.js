@@ -32961,6 +32961,220 @@ app.post("/safety-observation", apiKeyAuth, async (req, res) => {
   res.json({ success: true, observationId: null, ...record, saved: false });
 });
 
+// ── Round 122: Smart search, endpoint discovery, API metrics dashboard ────────
+
+// GET /api-catalogue — Return a catalogue of all available API endpoints
+app.get("/api-catalogue", apiKeyAuth, (req, res) => {
+  const catalogue = [
+    // Core AI endpoints
+    { path: "POST /review", category: "AI Analysis", description: "Compliance photo analysis — main AI endpoint" },
+    { path: "POST /visualise", category: "AI Analysis", description: "HVAC unit visualiser via Stable Diffusion" },
+    { path: "POST /before-after", category: "AI Analysis", description: "Before/after photo comparison" },
+    { path: "POST /stamp-photo", category: "AI Analysis", description: "GPS timestamp watermark on photos" },
+    { path: "POST /property-passport", category: "AI Analysis", description: "Property compliance history" },
+
+    // Compliance endpoints
+    { path: "POST /compliance-check", category: "Compliance", description: "Victorian regulation compliance checker" },
+    { path: "POST /risk-assessment", category: "Compliance", description: "Job risk assessment engine" },
+    { path: "POST /compliance-waiver", category: "Compliance", description: "Record a compliance waiver" },
+    { path: "GET /regulatory-updates", category: "Compliance", description: "Latest regulatory updates by trade and severity" },
+    { path: "POST /regulatory-breach", category: "Compliance", description: "Log a regulatory breach" },
+    { path: "POST /ai-compliance-summary", category: "Compliance", description: "AI-generated compliance summary" },
+    { path: "POST /ai-compliance-question", category: "Compliance", description: "Ask a compliance question to AI" },
+    { path: "POST /ncc-requirements/:buildingClass", category: "Compliance", description: "NCC requirements by building class" },
+    { path: "POST /ai-ncc-query", category: "Compliance", description: "AI query on NCC requirements" },
+    { path: "POST /compliance-health/:contractorId", category: "Compliance", description: "Contractor compliance health score" },
+
+    // Certificate endpoints
+    { path: "POST /plumbing-compliance-certificate", category: "Certificates", description: "Issue plumbing compliance certificate" },
+    { path: "POST /gas-compliance-certificate", category: "Certificates", description: "Issue gas compliance certificate" },
+    { path: "POST /electrical-safety-certificate", category: "Certificates", description: "Issue electrical safety certificate" },
+    { path: "POST /certificate-verify", category: "Certificates", description: "Verify a compliance certificate" },
+
+    // Safety endpoints
+    { path: "POST /safety-alert", category: "Safety", description: "Issue a site safety alert" },
+    { path: "POST /site-safety-brief/:jobType", category: "Safety", description: "Generate a site safety brief" },
+    { path: "POST /hot-work-permit", category: "Safety", description: "Issue a hot work permit" },
+    { path: "POST /excavation-permit", category: "Safety", description: "Issue an excavation permit" },
+    { path: "POST /confined-space-entry", category: "Safety", description: "Log a confined space entry" },
+    { path: "POST /jsa-record", category: "Safety", description: "Record a Job Safety Analysis" },
+    { path: "POST /ai-whs-plan", category: "Safety", description: "AI-generated WHS plan" },
+    { path: "POST /plant-prestart", category: "Safety", description: "Record plant pre-start inspection" },
+    { path: "POST /scaffolding-inspection", category: "Safety", description: "Record scaffolding inspection" },
+    { path: "POST /lifting-plan", category: "Safety", description: "Create a lifting plan" },
+    { path: "POST /hazard-log", category: "Safety", description: "Log a site hazard" },
+    { path: "POST /corrective-action", category: "Safety", description: "Record a corrective action" },
+    { path: "POST /safety-observation", category: "Safety", description: "Record a safety observation" },
+    { path: "POST /ai-safety-briefing", category: "Safety", description: "AI-generated safety briefing" },
+    { path: "POST /fire-safety-register", category: "Safety", description: "Register fire safety equipment" },
+    { path: "POST /evacuation-plan", category: "Safety", description: "Create site evacuation plan" },
+    { path: "POST /emergency-drill", category: "Safety", description: "Record emergency drill" },
+    { path: "POST /sop", category: "Safety", description: "Create Standard Operating Procedure" },
+    { path: "POST /ai-toolbox-talk", category: "Safety", description: "AI-generated toolbox talk" },
+
+    // Project management
+    { path: "POST /variation", category: "Project Management", description: "Submit a contract variation" },
+    { path: "POST /eot-claim", category: "Project Management", description: "Submit Extension of Time claim" },
+    { path: "POST /progress-claim", category: "Project Management", description: "Submit progress payment claim" },
+    { path: "POST /retention-release", category: "Project Management", description: "Record retention release" },
+    { path: "POST /superintendent-instruction", category: "Project Management", description: "Issue superintendent instruction" },
+    { path: "POST /rfi", category: "Project Management", description: "Submit Request for Information" },
+    { path: "POST /practical-completion", category: "Project Management", description: "Issue Practical Completion certificate" },
+    { path: "POST /final-completion", category: "Project Management", description: "Issue Final Completion certificate" },
+    { path: "POST /project-programme", category: "Project Management", description: "Create project programme" },
+    { path: "POST /milestone", category: "Project Management", description: "Record project milestone" },
+    { path: "POST /ncr", category: "Project Management", description: "Issue Non-Conformance Report" },
+    { path: "POST /punch-list", category: "Project Management", description: "Create punch list" },
+    { path: "POST /snagging-list", category: "Project Management", description: "Create snagging list" },
+    { path: "POST /project-closeout", category: "Project Management", description: "Record project closeout" },
+
+    // Financial
+    { path: "POST /job-costing", category: "Financial", description: "Job cost breakdown with margin analysis" },
+    { path: "POST /quote-comparison", category: "Financial", description: "Compare contractor quotes" },
+    { path: "POST /earned-value", category: "Financial", description: "Earned Value Management metrics" },
+    { path: "POST /project-financial-summary", category: "Financial", description: "Project financial snapshot" },
+    { path: "POST /ai-budget-forecast", category: "Financial", description: "AI cost-to-complete forecast" },
+    { path: "POST /payroll-run", category: "Financial", description: "Process payroll run" },
+    { path: "POST /superannuation-record", category: "Financial", description: "Record super contribution" },
+    { path: "POST /contractor-invoice", category: "Financial", description: "Record contractor invoice" },
+
+    // Documents
+    { path: "POST /drawing-register", category: "Documents", description: "Register project drawing" },
+    { path: "POST /transmittal", category: "Documents", description: "Issue document transmittal" },
+    { path: "POST /shop-drawing-approval", category: "Documents", description: "Shop drawing approval" },
+    { path: "POST /ai-drawing-review", category: "Documents", description: "AI drawing review" },
+    { path: "POST /ai-document-classifier", category: "Documents", description: "AI document type classifier" },
+    { path: "POST /document-expiry-check", category: "Documents", description: "Check documents for expiry alerts" },
+
+    // Email
+    { path: "POST /send-invoice-email", category: "Email", description: "Send invoice email via Resend" },
+    { path: "POST /send-near-miss-alert", category: "Email", description: "Send near-miss safety alert email" },
+    { path: "POST /send-welcome-email", category: "Email", description: "Send welcome email to new user" },
+
+    // Analytics & monitoring
+    { path: "GET /analytics", category: "Analytics", description: "Platform analytics dashboard" },
+    { path: "GET /stats", category: "Analytics", description: "API usage statistics" },
+    { path: "GET /health", category: "Analytics", description: "Server health check" },
+    { path: "GET /api-catalogue", category: "Analytics", description: "This endpoint — full API catalogue" },
+  ];
+
+  const byCategory = catalogue.reduce((acc, ep) => {
+    if (!acc[ep.category]) acc[ep.category] = [];
+    acc[ep.category].push({ path: ep.path, description: ep.description });
+    return acc;
+  }, {});
+
+  res.json({
+    totalEndpoints: catalogue.length,
+    categories: Object.keys(byCategory).length,
+    catalogue: byCategory,
+    version: "1.0.0",
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /ai-endpoint-search — AI helps a user find the right endpoint for their use case
+app.post("/ai-endpoint-search", apiKeyAuth, async (req, res) => {
+  const { query, context } = req.body;
+  if (!query) return res.status(400).json({ error: "query required." });
+
+  const sanitisedQuery = sanitiseInput(query);
+
+  const endpointList = [
+    "POST /review (compliance photo analysis)",
+    "POST /compliance-check (Victorian regulation checker)",
+    "POST /risk-assessment (job risk scoring)",
+    "POST /ai-safety-briefing (generate safety brief)",
+    "POST /ai-toolbox-talk (generate toolbox talk)",
+    "POST /variation (submit contract variation)",
+    "POST /progress-claim (progress payment claim)",
+    "POST /rfi (Request for Information)",
+    "POST /ncr (Non-Conformance Report)",
+    "POST /job-costing (job cost breakdown)",
+    "POST /ai-budget-forecast (cost-to-complete forecast)",
+    "POST /earned-value (EVM metrics)",
+    "POST /plumbing-compliance-certificate",
+    "POST /gas-compliance-certificate",
+    "POST /electrical-safety-certificate",
+    "POST /drawing-register (register project drawing)",
+    "POST /ai-document-classifier (classify document)",
+    "POST /ai-contract-review (review contract clauses)",
+    "POST /ai-scope-gap-analysis (find scope gaps)",
+    "POST /ai-specification-writer (write technical spec)",
+    "POST /practical-completion (PC certificate)",
+    "POST /defect-liability-claim (lodge DLP defect)",
+    "POST /heritage-assessment (heritage impact)",
+    "POST /noise-monitoring (noise readings)",
+    "POST /carbon-estimate (embodied carbon)",
+    "POST /site-access-log (sign in/out)",
+    "POST /payroll-run (process payroll)",
+    "GET /compliance-health/:contractorId (health score)",
+  ];
+
+  const prompt = `A user of the Elemetric construction API is looking for the right endpoint to use. Help them find the best match.
+
+User query: "${sanitisedQuery}"
+Context: ${sanitiseInput(context || "Not provided")}
+
+Available endpoints:
+${endpointList.join("\n")}
+
+Return a JSON object with:
+- "bestMatch": the most relevant endpoint path
+- "explanation": why this endpoint is the best match
+- "alternativeEndpoints": array of 2-3 other potentially relevant endpoints
+- "exampleRequest": a brief example of what to send to the best match endpoint
+- "confidence": "LOW"|"MEDIUM"|"HIGH"`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, query: sanitisedQuery, searchedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      bestMatch: "GET /api-catalogue",
+      explanation: "Use the API catalogue to browse all available endpoints and find the one you need.",
+      alternativeEndpoints: [],
+      exampleRequest: "GET /api-catalogue (no body required)",
+      confidence: "LOW",
+      query: sanitisedQuery, searchedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// GET /api-metrics — Real-time API usage metrics and performance data
+app.get("/api-metrics", apiKeyAuth, (req, res) => {
+  const uptimeSeconds = process.uptime();
+  const uptimeHours = Math.round(uptimeSeconds / 3600 * 10) / 10;
+
+  const cacheStats = analysisCache
+    ? { size: analysisCache.size, maxSize: analysisCache.max || 500, hitRate: "Available via cache library" }
+    : { size: 0, message: "Cache not initialised" };
+
+  res.json({
+    server: {
+      uptime: { seconds: Math.round(uptimeSeconds), hours: uptimeHours },
+      memoryUsageMb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+      nodeVersion: process.version,
+    },
+    apiUsage: {
+      totalRequests: usageStats.requests || 0,
+      openaiCalls: usageStats.openaiCalls || 0,
+      replicateCalls: usageStats.replicateCalls || 0,
+      emailsSent: usageStats.emailCalls || 0,
+      estimatedOpenAiCostUsd: usageStats.openaiCosts || null,
+    },
+    cache: cacheStats,
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
