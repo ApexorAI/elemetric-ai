@@ -67313,6 +67313,447 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /confined-space-entry-permit — Full confined space entry permit per OHS Regulations 2017 (Vic) Part 3.5
+app.post("/confined-space-entry-permit", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    permitNumber,
+    issueDate,
+    issueTime,
+    expiryDate,
+    expiryTime,
+    authorisedIssuer,
+    spaceId,
+    spaceDescription,
+    spaceType,            // tank | pit | sewer | vault | boiler | tunnel | void | manhole
+    entrants,             // array of { name, role }
+    standbyPerson,
+    standbyPersonTrained,
+    entryReason,
+    hazardsIdentified,    // array of strings
+    atmosphericHazards,   // oxygen deficiency | flammable gas | toxic gas
+    o2_pct,               // 19.5–23.5% safe range per AS 2865
+    lel_pct,              // lower explosive limit — <5% safe (<10% alert)
+    co_ppm,               // CO — <25 ppm for 8h
+    h2s_ppm,              // H2S — <1 ppm for 8h; IDLH 50 ppm
+    gasDetectionContinuous, // true | false
+    ventilationProvided,
+    ventilationType,      // mechanical | natural | forced-air
+    ventilationAdequate,
+    isolationsComplete,   // energy isolation completed before entry
+    hotWorkProhibited,    // true | false
+    rescueEquipmentPresent, // retrieval line, tripod, BA if required
+    rescuePlan,
+    communicationSystem,
+    ppeRequired,          // array of strings
+    permitStatus,         // ACTIVE | CANCELLED | COMPLETED
+    photos,
+    notes,
+  } = req.body;
+
+  // Critical atmosphere checks per AS 2865
+  const o2 = parseFloat(o2_pct) || 0;
+  const lel = parseFloat(lel_pct) || 0;
+  const co = parseFloat(co_ppm) || 0;
+  const h2s = parseFloat(h2s_ppm) || 0;
+
+  const atmosphericFailures = [];
+
+  if (o2 > 0 && (o2 < 19.5 || o2 > 23.5)) {
+    atmosphericFailures.push(`O₂ ${o2}% — outside safe range 19.5–23.5%`);
+  }
+  if (lel > 0 && lel >= 10) {
+    atmosphericFailures.push(`LEL ${lel}% — explosive atmosphere (≥10% LEL requires evacuation)`);
+  } else if (lel > 0 && lel >= 5) {
+    atmosphericFailures.push(`LEL ${lel}% — alert level (5–10% LEL), increase ventilation before entry`);
+  }
+  if (co > 25) {
+    atmosphericFailures.push(`CO ${co} ppm — exceeds 8h TWA of 25 ppm`);
+  }
+  if (h2s > 1) {
+    atmosphericFailures.push(`H₂S ${h2s} ppm — exceeds 8h TWA of 1 ppm`);
+  }
+
+  // Standby person required
+  const standbyIssue = !standbyPerson || !standbyPersonTrained;
+
+  // Rescue equipment
+  const rescueIssue = !rescueEquipmentPresent;
+
+  // Critical — evacuate
+  const criticalAtmosphere = atmosphericFailures.some(
+    (f) => f.includes("O₂") || f.includes("explosive") || f.includes("H₂S") && h2s >= 50
+  );
+
+  if (criticalAtmosphere || (lel > 0 && lel >= 10)) {
+    return res.status(422).json({
+      error: "CONFINED SPACE ENTRY PROHIBITED — atmospheric hazard detected",
+      atmosphericFailures,
+      immediateActions: [
+        "DO NOT ENTER confined space",
+        "Evacuate all personnel immediately if already inside",
+        "Purge and ventilate the space",
+        "Re-test atmosphere before any entry",
+        "Notify site manager and WorkSafe Victoria if incident",
+      ],
+      applicableStandards: ["AS 2865", "OHS Regulations 2017 (Vic) Part 3.5"],
+    });
+  }
+
+  // Non-critical but needs attention
+  const concerns = [...atmosphericFailures];
+  if (standbyIssue) concerns.push("Standby person not assigned or not trained — required for all confined space entries");
+  if (rescueIssue) concerns.push("Rescue equipment not present — retrieval equipment and rescue plan required per AS 2865");
+  if (!isolationsComplete) concerns.push("Energy isolations not confirmed complete before entry");
+  if (!gasDetectionContinuous) concerns.push("Continuous atmospheric monitoring not in place — required during occupied entry");
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    permit_number: sanitiseInput(permitNumber),
+    issue_date: issueDate,
+    issue_time: issueTime,
+    expiry_date: expiryDate,
+    expiry_time: expiryTime,
+    authorised_issuer: sanitiseInput(authorisedIssuer),
+    space_id: sanitiseInput(spaceId),
+    space_description: sanitiseInput(spaceDescription),
+    space_type: sanitiseInput(spaceType),
+    entrants: entrants || [],
+    standby_person: sanitiseInput(standbyPerson),
+    standby_person_trained: standbyPersonTrained,
+    entry_reason: sanitiseInput(entryReason),
+    hazards_identified: hazardsIdentified || [],
+    atmospheric_hazards: atmosphericHazards || [],
+    o2_pct,
+    lel_pct,
+    co_ppm,
+    h2s_ppm,
+    gas_detection_continuous: gasDetectionContinuous,
+    ventilation_provided: ventilationProvided,
+    ventilation_type: sanitiseInput(ventilationType),
+    ventilation_adequate: ventilationAdequate,
+    isolations_complete: isolationsComplete,
+    hot_work_prohibited: hotWorkProhibited,
+    rescue_equipment_present: rescueEquipmentPresent,
+    rescue_plan: sanitiseInput(rescuePlan),
+    communication_system: sanitiseInput(communicationSystem),
+    ppe_required: ppeRequired || [],
+    permit_status: sanitiseInput(permitStatus) || "ACTIVE",
+    concerns,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("confined_space_entry_permits")
+      .insert(record);
+    if (dbErr) console.error("DB error /confined-space-entry-permit:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Confined space entry permit issued",
+    permitNumber: sanitiseInput(permitNumber),
+    atmosphericReadings: { o2_pct, lel_pct, co_ppm, h2s_ppm },
+    atmosphericSafe: atmosphericFailures.length === 0,
+    concerns,
+    concernsCount: concerns.length,
+    permitStatus: sanitiseInput(permitStatus) || "ACTIVE",
+    applicableStandards: [
+      "AS 2865",
+      "OHS Regulations 2017 (Vic) Part 3.5",
+      "WorkSafe Victoria Confined Spaces Code of Practice",
+    ],
+    saved,
+  });
+});
+
+// POST /generator-load-test — Generator and UPS load testing record per AS 4509 / AS 62040
+app.post("/generator-load-test", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    facilityName,
+    equipmentId,
+    equipmentType,        // diesel-generator | gas-generator | UPS | battery-system
+    manufacturer,
+    model,
+    ratedPower_kVA,
+    testDate,
+    testedBy,
+    testType,             // monthly-exercise | annual-load | commissioning | post-repair
+    testLoad_pct,         // percentage of rated load applied
+    testDuration_minutes,
+    voltageAtLoad_V,
+    frequency_Hz,
+    powerFactor,
+    currentAtLoad_A,
+    engineOilPressure_kPa,
+    coolantTemp_C,
+    maxCoolantTemp_C,
+    exhaustTemp_C,
+    fuelLevel_pct,
+    fuelConsumption_L_hr,
+    automaticTransferSwitch, // true | false
+    atsTransferTime_seconds, // max 10 seconds for critical loads
+    atsRetransferTime_seconds,
+    upsOutputVoltage_V,
+    upsOutputFrequency_Hz,
+    batteryVoltage_V,
+    batteryCapacity_pct,
+    autonomyTime_minutes,   // how long batteries last at full load
+    alarmsTested,
+    alarmsCleared,
+    testResult,             // PASS | FAIL | CONDITIONAL
+    defectsFound,           // array of strings
+    photos,
+    notes,
+  } = req.body;
+
+  const testFailures = [];
+
+  // Voltage under load check — should be within ±5%
+  const ratedVoltage = 415; // typical 3-phase
+  const voltageAtTest = parseFloat(voltageAtLoad_V) || 0;
+  if (voltageAtTest > 0) {
+    const voltageDeviation = Math.abs(voltageAtTest - ratedVoltage) / ratedVoltage * 100;
+    if (voltageDeviation > 5) {
+      testFailures.push(`Voltage ${voltageAtTest} V deviates ${voltageDeviation.toFixed(1)}% from rated ${ratedVoltage} V — exceeds ±5% allowance`);
+    }
+  }
+
+  // Frequency check — 50 Hz ±0.5 Hz per AS 4509
+  const freq = parseFloat(frequency_Hz) || 0;
+  if (freq > 0 && (freq < 49.5 || freq > 50.5)) {
+    testFailures.push(`Frequency ${freq} Hz outside 50 ±0.5 Hz per AS 4509`);
+  }
+
+  // ATS transfer time — critical loads typically ≤10 seconds
+  const atsTime = parseFloat(atsTransferTime_seconds) || 0;
+  if (atsTime > 0 && atsTime > 10) {
+    testFailures.push(`ATS transfer time ${atsTime} s exceeds 10 s maximum for critical loads`);
+  }
+
+  // Coolant temperature
+  const coolantT = parseFloat(coolantTemp_C) || 0;
+  const maxCoolant = parseFloat(maxCoolantTemp_C) || 95;
+  if (coolantT > maxCoolant) {
+    testFailures.push(`Coolant temperature ${coolantT}°C exceeds maximum ${maxCoolant}°C — overheating risk`);
+  }
+
+  // Defects from tester
+  if (Array.isArray(defectsFound)) defectsFound.forEach((d) => testFailures.push(d));
+
+  const finalResult = testFailures.length === 0 ? "PASS" : "FAIL";
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    facility_name: sanitiseInput(facilityName),
+    equipment_id: sanitiseInput(equipmentId),
+    equipment_type: sanitiseInput(equipmentType),
+    manufacturer: sanitiseInput(manufacturer),
+    model: sanitiseInput(model),
+    rated_power_kva: ratedPower_kVA,
+    test_date: testDate,
+    tested_by: sanitiseInput(testedBy),
+    test_type: sanitiseInput(testType),
+    test_load_pct: testLoad_pct,
+    test_duration_minutes: testDuration_minutes,
+    voltage_at_load_v: voltageAtLoad_V,
+    frequency_hz: frequency_Hz,
+    power_factor: powerFactor,
+    current_at_load_a: currentAtLoad_A,
+    engine_oil_pressure_kpa: engineOilPressure_kPa,
+    coolant_temp_c: coolantTemp_C,
+    exhaust_temp_c: exhaustTemp_C,
+    fuel_level_pct: fuelLevel_pct,
+    fuel_consumption_l_hr: fuelConsumption_L_hr,
+    automatic_transfer_switch: automaticTransferSwitch,
+    ats_transfer_time_seconds: atsTransferTime_seconds,
+    ats_retransfer_time_seconds: atsRetransferTime_seconds,
+    ups_output_voltage_v: upsOutputVoltage_V,
+    battery_voltage_v: batteryVoltage_V,
+    battery_capacity_pct: batteryCapacity_pct,
+    autonomy_time_minutes: autonomyTime_minutes,
+    alarms_tested: alarmsTested,
+    alarms_cleared: alarmsCleared,
+    test_failures: testFailures,
+    test_result: finalResult,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("generator_load_tests")
+      .insert(record);
+    if (dbErr) console.error("DB error /generator-load-test:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Generator/UPS load test recorded",
+    testResult: finalResult,
+    testFailuresCount: testFailures.length,
+    testFailures,
+    atsTransferTimeOk: atsTime === 0 || atsTime <= 10,
+    applicableStandards: [
+      "AS 4509",
+      "AS/NZS 62040",
+      "AS/NZS 3000",
+      "AS 1418.19 (ATS)",
+    ],
+    saved,
+  });
+});
+
+// POST /ai-confined-space-assessment — AI assesses confined space hazards, ventilation, and entry requirements
+app.post("/ai-confined-space-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    spaceType,
+    spaceDescription,
+    knownHazards,
+    atmosphericReadings,  // { o2, lel, co, h2s }
+    previousContents,     // what was stored or used in space
+    adjacentPipework,
+    ventilationAvailable,
+    workDuration_hours,
+    workType,             // inspection | welding | cleaning | painting | maintenance | rescue
+    workerCount,
+    rescueCapability,
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are an occupational hygienist and confined space safety specialist with 20 years experience on Australian industrial and construction projects. Assess confined space entry hazards and requirements per AS 2865, OHS Regulations 2017 (Vic) Part 3.5, and WorkSafe Victoria Confined Spaces Code of Practice.
+
+Assess:
+1. Atmospheric hazards — oxygen deficiency/enrichment, flammable gases, toxic gases
+2. Physical hazards — engulfment, entrapment, heat, noise, radiation
+3. Ventilation requirements — purge volume, airflow rate, re-testing interval
+4. PPE requirements — SCBA, harness, retrieval line
+5. Standby person and rescue requirements
+6. Minimum entry conditions per AS 2865 Table 2
+7. Work activities that create new hazards inside space (welding creates CO, paint creates VOCs)
+
+Respond with JSON: { "hazardLevel": "low|medium|high|critical", "atmosphericHazards": [], "physicalHazards": [], "ventilationRequired": boolean, "ventilationSpec": "string", "retestInterval_minutes": number, "scbaRequired": boolean, "rescuePlanRequired": boolean, "standbyPersonRequired": boolean, "minimumEntryConditions": [], "workSpecificHazards": [], "isolationRequirements": [], "ppeRequired": [], "permitDuration_hours": number, "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const atm = atmosphericReadings || {};
+  const userContent = [
+    {
+      type: "text",
+      text: `Space type: ${spaceType || "not specified"}
+Space description: ${spaceDescription || "not specified"}
+Known hazards: ${Array.isArray(knownHazards) ? knownHazards.join(", ") : (knownHazards || "unknown")}
+Atmospheric readings: O₂=${atm.o2 || "?"}%, LEL=${atm.lel || "?"}%, CO=${atm.co || "?"} ppm, H₂S=${atm.h2s || "?"} ppm
+Previous contents: ${previousContents || "unknown"}
+Adjacent pipework: ${adjacentPipework || "none"}
+Ventilation available: ${ventilationAvailable || "no"}
+Work duration: ${workDuration_hours || "not specified"} hours
+Work type: ${workType || "not specified"}
+Number of workers: ${workerCount || "not specified"}
+Rescue capability: ${rescueCapability || "standby-person-only"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-confined-space-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        hazardLevel: "high",
+        atmosphericHazards: [
+          "Oxygen deficiency from biological decomposition or displacement",
+          "Flammable gas from adjacent gas mains or previous contents",
+          "Carbon monoxide from adjacent combustion or decomposition",
+          "Hydrogen sulphide from sewer gas or organic decomposition",
+        ],
+        physicalHazards: [
+          "Engulfment in accumulated liquids",
+          "Entrapment in narrow passages",
+          "Heat stress from lack of ventilation",
+          "Struck by falling objects through access point",
+        ],
+        ventilationRequired: true,
+        ventilationSpec:
+          "Minimum 20 air changes per hour using forced-air ventilation. Purge for minimum 15 minutes before entry. Monitor at entry and working level.",
+        retestInterval_minutes: 30,
+        scbaRequired: false,
+        rescuePlanRequired: true,
+        standbyPersonRequired: true,
+        minimumEntryConditions: [
+          "O₂ 19.5–23.5%",
+          "LEL <5%",
+          "CO <25 ppm",
+          "H₂S <1 ppm",
+          "All energy sources isolated and locked out",
+          "Continuous atmospheric monitoring active",
+          "Standby person in position",
+          "Rescue equipment set up and ready",
+          "Communication system working",
+        ],
+        workSpecificHazards: [
+          "Welding: CO generation inside space — increase ventilation, continuous CO monitoring",
+          "Painting: Solvent vapours exceed LEL — forced ventilation mandatory",
+        ],
+        isolationRequirements: [
+          "All pipework entering space blanked off (not just valved)",
+          "All mechanical equipment de-energised and locked out",
+          "All electrical supplies isolated",
+        ],
+        ppeRequired: [
+          "Full body harness with retrieval line",
+          "Safety helmet",
+          "P2 or appropriate respiratory protection based on hazard",
+          "Non-sparking tools if flammable atmosphere risk",
+        ],
+        permitDuration_hours: 8,
+        applicableStandards: [
+          "AS 2865",
+          "OHS Regulations 2017 (Vic) Part 3.5",
+          "WorkSafe Victoria Confined Spaces Code of Practice",
+        ],
+        recommendation:
+          "Issue confined space entry permit. Purge and ventilate before entry. Test atmosphere and document. Ensure standby person is trained in rescue. Continuous atmospheric monitoring during entire entry.",
+        summary:
+          "Confined space entry is high risk. The leading cause of confined space fatalities is the would-be rescuer who enters without proper equipment. Never enter without a tested atmosphere, standby person, rescue equipment, and entry permit.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
