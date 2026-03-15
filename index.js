@@ -42959,6 +42959,191 @@ Return JSON with:
   }
 });
 
+// POST /noise-impact-assessment — Create a noise impact assessment
+app.post("/noise-impact-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, siteAddress, state = "VIC",
+    workingHours, noiseReceivers = [],
+    constructionActivities = [], ppeaNearestReceiver_dba,
+    backgroundLevelL90_dba, workType = "CONSTRUCTION",
+    durationWeeks, distanceToNearestReceiverM,
+    noiseSuppressedEquipment = false, status = "DRAFT", notes,
+  } = req.body;
+  if (!siteAddress || !workingHours) {
+    return res.status(400).json({ error: "siteAddress and workingHours are required." });
+  }
+  // Victorian EPA noise limits (simplified)
+  const noiseLimits = {
+    weekday: { day: 65, evening: 60, night: 45 },
+    weekend: { day: 65, evening: 60, night: 45 },
+  };
+  const exceedancePotential = ppeaNearestReceiver_dba
+    ? Number(ppeaNearestReceiver_dba) > noiseLimits.weekday.day
+    : null;
+  const assessRef = `NIA-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    assess_ref: assessRef,
+    project_id: projectId || null,
+    site_address: sanitiseInput(siteAddress),
+    state: sanitiseInput(state),
+    working_hours: sanitiseInput(workingHours),
+    noise_receivers: Array.isArray(noiseReceivers) ? noiseReceivers.map(r => sanitiseInput(r)) : [],
+    construction_activities: Array.isArray(constructionActivities) ? constructionActivities.map(a => sanitiseInput(a)) : [],
+    ppea_nearest_receiver_dba: Number(ppeaNearestReceiver_dba) || null,
+    background_l90_dba: Number(backgroundLevelL90_dba) || null,
+    work_type: sanitiseInput(workType),
+    duration_weeks: Number(durationWeeks) || null,
+    distance_to_nearest_receiver_m: Number(distanceToNearestReceiverM) || null,
+    noise_suppressed_equipment: Boolean(noiseSuppressedEquipment),
+    noise_limits: noiseLimits,
+    exceedance_potential: exceedancePotential,
+    status,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("noise_impact_assessments").insert(record);
+    if (error) console.error("noise-impact-assessment DB error:", error.message);
+  }
+  res.json({
+    assessRef, siteAddress, state, workType,
+    exceedancePotential, noiseLimits: noiseLimits.weekday,
+    receiverCount: record.noise_receivers.length, saved: !!supabaseAdmin,
+  });
+});
+
+// POST /vibration-assessment — Record construction vibration monitoring
+app.post("/vibration-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, monitoringDate, activity, location,
+    ppv_mms, ppv_limit_mms, distance_m,
+    frequency_hz, dominantFrequency_hz,
+    receiverType = "RESIDENTIAL", vibrationEffect = "PERCEPTIBLE",
+    buildingType, reportingRequired = false,
+    structuralDamageRisk = false, equipmentUsed, notes,
+  } = req.body;
+  if (!projectId || !monitoringDate || !activity) {
+    return res.status(400).json({ error: "projectId, monitoringDate, and activity are required." });
+  }
+  // DIN 4150-3 guidance: residential <5mm/s, heritage structures <3mm/s
+  const limit = receiverType === "HERITAGE" ? 3 : receiverType === "INDUSTRIAL" ? 20 : 5;
+  const effectivePpv = Number(ppv_mms) || 0;
+  const exceedanceMargin = effectivePpv > 0 ? +(effectivePpv - (Number(ppv_limit_mms) || limit)).toFixed(2) : null;
+  const exceedance = exceedanceMargin !== null && exceedanceMargin > 0;
+  const vibRef = `VIB-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    vib_ref: vibRef,
+    project_id: projectId,
+    monitoring_date: monitoringDate,
+    activity: sanitiseInput(activity),
+    location: sanitiseInput(location || ""),
+    ppv_mms: effectivePpv,
+    ppv_limit_mms: Number(ppv_limit_mms) || limit,
+    exceedance,
+    exceedance_margin: exceedanceMargin,
+    distance_m: Number(distance_m) || null,
+    frequency_hz: Number(frequency_hz) || null,
+    dominant_frequency_hz: Number(dominantFrequency_hz) || null,
+    receiver_type: receiverType,
+    vibration_effect: sanitiseInput(vibrationEffect),
+    building_type: sanitiseInput(buildingType || ""),
+    reporting_required: Boolean(reportingRequired) || exceedance,
+    structural_damage_risk: Boolean(structuralDamageRisk) || (effectivePpv > limit * 2),
+    equipment_used: sanitiseInput(equipmentUsed || ""),
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("vibration_assessments").insert(record);
+    if (error) console.error("vibration-assessment DB error:", error.message);
+  }
+  res.json({
+    vibRef, activity, ppv_mms: effectivePpv, ppv_limit_mms: Number(ppv_limit_mms) || limit,
+    exceedance, exceedanceMargin, structuralDamageRisk: record.structural_damage_risk,
+    reportingRequired: record.reporting_required, saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-acoustic-assessment — AI assesses acoustic performance for a building
+app.post("/ai-acoustic-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    buildingType, state = "VIC", occupancyClass,
+    adjacentNoiseSources = [], internalNoiseSources = [],
+    walls, floor, ceiling, windows,
+    rw_external_facade, rw_party_wall, rw_floor_ceiling,
+    li_impact, hvacNoiseLevelNR,
+    occupantComplaints = false, nccSection_F5 = true, notes,
+  } = req.body;
+  if (!buildingType) {
+    return res.status(400).json({ error: "buildingType is required." });
+  }
+  const sanitisedBuildingType = sanitiseInput(buildingType);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian acoustic engineer specialising in NCC Section F5 compliance and AS/NZS 2107 acoustic standards.`;
+  const userPrompt = `Assess acoustic performance for:
+Building type: ${sanitisedBuildingType}
+State: ${sanitisedState}
+Occupancy: ${sanitiseInput(occupancyClass || "Not specified")}
+External noise sources: ${adjacentNoiseSources.map(s => sanitiseInput(s)).join(", ")}
+Internal noise sources: ${internalNoiseSources.map(s => sanitiseInput(s)).join(", ")}
+Wall construction: ${sanitiseInput(walls || "Not specified")}
+Floor: ${sanitiseInput(floor || "Not specified")}
+Ceiling: ${sanitiseInput(ceiling || "Not specified")}
+Window type: ${sanitiseInput(windows || "Not specified")}
+Rw (facade): ${rw_external_facade || "Not measured"} dB
+Rw (party wall): ${rw_party_wall || "Not measured"} dB
+Rw (floor/ceiling): ${rw_floor_ceiling || "Not measured"} dB
+Li (impact): ${li_impact || "Not measured"} dB
+HVAC noise: ${hvacNoiseLevelNR || "Not assessed"} NR
+Occupant complaints: ${occupantComplaints}
+NCC Section F5 applicable: ${nccSection_F5}
+
+Return JSON with:
+{
+  "overallRating": "COMPLIANT|BORDERLINE|NON_COMPLIANT|REQUIRES_ASSESSMENT",
+  "nccRequirements": [{"element": "...", "required": "...", "provided": "...", "status": "PASS|FAIL|UNKNOWN"}],
+  "airborneNoiseAssessment": "...",
+  "impactNoiseAssessment": "...",
+  "hvacNoiseAssessment": "...",
+  "remediationRequired": ["...", "..."],
+  "upgrades": [{"element": "...", "solution": "...", "expectedImprovement": "..."}],
+  "applicableStandards": ["AS/NZS 2107", "NCC 2022 Section F5", "..."],
+  "recommendation": "...",
+  "acousticConsultantRequired": false
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ buildingType: sanitisedBuildingType, state: sanitisedState, assessment });
+  } catch (err) {
+    console.error("ai-acoustic-assessment error:", err.message);
+    res.json({
+      buildingType: sanitisedBuildingType, state: sanitisedState,
+      assessment: {
+        overallRating: "REQUIRES_ASSESSMENT",
+        nccRequirements: [],
+        airborneNoiseAssessment: "Airborne noise data insufficient for assessment.",
+        impactNoiseAssessment: "Impact noise data insufficient for assessment.",
+        hvacNoiseAssessment: "HVAC noise data insufficient for assessment.",
+        remediationRequired: [],
+        upgrades: [],
+        applicableStandards: ["AS/NZS 2107 (Acoustics in buildings)", "NCC 2022 Section F5", "AS 1191 (Methods for laboratory measurement)"],
+        recommendation: "Engage an acoustic engineer for formal NCC Section F5 assessment.",
+        acousticConsultantRequired: true,
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
