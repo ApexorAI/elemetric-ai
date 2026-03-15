@@ -73571,6 +73571,379 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 265 ─────────────────────────────────────────────────────────────────
+
+// POST /insulation-inspection — Record thermal and acoustic insulation installation inspection
+app.post("/insulation-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, location, inspectionDate, inspectedBy,
+      insulationType, application, productBrand,
+      specifiedRValue, measuredRValue,
+      specifiedThicknessMm, measuredThicknessMm,
+      continuityOk, gapsPresent, gapDetails,
+      compressionIssues, moistureDamage,
+      vapourBarrierRequired, vapourBarrierInstalled,
+      nccEnergyClassRequired, nccClassAchieved,
+      safetyInformationSheet, installationCertificate, notes
+    } = req.body;
+
+    if (!projectId || !location || !inspectionDate || !inspectedBy) {
+      return res.status(400).json({ error: "projectId, location, inspectionDate, inspectedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeLocation = sanitiseInput(String(location));
+    const safeInspector = sanitiseInput(String(inspectedBy));
+
+    const criticalIssues = [];
+    const warnings = [];
+
+    const specRValue = parseFloat(specifiedRValue) || null;
+    const measRValue = parseFloat(measuredRValue) || null;
+    const specThick = parseFloat(specifiedThicknessMm) || null;
+    const measThick = parseFloat(measuredThicknessMm) || null;
+
+    // NCC 2022 Section J — Energy Efficiency
+    if (specRValue !== null && measRValue !== null) {
+      if (measRValue < specRValue * 0.9) {
+        criticalIssues.push(`R-value ${measRValue} below 90% of specified ${specRValue} — NCC energy efficiency non-compliance.`);
+      } else if (measRValue < specRValue) {
+        warnings.push(`R-value ${measRValue} slightly below specified ${specRValue} — verify within acceptable tolerance.`);
+      }
+    }
+
+    if (specThick !== null && measThick !== null && measThick < specThick * 0.9) {
+      criticalIssues.push(`Insulation thickness ${measThick}mm below 90% of specified ${specThick}mm — R-value will not be achieved.`);
+    }
+
+    if (compressionIssues === true || compressionIssues === "true") {
+      criticalIssues.push("Insulation compressed — compression reduces R-value below rated performance.");
+    }
+
+    if (gapsPresent === true || gapsPresent === "true") {
+      const gapInfo = gapDetails ? sanitiseInput(String(gapDetails)) : "unspecified locations";
+      criticalIssues.push(`Gaps in insulation at ${gapInfo} — thermal bridging will cause NCC non-compliance. Fill all gaps before lining.`);
+    }
+
+    if (!continuityOk) {
+      warnings.push("Insulation continuity not confirmed — check at junctions, corners, penetrations, and around frames.");
+    }
+
+    if (moistureDamage === true || moistureDamage === "true") {
+      criticalIssues.push("Moisture-damaged insulation detected — wet insulation must be removed and replaced (AS 3999).");
+    }
+
+    if ((vapourBarrierRequired === true || vapourBarrierRequired === "true") && !(vapourBarrierInstalled === true || vapourBarrierInstalled === "true")) {
+      criticalIssues.push("Vapour barrier required but not installed — moisture condensation risk within building envelope.");
+    }
+
+    if (nccEnergyClassRequired && !nccClassAchieved) {
+      warnings.push(`NCC energy class ${nccEnergyClassRequired} required — confirm compliance via NatHERS or Section J calculation.`);
+    }
+
+    if (!safetyInformationSheet) {
+      warnings.push("Safety information sheet not confirmed on site — required for glass wool/mineral fibre products (SDS compliance).");
+    }
+    if (!installationCertificate) {
+      warnings.push("Installation certificate not recorded — document for building permit compliance.");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "FAIL" : warnings.length > 0 ? "CONDITIONAL_PASS" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("insulation_inspections")
+        .insert({
+          project_id: safeProject,
+          location: safeLocation,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          insulation_type: insulationType ? sanitiseInput(String(insulationType)) : null,
+          application: application ? sanitiseInput(String(application)) : null,
+          product_brand: productBrand ? sanitiseInput(String(productBrand)) : null,
+          specified_r_value: specRValue,
+          measured_r_value: measRValue,
+          specified_thickness_mm: specThick,
+          measured_thickness_mm: measThick,
+          continuity_ok: continuityOk || false,
+          gaps_present: gapsPresent || false,
+          compression_issues: compressionIssues || false,
+          moisture_damage: moistureDamage || false,
+          vapour_barrier_required: vapourBarrierRequired || false,
+          vapour_barrier_installed: vapourBarrierInstalled || false,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Insulation fails NCC/specification requirements — rectify before lining.",
+        standards: ["NCC 2022 Section J", "AS 3999", "AS/NZS 4859.1"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      specifiedRValue: specRValue,
+      measuredRValue: measRValue,
+      standards: ["NCC 2022 Section J", "AS 3999", "AS/NZS 4859.1"],
+    });
+  } catch (err) {
+    console.error("POST /insulation-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record insulation inspection." });
+  }
+});
+
+// POST /cladding-fire-compliance-record — Record cladding fire safety compliance assessment per post-Lacrosse reforms
+app.post("/cladding-fire-compliance-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, buildingAddress, assessmentDate, assessedBy,
+      buildingHeight, buildingClass,
+      claddingType, claddingBrand, claddingFrm,
+      alucobondOrSimilar, compositePanelType,
+      fireGroupRating, specifiedFireGroup, testReportNumber,
+      buildingOverXStoreys, remedialNoticeIssued, remedialNoticeNumber,
+      fireEngineerApproval, sprinklerSystemPresent,
+      buildingActRegistered, insulationInCavity, notes
+    } = req.body;
+
+    if (!projectId || !buildingAddress || !assessmentDate || !assessedBy) {
+      return res.status(400).json({ error: "projectId, buildingAddress, assessmentDate, assessedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeAddress = sanitiseInput(String(buildingAddress));
+    const safeAssessedBy = sanitiseInput(String(assessedBy));
+
+    const criticalIssues = [];
+    const warnings = [];
+
+    const heightM = parseFloat(buildingHeight) || null;
+    const buildClass = parseInt(buildingClass) || null;
+
+    // Building Act 1993 (Vic) — Cladding Safety Victoria reforms post-2019
+    // NCC 2022 — buildings > 3 storeys (Class 2-9) require non-combustible cladding or Group 1/2 fire rated
+    const isHighRise = (buildingOverXStoreys === true || buildingOverXStoreys === "true") ||
+      (heightM !== null && heightM > 9);
+
+    if (isHighRise) {
+      const frm = String(fireGroupRating || "").toUpperCase();
+      const specFrm = String(specifiedFireGroup || "").toUpperCase();
+
+      if (alucobondOrSimilar === true || alucobondOrSimilar === "true") {
+        const panelType = String(compositePanelType || "").toLowerCase();
+        if (panelType.includes("pe") || panelType.includes("polyethylene")) {
+          criticalIssues.push("Aluminium composite panel with PE core detected on building >3 storeys — non-compliant with NCC 2022 Spec C1.1, Building Act 1993 (Vic). Cladding Safety Victoria notification required.");
+        } else if (panelType.includes("fr") || panelType.includes("fire retardant")) {
+          warnings.push("Aluminium composite panel with FR core — verify Group 1 or Group 2 fire test report meets NCC 2022 requirements.");
+        }
+      }
+
+      if (frm && specFrm && frm !== specFrm) {
+        criticalIssues.push(`Installed cladding fire group ${fireGroupRating} does not match specified ${specifiedFireGroup} — fire safety non-compliance.`);
+      }
+
+      if (!testReportNumber) {
+        warnings.push("Fire test report number not recorded — required to verify compliance of cladding system.");
+      }
+
+      if (!fireEngineerApproval && (alucobondOrSimilar === true || alucobondOrSimilar === "true")) {
+        criticalIssues.push("Combustible cladding without fire engineer approval — Performance Solution required (NCC 2022).");
+      }
+    }
+
+    if (remedialNoticeIssued === true || remedialNoticeIssued === "true") {
+      criticalIssues.push(`Remedial notice issued ${remedialNoticeNumber ? "(ref: " + sanitiseInput(String(remedialNoticeNumber)) + ")" : ""} — building owner must comply with rectification program (Building Act 1993 Vic).`);
+    }
+
+    if (!buildingActRegistered && isHighRise) {
+      warnings.push("Building not confirmed registered with Cladding Safety Victoria — required for affected buildings under Building Act 1993 (Vic) s.250I.");
+    }
+
+    if (insulationInCavity === true || insulationInCavity === "true") {
+      warnings.push("Combustible insulation in cavity — assess fire propagation risk per NCC 2022.");
+    }
+
+    const complianceStatus = criticalIssues.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "REVIEW_REQUIRED" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("cladding_fire_compliance_records")
+        .insert({
+          project_id: safeProject,
+          building_address: safeAddress,
+          assessment_date: assessmentDate,
+          assessed_by: safeAssessedBy,
+          building_height_m: heightM,
+          building_class: buildClass,
+          cladding_type: claddingType ? sanitiseInput(String(claddingType)) : null,
+          cladding_brand: claddingBrand ? sanitiseInput(String(claddingBrand)) : null,
+          fire_group_rating: fireGroupRating || null,
+          specified_fire_group: specifiedFireGroup || null,
+          test_report_number: testReportNumber ? sanitiseInput(String(testReportNumber)) : null,
+          alucobond_or_similar: alucobondOrSimilar || false,
+          composite_panel_type: compositePanelType ? sanitiseInput(String(compositePanelType)) : null,
+          remedial_notice_issued: remedialNoticeIssued || false,
+          remedial_notice_number: remedialNoticeNumber ? sanitiseInput(String(remedialNoticeNumber)) : null,
+          fire_engineer_approval: fireEngineerApproval || false,
+          sprinkler_system_present: sprinklerSystemPresent || false,
+          building_act_registered: buildingActRegistered || false,
+          compliance_status: complianceStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        complianceStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Cladding fire safety non-compliance — notify Cladding Safety Victoria and building owner immediately.",
+        standards: ["NCC 2022 Spec C1.1", "Building Act 1993 (Vic)", "Cladding Safety Victoria"],
+      });
+    }
+
+    res.json({
+      complianceStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      isHighRise,
+      claddingType: claddingType || null,
+      standards: ["NCC 2022 Spec C1.1", "Building Act 1993 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /cladding-fire-compliance-record error:", err.message);
+    res.status(500).json({ error: "Failed to record cladding fire compliance." });
+  }
+});
+
+// POST /ai-fire-safety-assessment — AI assesses fire safety adequacy of a building
+app.post("/ai-fire-safety-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      buildingType, buildingClass, heightStoreys, occupantLoad,
+      sprinklersPresent, smokeAlarmType, firePanelType,
+      exitDoorsCount, exitSignageOk, emergencyLightingOk,
+      fireDoorCount, fireDoorCondition, hoseReelCount,
+      extinguisherCount, deficienciesObserved, siteContext
+    } = req.body;
+
+    if (!buildingType || !buildingClass) {
+      return res.status(400).json({ error: "buildingType and buildingClass are required." });
+    }
+
+    const safeBuildingType = sanitiseInput(String(buildingType));
+    const safeBuildingClass = sanitiseInput(String(buildingClass));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const deficiencies = Array.isArray(deficienciesObserved) ? deficienciesObserved.map(d => sanitiseInput(String(d))) : [];
+
+    const prompt = `You are a fire safety engineer assessing fire safety adequacy for a Victorian building.
+
+Building type: ${safeBuildingType}
+Building class (NCC): ${safeBuildingClass}
+Height (storeys): ${heightStoreys || "Unknown"}
+Occupant load: ${occupantLoad || "Unknown"}
+Sprinklers: ${sprinklersPresent ? "Yes" : "No"}
+Smoke alarm type: ${smokeAlarmType || "Unknown"}
+Fire panel type: ${firePanelType || "Unknown"}
+Exit doors: ${exitDoorsCount || "Unknown"}
+Exit signage ok: ${exitSignageOk ? "Yes" : "No"}
+Emergency lighting ok: ${emergencyLightingOk ? "Yes" : "No"}
+Fire doors: ${fireDoorCount || "Unknown"} (condition: ${fireDoorCondition || "Not stated"})
+Hose reels: ${hoseReelCount || "Unknown"}
+Fire extinguishers: ${extinguisherCount || "Unknown"}
+Deficiencies observed: ${deficiencies.join("; ") || "None recorded"}
+Location: ${safeSite}
+
+Assess under:
+- NCC 2022 Section C/D/E (fire resistance, access & egress, fire fighting)
+- AS 1851 (maintenance of fire protection systems)
+- AS 3745 (emergency planning)
+- AS 2293.1/2 (emergency lighting)
+- Building Act 1993 (Vic) and Fire Safety Act 1993 (Vic)
+
+Provide:
+1. Overall fire safety risk rating
+2. Critical compliance gaps requiring immediate rectification
+3. Maintenance obligations under AS 1851
+4. Emergency plan requirements
+5. Recommended fire engineer/essential safety measures audit
+
+Respond ONLY in JSON:
+{
+  "fireSafetyRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "criticalGaps": ["string"],
+  "maintenanceObligations": ["string"],
+  "emergencyPlanRequirements": ["string"],
+  "esmAuditRequired": true|false,
+  "sprinklerRequired": true|false|null,
+  "applicableStandards": ["string"],
+  "evacuationRiskLevel": "LOW|MODERATE|HIGH",
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 750,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        fireSafetyRisk: "MODERATE",
+        criticalGaps: ["AI assessment unavailable — engage fire safety engineer"],
+        maintenanceObligations: ["Annual inspection of all essential safety measures per AS 1851"],
+        emergencyPlanRequirements: ["Maintain current Emergency Management Plan per AS 3745"],
+        esmAuditRequired: true,
+        sprinklerRequired: null,
+        applicableStandards: ["NCC 2022", "AS 1851", "AS 3745", "AS 2293.1"],
+        evacuationRiskLevel: "MODERATE",
+        summary: "AI fire safety assessment unavailable. Fire safety engineer assessment required.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      buildingType: safeBuildingType,
+      buildingClass: safeBuildingClass,
+      standards: ["NCC 2022", "AS 1851", "AS 3745", "AS 2293.1", "Building Act 1993 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /ai-fire-safety-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess fire safety." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
