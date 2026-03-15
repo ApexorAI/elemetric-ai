@@ -77538,6 +77538,379 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 276 ─────────────────────────────────────────────────────────────────
+
+// POST /energy-efficiency-assessment — Record NCC Section J / NatHERS energy compliance
+app.post("/energy-efficiency-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, buildingAddress, assessmentDate, assessedBy,
+      buildingClass, climateZone, assessmentMethod,
+      nathersRating, nccRequiredRating,
+      wallInsulationRValue, roofInsulationRValue, floorInsulationRValue,
+      glazingUValue, glazingShgc, windowToFloorRatio,
+      hvacEfficiencyClass, lightingPowerDensity, hotWaterSystem,
+      solarPvKw, batteryStorageKwh,
+      sectionJCompliant, nathersCompliant, greenStarTarget,
+      certRef, notes
+    } = req.body;
+
+    if (!projectId || !buildingAddress || !assessmentDate || !assessedBy) {
+      return res.status(400).json({ error: "projectId, buildingAddress, assessmentDate, assessedBy are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeAddress = sanitiseInput(String(buildingAddress));
+    const safeAssessedBy = sanitiseInput(String(assessedBy));
+
+    const criticalIssues = [];
+    const warnings = [];
+
+    const buildClass = parseInt(buildingClass) || null;
+    const nathers = parseFloat(nathersRating) || null;
+    const nccRequired = parseFloat(nccRequiredRating) || null;
+    const wallRValue = parseFloat(wallInsulationRValue) || null;
+    const roofRValue = parseFloat(roofInsulationRValue) || null;
+    const glazingU = parseFloat(glazingUValue) || null;
+    const wtfr = parseFloat(windowToFloorRatio) || null;
+
+    // NCC 2022 Section J — Energy Efficiency
+    if (nathers !== null && nccRequired !== null && nathers < nccRequired) {
+      criticalIssues.push(`NatHERS rating ${nathers} stars below NCC minimum ${nccRequired} stars — non-compliant. Redesign required (NCC 2022 Section J).`);
+    }
+
+    if (sectionJCompliant === false || sectionJCompliant === "false") {
+      criticalIssues.push("Section J compliance not achieved — building permit cannot be issued for non-compliant NCC Section J design.");
+    }
+
+    // Class 2-9 — Section J DTS or JV3 performance path
+    if (buildClass && buildClass >= 2 && buildClass <= 9) {
+      if (!assessmentMethod) {
+        warnings.push("Assessment method (DTS or JV3) not recorded — document compliance pathway for building permit.");
+      }
+    }
+
+    // Class 1 — NatHERS or Section J DTS
+    if (buildClass === 1) {
+      if (!nathers && !sectionJCompliant) {
+        warnings.push("Class 1 building — either NatHERS 6-star rating or Section J DTS compliance required (NCC 2022 J1.2).");
+      }
+    }
+
+    // Roof insulation — minimum R2.5 for most Victorian climate zones
+    if (roofRValue !== null && roofRValue < 2.5) {
+      warnings.push(`Roof R-value ${roofRValue} — below typical NCC minimum R2.5 for Victorian climate zones. Verify against Section J requirements.`);
+    }
+
+    // Window-to-floor ratio
+    if (wtfr !== null && wtfr > 0.35 && !glazingU) {
+      warnings.push(`Window-to-floor ratio ${(wtfr * 100).toFixed(0)}% — high glazing area requires U-value and SHGC specification per NCC 2022 Table J2.4.`);
+    }
+
+    if (glazingU !== null && glazingU > 3.0) {
+      warnings.push(`Glazing U-value ${glazingU} W/m²K — high heat transfer. Consider double-glazing to improve performance.`);
+    }
+
+    const assessmentStatus = criticalIssues.length > 0 ? "NON_COMPLIANT" : warnings.length > 0 ? "REVIEW_REQUIRED" : "COMPLIANT";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("energy_efficiency_assessments")
+        .insert({
+          project_id: safeProject,
+          building_address: safeAddress,
+          assessment_date: assessmentDate,
+          assessed_by: safeAssessedBy,
+          building_class: buildClass,
+          climate_zone: climateZone || null,
+          assessment_method: assessmentMethod ? sanitiseInput(String(assessmentMethod)) : null,
+          nathers_rating: nathers,
+          ncc_required_rating: nccRequired,
+          wall_insulation_r_value: wallRValue,
+          roof_insulation_r_value: roofRValue,
+          floor_insulation_r_value: floorInsulationRValue || null,
+          glazing_u_value: glazingU,
+          glazing_shgc: glazingShgc || null,
+          window_to_floor_ratio: wtfr,
+          hvac_efficiency_class: hvacEfficiencyClass ? sanitiseInput(String(hvacEfficiencyClass)) : null,
+          lighting_power_density: lightingPowerDensity || null,
+          hot_water_system: hotWaterSystem ? sanitiseInput(String(hotWaterSystem)) : null,
+          solar_pv_kw: solarPvKw || null,
+          battery_storage_kwh: batteryStorageKwh || null,
+          section_j_compliant: sectionJCompliant !== false && sectionJCompliant !== "false",
+          nathers_compliant: nathersCompliant !== false && nathersCompliant !== "false",
+          green_star_target: greenStarTarget ? sanitiseInput(String(greenStarTarget)) : null,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          assessment_status: assessmentStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        assessmentStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Energy efficiency non-compliant — redesign required before building permit.",
+        standards: ["NCC 2022 Section J", "AS/NZS 4755 series"],
+      });
+    }
+
+    res.json({
+      assessmentStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      nathersRating: nathers,
+      nccRequiredRating: nccRequired,
+      standards: ["NCC 2022 Section J", "NatHERS"],
+    });
+  } catch (err) {
+    console.error("POST /energy-efficiency-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to record energy efficiency assessment." });
+  }
+});
+
+// POST /building-permit-application — Track building permit application status and conditions
+app.post("/building-permit-application", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, siteAddress, applicationDate, applicantName,
+      buildingSurveyor, buildingClass, workDescription,
+      estimatedCostAud, buildingPermitLevy,
+      planningPermitRef, ownerBuilderPermit,
+      documentsSubmitted, documentList,
+      permitIssued, permitNumber, permitIssueDate,
+      permitExpiryDate, startedByDate, completedByDate,
+      essentialSafetyCertRequired,
+      buildingInspectionsRequired, inspectionsList,
+      certifyingPlanner, structuralEngineerApproval,
+      notes
+    } = req.body;
+
+    if (!projectId || !siteAddress || !applicationDate || !applicantName) {
+      return res.status(400).json({ error: "projectId, siteAddress, applicationDate, applicantName are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeAddress = sanitiseInput(String(siteAddress));
+    const safeApplicant = sanitiseInput(String(applicantName));
+
+    const docs = Array.isArray(documentList) ? documentList : [];
+    const inspections = Array.isArray(inspectionsList) ? inspectionsList : [];
+    const warnings = [];
+    const criticalIssues = [];
+
+    // Building Act 1993 (Vic) — building permit requirements
+    const permitCost = parseFloat(estimatedCostAud) || 0;
+    if (permitCost > 0) {
+      // Building permit levy — approximately 0.128% for works > $10,000
+      const expectedLevy = permitCost > 10000 ? permitCost * 0.00128 : 0;
+      const submittedLevy = parseFloat(buildingPermitLevy) || 0;
+      if (expectedLevy > 0 && submittedLevy < expectedLevy * 0.9) {
+        warnings.push(`Building permit levy $${submittedLevy.toFixed(2)} appears low for works value $${permitCost.toLocaleString()} — verify levy calculation (Building Act 1993 Vic s.201).`);
+      }
+    }
+
+    if (permitIssued === true || permitIssued === "true") {
+      if (permitExpiryDate) {
+        const expiry = new Date(permitExpiryDate);
+        const now = new Date();
+        const daysToExpiry = Math.floor((expiry - now) / (1000 * 60 * 60 * 24));
+        if (daysToExpiry < 0) {
+          criticalIssues.push(`Building permit expired ${Math.abs(daysToExpiry)} days ago — works are unlawful. Apply for extension or new permit (Building Regulations 2018 Vic reg 42).`);
+        } else if (daysToExpiry < 60) {
+          warnings.push(`Building permit expires in ${daysToExpiry} days — ensure works commence and progress milestones are met.`);
+        }
+      }
+      if (!startedByDate) {
+        warnings.push("'Works must start by' date not recorded — building permits typically require commencement within 12 months.");
+      }
+    }
+
+    if (!documentsSubmitted) {
+      warnings.push("Document submission not confirmed — ensure all required documents are lodged with RBS.");
+    }
+
+    if (!structuralEngineerApproval) {
+      warnings.push("Structural engineer approval not confirmed — required for most Class 1-9 buildings.");
+    }
+
+    const applicationStatus = criticalIssues.length > 0 ? "NON_COMPLIANT" : permitIssued ? "PERMIT_ISSUED" : "PENDING";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("building_permit_applications")
+        .insert({
+          project_id: safeProject,
+          site_address: safeAddress,
+          application_date: applicationDate,
+          applicant_name: safeApplicant,
+          building_surveyor: buildingSurveyor ? sanitiseInput(String(buildingSurveyor)) : null,
+          building_class: buildingClass || null,
+          work_description: workDescription ? sanitiseInput(String(workDescription)) : null,
+          estimated_cost_aud: permitCost || null,
+          building_permit_levy: buildingPermitLevy || null,
+          planning_permit_ref: planningPermitRef ? sanitiseInput(String(planningPermitRef)) : null,
+          owner_builder_permit: ownerBuilderPermit || false,
+          documents_submitted: documentsSubmitted || false,
+          document_list: docs,
+          permit_issued: permitIssued || false,
+          permit_number: permitNumber ? sanitiseInput(String(permitNumber)) : null,
+          permit_issue_date: permitIssueDate || null,
+          permit_expiry_date: permitExpiryDate || null,
+          started_by_date: startedByDate || null,
+          completed_by_date: completedByDate || null,
+          essential_safety_cert_required: essentialSafetyCertRequired || false,
+          building_inspections_required: buildingInspectionsRequired || false,
+          inspections_list: inspections,
+          application_status: applicationStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        applicationStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Building permit non-compliance — works are unlawful or permit has expired.",
+        standards: ["Building Act 1993 (Vic)", "Building Regulations 2018 (Vic)"],
+      });
+    }
+
+    res.json({
+      applicationStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      permitNumber: permitNumber || null,
+      standards: ["Building Act 1993 (Vic)", "Building Regulations 2018 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /building-permit-application error:", err.message);
+    res.status(500).json({ error: "Failed to record building permit application." });
+  }
+});
+
+// POST /ai-building-compliance-gap-analysis — AI identifies NCC compliance gaps for a building project
+app.post("/ai-building-compliance-gap-analysis", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      buildingType, buildingClass, stories, occupantLoad,
+      constructionType, claddingMaterial, roofType,
+      knownDeviations, designStage, assessmentScope, siteContext
+    } = req.body;
+
+    if (!buildingType || !buildingClass) {
+      return res.status(400).json({ error: "buildingType and buildingClass are required." });
+    }
+
+    const safeBuildingType = sanitiseInput(String(buildingType));
+    const safeBuildingClass = sanitiseInput(String(buildingClass));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const deviations = Array.isArray(knownDeviations) ? knownDeviations.map(d => sanitiseInput(String(d))) : [];
+    const scope = Array.isArray(assessmentScope) ? assessmentScope.map(s => sanitiseInput(String(s))) : [];
+
+    const prompt = `You are a building code consultant conducting an NCC compliance gap analysis for a Victorian building project.
+
+Building type: ${safeBuildingType}
+Building class (NCC): ${safeBuildingClass}
+Number of storeys: ${stories || "Unknown"}
+Occupant load: ${occupantLoad || "Unknown"}
+Construction type: ${constructionType || "Unknown"}
+Cladding material: ${claddingMaterial || "Unknown"}
+Roof type: ${roofType || "Unknown"}
+Known deviations from NCC: ${deviations.join("; ") || "None identified"}
+Design stage: ${designStage || "Not stated"}
+Assessment scope: ${scope.join(", ") || "Full NCC"}
+Location: ${safeSite}
+
+Identify NCC 2022 compliance gaps across all relevant sections:
+- Section C (fire resistance)
+- Section D (access and egress)
+- Section E (services and equipment)
+- Section F (health and amenity)
+- Section G (ancillary provisions)
+- Section H (class-specific provisions)
+- Section J (energy efficiency)
+- Section I (structure)
+
+Respond ONLY in JSON:
+{
+  "overallComplianceRisk": "LOW|MODERATE|HIGH|CRITICAL",
+  "gapsBySection": {
+    "sectionC": ["string"],
+    "sectionD": ["string"],
+    "sectionE": ["string"],
+    "sectionF": ["string"],
+    "sectionJ": ["string"]
+  },
+  "criticalGaps": ["string"],
+  "performanceSolutionsRequired": ["string"],
+  "buildingLevyImplications": "string",
+  "recommendedActions": ["string"],
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 900,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        overallComplianceRisk: "MODERATE",
+        gapsBySection: {
+          sectionC: ["AI analysis unavailable — engage fire safety engineer"],
+          sectionD: ["Verify access and egress compliance with NCC 2022 Section D"],
+          sectionE: ["Confirm fire services commissioning"],
+          sectionF: ["Review health and amenity provisions"],
+          sectionJ: ["Verify energy efficiency compliance path"],
+        },
+        criticalGaps: ["AI gap analysis unavailable — manual NCC review required"],
+        performanceSolutionsRequired: [],
+        buildingLevyImplications: "Confirm levy calculation with building surveyor.",
+        recommendedActions: ["Engage registered building surveyor for formal NCC compliance review"],
+        applicableStandards: ["NCC 2022", "Building Act 1993 (Vic)", "Building Regulations 2018 (Vic)"],
+        summary: "AI NCC gap analysis unavailable. Engage registered building surveyor for formal compliance assessment.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      buildingType: safeBuildingType,
+      buildingClass: safeBuildingClass,
+      standards: ["NCC 2022", "Building Act 1993 (Vic)", "Building Regulations 2018 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /ai-building-compliance-gap-analysis error:", err.message);
+    res.status(500).json({ error: "Failed to assess building compliance gaps." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
