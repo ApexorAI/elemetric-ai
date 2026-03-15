@@ -30030,6 +30030,219 @@ Return a JSON object with:
   }
 });
 
+// ── Round 106: Environmental management, sustainability, green star ───────────
+
+// POST /environmental-management-plan — Create an EMP record for a project
+app.post("/environmental-management-plan", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, environmentalManager,
+    significantAspects = [], controlMeasures = [],
+    environmentalObjectives = [], monitoringFrequency = "weekly",
+    emergencyProcedures, spillKitLocation, wasteManagementPlan,
+    erosionControl, dustManagement, noiseManagement, state = "VIC",
+  } = req.body;
+
+  if (!projectId || !projectName) return res.status(400).json({ error: "projectId and projectName required." });
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    environmental_manager: sanitiseInput(environmentalManager || ""),
+    significant_aspects: significantAspects.map(a => sanitiseInput(a)),
+    control_measures: controlMeasures.map(c => ({
+      aspect: sanitiseInput(c.aspect || ""),
+      measure: sanitiseInput(c.measure || ""),
+      responsibility: sanitiseInput(c.responsibility || ""),
+    })),
+    environmental_objectives: environmentalObjectives.map(o => sanitiseInput(o)),
+    monitoring_frequency: sanitiseInput(monitoringFrequency),
+    emergency_procedures: sanitiseInput(emergencyProcedures || "Immediately contain spill, report to site supervisor, contact EPA if required."),
+    spill_kit_location: sanitiseInput(spillKitLocation || ""),
+    waste_management_plan: sanitiseInput(wasteManagementPlan || "Separate general, recyclable, and hazardous waste. Use licensed waste carrier."),
+    erosion_control: sanitiseInput(erosionControl || "Install silt fences and sediment traps as required."),
+    dust_management: sanitiseInput(dustManagement || "Water suppression and wind barriers during dry conditions."),
+    noise_management: sanitiseInput(noiseManagement || "Restrict noisy works to approved hours. Monitor noise levels."),
+    state: sanitiseInput(state),
+    status: "ACTIVE",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("environmental_management_plans")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, empId: data.id, ...record });
+  }
+
+  res.json({ success: true, empId: null, ...record, saved: false });
+});
+
+// POST /sustainability-checklist — Record sustainability and green building initiative tracking
+app.post("/sustainability-checklist", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, targetRating, ratingTool = "GREEN_STAR",
+    categories = [], targetPoints, achievedPoints = 0,
+    initiatives = [],
+  } = req.body;
+
+  if (!projectId) return res.status(400).json({ error: "projectId required." });
+
+  const validTools = ["GREEN_STAR", "NABERS", "WELL", "LEED", "BASIX", "NCC_SECTION_J"];
+  const tool = (ratingTool || "GREEN_STAR").toUpperCase();
+
+  const processedInitiatives = initiatives.map(init => ({
+    category: sanitiseInput(init.category || ""),
+    initiative: sanitiseInput(init.initiative || ""),
+    targetPoints: Number(init.targetPoints) || 0,
+    achievedPoints: Number(init.achievedPoints) || 0,
+    status: ["ACHIEVED", "IN_PROGRESS", "PLANNED", "NOT_PURSUED"].includes((init.status || "").toUpperCase())
+      ? init.status.toUpperCase() : "PLANNED",
+    notes: sanitiseInput(init.notes || ""),
+  }));
+
+  const totalTarget = processedInitiatives.reduce((s, i) => s + i.targetPoints, 0) || Number(targetPoints) || 0;
+  const totalAchieved = processedInitiatives.reduce((s, i) => s + i.achievedPoints, 0) || Number(achievedPoints);
+  const progressPercent = totalTarget > 0 ? Math.round((totalAchieved / totalTarget) * 100) : 0;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    target_rating: sanitiseInput(targetRating || ""),
+    rating_tool: validTools.includes(tool) ? tool : "GREEN_STAR",
+    categories: Array.isArray(categories) ? categories.map(c => sanitiseInput(c)) : [],
+    target_points: totalTarget,
+    achieved_points: totalAchieved,
+    progress_percent: progressPercent,
+    initiatives: processedInitiatives,
+    initiative_count: processedInitiatives.length,
+    status: progressPercent >= 100 ? "TARGET_MET" : progressPercent >= 75 ? "ON_TRACK" : "AT_RISK",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("sustainability_checklists")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, checklistId: data.id, ...record });
+  }
+
+  res.json({ success: true, checklistId: null, ...record, saved: false });
+});
+
+// POST /carbon-estimate — Estimate embodied carbon for construction materials
+app.post("/carbon-estimate", apiKeyAuth, async (req, res) => {
+  const { projectId, materials = [], projectType, floorArea } = req.body;
+  if (!materials.length) return res.status(400).json({ error: "At least one material required." });
+
+  // Approximate embodied carbon factors (kg CO2e per unit) — indicative only
+  const carbonFactors = {
+    "concrete": { unit: "m3", factor: 300 },         // ~300 kg CO2e/m3
+    "steel": { unit: "tonne", factor: 1800 },          // ~1800 kg CO2e/tonne
+    "timber": { unit: "m3", factor: -700 },            // ~-700 kg CO2e/m3 (carbon sequestration)
+    "aluminium": { unit: "tonne", factor: 8000 },      // ~8000 kg CO2e/tonne
+    "glass": { unit: "tonne", factor: 1000 },
+    "brick": { unit: "1000_units", factor: 270 },
+    "plasterboard": { unit: "m2", factor: 3.4 },
+    "insulation": { unit: "m2", factor: 1.5 },
+    "copper": { unit: "kg", factor: 3.8 },
+    "pvc": { unit: "kg", factor: 4.0 },
+  };
+
+  const processedMaterials = materials.map(m => {
+    const mat = (m.material || "").toLowerCase();
+    const qty = Number(m.quantity) || 0;
+    const factor = carbonFactors[mat] || { unit: "unit", factor: 0 };
+    const carbonKg = qty * factor.factor;
+    return {
+      material: sanitiseInput(m.material || ""),
+      quantity: qty,
+      unit: sanitiseInput(m.unit || factor.unit),
+      carbonFactor: factor.factor,
+      carbonKg: Math.round(carbonKg),
+      carbonTonnes: Math.round(carbonKg / 10) / 100,
+      isEstimate: true,
+    };
+  });
+
+  const totalCarbonKg = processedMaterials.reduce((s, m) => s + m.carbonKg, 0);
+  const totalCarbonTonnes = Math.round(totalCarbonKg / 10) / 100;
+  const carbonPerM2 = floorArea ? Math.round(totalCarbonKg / Number(floorArea)) : null;
+
+  // Benchmark comparisons (kg CO2e/m2)
+  const benchmarks = { residential: 600, commercial: 800, industrial: 500 };
+  const benchmark = benchmarks[(projectType || "").toLowerCase()] || null;
+  const vsGoodPractice = benchmark && carbonPerM2 ? (carbonPerM2 <= benchmark * 0.75 ? "BELOW_BENCHMARK" : carbonPerM2 <= benchmark ? "AT_BENCHMARK" : "ABOVE_BENCHMARK") : null;
+
+  res.json({
+    projectId: projectId || null,
+    materials: processedMaterials,
+    totalCarbonKg,
+    totalCarbonTonnes,
+    carbonPerM2,
+    benchmark: benchmark ? { value: benchmark, unit: "kg CO2e/m2", type: projectType } : null,
+    vsGoodPractice,
+    disclaimer: "These are indicative estimates only. Engage a carbon consultant for project-certified calculations.",
+    estimatedAt: new Date().toISOString(),
+  });
+});
+
+// POST /waste-tracking — Log construction waste quantities by type
+app.post("/waste-tracking", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, reportingPeriod, wasteItems = [],
+    recyclingContractor, landFillContractor, hazardousContractor, notes,
+  } = req.body;
+
+  if (!projectId || !wasteItems.length) return res.status(400).json({ error: "projectId and wasteItems required." });
+
+  const validCategories = ["GENERAL", "RECYCLABLE", "HAZARDOUS", "CONCRETE", "TIMBER", "METAL", "PLASTERBOARD", "GREEN_WASTE", "ELECTRICAL", "OTHER"];
+
+  const processedItems = wasteItems.map(w => ({
+    category: validCategories.includes((w.category || "").toUpperCase()) ? w.category.toUpperCase() : "GENERAL",
+    description: sanitiseInput(w.description || ""),
+    quantityKg: Number(w.quantityKg) || 0,
+    disposalMethod: ["LANDFILL", "RECYCLED", "REUSED", "HAZARDOUS_DISPOSAL"].includes((w.disposalMethod || "").toUpperCase()) ? w.disposalMethod.toUpperCase() : "LANDFILL",
+    manifestNumber: sanitiseInput(w.manifestNumber || ""),
+  }));
+
+  const totalKg = processedItems.reduce((s, w) => s + w.quantityKg, 0);
+  const recycledKg = processedItems.filter(w => w.disposalMethod === "RECYCLED" || w.disposalMethod === "REUSED").reduce((s, w) => s + w.quantityKg, 0);
+  const landfillKg = processedItems.filter(w => w.disposalMethod === "LANDFILL").reduce((s, w) => s + w.quantityKg, 0);
+  const diversionRate = totalKg > 0 ? Math.round((recycledKg / totalKg) * 100) : 0;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    reporting_period: sanitiseInput(reportingPeriod || new Date().toISOString().split("T")[0]),
+    waste_items: processedItems,
+    total_kg: totalKg,
+    recycled_kg: recycledKg,
+    landfill_kg: landfillKg,
+    diversion_rate_percent: diversionRate,
+    recycling_contractor: sanitiseInput(recyclingContractor || ""),
+    land_fill_contractor: sanitiseInput(landFillContractor || ""),
+    hazardous_contractor: sanitiseInput(hazardousContractor || ""),
+    notes: sanitiseInput(notes || ""),
+    logged_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("waste_tracking")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, wasteLogId: data.id, diversionRate, totalKg, recycledKg, landfillKg, ...record });
+  }
+
+  res.json({ success: true, wasteLogId: null, diversionRate, totalKg, recycledKg, landfillKg, ...record, saved: false });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
