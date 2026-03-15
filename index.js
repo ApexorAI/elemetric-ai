@@ -38300,6 +38300,219 @@ Return JSON with:
   }
 });
 
+// POST /cash-flow-forecast — Generate a project cash flow forecast
+app.post("/cash-flow-forecast", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, contractValueAud, startDate, completionDate,
+    retentionPercent = 5, paymentTermsDays = 28,
+    s_curve_type = "NORMAL",
+    milestones = [],
+    overheadMonthlyCost = 0, labourPercentage = 40,
+    materialPercentage = 35, subcontractorPercentage = 20,
+  } = req.body;
+  if (!contractValueAud || !startDate || !completionDate) {
+    return res.status(400).json({ error: "contractValueAud, startDate, and completionDate are required." });
+  }
+  const start = new Date(startDate);
+  const end = new Date(completionDate);
+  const durationMs = end - start;
+  const durationMonths = Math.ceil(durationMs / (30 * 86400000));
+  if (durationMonths <= 0) return res.status(400).json({ error: "completionDate must be after startDate." });
+  const value = Number(contractValueAud);
+  const retention = value * (Number(retentionPercent) / 100);
+  const certifiableValue = value - retention;
+  // Generate monthly S-curve distribution
+  const months = [];
+  for (let i = 0; i < durationMonths; i++) {
+    const monthDate = new Date(start.getFullYear(), start.getMonth() + i, 1);
+    const t = i / (durationMonths - 1 || 1);
+    // S-curve: slow start, fast middle, slow end
+    let pct;
+    if (s_curve_type === "FRONT_LOADED") pct = Math.pow(t, 0.5);
+    else if (s_curve_type === "BACK_LOADED") pct = Math.pow(t, 2);
+    else pct = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+    const cumulative = pct * certifiableValue;
+    const monthly = i === 0 ? cumulative : cumulative - (months[i - 1]?.cumulativeEarned || 0);
+    const cashIn = monthly * (1 - Number(retentionPercent) / 100);
+    const paymentMonth = new Date(monthDate.getFullYear(), monthDate.getMonth() + Math.ceil(Number(paymentTermsDays) / 30), 1);
+    months.push({
+      month: i + 1,
+      monthLabel: monthDate.toISOString().slice(0, 7),
+      paymentReceiptMonth: paymentMonth.toISOString().slice(0, 7),
+      progressClaimed: +monthly.toFixed(2),
+      cumulativeEarned: +cumulative.toFixed(2),
+      cashIn: +cashIn.toFixed(2),
+      overhead: +Number(overheadMonthlyCost).toFixed(2),
+      labour: +(monthly * (Number(labourPercentage) / 100)).toFixed(2),
+      materials: +(monthly * (Number(materialPercentage) / 100)).toFixed(2),
+      subcontractors: +(monthly * (Number(subcontractorPercentage) / 100)).toFixed(2),
+      netCashFlow: +(cashIn - Number(overheadMonthlyCost)).toFixed(2),
+    });
+  }
+  const totalCashIn = months.reduce((s, m) => s + m.cashIn, 0);
+  const peakNegativeCashFlow = Math.min(...months.map(m => m.netCashFlow));
+  const cashFlowRef = `CF-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    cashflow_ref: cashFlowRef,
+    project_id: projectId || null,
+    project_name: sanitiseInput(projectName || ""),
+    contract_value_aud: value,
+    retention_percent: Number(retentionPercent),
+    retention_amount: +retention.toFixed(2),
+    duration_months: durationMonths,
+    s_curve_type,
+    payment_terms_days: Number(paymentTermsDays),
+    months,
+    total_cash_in: +totalCashIn.toFixed(2),
+    peak_negative_cash_flow: +peakNegativeCashFlow.toFixed(2),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("cash_flow_forecasts").insert(record);
+    if (error) console.error("cash-flow-forecast DB error:", error.message);
+  }
+  res.json({
+    cashFlowRef, projectId, contractValueAud: value, durationMonths,
+    retentionAmount: +retention.toFixed(2), sCurveType: s_curve_type,
+    totalCashIn: +totalCashIn.toFixed(2), peakNegativeCashFlow: +peakNegativeCashFlow.toFixed(2),
+    months, saved: !!supabaseAdmin,
+  });
+});
+
+// POST /subcontractor-payment-schedule — Generate payment schedule for a subcontractor
+app.post("/subcontractor-payment-schedule", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, subcontractorName, trade, contractValueAud,
+    retentionPercent = 5, paymentTermsDays = 25,
+    progressClaims = [],
+    securityOfPaymentAct = true, state = "VIC",
+  } = req.body;
+  if (!subcontractorName || !contractValueAud) {
+    return res.status(400).json({ error: "subcontractorName and contractValueAud are required." });
+  }
+  const value = Number(contractValueAud);
+  const retentionRate = Number(retentionPercent) / 100;
+  const scheduleRef = `SPS-${Date.now().toString(36).toUpperCase()}`;
+  const schedule = Array.isArray(progressClaims) ? progressClaims.map((claim, i) => {
+    const claimAmount = Number(claim.amount) || 0;
+    const retentionHeld = claimAmount * retentionRate;
+    const payableAmount = claimAmount - retentionHeld;
+    const claimDate = claim.date ? new Date(claim.date) : new Date();
+    const dueDate = new Date(claimDate.getTime() + Number(paymentTermsDays) * 86400000);
+    const isOverdue = dueDate < new Date() && !claim.paid;
+    return {
+      claimNumber: i + 1,
+      claimRef: `CLAIM-${(i + 1).toString().padStart(3, "0")}`,
+      claimDate: claimDate.toISOString().split("T")[0],
+      claimAmount: +claimAmount.toFixed(2),
+      retentionHeld: +retentionHeld.toFixed(2),
+      payableAmount: +payableAmount.toFixed(2),
+      dueDate: dueDate.toISOString().split("T")[0],
+      paid: Boolean(claim.paid),
+      paidDate: claim.paidDate || null,
+      isOverdue,
+      sopActApplicable: securityOfPaymentAct,
+    };
+  }) : [];
+  const totalClaimed = schedule.reduce((s, c) => s + c.claimAmount, 0);
+  const totalPaid = schedule.filter(c => c.paid).reduce((s, c) => s + c.payableAmount, 0);
+  const totalOutstanding = schedule.filter(c => !c.paid).reduce((s, c) => s + c.payableAmount, 0);
+  const totalRetentionHeld = schedule.reduce((s, c) => s + c.retentionHeld, 0);
+  const retentionRelease = totalRetentionHeld / 2;
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("subcontractor_payment_schedules").insert({
+      schedule_ref: scheduleRef, project_id: projectId || null,
+      subcontractor_name: sanitiseInput(subcontractorName),
+      trade: sanitiseInput(trade || ""),
+      contract_value_aud: value, retention_percent: Number(retentionPercent),
+      payment_terms_days: Number(paymentTermsDays), schedule, state: sanitiseInput(state),
+      created_at: new Date().toISOString(),
+    });
+    if (error) console.error("subcontractor-payment-schedule DB error:", error.message);
+  }
+  res.json({
+    scheduleRef, subcontractorName, trade, contractValueAud: value,
+    paymentTermsDays: Number(paymentTermsDays), retentionPercent: Number(retentionPercent),
+    summary: {
+      totalClaimed: +totalClaimed.toFixed(2), totalPaid: +totalPaid.toFixed(2),
+      totalOutstanding: +totalOutstanding.toFixed(2), totalRetentionHeld: +totalRetentionHeld.toFixed(2),
+      retentionOnCertifiedCompletion: +retentionRelease.toFixed(2),
+      retentionOnDefectsExpiry: +retentionRelease.toFixed(2),
+      overdueCount: schedule.filter(c => c.isOverdue).length,
+    },
+    schedule, sopActApplicable: securityOfPaymentAct, state, saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-estimate-review — AI reviews a cost estimate for reasonableness
+app.post("/ai-estimate-review", apiKeyAuth, async (req, res) => {
+  const {
+    trade, projectType = "residential", state = "VIC",
+    estimateItems = [], totalEstimateAud, scopeDescription,
+    comparableProjectSize, comparableUnit = "m2",
+  } = req.body;
+  if (!trade || !totalEstimateAud) {
+    return res.status(400).json({ error: "trade and totalEstimateAud are required." });
+  }
+  const sanitisedTrade = sanitiseInput(trade);
+  const sanitisedType = sanitiseInput(projectType);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian quantity surveyor and cost estimating specialist. Review construction cost estimates for reasonableness.`;
+  const userPrompt = `Review this ${sanitisedTrade} cost estimate for an Australian ${sanitisedType} project in ${sanitisedState}:
+Scope: ${sanitiseInput(scopeDescription || "As per line items")}
+Total estimate: $${totalEstimateAud} AUD
+Project size: ${comparableProjectSize ? `${comparableProjectSize} ${comparableUnit}` : "Not specified"}
+Rate per ${comparableUnit}: ${comparableProjectSize ? `$${(Number(totalEstimateAud) / Number(comparableProjectSize)).toFixed(0)}` : "N/A"}
+Line items: ${estimateItems.slice(0, 10).map(i => `${sanitiseInput(i.description || "")}: $${i.amount}`).join("; ")}
+
+Return JSON with:
+{
+  "overallAssessment": "REASONABLE|HIGH|LOW|REQUIRES_REVIEW",
+  "confidenceLevel": "HIGH|MEDIUM|LOW",
+  "benchmarkRatePerUnit": 0,
+  "benchmarkRangeMin": 0,
+  "benchmarkRangeMax": 0,
+  "varianceFromBenchmark": "+15%",
+  "flaggedItems": [{"item": "...", "issue": "...", "suggestedRate": "..."}],
+  "missingAllowances": ["...", "..."],
+  "risksNotAllowedFor": ["...", "..."],
+  "marketConditionsNote": "...",
+  "recommendation": "...",
+  "summaryStatement": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const review = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ trade: sanitisedTrade, projectType: sanitisedType, state: sanitisedState, totalEstimateAud: Number(totalEstimateAud), review });
+  } catch (err) {
+    console.error("ai-estimate-review error:", err.message);
+    res.json({
+      trade: sanitisedTrade, projectType: sanitisedType, state: sanitisedState, totalEstimateAud: Number(totalEstimateAud),
+      review: {
+        overallAssessment: "REQUIRES_REVIEW",
+        confidenceLevel: "LOW",
+        benchmarkRatePerUnit: null, benchmarkRangeMin: null, benchmarkRangeMax: null,
+        varianceFromBenchmark: "Unable to calculate",
+        flaggedItems: [],
+        missingAllowances: ["Contingency (typically 10-15%)", "Preliminary and general costs", "Builder's margin"],
+        risksNotAllowedFor: ["Design changes", "Site-specific conditions", "Material price escalation"],
+        marketConditionsNote: "Australian construction costs have risen significantly. Engage a quantity surveyor for formal review.",
+        recommendation: "Obtain independent quantity surveyor review before accepting this estimate.",
+        summaryStatement: "Automated estimate review is unavailable. Manual review by qualified QS recommended.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
