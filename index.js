@@ -34977,6 +34977,186 @@ app.get("/certification-wallet/:contractorId", apiKeyAuth, async (req, res) => {
   res.status(503).json({ error: "Database not configured." });
 });
 
+// ── Round 132: AI mentor, skill gap assessment, learning pathway ───────────────
+
+// POST /ai-skill-gap — AI assesses a contractor's skill gaps against role requirements
+app.post("/ai-skill-gap", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, trade, experienceYears, currentSkills = [],
+    targetRole, certifications = [], recentTraining = [],
+    state = "VIC",
+  } = req.body;
+
+  if (!trade || !targetRole) return res.status(400).json({ error: "trade and targetRole required." });
+
+  const sanitisedSkills = currentSkills.map(s => sanitiseInput(s)).join(", ");
+  const sanitisedCerts = certifications.map(c => sanitiseInput(c)).join(", ");
+  const sanitisedTraining = recentTraining.map(t => sanitiseInput(t)).join(", ");
+
+  const prompt = `You are a senior construction industry training and development expert in Australia. Assess the following contractor's skill profile and identify gaps.
+
+Trade: ${sanitiseInput(trade)}
+Target role: ${sanitiseInput(targetRole)}
+Years experience: ${experienceYears || "Unknown"}
+State: ${sanitiseInput(state)}
+Current skills: ${sanitisedSkills || "Not specified"}
+Certifications held: ${sanitisedCerts || "None provided"}
+Recent training: ${sanitisedTraining || "None provided"}
+
+Return a JSON object with:
+- "overallReadiness": 0-100 score for role readiness
+- "readinessLevel": "BEGINNER"|"DEVELOPING"|"COMPETENT"|"PROFICIENT"|"EXPERT"
+- "skillGaps": array of { "skill": string, "importance": "ESSENTIAL"|"IMPORTANT"|"USEFUL", "currentLevel": "NONE"|"BASIC"|"INTERMEDIATE", "targetLevel": "INTERMEDIATE"|"ADVANCED", "trainingNeeded": string }
+- "certificationGaps": array of missing certifications required for the role
+- "strengths": array of existing strengths
+- "estimatedTimeToReady": string (e.g., "6-12 months")
+- "learningPathway": array of { "step": number, "action": string, "duration": string, "priority": "IMMEDIATE"|"SHORT_TERM"|"MEDIUM_TERM" }
+- "recommendedTrainingProviders": array of Australian training provider types
+- "salaryPotential": string indicating earning potential at target role`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1800,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, contractorId, trade, targetRole, state, assessedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      overallReadiness: 50,
+      readinessLevel: "DEVELOPING",
+      skillGaps: [],
+      certificationGaps: [],
+      strengths: currentSkills.slice(0, 3),
+      estimatedTimeToReady: "Assessment unavailable",
+      learningPathway: [{ step: 1, action: "Consult with a registered training organisation (RTO) for formal assessment", duration: "1 week", priority: "IMMEDIATE" }],
+      recommendedTrainingProviders: ["Registered Training Organisations (RTOs)", "TAFE"],
+      salaryPotential: "Consult industry salary guides",
+      contractorId, trade, targetRole, state, assessedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /training-plan — Create a personal development / training plan for a contractor
+app.post("/training-plan", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, contractorName, trade, createdBy,
+    planYear, goals = [], trainingItems = [],
+    cpdTargetPoints = 20, mentorAssigned,
+    reviewDate,
+  } = req.body;
+
+  if (!contractorId || !trade) return res.status(400).json({ error: "contractorId and trade required." });
+
+  const processedTraining = trainingItems.map((item, idx) => ({
+    itemId: `TI-${String(idx + 1).padStart(3, "0")}`,
+    trainingName: sanitiseInput(item.trainingName || ""),
+    provider: sanitiseInput(item.provider || ""),
+    type: ["FORMAL", "ON_JOB", "SELF_DIRECTED", "MENTORING", "WORKSHOP", "ONLINE"].includes((item.type || "").toUpperCase()) ? item.type.toUpperCase() : "FORMAL",
+    plannedDate: item.plannedDate || null,
+    completedDate: item.completedDate || null,
+    cpdPoints: Number(item.cpdPoints) || 0,
+    cost: Number(item.cost) || null,
+    status: item.completedDate ? "COMPLETED" : "PLANNED",
+    notes: sanitiseInput(item.notes || ""),
+  }));
+
+  const completedItems = processedTraining.filter(t => t.status === "COMPLETED").length;
+  const totalCpdEarned = processedTraining.filter(t => t.status === "COMPLETED").reduce((s, t) => s + t.cpdPoints, 0);
+  const totalCpdPlanned = processedTraining.reduce((s, t) => s + t.cpdPoints, 0);
+  const completionPercent = processedTraining.length > 0 ? Math.round((completedItems / processedTraining.length) * 100) : 0;
+
+  const record = {
+    contractor_id: sanitiseInput(contractorId),
+    contractor_name: sanitiseInput(contractorName || ""),
+    trade: sanitiseInput(trade),
+    created_by: sanitiseInput(createdBy || ""),
+    plan_year: Number(planYear) || new Date().getFullYear(),
+    goals: goals.map(g => sanitiseInput(g)),
+    training_items: processedTraining,
+    training_item_count: processedTraining.length,
+    completed_items: completedItems,
+    completion_percent: completionPercent,
+    cpd_target_points: Number(cpdTargetPoints),
+    cpd_earned_points: totalCpdEarned,
+    cpd_planned_points: totalCpdPlanned,
+    cpd_target_met: totalCpdEarned >= Number(cpdTargetPoints),
+    mentor_assigned: sanitiseInput(mentorAssigned || ""),
+    review_date: reviewDate || null,
+    status: "ACTIVE",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("training_plans")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, planId: data.id, completionPercent, cpdEarned: totalCpdEarned, ...record });
+  }
+
+  res.json({ success: true, planId: null, completionPercent, cpdEarned: totalCpdEarned, ...record, saved: false });
+});
+
+// POST /ai-career-advisor — AI provides construction career development advice
+app.post("/ai-career-advisor", apiKeyAuth, async (req, res) => {
+  const {
+    currentRole, trade, experienceYears, qualifications = [],
+    careerGoals = [], challenges = [], state = "VIC",
+  } = req.body;
+
+  if (!currentRole || !trade) return res.status(400).json({ error: "currentRole and trade required." });
+
+  const prompt = `You are an experienced Australian construction industry career advisor. Provide personalised career development advice.
+
+Current role: ${sanitiseInput(currentRole)}
+Trade: ${sanitiseInput(trade)}
+Experience: ${experienceYears || "Unknown"} years
+State: ${sanitiseInput(state)}
+Qualifications: ${qualifications.map(q => sanitiseInput(q)).join(", ") || "None specified"}
+Career goals: ${careerGoals.map(g => sanitiseInput(g)).join("; ") || "Not specified"}
+Challenges: ${challenges.map(c => sanitiseInput(c)).join("; ") || "None specified"}
+
+Return a JSON object with:
+- "careerPathways": array of { "pathway": string, "description": string, "yearsToAchieve": string, "keyRequirements": string[] }
+- "immediateActions": array of specific actions to take in the next 3 months
+- "qualificationsToGet": array of { "qualification": string, "provider": string, "duration": string, "cost": string, "valueRating": "HIGH"|"MEDIUM"|"LOW" }
+- "industryTrends": array of trends affecting the trade that create opportunity
+- "earningPotential": object with { "current": string, "in2Years": string, "in5Years": string }
+- "networkingAdvice": string
+- "motivationalMessage": short inspiring message
+- "disclaimer": standard disclaimer`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, currentRole, trade, state, advisedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      careerPathways: [{ pathway: "Senior Tradesperson", description: "Progress to senior roles through experience and further qualifications.", yearsToAchieve: "2-5 years", keyRequirements: ["Advanced trade certificate", "Safety leadership training"] }],
+      immediateActions: ["Identify gaps in your current skill set", "Speak with a mentor in your trade", "Research available training courses"],
+      qualificationsToGet: [],
+      industryTrends: ["Growing demand for sustainable construction skills", "Digital tools and BIM becoming standard"],
+      earningPotential: { current: "Consult industry salary guides", in2Years: "N/A", in5Years: "N/A" },
+      networkingAdvice: "Join industry associations and attend trade events.",
+      motivationalMessage: "Every expert was once a beginner. Keep building your skills.",
+      disclaimer: "Career advice is general in nature. Consult a career counsellor for personalised guidance.",
+      currentRole, trade, state, advisedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
