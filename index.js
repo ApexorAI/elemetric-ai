@@ -59011,6 +59011,311 @@ Return a JSON object with:
   }
 });
 
+// POST /energy-audit-record — Record a commercial energy audit per AS/NZS 3598
+app.post("/energy-audit-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      auditRef,
+      auditDate,
+      auditor,
+      auditorAccreditation,
+      propertyAddress,
+      buildingClass,
+      occupancyType,
+      grossFloorAreaM2,
+      auditLevel,
+      ratingPeriodFrom,
+      ratingPeriodTo,
+      annualElectricityKwh,
+      annualGasGj,
+      annualOtherEnergyGj,
+      totalEnergyGj,
+      energyIntensityMjM2,
+      nationalMedianMjM2,
+      currentNabersRating,
+      hvacEnergyPercent,
+      lightingEnergyPercent,
+      hotWaterEnergyPercent,
+      otherEnergyPercent,
+      opportunitiesIdentified,
+      totalEstimatedSavingsGj,
+      totalEstimatedSavingsDollar,
+      paybackPeriodYears,
+      co2EmissionsT,
+      renewableEnergyPercent,
+      certifiedByAuditor,
+      notes,
+    } = req.body;
+
+    if (!projectId || !auditDate || !auditor || !propertyAddress || !auditLevel) {
+      return res.status(400).json({ error: "projectId, auditDate, auditor, propertyAddress, and auditLevel are required" });
+    }
+
+    const flags = [];
+    if (energyIntensityMjM2 && nationalMedianMjM2 && Number(energyIntensityMjM2) > Number(nationalMedianMjM2) * 1.5) {
+      flags.push(`Energy intensity ${energyIntensityMjM2} MJ/m² is >50% above national median ${nationalMedianMjM2} MJ/m² — significant energy efficiency improvement opportunity`);
+    }
+    if (!certifiedByAuditor) flags.push("Audit report not yet certified by accredited energy auditor — required for AS/NZS 3598 compliance");
+    if (opportunitiesIdentified && Array.isArray(opportunitiesIdentified) && opportunitiesIdentified.length === 0) {
+      flags.push("No energy efficiency opportunities identified — review audit scope and depth");
+    }
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      audit_ref: sanitiseInput(auditRef || `EA-${Date.now()}`),
+      audit_date: auditDate,
+      auditor: sanitiseInput(auditor),
+      auditor_accreditation: sanitiseInput(auditorAccreditation || ""),
+      property_address: sanitiseInput(propertyAddress),
+      building_class: sanitiseInput(buildingClass || ""),
+      occupancy_type: sanitiseInput(occupancyType || ""),
+      gross_floor_area_m2: grossFloorAreaM2 || null,
+      audit_level: sanitiseInput(String(auditLevel)),
+      rating_period_from: ratingPeriodFrom || null,
+      rating_period_to: ratingPeriodTo || null,
+      annual_electricity_kwh: annualElectricityKwh || null,
+      annual_gas_gj: annualGasGj || null,
+      annual_other_energy_gj: annualOtherEnergyGj || null,
+      total_energy_gj: totalEnergyGj || null,
+      energy_intensity_mj_m2: energyIntensityMjM2 || null,
+      national_median_mj_m2: nationalMedianMjM2 || null,
+      current_nabers_rating: currentNabersRating || null,
+      hvac_energy_percent: hvacEnergyPercent || null,
+      lighting_energy_percent: lightingEnergyPercent || null,
+      hot_water_energy_percent: hotWaterEnergyPercent || null,
+      other_energy_percent: otherEnergyPercent || null,
+      opportunities_identified: Array.isArray(opportunitiesIdentified) ? opportunitiesIdentified.map(o => sanitiseInput(o)) : [],
+      total_estimated_savings_gj: totalEstimatedSavingsGj || null,
+      total_estimated_savings_dollar: totalEstimatedSavingsDollar || null,
+      payback_period_years: paybackPeriodYears || null,
+      co2_emissions_t: co2EmissionsT || null,
+      renewable_energy_percent: renewableEnergyPercent || null,
+      certified_by_auditor: !!certifiedByAuditor,
+      flags,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("energy_audit_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    res.json({
+      auditRef: record.audit_ref,
+      auditLevel,
+      flags,
+      applicableStandards: ["AS/NZS 3598.1 Energy audits for commercial buildings", "AS/NZS 3598.2 Energy audits for industrial and large commercial buildings", "NABERS — National Australian Built Environment Rating System"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/energy-audit-record error:", err.message);
+    res.status(500).json({ error: "Failed to record energy audit" });
+  }
+});
+
+// POST /structural-monitoring-record — Record structural settlement, tilt, crack, or convergence monitoring
+app.post("/structural-monitoring-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      monitoringRef,
+      date,
+      time,
+      monitoredBy,
+      monitoringType,
+      instrumentRef,
+      calibrationDate,
+      location,
+      structureElement,
+      monitoringPointRef,
+      triggerLevel,
+      alarmLevel,
+      actionLevel,
+      currentReading,
+      previousReading,
+      cumulativeMovement,
+      movementRate,
+      crackWidth,
+      crackLength,
+      settlementMm,
+      tiltDegrees,
+      piezometerLevel,
+      convergenceMm,
+      withinTriggerLevel,
+      withinAlarmLevel,
+      withinActionLevel,
+      structuralEngineerNotified,
+      worksSuspended,
+      remedialActionRequired,
+      remedialDescription,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !monitoredBy || !monitoringType || !location || currentReading === undefined) {
+      return res.status(400).json({ error: "projectId, date, monitoredBy, monitoringType, location, and currentReading are required" });
+    }
+
+    const alerts = [];
+    if (!withinTriggerLevel) alerts.push(`Trigger level breached — reading ${currentReading} has passed trigger level ${triggerLevel}. Increase monitoring frequency.`);
+    if (!withinAlarmLevel) {
+      alerts.push(`ALARM level breached — reading ${currentReading} has passed alarm level ${alarmLevel}. Notify structural engineer immediately.`);
+      console.warn(`[STRUCTURAL MONITORING] ${structureElement || location} at ${projectId} — ALARM level breached: ${currentReading}`);
+    }
+    if (!withinActionLevel) {
+      alerts.push(`ACTION level breached — reading ${currentReading} has passed action level ${actionLevel}. SUSPEND WORKS pending structural engineer review.`);
+      console.warn(`[STRUCTURAL MONITORING CRITICAL] ${structureElement || location} at ${projectId} — ACTION level breached: ${currentReading}. Works should be suspended.`);
+    }
+    if (worksSuspended) alerts.push("Works suspended — resume only after structural engineer review and written clearance");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      monitoring_ref: sanitiseInput(monitoringRef || `SM-${Date.now()}`),
+      date,
+      time: sanitiseInput(time || ""),
+      monitored_by: sanitiseInput(monitoredBy),
+      monitoring_type: sanitiseInput(monitoringType),
+      instrument_ref: sanitiseInput(instrumentRef || ""),
+      calibration_date: calibrationDate || null,
+      location: sanitiseInput(location),
+      structure_element: sanitiseInput(structureElement || ""),
+      monitoring_point_ref: sanitiseInput(monitoringPointRef || ""),
+      trigger_level: triggerLevel !== undefined ? Number(triggerLevel) : null,
+      alarm_level: alarmLevel !== undefined ? Number(alarmLevel) : null,
+      action_level: actionLevel !== undefined ? Number(actionLevel) : null,
+      current_reading: Number(currentReading),
+      previous_reading: previousReading !== undefined ? Number(previousReading) : null,
+      cumulative_movement: cumulativeMovement !== undefined ? Number(cumulativeMovement) : null,
+      movement_rate: movementRate !== undefined ? Number(movementRate) : null,
+      crack_width: crackWidth || null,
+      crack_length: crackLength || null,
+      settlement_mm: settlementMm || null,
+      tilt_degrees: tiltDegrees || null,
+      piezometer_level: piezometerLevel || null,
+      convergence_mm: convergenceMm || null,
+      within_trigger_level: !!withinTriggerLevel,
+      within_alarm_level: !!withinAlarmLevel,
+      within_action_level: !!withinActionLevel,
+      structural_engineer_notified: !!structuralEngineerNotified,
+      works_suspended: !!worksSuspended,
+      remedial_action_required: !!remedialActionRequired,
+      remedial_description: sanitiseInput(remedialDescription || ""),
+      alerts,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("structural_monitoring_records").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (!withinActionLevel) {
+      return res.status(422).json({ criticalAlert: true, alerts, message: "ACTION level breached. Suspend all works near this structure and contact structural engineer immediately.", record, saved });
+    }
+
+    res.json({ alerts, criticalAlert: false, currentReading: Number(currentReading), record, saved });
+  } catch (err) {
+    console.error("/structural-monitoring-record error:", err.message);
+    res.status(500).json({ error: "Failed to record structural monitoring" });
+  }
+});
+
+// POST /ai-energy-audit-report — AI generates energy audit findings and recommendations
+app.post("/ai-energy-audit-report", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      buildingType,
+      buildingArea,
+      annualEnergyGj,
+      energyIntensity,
+      currentNabersRating,
+      mainEnergySystems,
+      observedIssues,
+      operatingHours,
+      occupancyRate,
+    } = req.body;
+
+    if (!buildingType || !annualEnergyGj) {
+      return res.status(400).json({ error: "buildingType and annualEnergyGj are required" });
+    }
+
+    const prompt = `You are an AS/NZS 3598 accredited energy auditor with expertise in NABERS, NCC 2022 Section J, and Victorian energy efficiency programs.
+
+Analyse energy usage and provide audit recommendations for:
+- Building type: ${sanitiseInput(buildingType)}
+- Building area: ${sanitiseInput(String(buildingArea || "not specified"))} m²
+- Annual energy consumption: ${sanitiseInput(String(annualEnergyGj))} GJ
+- Energy intensity: ${sanitiseInput(String(energyIntensity || "not specified"))} MJ/m²
+- Current NABERS rating: ${sanitiseInput(String(currentNabersRating || "not rated"))}
+- Main energy systems: ${sanitiseInput(mainEnergySystems || "HVAC, lighting, hot water")}
+- Observed issues: ${sanitiseInput(observedIssues || "none")}
+- Operating hours: ${sanitiseInput(operatingHours || "business hours")}
+- Occupancy rate: ${sanitiseInput(String(occupancyRate || "75"))}%
+
+Return a JSON object with:
+{
+  "energyPerformanceRating": string,
+  "benchmarkComparison": string,
+  "topEnergyConsumers": [string],
+  "priorityOpportunities": [{"measure": string, "estimatedSavingsPercent": string, "paybackYears": string}],
+  "hvacRecommendations": string,
+  "lightingRecommendations": string,
+  "buildingEnvelopeRecommendations": string,
+  "behaviouralRecommendations": string,
+  "renewableEnergyOpportunity": string,
+  "estimatedCarbonReduction": string,
+  "nabersImprovementPath": string,
+  "victorianIncentives": [string],
+  "applicableStandards": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const report = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ buildingType, annualEnergyGj, report });
+  } catch (err) {
+    console.error("/ai-energy-audit-report error:", err.message);
+    res.json({
+      buildingType: req.body.buildingType || "",
+      annualEnergyGj: req.body.annualEnergyGj || null,
+      report: {
+        energyPerformanceRating: "Assessment required — compare to NABERS national median for building type",
+        benchmarkComparison: "National median for commercial offices is approx 500–800 MJ/m²/year depending on hours and occupancy",
+        topEnergyConsumers: ["HVAC (typically 40–60%)", "Lighting (typically 20–30%)", "Plug loads and equipment (15–20%)", "Hot water (5–10%)"],
+        priorityOpportunities: [
+          { measure: "HVAC BMS optimisation and scheduling", estimatedSavingsPercent: "10–20%", paybackYears: "1–3" },
+          { measure: "LED lighting upgrade with occupancy sensors", estimatedSavingsPercent: "30–50% of lighting load", paybackYears: "2–5" },
+          { measure: "Variable speed drives on HVAC fans/pumps", estimatedSavingsPercent: "15–25% of HVAC load", paybackYears: "2–4" },
+        ],
+        hvacRecommendations: "Review BMS setpoints and schedules. Implement demand-controlled ventilation. Investigate chiller and boiler efficiency. Consider heat pump hot water.",
+        lightingRecommendations: "Upgrade fluorescent to LED (40–50% energy reduction). Install occupancy sensors in low-use areas. Maximise daylight harvesting.",
+        buildingEnvelopeRecommendations: "Inspect and improve building sealing. Check and upgrade insulation. Consider window film or external shading for east/west facades.",
+        behaviouralRecommendations: "Implement after-hours shutdown procedures. Engage occupants in energy saving. Monthly energy dashboard reporting.",
+        renewableEnergyOpportunity: "Rooftop solar PV typically provides 20–30% of office electricity needs. Consider feed-in tariff and battery storage. Victorian VEU rebates available.",
+        estimatedCarbonReduction: "Each 10% energy reduction in a 2,000 m² commercial office reduces CO2 by approximately 20–40 tonnes CO2-e per year",
+        nabersImprovementPath: "Implement priority measures to achieve 5-star NABERS Energy within 3 years. Consider Green Star Performance certification for market recognition.",
+        victorianIncentives: ["Victorian Energy Upgrades (VEU) program — rebates for LEDs, HVAC, insulation", "Business Energy Advice Program (BEAP)", "Solar for Business program"],
+        applicableStandards: ["AS/NZS 3598.1 Energy audits", "NABERS Energy rating protocol", "NCC 2022 Section J — energy efficiency"],
+        recommendation: "Commission a Level 2 AS/NZS 3598 energy audit to identify and quantify all major opportunities. Prioritise HVAC optimisation and LED lighting as the highest value-to-payback measures.",
+        summary: "A structured energy audit reveals significant energy savings potential in most commercial buildings. HVAC and lighting are typically the largest opportunities with payback periods under 5 years.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
