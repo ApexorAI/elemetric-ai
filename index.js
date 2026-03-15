@@ -41411,6 +41411,204 @@ app.post("/waste-reduction-plan", apiKeyAuth, async (req, res) => {
   });
 });
 
+// POST /complaint-register — Log a formal complaint
+app.post("/complaint-register", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, complaintSource = "CLIENT", complainantName, complainantEmail,
+    complainantPhone, complaintDate, complaintDescription, complaintCategory,
+    severity = "MEDIUM", assignedTo, targetResolutionDate,
+    acknowledgementSent = false, status = "OPEN", notes,
+  } = req.body;
+  if (!complaintDescription || !complainantName) {
+    return res.status(400).json({ error: "complaintDescription and complainantName are required." });
+  }
+  const validSources = ["CLIENT", "REGULATOR", "NEIGHBOUR", "EMPLOYEE", "SUBCONTRACTOR", "PUBLIC", "OTHER"];
+  const validSeverities = ["CRITICAL", "HIGH", "MEDIUM", "LOW"];
+  const validStatuses = ["OPEN", "IN_PROGRESS", "RESOLVED", "CLOSED", "ESCALATED"];
+  if (!validSources.includes(complaintSource)) return res.status(400).json({ error: `complaintSource must be one of: ${validSources.join(", ")}` });
+  if (!validSeverities.includes(severity)) return res.status(400).json({ error: `severity must be one of: ${validSeverities.join(", ")}` });
+  if (!validStatuses.includes(status)) return res.status(400).json({ error: `status must be one of: ${validStatuses.join(", ")}` });
+  const complaintRef = `CMP-${Date.now().toString(36).toUpperCase()}`;
+  const acknowledgementDeadline = new Date(Date.now() + (severity === "CRITICAL" ? 1 : severity === "HIGH" ? 2 : 5) * 86400000).toISOString().split("T")[0];
+  const record = {
+    complaint_ref: complaintRef,
+    project_id: projectId || null,
+    complaint_source: complaintSource,
+    complainant_name: sanitiseInput(complainantName),
+    complainant_email: complainantEmail && isValidEmail(complainantEmail) ? complainantEmail : null,
+    complainant_phone: sanitiseInput(complainantPhone || ""),
+    complaint_date: complaintDate || new Date().toISOString().split("T")[0],
+    complaint_description: sanitiseInput(complaintDescription),
+    complaint_category: sanitiseInput(complaintCategory || ""),
+    severity,
+    assigned_to: sanitiseInput(assignedTo || ""),
+    target_resolution_date: targetResolutionDate || null,
+    acknowledgement_deadline: acknowledgementDeadline,
+    acknowledgement_sent: Boolean(acknowledgementSent),
+    status,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("complaint_register").insert(record);
+    if (error) console.error("complaint-register DB error:", error.message);
+  }
+  res.json({
+    complaintRef, severity, status, acknowledgementDeadline,
+    targetResolutionDate, saved: !!supabaseAdmin,
+  });
+});
+
+// GET /complaint-register — List complaints
+app.get("/complaint-register", apiKeyAuth, async (req, res) => {
+  const { projectId, status, severity } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("complaint_register").select("*").order("complaint_date", { ascending: false });
+  if (projectId) query = query.eq("project_id", projectId);
+  if (status) query = query.eq("status", status);
+  if (severity) query = query.eq("severity", severity);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({
+    count: data.length,
+    open: data.filter(c => c.status === "OPEN").length,
+    critical: data.filter(c => c.severity === "CRITICAL").length,
+    pendingAck: data.filter(c => !c.acknowledgement_sent).length,
+    complaints: data,
+  });
+});
+
+// POST /quality-non-conformance — Record a quality non-conformance (NCR)
+app.post("/quality-non-conformance", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, title, description, location,
+    tradeResponsible, ncrCategory, severity = "MEDIUM",
+    nonConformingWork = "", specificationReference,
+    immediateAction, rootCause, correctiveAction,
+    preventiveAction, verificationRequired = true,
+    raisedBy, reviewDate, status = "OPEN", linkedInspectionRef,
+    notes,
+  } = req.body;
+  if (!projectId || !title || !description) {
+    return res.status(400).json({ error: "projectId, title, and description are required." });
+  }
+  const validSeverities = ["CRITICAL", "MAJOR", "MINOR", "OBSERVATION"];
+  const validStatuses = ["OPEN", "DISPOSITION_PENDING", "IN_RECTIFICATION", "VERIFICATION_PENDING", "CLOSED", "CANCELLED"];
+  if (!validSeverities.includes(severity)) return res.status(400).json({ error: `severity must be one of: ${validSeverities.join(", ")}` });
+  if (!validStatuses.includes(status)) return res.status(400).json({ error: `status must be one of: ${validStatuses.join(", ")}` });
+  const ncrRef = `NCR-${Date.now().toString(36).toUpperCase()}`;
+  const responseDeadlineDays = severity === "CRITICAL" ? 2 : severity === "MAJOR" ? 7 : 14;
+  const responseDeadline = new Date(Date.now() + responseDeadlineDays * 86400000).toISOString().split("T")[0];
+  const record = {
+    ncr_ref: ncrRef,
+    project_id: projectId,
+    title: sanitiseInput(title),
+    description: sanitiseInput(description),
+    location: sanitiseInput(location || ""),
+    trade_responsible: sanitiseInput(tradeResponsible || ""),
+    ncr_category: sanitiseInput(ncrCategory || ""),
+    severity,
+    non_conforming_work: sanitiseInput(nonConformingWork),
+    specification_reference: sanitiseInput(specificationReference || ""),
+    immediate_action: sanitiseInput(immediateAction || ""),
+    root_cause: sanitiseInput(rootCause || ""),
+    corrective_action: sanitiseInput(correctiveAction || ""),
+    preventive_action: sanitiseInput(preventiveAction || ""),
+    verification_required: Boolean(verificationRequired),
+    raised_by: sanitiseInput(raisedBy || ""),
+    review_date: reviewDate || responseDeadline,
+    response_deadline: responseDeadline,
+    status,
+    linked_inspection_ref: sanitiseInput(linkedInspectionRef || ""),
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("quality_non_conformances").insert(record);
+    if (error) console.error("quality-non-conformance DB error:", error.message);
+  }
+  res.json({ ncrRef, severity, status, responseDeadline, verificationRequired, saved: !!supabaseAdmin });
+});
+
+// POST /ai-complaint-response — AI drafts a professional response to a complaint
+app.post("/ai-complaint-response", apiKeyAuth, async (req, res) => {
+  const {
+    complaintRef, complainantName, complaintDescription, complaintCategory,
+    severity = "MEDIUM", companyName, tradeOrService, responseType = "ACKNOWLEDGEMENT",
+    proposedResolution, resolutionTimeframe, additionalContext,
+  } = req.body;
+  if (!complaintDescription || !complainantName) {
+    return res.status(400).json({ error: "complaintDescription and complainantName are required." });
+  }
+  const validTypes = ["ACKNOWLEDGEMENT", "INVESTIGATION_UPDATE", "FINAL_RESOLUTION", "REJECTION"];
+  if (!validTypes.includes(responseType)) {
+    return res.status(400).json({ error: `responseType must be one of: ${validTypes.join(", ")}` });
+  }
+  const sanitisedName = sanitiseInput(complainantName);
+  const sanitisedCompany = sanitiseInput(companyName || "Our company");
+  const sanitisedTrade = sanitiseInput(tradeOrService || "trade services");
+  const systemPrompt = `You are a professional customer relations specialist for an Australian trade services company. Write empathetic, professional complaint responses.`;
+  const userPrompt = `Draft a ${responseType.replace(/_/g, " ").toLowerCase()} response to this complaint:
+Complainant: ${sanitisedName}
+Complaint: ${sanitiseInput(complaintDescription)}
+Category: ${sanitiseInput(complaintCategory || "General")}
+Severity: ${severity}
+Company: ${sanitisedCompany}
+Service: ${sanitisedTrade}
+Proposed resolution: ${sanitiseInput(proposedResolution || "Under investigation")}
+Resolution timeframe: ${sanitiseInput(resolutionTimeframe || "Within 5 business days")}
+Additional context: ${sanitiseInput(additionalContext || "")}
+
+Return JSON with:
+{
+  "subject": "...",
+  "salutation": "...",
+  "openingParagraph": "...",
+  "acknowledgementOfConcern": "...",
+  "investigationStatement": "...",
+  "proposedActionParagraph": "...",
+  "timelineCommitment": "...",
+  "contactDetails": "...",
+  "closingParagraph": "...",
+  "signoff": "...",
+  "internalNotes": "...",
+  "toneAssessment": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const response = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ complaintRef, complainantName: sanitisedName, responseType, response });
+  } catch (err) {
+    console.error("ai-complaint-response error:", err.message);
+    res.json({
+      complaintRef, complainantName: sanitisedName, responseType,
+      response: {
+        subject: `Re: Your complaint — Reference ${complaintRef || "Pending"}`,
+        salutation: `Dear ${sanitisedName},`,
+        openingParagraph: `Thank you for taking the time to bring this matter to our attention.`,
+        acknowledgementOfConcern: "We take all complaints seriously and are committed to resolving this matter promptly.",
+        investigationStatement: "We are currently investigating the circumstances you have described.",
+        proposedActionParagraph: sanitiseInput(proposedResolution || "We will be in contact with proposed resolution steps shortly."),
+        timelineCommitment: sanitiseInput(resolutionTimeframe || "We aim to respond within 5 business days."),
+        contactDetails: "Please do not hesitate to contact our office if you have any further concerns.",
+        closingParagraph: "We appreciate your patience while we work to resolve this matter.",
+        signoff: `Yours sincerely,\n${sanitisedCompany}`,
+        internalNotes: "AI response unavailable — manual draft applied.",
+        toneAssessment: "Professional and empathetic",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
