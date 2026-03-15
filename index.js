@@ -7625,6 +7625,485 @@ app.post("/supervisor-report", (req, res) => {
   });
 });
 
+// ── POST /generate-permit-checklist ──────────────────────────────────────────
+// Returns a trade-specific checklist of everything required to obtain the
+// applicable permit or authority approval before starting work in Victoria.
+app.post("/generate-permit-checklist", (req, res) => {
+  const { jobType, scope, existingBuilding = false } = req.body || {};
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+
+  if (!jobType || !SUPPORTED.includes(jobType.toLowerCase())) {
+    return res.status(400).json({ error: `jobType required. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+
+  const PERMIT_REQUIREMENTS = {
+    plumbing: {
+      permitName:     "Plumbing Permit (for work >$750 or prescribed work)",
+      issuingBody:    "Victorian Building Authority (VBA) via a licensed plumber",
+      alwaysRequired: false,
+      requiresPermit: "Roof plumbing, new hot water systems, any work requiring a building permit",
+      documents: [
+        { item: "Owner/Builder approval or building owner consent", required: true },
+        { item: "Site plan showing location of proposed work", required: true },
+        { item: "Plumber's licence number (VBA)", required: true },
+        { item: "Proposed materials list and specifications", required: false },
+        { item: "Council connection approval (for new sewer/water main connections)", required: false },
+      ],
+      postWorkDocs: [
+        { item: "Certificate of Compliance (CoC) filed with VBA within 2 business days", required: true },
+        { item: "Owner copy of CoC provided", required: true },
+        { item: "Test records retained for 7 years", required: true },
+      ],
+    },
+    gas: {
+      permitName:     "Not required — Certificate of Compliance mandatory after work",
+      issuingBody:    "Energy Safe Victoria (ESV)",
+      alwaysRequired: false,
+      requiresPermit: "No permit required; ESV compliance certificate must be lodged",
+      documents: [
+        { item: "ESV-licensed gas fitter details", required: true },
+        { item: "Appliance AGA/SAA certification documents", required: true },
+        { item: "Site plan showing gas installation layout", required: false },
+      ],
+      postWorkDocs: [
+        { item: "Gas Compliance Certificate lodged with ESV within 48 hours", required: true },
+        { item: "Pressure test results retained", required: true },
+        { item: "Appliance instruction manual provided to owner", required: true },
+      ],
+    },
+    electrical: {
+      permitName:     "Not required — Certificate of Electrical Safety (CoES) mandatory",
+      issuingBody:    "Energy Safe Victoria (ESV)",
+      alwaysRequired: false,
+      requiresPermit: "No permit; CoES must be lodged with ESV after all prescribed electrical work",
+      documents: [
+        { item: "REC (Registered Electrical Contractor) licence number", required: true },
+        { item: "Electrical installation plans for new circuits (commercial)", required: false },
+        { item: "ESV work category selection", required: true },
+      ],
+      postWorkDocs: [
+        { item: "CoES lodged with ESV within 5 days (residential) / 2 days (commercial)", required: true },
+        { item: "Test results (insulation, earth continuity, RCD) retained for 5 years", required: true },
+        { item: "Owner notified of RCD test procedure", required: true },
+      ],
+    },
+    drainage: {
+      permitName:     "Plumbing Permit (where building permit is also required)",
+      issuingBody:    "Victorian Building Authority (VBA)",
+      alwaysRequired: false,
+      requiresPermit: "New house drains, alterations to drainage serving >1 property, stormwater connections",
+      documents: [
+        { item: "Site plan with drainage layout and falls indicated", required: true },
+        { item: "Council sewer / stormwater connection approval", required: false },
+        { item: "Drainer licence number (VBA)", required: true },
+      ],
+      postWorkDocs: [
+        { item: "Certificate of Compliance (CoC) lodged with VBA", required: true },
+        { item: "Hydraulic test result retained", required: true },
+        { item: "As-installed drainage plan retained", required: false },
+      ],
+    },
+    carpentry: {
+      permitName:     "Building Permit",
+      issuingBody:    "Registered Building Surveyor (private or council)",
+      alwaysRequired: true,
+      requiresPermit: "New dwellings, extensions, structural alterations, decks >1 m, carports",
+      documents: [
+        { item: "Completed building permit application form", required: true },
+        { item: "Site plan (survey or sketch) with dimensions and setbacks", required: true },
+        { item: "Architectural drawings (floor plans, elevations, sections)", required: true },
+        { item: "Engineering documentation for structural members", required: true },
+        { item: "Owner Builder Permit (if owner is acting as builder)", required: false },
+        { item: "Domestic builder licence number (VBA)", required: true },
+        { item: "Owner consent / land title", required: true },
+        { item: "Overlay / planning permit (if required by council)", required: false },
+        { item: "Bushfire Attack Level (BAL) assessment (if BAL-12.5 or above)", required: existingBuilding ? false : false },
+      ],
+      postWorkDocs: [
+        { item: "Mandatory inspections completed (footing, frame, lock-up, final)", required: true },
+        { item: "Certificate of Occupancy or Final Certificate issued by Building Surveyor", required: true },
+        { item: "Energy rating certificate", required: true },
+        { item: "Maintenance schedule for owner", required: false },
+      ],
+    },
+    hvac: {
+      permitName:     "ARC Licence for refrigerants; Building Permit if structural ducting",
+      issuingBody:    "Australian Refrigeration Council (ARC) / VBA",
+      alwaysRequired: false,
+      requiresPermit: "Refrigerant handling requires ARC licence; building permit required if structural penetrations",
+      documents: [
+        { item: "ARC licence for technician handling refrigerant", required: true },
+        { item: "Refrigerant type and charge weight documented", required: true },
+        { item: "Building permit application (if roof/wall penetrations required)", required: false },
+        { item: "Equipment manufacturer specifications", required: true },
+      ],
+      postWorkDocs: [
+        { item: "ARC service record updated", required: true },
+        { item: "Commissioning report signed", required: true },
+        { item: "Owner handover — operating manual and filter maintenance schedule", required: true },
+      ],
+    },
+  };
+
+  const req_data = PERMIT_REQUIREMENTS[jobType.toLowerCase()];
+  const scopeTriggers = Array.isArray(scope) ? scope.map(s => String(s).toLowerCase()) : [];
+
+  // Flag extra items triggered by scope
+  const extraItems = [];
+  if (scopeTriggers.some(s => s.includes("heritage") || s.includes("overlay"))) {
+    extraItems.push({ item: "Heritage overlay permit from council Heritage Advisor", required: true, trigger: "heritage overlay" });
+  }
+  if (scopeTriggers.some(s => s.includes("asbestos") || s.includes("fibro"))) {
+    extraItems.push({ item: "Asbestos assessment report by licensed assessor before work starts", required: true, trigger: "asbestos" });
+    extraItems.push({ item: "Licensed asbestos removalist engaged (if Class A removal)", required: false, trigger: "asbestos" });
+  }
+  if (scopeTriggers.some(s => s.includes("flood") || s.includes("waterway"))) {
+    extraItems.push({ item: "Melbourne Water / relevant catchment authority approval", required: true, trigger: "flood zone / waterway" });
+  }
+
+  return res.json({
+    jobType,
+    permitName:        req_data.permitName,
+    issuingBody:       req_data.issuingBody,
+    permitAlwaysRequired: req_data.alwaysRequired,
+    requiresPermitWhen:   req_data.requiresPermit,
+    preworkDocuments:  [...req_data.documents, ...extraItems],
+    postworkDocuments: req_data.postWorkDocs,
+    scopeTriggeredItems: extraItems,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /apprentice-guide ─────────────────────────────────────────────────────
+// Breaks down an AI analysis result into educational commentary for apprentices.
+// Explains why each missing item matters and links to the relevant standard.
+app.post("/apprentice-guide", async (req, res) => {
+  const { jobType, itemsMissing = [], itemsDetected = [], complianceScore } = req.body || {};
+
+  if (!jobType) {
+    return res.status(400).json({ error: "jobType is required." });
+  }
+
+  if (!client) {
+    return res.status(503).json({ error: "AI service not configured." });
+  }
+
+  if (itemsMissing.length === 0 && itemsDetected.length === 0) {
+    return res.status(400).json({ error: "At least one of itemsMissing or itemsDetected is required." });
+  }
+
+  const prompt = `You are a senior Victorian tradesperson explaining a compliance result to a first-year apprentice.
+Job type: ${jobType}
+Compliance score: ${complianceScore !== undefined ? complianceScore + "%" : "not provided"}
+Items detected correctly: ${itemsDetected.slice(0, 10).join(", ") || "none"}
+Missing items: ${itemsMissing.slice(0, 8).join(", ") || "none"}
+
+For each missing item, explain in plain language:
+1. What the item IS (one sentence)
+2. WHY it matters for safety/compliance (one sentence)
+3. The relevant Australian Standard or Victorian regulation
+
+Keep each explanation under 60 words. Format as JSON array:
+[{"item":"...","whatItIs":"...","whyItMatters":"...","standard":"..."}]
+Return ONLY the JSON array.`;
+
+  try {
+    const response = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 600,
+      temperature: 0.3,
+    });
+
+    const raw = response.choices[0]?.message?.content?.trim() || "[]";
+    let explanations;
+    try {
+      const match = raw.match(/\[[\s\S]*\]/);
+      explanations = JSON.parse(match ? match[0] : raw);
+    } catch {
+      explanations = itemsMissing.slice(0, 8).map(item => ({ item, whatItIs: null, whyItMatters: null, standard: null }));
+    }
+
+    usageStats.openaiCalls++;
+
+    const tips = CHECKLISTS[jobType.toLowerCase()] || [];
+    const detectedTips = itemsDetected.slice(0, 5).map(item => {
+      const matched = tips.find(t => item.toLowerCase().includes(t.item.toLowerCase().substring(0, 15)));
+      return { item, tip: matched?.tip || "Good work capturing this item — keep it consistent on every job." };
+    });
+
+    return res.json({
+      jobType,
+      complianceScore: complianceScore ?? null,
+      forApprentice: true,
+      missingItemExplanations: explanations,
+      detectedItemPraise: detectedTips,
+      encouragement: complianceScore >= 80
+        ? "Great result! A score above 80% shows strong compliance habits — keep it up."
+        : complianceScore >= 70
+        ? "Solid score. Focus on the missing items above and you'll hit 90+ next time."
+        : "There's room to improve. Study the standards for each missing item before your next job.",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("apprentice-guide error:", err);
+    return res.status(500).json({ error: "Guide generation failed." });
+  }
+});
+
+// ── GET /maintenance-schedule ─────────────────────────────────────────────────
+// Returns a 12-month maintenance calendar for a given trade type and install date.
+// Covers all periodic inspections and service tasks required in Victoria.
+app.get("/maintenance-schedule", (req, res) => {
+  const { jobType, installDate, assetLabel } = req.query;
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+
+  if (!jobType || !SUPPORTED.includes(jobType.toLowerCase())) {
+    return res.status(400).json({ error: `jobType required. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+
+  const baseDate = installDate ? new Date(installDate) : new Date();
+  if (isNaN(baseDate.getTime())) {
+    return res.status(400).json({ error: "installDate must be a valid ISO date if provided." });
+  }
+
+  const addMonths = (date, months) => {
+    const d = new Date(date);
+    d.setMonth(d.getMonth() + months);
+    return d;
+  };
+
+  const SCHEDULES = {
+    plumbing: [
+      { intervalMonths: 3,  task: "Inspect all visible pipe joints and fittings for drips or corrosion", urgency: "routine" },
+      { intervalMonths: 6,  task: "Test PTR (pressure-temperature relief) valve — lift lever briefly", urgency: "important" },
+      { intervalMonths: 12, task: "Service hot water system — anode rod check, flush sediment", urgency: "important" },
+      { intervalMonths: 12, task: "Test all isolation valves — exercise to prevent seizing", urgency: "routine" },
+      { intervalMonths: 12, task: "Testable backflow prevention device — annual test by licensed plumber", urgency: "mandatory" },
+      { intervalMonths: 60, task: "Full plumbing installation review — pressure, flow, compliance check", urgency: "recommended" },
+    ],
+    gas: [
+      { intervalMonths: 6,  task: "Visually inspect all gas hoses and connections for cracks or wear", urgency: "important" },
+      { intervalMonths: 12, task: "Service all gas appliances (burners, heat exchangers, controls)", urgency: "mandatory" },
+      { intervalMonths: 12, task: "Check flue terminals are unobstructed and clearances maintained", urgency: "important" },
+      { intervalMonths: 12, task: "Test gas isolation valve operation at meter and each appliance", urgency: "routine" },
+      { intervalMonths: 24, task: "Gas tightness test on all pipework by licensed gas fitter (ESV recommended)", urgency: "recommended" },
+    ],
+    electrical: [
+      { intervalMonths: 3,  task: "Test RCD (safety switch) — push test button on switchboard", urgency: "mandatory" },
+      { intervalMonths: 12, task: "Inspect all power outlets and switches for damage, scorch marks, or loose fittings", urgency: "important" },
+      { intervalMonths: 12, task: "Check smoke alarms are functional — test and replace batteries", urgency: "mandatory" },
+      { intervalMonths: 12, task: "Inspect switchboard — check for loose connections, corrosion, labelling", urgency: "important" },
+      { intervalMonths: 60, task: "Professional electrical safety inspection by licensed electrician (ESV recommended)", urgency: "recommended" },
+    ],
+    drainage: [
+      { intervalMonths: 6,  task: "Clear all floor grate and inspection opening covers — check for blockages", urgency: "routine" },
+      { intervalMonths: 12, task: "Flush all drain lines with water to check flow rates", urgency: "routine" },
+      { intervalMonths: 12, task: "Inspect all trap seals — confirm they hold water", urgency: "important" },
+      { intervalMonths: 24, task: "CCTV inspection of underground drainage for root intrusion or collapse (older properties)", urgency: "recommended" },
+      { intervalMonths: 12, task: "Test backwater valve operation — clean float if present", urgency: "important" },
+    ],
+    carpentry: [
+      { intervalMonths: 6,  task: "Check roof for lifted or cracked tiles, missing pointing, or rust in gutters", urgency: "important" },
+      { intervalMonths: 12, task: "Inspect all timber decking for rot, splitting, or loose fixings", urgency: "important" },
+      { intervalMonths: 12, task: "Check weep holes in brickwork are unobstructed", urgency: "routine" },
+      { intervalMonths: 12, task: "Inspect wet area waterproofing — look for cracked grout, lifting tiles", urgency: "important" },
+      { intervalMonths: 12, task: "Check all doors and windows open/close freely — inspect seals and flashings", urgency: "routine" },
+      { intervalMonths: 36, task: "Re-paint or re-coat all exposed external timber to prevent rot", urgency: "recommended" },
+    ],
+    hvac: [
+      { intervalMonths: 1,  task: "Clean or replace return air filter (monthly during heavy use seasons)", urgency: "mandatory" },
+      { intervalMonths: 3,  task: "Clean indoor unit coil and inspect for mould or odour", urgency: "important" },
+      { intervalMonths: 6,  task: "Check condensate drain is clear and draining freely", urgency: "important" },
+      { intervalMonths: 12, task: "Full HVAC service — refrigerant check, coil clean, electrical checks, controls test", urgency: "mandatory" },
+      { intervalMonths: 12, task: "Inspect outdoor unit — clear debris, check fan and coil condition", urgency: "important" },
+      { intervalMonths: 24, task: "Ductwork inspection — check insulation, joints, and air balancing dampers", urgency: "recommended" },
+    ],
+  };
+
+  const schedule = (SCHEDULES[jobType.toLowerCase()] || []).map((entry, idx) => ({
+    taskNumber:    idx + 1,
+    task:          entry.task,
+    urgency:       entry.urgency,
+    intervalMonths: entry.intervalMonths,
+    nextDueDate:   addMonths(baseDate, entry.intervalMonths).toISOString().split("T")[0],
+  })).sort((a, b) => new Date(a.nextDueDate) - new Date(b.nextDueDate));
+
+  return res.json({
+    jobType,
+    assetLabel:  assetLabel || null,
+    installDate: baseDate.toISOString().split("T")[0],
+    taskCount:   schedule.length,
+    schedule,
+    note: "Maintenance tasks marked 'mandatory' may have regulatory or warranty implications. All work must be performed by an appropriately licensed tradesperson.",
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /quality-assurance ───────────────────────────────────────────────────
+// Runs a multi-point QA check across a completed job analysis. Returns a
+// structured pass/fail result for each quality gate with an overall QA status.
+app.post("/quality-assurance", (req, res) => {
+  const {
+    jobType,
+    complianceScore,
+    confidence,
+    itemsMissing     = [],
+    itemsDetected    = [],
+    gpsRecorded,
+    signatureObtained,
+    certificateFiled,
+    photoCount,
+    permitObtained,
+    testRecorded,
+    labourRate,
+    materialsTotal,
+    jobDate,
+  } = req.body || {};
+
+  if (!jobType) {
+    return res.status(400).json({ error: "jobType is required." });
+  }
+
+  const REQUIRED_PHOTOS = { plumbing: 8, gas: 8, electrical: 8, drainage: 6, carpentry: 6, hvac: 6 };
+  const requiredPhotos  = REQUIRED_PHOTOS[jobType?.toLowerCase()] || 6;
+
+  const gates = [];
+
+  const gate = (id, name, pass, value, failMsg, severity = "high") => {
+    gates.push({ id, name, pass, value: value ?? null, message: pass ? "Pass" : failMsg, severity });
+  };
+
+  gate("score_threshold",   "Compliance score ≥ 70%",        (complianceScore ?? 0) >= 70,              `${complianceScore ?? "?"}%`,        "Score below minimum threshold",                            "critical");
+  gate("confidence_level",  "AI confidence ≥ 60%",           (confidence ?? 0) >= 60,                   `${confidence ?? "?"}%`,             "Low AI confidence — re-photograph",                        "high");
+  gate("photo_count",       `Minimum ${requiredPhotos} photos`, (photoCount ?? 0) >= requiredPhotos,     `${photoCount ?? "?"} provided`,     `Fewer than ${requiredPhotos} photos submitted`,            "high");
+  gate("no_critical_missing","No critical items missing",     !itemsMissing.some(i =>
+    ["certificate","rcd","ptr","backflow","earth","gas compliance","permit"].some(k => i.toLowerCase().includes(k))),
+    `${itemsMissing.length} missing`,  "Critical compliance item(s) are missing",                         "critical");
+  gate("gps_recorded",      "GPS location recorded",         gpsRecorded === true,                       gpsRecorded ?? "not set",            "GPS not recorded — adds liability risk",                    "medium");
+  gate("signature_obtained","Customer signature obtained",   signatureObtained === true,                 signatureObtained ?? "not set",      "Customer signature not recorded",                          "medium");
+  gate("certificate_filed", "Compliance certificate filed",  certificateFiled === true,                  certificateFiled ?? "not set",       "Certificate not filed with regulator",                     "critical");
+  gate("test_recorded",     "Test results recorded",         testRecorded === true,                      testRecorded ?? "not set",           "No test record documented",                                "high");
+
+  if (jobType?.toLowerCase() === "carpentry") {
+    gate("permit_obtained", "Building permit obtained",      permitObtained === true,                    permitObtained ?? "not set",         "Building permit not confirmed",                            "critical");
+  }
+
+  const criticalFails = gates.filter(g => !g.pass && g.severity === "critical");
+  const highFails     = gates.filter(g => !g.pass && g.severity === "high");
+  const mediumFails   = gates.filter(g => !g.pass && g.severity === "medium");
+  const passCount     = gates.filter(g => g.pass).length;
+  const qaScore       = Math.round((passCount / gates.length) * 100);
+
+  const qaStatus = criticalFails.length > 0 ? "FAIL — Critical"
+    : highFails.length > 0    ? "FAIL — High Issues"
+    : mediumFails.length > 0  ? "PASS — With Warnings"
+    : "PASS";
+
+  return res.json({
+    jobType,
+    qaStatus,
+    qaScore:          `${qaScore}%`,
+    gatesPassed:      passCount,
+    totalGates:       gates.length,
+    criticalFailCount: criticalFails.length,
+    highFailCount:    highFails.length,
+    mediumWarnings:   mediumFails.length,
+    gates,
+    criticalActions:  criticalFails.map(g => g.message),
+    recommendation:   criticalFails.length > 0
+      ? "Do NOT file compliance certificate until critical items are resolved."
+      : highFails.length > 0
+      ? "Resolve high-severity issues before issuing documentation to the owner."
+      : mediumFails.length > 0
+      ? "Address warnings at earliest opportunity. Certificate may be filed with caution."
+      : "All quality gates passed. Job is ready for compliance certificate filing.",
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /document-checklist ──────────────────────────────────────────────────
+// Returns a complete document checklist for a finished job. Covers everything
+// a tradesperson must provide to the owner and regulator at handover.
+app.post("/document-checklist", (req, res) => {
+  const { jobType, certificateFiled, gpsRecorded, signatureObtained, permitObtained, testRecorded } = req.body || {};
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+
+  if (!jobType || !SUPPORTED.includes(jobType.toLowerCase())) {
+    return res.status(400).json({ error: `jobType required. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+
+  const DOCUMENT_SETS = {
+    plumbing: [
+      { doc: "Certificate of Compliance (CoC)", recipient: "VBA + owner copy", mandatory: true, deadline: "2 business days after completion" },
+      { doc: "Pressure test results", recipient: "Retained by tradesperson for 7 years", mandatory: true, deadline: "At completion" },
+      { doc: "Backflow prevention test report (if applicable)", recipient: "Owner + water authority", mandatory: false, deadline: "At completion" },
+      { doc: "Manufacturer warranty documentation (HWS etc.)", recipient: "Owner", mandatory: true, deadline: "At handover" },
+      { doc: "Customer sign-off / work acceptance", recipient: "Retained by tradesperson", mandatory: false, deadline: "At handover" },
+    ],
+    gas: [
+      { doc: "Gas Compliance Certificate", recipient: "ESV + owner copy", mandatory: true, deadline: "48 hours after completion" },
+      { doc: "Pressure test records (working and tightness)", recipient: "Retained for 5 years", mandatory: true, deadline: "At completion" },
+      { doc: "Appliance instruction manuals", recipient: "Owner", mandatory: true, deadline: "At handover" },
+      { doc: "Location of gas isolation valve — written notice to owner", recipient: "Owner", mandatory: true, deadline: "At handover" },
+    ],
+    electrical: [
+      { doc: "Certificate of Electrical Safety (CoES)", recipient: "ESV (lodged online) + owner", mandatory: true, deadline: "5 days residential / 2 days commercial" },
+      { doc: "Test results (insulation resistance, earth continuity, RCD trip)", recipient: "Retained for 5 years", mandatory: true, deadline: "At completion" },
+      { doc: "Circuit directory (switchboard schedule)", recipient: "Affixed to switchboard + owner copy", mandatory: true, deadline: "At completion" },
+      { doc: "RCD test procedure instructions for owner", recipient: "Owner", mandatory: true, deadline: "At handover" },
+    ],
+    drainage: [
+      { doc: "Certificate of Compliance (CoC)", recipient: "VBA + owner copy", mandatory: true, deadline: "2 business days after completion" },
+      { doc: "Hydraulic test record", recipient: "Retained for 7 years", mandatory: true, deadline: "At completion" },
+      { doc: "As-installed drainage sketch", recipient: "Owner (recommended)", mandatory: false, deadline: "At handover" },
+    ],
+    carpentry: [
+      { doc: "Building permit (pre-work)", recipient: "Displayed on site during construction", mandatory: true, deadline: "Before commencing work" },
+      { doc: "Mandatory inspection sign-offs (footing, frame, etc.)", recipient: "Building Surveyor + retained", mandatory: true, deadline: "At each stage" },
+      { doc: "Certificate of Occupancy / Final Certificate", recipient: "Owner + council", mandatory: true, deadline: "At practical completion" },
+      { doc: "Energy rating certificate (NatHERS)", recipient: "Owner + council", mandatory: true, deadline: "At completion" },
+      { doc: "Structural engineer's inspection report (if required)", recipient: "Building Surveyor + owner", mandatory: false, deadline: "During construction" },
+      { doc: "Domestic Building Contract", recipient: "Owner", mandatory: true, deadline: "Before commencing work" },
+    ],
+    hvac: [
+      { doc: "ARC service record update", recipient: "ARC database", mandatory: true, deadline: "Within 24 hours" },
+      { doc: "Commissioning report", recipient: "Owner", mandatory: true, deadline: "At handover" },
+      { doc: "Filter maintenance schedule", recipient: "Owner", mandatory: true, deadline: "At handover" },
+      { doc: "Warranty registration", recipient: "Manufacturer + owner copy", mandatory: true, deadline: "Within 30 days" },
+      { doc: "Refrigerant logbook entry", recipient: "Retained by tradesperson", mandatory: true, deadline: "At completion" },
+    ],
+  };
+
+  const docs = DOCUMENT_SETS[jobType.toLowerCase()] || [];
+
+  // Mark already-completed items based on body params
+  const statusMap = {
+    "Certificate of Compliance (CoC)": certificateFiled,
+    "Certificate of Electrical Safety (CoES)": certificateFiled,
+    "Gas Compliance Certificate": certificateFiled,
+    "Customer sign-off / work acceptance": signatureObtained,
+  };
+
+  const enriched = docs.map(d => ({
+    ...d,
+    status: statusMap[d.doc] === true ? "complete" : statusMap[d.doc] === false ? "outstanding" : "unknown",
+  }));
+
+  const outstanding = enriched.filter(d => d.mandatory && d.status !== "complete");
+
+  return res.json({
+    jobType,
+    totalDocuments:      docs.length,
+    mandatoryCount:      docs.filter(d => d.mandatory).length,
+    outstandingCount:    outstanding.length,
+    documents:           enriched,
+    outstandingMandatory: outstanding.map(d => ({ doc: d.doc, deadline: d.deadline })),
+    readyToHandover:     outstanding.length === 0,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
