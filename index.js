@@ -39578,6 +39578,201 @@ Return JSON with:
   }
 });
 
+// POST /hvac-service-record — Record an HVAC service event
+app.post("/hvac-service-record", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, projectId, systemDescription, systemType = "SPLIT_SYSTEM",
+    make, model, serialNumber, serviceDate, serviceType = "ROUTINE",
+    technicianName, arcLicenceNumber, nextServiceDue,
+    filtersCleaned = false, refrigerantType, refrigerantAdded_kg,
+    refrigerantRecovered_kg, refrigerantGwp,
+    systemPressureKpa, supplyAirTempC, returnAirTempC,
+    serviceResult = "SERVICEABLE", defectsFound = [], notes,
+  } = req.body;
+  if (!propertyAddress || !serviceDate || !technicianName) {
+    return res.status(400).json({ error: "propertyAddress, serviceDate, and technicianName are required." });
+  }
+  const validSystemTypes = ["SPLIT_SYSTEM", "DUCTED", "MULTI_HEAD", "VRF_VRV", "CHILLER", "EVAPORATIVE", "PACKAGE_UNIT"];
+  const validServiceTypes = ["ROUTINE", "REACTIVE", "BREAKDOWN", "COMMISSIONING", "DECOMMISSION", "ANNUAL_INSPECTION"];
+  if (!validSystemTypes.includes(systemType)) return res.status(400).json({ error: `systemType must be one of: ${validSystemTypes.join(", ")}` });
+  if (!validServiceTypes.includes(serviceType)) return res.status(400).json({ error: `serviceType must be one of: ${validServiceTypes.join(", ")}` });
+  const serviceRef = `HVAC-${Date.now().toString(36).toUpperCase()}`;
+  const co2eAdded = refrigerantAdded_kg && refrigerantGwp
+    ? Number(refrigerantAdded_kg) * Number(refrigerantGwp)
+    : null;
+  const daysUntilService = nextServiceDue
+    ? Math.ceil((new Date(nextServiceDue) - new Date()) / (1000 * 60 * 60 * 24))
+    : null;
+  const record = {
+    service_ref: serviceRef,
+    property_address: sanitiseInput(propertyAddress),
+    project_id: projectId || null,
+    system_description: sanitiseInput(systemDescription || ""),
+    system_type: systemType,
+    make: sanitiseInput(make || ""),
+    model: sanitiseInput(model || ""),
+    serial_number: sanitiseInput(serialNumber || ""),
+    service_date: serviceDate,
+    service_type: serviceType,
+    technician_name: sanitiseInput(technicianName),
+    arc_licence_number: sanitiseInput(arcLicenceNumber || ""),
+    next_service_due: nextServiceDue || null,
+    filters_cleaned: Boolean(filtersCleaned),
+    refrigerant_type: sanitiseInput(refrigerantType || ""),
+    refrigerant_added_kg: Number(refrigerantAdded_kg) || null,
+    refrigerant_recovered_kg: Number(refrigerantRecovered_kg) || null,
+    refrigerant_gwp: Number(refrigerantGwp) || null,
+    co2e_added_kg: co2eAdded ? +co2eAdded.toFixed(2) : null,
+    system_pressure_kpa: Number(systemPressureKpa) || null,
+    supply_air_temp_c: Number(supplyAirTempC) || null,
+    return_air_temp_c: Number(returnAirTempC) || null,
+    delta_t: (returnAirTempC && supplyAirTempC) ? +(Number(returnAirTempC) - Number(supplyAirTempC)).toFixed(1) : null,
+    service_result: serviceResult,
+    defects_found: Array.isArray(defectsFound) ? defectsFound.map(d => sanitiseInput(d)) : [],
+    days_until_service: daysUntilService,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("hvac_service_records").insert(record);
+    if (error) console.error("hvac-service-record DB error:", error.message);
+  }
+  res.json({
+    serviceRef, systemType, serviceType, serviceDate, serviceResult,
+    defectCount: record.defects_found.length, co2eAdded, daysUntilService,
+    saved: !!supabaseAdmin,
+  });
+});
+
+// POST /refrigerant-log — Log refrigerant usage for ARC compliance
+app.post("/refrigerant-log", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, systemRef, technicianName, arcLicenceNumber,
+    logDate, refrigerantType, actionType,
+    quantityKg, stockBalanceKg, cylinderNumber,
+    reasonForAction, customerName, siteAddress, notes,
+  } = req.body;
+  if (!technicianName || !arcLicenceNumber || !logDate || !refrigerantType || !actionType || !quantityKg) {
+    return res.status(400).json({ error: "technicianName, arcLicenceNumber, logDate, refrigerantType, actionType, and quantityKg are required." });
+  }
+  const validActions = ["CHARGED", "RECOVERED", "DECANTED", "PURCHASED", "RETURNED", "DESTROYED", "VENTED_EMERGENCY"];
+  if (!validActions.includes(actionType)) {
+    return res.status(400).json({ error: `actionType must be one of: ${validActions.join(", ")}` });
+  }
+  const logRef = `REF-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    log_ref: logRef,
+    property_address: sanitiseInput(propertyAddress || ""),
+    system_ref: sanitiseInput(systemRef || ""),
+    technician_name: sanitiseInput(technicianName),
+    arc_licence_number: sanitiseInput(arcLicenceNumber),
+    log_date: logDate,
+    refrigerant_type: sanitiseInput(refrigerantType),
+    action_type: actionType,
+    quantity_kg: Number(quantityKg),
+    stock_balance_kg: Number(stockBalanceKg) || null,
+    cylinder_number: sanitiseInput(cylinderNumber || ""),
+    reason_for_action: sanitiseInput(reasonForAction || ""),
+    customer_name: sanitiseInput(customerName || ""),
+    site_address: sanitiseInput(siteAddress || ""),
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("refrigerant_logs").insert(record);
+    if (error) console.error("refrigerant-log DB error:", error.message);
+  }
+  res.json({
+    logRef, refrigerantType, actionType, quantityKg: Number(quantityKg),
+    stockBalanceKg: Number(stockBalanceKg) || null, saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-hvac-compliance-summary — AI summarises HVAC compliance for a premises
+app.post("/ai-hvac-compliance-summary", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, propertyType = "commercial", state = "VIC",
+    systemCount = 0, lastServiceDate, serviceScheduleCurrent = false,
+    refrigerantType, nccBcaCompliant = false, minFreshAirLps,
+    filterMaintenanceCurrent = false, knownIssues = [],
+    energyEfficiencyRating, certifications = [],
+  } = req.body;
+  if (!propertyAddress) {
+    return res.status(400).json({ error: "propertyAddress is required." });
+  }
+  const sanitisedAddress = sanitiseInput(propertyAddress);
+  const sanitisedType = sanitiseInput(propertyType);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian HVAC compliance specialist with expertise in mechanical services and indoor air quality.`;
+  const userPrompt = `Assess HVAC compliance for:
+Address: ${sanitisedAddress}
+Property type: ${sanitisedType}
+State: ${sanitisedState}
+System count: ${systemCount}
+Last service: ${sanitiseInput(lastServiceDate || "Unknown")}
+Service schedule current: ${serviceScheduleCurrent}
+Refrigerant type: ${sanitiseInput(refrigerantType || "Unknown")}
+NCC/BCA compliant: ${nccBcaCompliant}
+Min fresh air supply: ${minFreshAirLps ? `${minFreshAirLps} L/s` : "Unknown"}
+Filter maintenance current: ${filterMaintenanceCurrent}
+Energy efficiency rating: ${sanitiseInput(energyEfficiencyRating || "Unknown")}
+Known issues: ${knownIssues.map(i => sanitiseInput(i)).join("; ") || "None"}
+Certifications: ${certifications.map(c => sanitiseInput(c)).join("; ") || "None"}
+
+Return JSON with:
+{
+  "overallComplianceStatus": "COMPLIANT|PARTIALLY_COMPLIANT|NON_COMPLIANT|UNKNOWN",
+  "complianceScore": 65,
+  "indoorAirQualityRisk": "HIGH|MEDIUM|LOW",
+  "immediateActions": ["...", "..."],
+  "scheduledActions": [{"action": "...", "timeframe": "...", "priority": "HIGH"}],
+  "regulatoryChecklist": [{"requirement": "...", "status": "MET|NOT_MET|UNKNOWN"}],
+  "applicableStandards": ["AS/NZS ...", "..."],
+  "refrigerantPhaseOutRisk": "...",
+  "energyComplianceNote": "...",
+  "maintenanceGaps": ["...", "..."],
+  "estimatedUpgradeCost": "...",
+  "nextAuditRecommended": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const summary = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ propertyAddress: sanitisedAddress, propertyType: sanitisedType, state: sanitisedState, summary });
+  } catch (err) {
+    console.error("ai-hvac-compliance-summary error:", err.message);
+    res.json({
+      propertyAddress: sanitisedAddress, propertyType: sanitisedType, state: sanitisedState,
+      summary: {
+        overallComplianceStatus: "UNKNOWN",
+        complianceScore: 0,
+        indoorAirQualityRisk: "MEDIUM",
+        immediateActions: !serviceScheduleCurrent ? ["Schedule HVAC service immediately"] : ["Conduct compliance audit"],
+        scheduledActions: [{ action: "HVAC compliance audit", timeframe: "Within 3 months", priority: "HIGH" }],
+        regulatoryChecklist: [
+          { requirement: "Service schedule maintained", status: serviceScheduleCurrent ? "MET" : "NOT_MET" },
+          { requirement: "Filter maintenance current", status: filterMaintenanceCurrent ? "MET" : "NOT_MET" },
+          { requirement: "NCC/BCA fresh air requirements met", status: nccBcaCompliant ? "MET" : "UNKNOWN" },
+        ],
+        applicableStandards: ["AS 1668.2 (Mechanical ventilation)", "AS/NZS 3666.1 (Air handling systems)", "NCC 2022 Section J"],
+        refrigerantPhaseOutRisk: refrigerantType && refrigerantType.includes("R22") ? "HIGH — R22 is being phased out. Plan replacement." : "Assess refrigerant type against current schedules.",
+        energyComplianceNote: "Section J energy efficiency assessment may be required for commercial premises.",
+        maintenanceGaps: ["Full service history review required", "Filter replacement schedule required"],
+        estimatedUpgradeCost: "TBD — requires HVAC audit",
+        nextAuditRecommended: "Within 12 months",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
