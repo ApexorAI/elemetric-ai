@@ -39974,6 +39974,204 @@ Return JSON with:
   }
 });
 
+// POST /structural-inspection-record — Record a structural inspection
+app.post("/structural-inspection-record", apiKeyAuth, async (req, res) => {
+  const {
+    propertyAddress, projectId, structureType, inspectionDate,
+    inspectorName, inspectorQualification, buildYear,
+    elementsInspected = [], defectsFound = [], cracksFound = [],
+    condition = "FAIR", loadBearingConcern = false,
+    foundationConcern = false, immediateEvacuationRequired = false,
+    engineerReferralRequired = false, nextInspectionDate,
+    remedialActions = [], estimatedRemedialCostAud, notes,
+  } = req.body;
+  if (!propertyAddress || !inspectionDate || !inspectorName || !structureType) {
+    return res.status(400).json({ error: "propertyAddress, inspectionDate, inspectorName, and structureType are required." });
+  }
+  const validConditions = ["EXCELLENT", "GOOD", "FAIR", "POOR", "CRITICAL", "UNSAFE"];
+  if (!validConditions.includes(condition)) {
+    return res.status(400).json({ error: `condition must be one of: ${validConditions.join(", ")}` });
+  }
+  if (immediateEvacuationRequired) {
+    // Flag as high urgency but still create the record
+    console.warn(`URGENT: Evacuation required at ${propertyAddress} per inspection ${new Date().toISOString()}`);
+  }
+  const inspectionRef = `STR-${Date.now().toString(36).toUpperCase()}`;
+  const overallRisk = immediateEvacuationRequired || condition === "UNSAFE" ? "CRITICAL"
+    : condition === "CRITICAL" || loadBearingConcern || foundationConcern ? "HIGH"
+    : condition === "POOR" ? "MEDIUM"
+    : "LOW";
+  const record = {
+    inspection_ref: inspectionRef,
+    property_address: sanitiseInput(propertyAddress),
+    project_id: projectId || null,
+    structure_type: sanitiseInput(structureType),
+    inspection_date: inspectionDate,
+    inspector_name: sanitiseInput(inspectorName),
+    inspector_qualification: sanitiseInput(inspectorQualification || ""),
+    build_year: Number(buildYear) || null,
+    elements_inspected: Array.isArray(elementsInspected) ? elementsInspected.map(e => sanitiseInput(e)) : [],
+    defects_found: Array.isArray(defectsFound) ? defectsFound.map(d => sanitiseInput(d)) : [],
+    cracks_found: Array.isArray(cracksFound) ? cracksFound.map(c => sanitiseInput(c)) : [],
+    condition,
+    load_bearing_concern: Boolean(loadBearingConcern),
+    foundation_concern: Boolean(foundationConcern),
+    immediate_evacuation_required: Boolean(immediateEvacuationRequired),
+    engineer_referral_required: Boolean(engineerReferralRequired) || loadBearingConcern || foundationConcern,
+    next_inspection_date: nextInspectionDate || null,
+    remedial_actions: Array.isArray(remedialActions) ? remedialActions.map(a => sanitiseInput(a)) : [],
+    estimated_remedial_cost_aud: Number(estimatedRemedialCostAud) || null,
+    overall_risk: overallRisk,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("structural_inspections").insert(record);
+    if (error) console.error("structural-inspection-record DB error:", error.message);
+  }
+  res.json({
+    inspectionRef, structureType, condition, overallRisk,
+    defectCount: record.defects_found.length,
+    immediateEvacuationRequired, engineerReferralRequired: record.engineer_referral_required,
+    saved: !!supabaseAdmin,
+  });
+});
+
+// POST /geotechnical-report-summary — Store a geotechnical report summary
+app.post("/geotechnical-report-summary", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, siteAddress, reportAuthor, reportDate, reportReference,
+    soilClassification, reactivityClass, bearingCapacityKpa,
+    foundationRecommendation, groundwaterDepthM, groundwaterIssues = false,
+    contaminationFound = false, contaminantTypes = [],
+    cbr_value, rockEncountered = false, rockDepthM,
+    specialConditions = [], sitePrepRequired = [], notes,
+  } = req.body;
+  if (!siteAddress || !reportDate || !reportAuthor) {
+    return res.status(400).json({ error: "siteAddress, reportDate, and reportAuthor are required." });
+  }
+  const validSoilClasses = ["A", "S", "M", "H1", "H2", "E", "P"];
+  const sanitisedClass = soilClassification ? soilClassification.toUpperCase() : null;
+  if (sanitisedClass && !validSoilClasses.includes(sanitisedClass)) {
+    return res.status(400).json({ error: `soilClassification must be one of: ${validSoilClasses.join(", ")} (AS 2870)` });
+  }
+  const geoRef = `GEO-${Date.now().toString(36).toUpperCase()}`;
+  const reactivityRisk = ["H1", "H2", "E", "P"].includes(sanitisedClass) ? "HIGH"
+    : sanitisedClass === "M" ? "MEDIUM"
+    : "LOW";
+  const record = {
+    geo_ref: geoRef,
+    project_id: projectId || null,
+    site_address: sanitiseInput(siteAddress),
+    report_author: sanitiseInput(reportAuthor),
+    report_date: reportDate,
+    report_reference: sanitiseInput(reportReference || ""),
+    soil_classification: sanitisedClass,
+    reactivity_class: sanitiseInput(reactivityClass || ""),
+    bearing_capacity_kpa: Number(bearingCapacityKpa) || null,
+    foundation_recommendation: sanitiseInput(foundationRecommendation || ""),
+    groundwater_depth_m: Number(groundwaterDepthM) || null,
+    groundwater_issues: Boolean(groundwaterIssues),
+    contamination_found: Boolean(contaminationFound),
+    contaminant_types: Array.isArray(contaminantTypes) ? contaminantTypes.map(c => sanitiseInput(c)) : [],
+    cbr_value: Number(cbr_value) || null,
+    rock_encountered: Boolean(rockEncountered),
+    rock_depth_m: Number(rockDepthM) || null,
+    special_conditions: Array.isArray(specialConditions) ? specialConditions.map(s => sanitiseInput(s)) : [],
+    site_prep_required: Array.isArray(sitePrepRequired) ? sitePrepRequired.map(p => sanitiseInput(p)) : [],
+    reactivity_risk: reactivityRisk,
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("geotechnical_reports").insert(record);
+    if (error) console.error("geotechnical-report-summary DB error:", error.message);
+  }
+  res.json({
+    geoRef, siteAddress, soilClassification: sanitisedClass, reactivityRisk,
+    bearingCapacityKpa: Number(bearingCapacityKpa) || null,
+    groundwaterIssues, contaminationFound, saved: !!supabaseAdmin,
+  });
+});
+
+// POST /ai-structural-risk-assessment — AI assesses structural risk from observations
+app.post("/ai-structural-risk-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    structureType, structureAge_years, observations = [],
+    cracksDescription, settlementObserved = false, waterDamage = false,
+    timberDecay = false, corrosion = false, fireOrFloodHistory = false,
+    previousRepairs = [], buildingClass, state = "VIC",
+  } = req.body;
+  if (!structureType || !observations.length) {
+    return res.status(400).json({ error: "structureType and observations are required." });
+  }
+  const sanitisedType = sanitiseInput(structureType);
+  const sanitisedState = sanitiseInput(state);
+  const systemPrompt = `You are an Australian structural engineer and building inspector. Assess structural risk and recommend remedial actions.`;
+  const userPrompt = `Assess structural risk for:
+Structure type: ${sanitisedType}
+Age: ${structureAge_years ? `${structureAge_years} years` : "Unknown"}
+Building class: ${sanitiseInput(buildingClass || "Unknown")}
+State: ${sanitisedState}
+Observations: ${observations.map(o => sanitiseInput(o)).join("; ")}
+Cracks description: ${sanitiseInput(cracksDescription || "None observed")}
+Settlement observed: ${settlementObserved}
+Water damage: ${waterDamage}
+Timber decay: ${timberDecay}
+Corrosion present: ${corrosion}
+Fire or flood history: ${fireOrFloodHistory}
+Previous repairs: ${previousRepairs.map(r => sanitiseInput(r)).join("; ") || "None"}
+
+Return JSON with:
+{
+  "overallRisk": "CRITICAL|HIGH|MEDIUM|LOW",
+  "structuralIntegrity": "COMPROMISED|MARGINAL|ADEQUATE|GOOD",
+  "primaryConcerns": ["...", "..."],
+  "failureRisks": [{"mechanism": "...", "likelihood": "HIGH|MEDIUM|LOW", "consequence": "..."}],
+  "immediateActions": ["...", "..."],
+  "engineeringAssessmentRequired": true,
+  "remediationOptions": [{"option": "...", "cost": "...", "effectiveness": "..."}],
+  "monitoringRecommendations": ["...", "..."],
+  "applicableStandards": ["...", "..."],
+  "usageRestrictions": "...",
+  "professionalStatement": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ structureType: sanitisedType, state: sanitisedState, assessment });
+  } catch (err) {
+    console.error("ai-structural-risk-assessment error:", err.message);
+    const urgentFlags = [settlementObserved, waterDamage, timberDecay, corrosion, fireOrFloodHistory];
+    const highRisk = urgentFlags.filter(Boolean).length >= 2;
+    res.json({
+      structureType: sanitisedType, state: sanitisedState,
+      assessment: {
+        overallRisk: highRisk ? "HIGH" : "MEDIUM",
+        structuralIntegrity: highRisk ? "MARGINAL" : "ADEQUATE",
+        primaryConcerns: observations.slice(0, 3),
+        failureRisks: [{ mechanism: "General degradation", likelihood: "MEDIUM", consequence: "Potential structural failure if unaddressed" }],
+        immediateActions: highRisk ? ["Engage structural engineer immediately", "Restrict access to affected areas"] : ["Commission structural engineer inspection"],
+        engineeringAssessmentRequired: true,
+        remediationOptions: [{ option: "Structural engineer assessment and remediation", cost: "TBD", effectiveness: "HIGH" }],
+        monitoringRecommendations: ["Install crack monitors if cracking present", "Regular visual inspections"],
+        applicableStandards: ["AS 3700 (Masonry Structures)", "AS 1720.1 (Timber Structures)", "NCC 2022"],
+        usageRestrictions: "Do not use or occupy areas showing signs of structural distress until assessed by a structural engineer.",
+        professionalStatement: "This is an AI-generated preliminary assessment only. A qualified structural engineer must conduct a formal assessment.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
