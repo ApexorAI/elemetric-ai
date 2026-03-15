@@ -30402,6 +30402,158 @@ app.post("/bim-execution-plan", apiKeyAuth, async (req, res) => {
   res.json({ success: true, bepId: null, ...record, saved: false });
 });
 
+// ── Round 108: Contractor performance, KPI tracking, AI performance report ────
+
+// POST /contractor-kpi — Record KPI scores for a contractor on a project
+app.post("/contractor-kpi", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, contractorId, contractorName, period,
+    kpiScores = {}, reviewedBy, notes,
+  } = req.body;
+
+  if (!projectId || !contractorId) return res.status(400).json({ error: "projectId and contractorId required." });
+
+  // Standard KPIs with weights
+  const kpiDefinitions = [
+    { key: "safetyCompliance", label: "Safety Compliance", weight: 25 },
+    { key: "qualityOfWork", label: "Quality of Work", weight: 25 },
+    { key: "programmeAdherence", label: "Programme Adherence", weight: 20 },
+    { key: "documentationAccuracy", label: "Documentation Accuracy", weight: 15 },
+    { key: "communication", label: "Communication", weight: 10 },
+    { key: "environmentalCompliance", label: "Environmental Compliance", weight: 5 },
+  ];
+
+  const scoredKpis = kpiDefinitions.map(kpi => {
+    const score = Math.min(10, Math.max(0, Number(kpiScores[kpi.key]) || 0));
+    return { ...kpi, score, weightedScore: (score / 10) * kpi.weight };
+  });
+
+  const totalWeight = kpiDefinitions.reduce((s, k) => s + k.weight, 0);
+  const totalWeightedScore = scoredKpis.reduce((s, k) => s + k.weightedScore, 0);
+  const overallScore = Math.round((totalWeightedScore / totalWeight) * 100 * 10) / 10;
+  const grade = overallScore >= 90 ? "A" : overallScore >= 75 ? "B" : overallScore >= 60 ? "C" : overallScore >= 50 ? "D" : "F";
+  const performanceStatus = overallScore >= 75 ? "SATISFACTORY" : overallScore >= 60 ? "NEEDS_IMPROVEMENT" : "UNSATISFACTORY";
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    contractor_id: sanitiseInput(contractorId),
+    contractor_name: sanitiseInput(contractorName || ""),
+    period: sanitiseInput(period || new Date().toISOString().slice(0, 7)),
+    kpi_scores: scoredKpis,
+    overall_score: overallScore,
+    grade,
+    performance_status: performanceStatus,
+    reviewed_by: sanitiseInput(reviewedBy || ""),
+    notes: sanitiseInput(notes || ""),
+    assessed_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("contractor_kpis")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, kpiId: data.id, overallScore, grade, performanceStatus, kpiScores: scoredKpis });
+  }
+
+  res.json({ success: true, kpiId: null, overallScore, grade, performanceStatus, kpiScores: scoredKpis, saved: false });
+});
+
+// GET /contractor-kpi-history/:contractorId — Get KPI history for a contractor
+app.get("/contractor-kpi-history/:contractorId", apiKeyAuth, async (req, res) => {
+  const { contractorId } = req.params;
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("contractor_kpis")
+      .select("*")
+      .eq("contractor_id", contractorId)
+      .order("assessed_at", { ascending: false });
+
+    if (error) return res.status(500).json({ error: "DB error." });
+
+    const avgScore = data && data.length > 0
+      ? Math.round((data.reduce((s, k) => s + k.overall_score, 0) / data.length) * 10) / 10
+      : null;
+    const trend = data && data.length >= 2
+      ? data[0].overall_score > data[data.length - 1].overall_score ? "IMPROVING" : data[0].overall_score < data[data.length - 1].overall_score ? "DECLINING" : "STABLE"
+      : null;
+
+    return res.json({ contractorId, assessments: data || [], count: (data || []).length, averageScore: avgScore, trend });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /ai-performance-report — AI generates a narrative performance report for a contractor
+app.post("/ai-performance-report", apiKeyAuth, async (req, res) => {
+  const {
+    contractorName, projectName, period,
+    overallScore, kpiBreakdown = [],
+    incidents = 0, ncrCount = 0, variationsSubmitted = 0,
+    eotClaims = 0, programmeVarianceDays = 0,
+  } = req.body;
+
+  if (!contractorName || overallScore === undefined)
+    return res.status(400).json({ error: "contractorName and overallScore required." });
+
+  const kpiText = kpiBreakdown.map(k => `${k.label || k.key}: ${k.score}/10`).join(", ");
+
+  const prompt = `You are an experienced construction project manager writing a formal contractor performance report for an Australian construction project.
+
+Contractor: ${sanitiseInput(contractorName)}
+Project: ${sanitiseInput(projectName || "Not specified")}
+Period: ${sanitiseInput(period || "Project to date")}
+Overall KPI score: ${overallScore}/100
+KPI breakdown: ${kpiText || "Not provided"}
+Safety incidents: ${incidents}
+Non-conformances (NCRs): ${ncrCount}
+Variations submitted: ${variationsSubmitted}
+EOT claims: ${eotClaims}
+Programme variance: ${programmeVarianceDays} days ${programmeVarianceDays > 0 ? "behind" : programmeVarianceDays < 0 ? "ahead" : "on schedule"}
+
+Write a formal performance assessment. Return a JSON object with:
+- "executiveSummary": 2-3 sentence summary
+- "strengths": array of 3-5 specific performance strengths
+- "areasForImprovement": array of areas needing improvement
+- "safetyAssessment": string
+- "qualityAssessment": string
+- "programmeAssessment": string
+- "recommendedActions": array of { "action": string, "priority": "LOW"|"MEDIUM"|"HIGH", "timeline": string }
+- "overallRating": "EXCELLENT"|"GOOD"|"SATISFACTORY"|"NEEDS_IMPROVEMENT"|"UNSATISFACTORY"
+- "retentionRecommendation": "RETAIN"|"RETAIN_WITH_CONDITIONS"|"PERFORMANCE_IMPROVEMENT_PLAN"|"TERMINATE"
+- "closingStatement": 1-2 sentence closing`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, contractorName, overallScore, period, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    const rating = overallScore >= 90 ? "EXCELLENT" : overallScore >= 75 ? "GOOD" : overallScore >= 60 ? "SATISFACTORY" : overallScore >= 50 ? "NEEDS_IMPROVEMENT" : "UNSATISFACTORY";
+    return res.json({
+      executiveSummary: `${contractorName} has achieved an overall KPI score of ${overallScore}/100 for the period.`,
+      strengths: ["Performance data recorded successfully."],
+      areasForImprovement: overallScore < 75 ? ["Review performance against all KPI categories."] : [],
+      safetyAssessment: "Safety performance review required.",
+      qualityAssessment: "Quality performance review required.",
+      programmeAssessment: programmeVarianceDays === 0 ? "On programme." : `${Math.abs(programmeVarianceDays)} days ${programmeVarianceDays > 0 ? "behind schedule." : "ahead of schedule."}`,
+      recommendedActions: [],
+      overallRating: rating,
+      retentionRecommendation: overallScore >= 60 ? "RETAIN" : "PERFORMANCE_IMPROVEMENT_PLAN",
+      closingStatement: "Automated report generation temporarily unavailable. Manual narrative review recommended.",
+      contractorName, overallScore, period, generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
