@@ -32447,6 +32447,177 @@ app.post("/electrical-safety-certificate", apiKeyAuth, async (req, res) => {
   res.json({ success: true, certId: null, certificateNumber: certNumber, status: record.status, ...record, saved: false });
 });
 
+// ── Round 119: AI document classifier, document expiry alerts, batch health ────
+
+// POST /ai-document-classifier — AI classifies an uploaded document by type and extracts key metadata
+app.post("/ai-document-classifier", apiKeyAuth, async (req, res) => {
+  const {
+    documentTitle, documentText, fileName, mimeType, pageCount,
+  } = req.body;
+
+  if (!documentTitle && !documentText) return res.status(400).json({ error: "documentTitle or documentText required." });
+
+  const sanitisedTitle = sanitiseInput(documentTitle || "");
+  const sanitisedText = sanitiseInput((documentText || "").slice(0, 3000));
+
+  const prompt = `You are a construction document management expert. Classify the following document and extract key metadata.
+
+Document title: ${sanitisedTitle}
+File name: ${sanitiseInput(fileName || "")}
+MIME type: ${sanitiseInput(mimeType || "")}
+Page count: ${pageCount || "Unknown"}
+Document text excerpt:
+${sanitisedText}
+
+Return a JSON object with:
+- "documentType": primary classification (e.g., "Certificate of Compliance", "Invoice", "Drawing", "Specification", "Contract", "Permit", "Insurance Certificate", "Safety Plan", etc.)
+- "subType": more specific classification
+- "confidence": "LOW"|"MEDIUM"|"HIGH"
+- "extractedData": object with any key fields detected (e.g., { "certNumber": "...", "expiryDate": "...", "issuer": "...", "amount": null, "contractor": "...", "jobAddress": "..." })
+- "expiryDate": ISO date string if an expiry/renewal date is found, else null
+- "issueDate": ISO date string if an issue date is found, else null
+- "parties": array of party names detected
+- "actionRequired": boolean — whether this document requires any action
+- "actionDescription": string — what action is needed if any
+- "suggestedTags": array of keywords for categorisation
+- "complianceRelevance": "NONE"|"LOW"|"MEDIUM"|"HIGH" — how important for compliance`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1200,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, documentTitle: sanitisedTitle, fileName, classifiedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      documentType: "Unknown",
+      subType: "Manual classification required",
+      confidence: "LOW",
+      extractedData: {},
+      expiryDate: null, issueDate: null, parties: [],
+      actionRequired: false, actionDescription: "",
+      suggestedTags: [],
+      complianceRelevance: "MEDIUM",
+      documentTitle: sanitisedTitle, fileName, classifiedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /document-expiry-check — Check multiple documents for upcoming expiries and generate alerts
+app.post("/document-expiry-check", apiKeyAuth, async (req, res) => {
+  const { documents = [], alertThresholdDays = 30 } = req.body;
+
+  if (!documents.length) return res.status(400).json({ error: "documents array required." });
+
+  const threshold = Number(alertThresholdDays) || 30;
+  const now = new Date();
+
+  const results = documents.map(doc => {
+    const expiry = doc.expiryDate ? new Date(doc.expiryDate) : null;
+    const daysToExpiry = expiry ? Math.ceil((expiry - now) / (1000 * 60 * 60 * 24)) : null;
+    const isExpired = daysToExpiry !== null && daysToExpiry < 0;
+    const isExpiringSoon = daysToExpiry !== null && !isExpired && daysToExpiry <= threshold;
+
+    return {
+      documentId: sanitiseInput(doc.documentId || ""),
+      documentTitle: sanitiseInput(doc.documentTitle || ""),
+      documentType: sanitiseInput(doc.documentType || ""),
+      expiryDate: doc.expiryDate || null,
+      daysToExpiry,
+      isExpired,
+      isExpiringSoon,
+      alertLevel: isExpired ? "CRITICAL" : isExpiringSoon && daysToExpiry <= 7 ? "HIGH" : isExpiringSoon ? "MEDIUM" : "OK",
+      renewalAction: isExpired ? "RENEW IMMEDIATELY — document has expired" : isExpiringSoon ? `Renew within ${daysToExpiry} days` : null,
+    };
+  });
+
+  const expired = results.filter(r => r.isExpired).length;
+  const expiringSoon = results.filter(r => r.isExpiringSoon).length;
+  const critical = results.filter(r => r.alertLevel === "CRITICAL" || r.alertLevel === "HIGH").length;
+
+  res.json({
+    documentCount: documents.length,
+    alertThresholdDays: threshold,
+    expiredCount: expired,
+    expiringSoonCount: expiringSoon,
+    criticalAlertCount: critical,
+    allClear: expired === 0 && expiringSoon === 0,
+    results,
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+// GET /compliance-health/:contractorId — Generate a compliance health score for a contractor
+app.get("/compliance-health/:contractorId", apiKeyAuth, async (req, res) => {
+  const { contractorId } = req.params;
+
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  // Fetch multiple compliance data points in parallel
+  const [licResult, insResult, kpiResult, ncrResult, incidentResult] = await Promise.all([
+    supabaseAdmin.from("subcontractor_register").select("licence_expiry, insurance_expiry, status").eq("contractor_id", contractorId).single(),
+    supabaseAdmin.from("insurance_certificates").select("alert_status, insurance_type").eq("contractor_id", contractorId).eq("status", "ACTIVE"),
+    supabaseAdmin.from("contractor_kpis").select("overall_score, assessed_at").eq("contractor_id", contractorId).order("assessed_at", { ascending: false }).limit(1),
+    supabaseAdmin.from("ncr_register").select("id, status, severity").eq("issued_to", contractorId).eq("status", "OPEN"),
+    supabaseAdmin.from("incident_register").select("id, severity, status").eq("contractor_id", contractorId).gte("occurred_at", new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString()),
+  ]);
+
+  const profile = licResult.data;
+  const insurances = insResult.data || [];
+  const latestKpi = kpiResult.data?.[0];
+  const openNcrs = ncrResult.data || [];
+  const recentIncidents = incidentResult.data || [];
+
+  // Score components (0–100)
+  let licenceScore = 100;
+  if (profile?.licence_expiry && new Date(profile.licence_expiry) < new Date()) licenceScore = 0;
+  else if (profile?.licence_expiry && new Date(profile.licence_expiry) < new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)) licenceScore = 50;
+
+  const expiredInsurance = insurances.filter(i => i.alert_status === "EXPIRED").length;
+  const insuranceScore = Math.max(0, 100 - expiredInsurance * 50);
+
+  const kpiScore = latestKpi ? latestKpi.overall_score : 70; // default if no KPI data
+
+  const criticalNcrs = openNcrs.filter(n => n.severity === "CRITICAL").length;
+  const majorNcrs = openNcrs.filter(n => n.severity === "MAJOR").length;
+  const ncrScore = Math.max(0, 100 - criticalNcrs * 30 - majorNcrs * 15);
+
+  const seriousIncidents = recentIncidents.filter(i => ["SERIOUS", "CRITICAL", "FATALITY"].includes(i.severity)).length;
+  const incidentScore = Math.max(0, 100 - seriousIncidents * 25);
+
+  const overallHealth = Math.round(
+    licenceScore * 0.25 + insuranceScore * 0.20 + kpiScore * 0.25 + ncrScore * 0.15 + incidentScore * 0.15
+  );
+
+  const healthGrade = overallHealth >= 90 ? "A" : overallHealth >= 75 ? "B" : overallHealth >= 60 ? "C" : overallHealth >= 50 ? "D" : "F";
+  const healthStatus = overallHealth >= 75 ? "HEALTHY" : overallHealth >= 60 ? "NEEDS_ATTENTION" : "AT_RISK";
+
+  return res.json({
+    contractorId,
+    overallHealthScore: overallHealth,
+    healthGrade,
+    healthStatus,
+    breakdown: {
+      licenceCompliance: { score: licenceScore, weight: "25%" },
+      insuranceCompliance: { score: insuranceScore, weight: "20%", expiredCount: expiredInsurance },
+      performanceKpi: { score: kpiScore, weight: "25%", latestScore: latestKpi?.overall_score || null },
+      ncrCompliance: { score: ncrScore, weight: "15%", openNcrs: openNcrs.length, criticalOpen: criticalNcrs },
+      safetyRecord: { score: incidentScore, weight: "15%", recentSerious: seriousIncidents },
+    },
+    alerts: [
+      ...( licenceScore < 50 ? ["Licence expired or expiring within 30 days"] : []),
+      ...( expiredInsurance > 0 ? [`${expiredInsurance} insurance certificate(s) expired`] : []),
+      ...( criticalNcrs > 0 ? [`${criticalNcrs} critical NCR(s) outstanding`] : []),
+      ...( seriousIncidents > 0 ? [`${seriousIncidents} serious safety incident(s) in last 90 days`] : []),
+    ],
+    generatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
