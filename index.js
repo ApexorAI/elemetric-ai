@@ -61301,6 +61301,382 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /post-tensioning-record — Record PT stressing operations per AS 1314 / AS 3600
+app.post("/post-tensioning-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    elementId,
+    tendonId,
+    stressingDate,
+    stressingOperator,
+    tendonType,           // bonded | unbonded
+    strandSpec,           // e.g. "12.7 mm 7-wire low-relaxation"
+    nominalDiameter_mm,
+    jackId,
+    jackCalibrationDate,
+    designLoad_kN,
+    designExtension_mm,
+    extension1_mm,        // first-end extension
+    extension2_mm,        // second-end extension (if stressed both ends)
+    finalLoad_kN,
+    pumpPressure_bar,
+    frictionCoefficient,
+    wobbleCoefficient,
+    concreteStrength_MPa, // at time of stressing
+    minStressingStrength_MPa, // design minimum
+    anchorageSlip_mm,
+    designAnchorageSlip_mm,
+    strands,              // number of strands in tendon
+    elongationTolerance,  // % — default ±7% per AS 1314
+    notes,
+    photos,
+  } = req.body;
+
+  const issues = [];
+
+  // Concrete strength check — must reach minimum before stressing
+  const actualStr = parseFloat(concreteStrength_MPa) || 0;
+  const minStr = parseFloat(minStressingStrength_MPa) || 0;
+  if (minStr > 0 && actualStr < minStr) {
+    issues.push(
+      `Concrete strength ${actualStr} MPa is below minimum stressing strength ${minStr} MPa — do not stress`
+    );
+  }
+
+  // Extension tolerance check (AS 1314 allows ±7% by default, or as specified)
+  const tol = parseFloat(elongationTolerance) || 7; // percent
+  const design = parseFloat(designExtension_mm) || 0;
+  if (design > 0) {
+    const measuredTotal =
+      (parseFloat(extension1_mm) || 0) + (parseFloat(extension2_mm) || 0);
+    const expectedTotal = extension2_mm !== undefined ? design * 2 : design;
+    const devPct = Math.abs(((measuredTotal - expectedTotal) / expectedTotal) * 100);
+    if (devPct > tol) {
+      issues.push(
+        `Measured extension ${measuredTotal.toFixed(1)} mm deviates ${devPct.toFixed(1)}% from design — exceeds ±${tol}% tolerance`
+      );
+    }
+  }
+
+  // Jack calibration currency check (calibrations valid 6 months per AS 1314)
+  if (jackCalibrationDate) {
+    const calibAge =
+      (Date.now() - new Date(jackCalibrationDate).getTime()) / (1000 * 60 * 60 * 24);
+    if (calibAge > 180) {
+      issues.push(`Jack calibration is ${Math.round(calibAge)} days old — exceeds 180-day maximum per AS 1314`);
+    }
+  }
+
+  if (issues.length > 0) {
+    return res.status(422).json({
+      error: "Post-tensioning stressing record identifies compliance issues",
+      issues,
+      immediateActions: [
+        "Do not continue stressing until issues resolved",
+        "Notify PT engineer and site supervisor",
+        "Resolve concrete strength or extension deviations before proceeding",
+      ],
+      applicableStandards: ["AS 1314", "AS 3600", "AS/NZS 4672"],
+    });
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    element_id: sanitiseInput(elementId),
+    tendon_id: sanitiseInput(tendonId),
+    stressing_date: stressingDate,
+    stressing_operator: sanitiseInput(stressingOperator),
+    tendon_type: sanitiseInput(tendonType),
+    strand_spec: sanitiseInput(strandSpec),
+    nominal_diameter_mm: nominalDiameter_mm,
+    jack_id: sanitiseInput(jackId),
+    jack_calibration_date: jackCalibrationDate,
+    design_load_kn: designLoad_kN,
+    design_extension_mm: designExtension_mm,
+    extension1_mm,
+    extension2_mm,
+    final_load_kn: finalLoad_kN,
+    pump_pressure_bar: pumpPressure_bar,
+    friction_coefficient: frictionCoefficient,
+    wobble_coefficient: wobbleCoefficient,
+    concrete_strength_mpa: concreteStrength_MPa,
+    min_stressing_strength_mpa: minStressingStrength_MPa,
+    anchorage_slip_mm: anchorageSlip_mm,
+    design_anchorage_slip_mm: designAnchorageSlip_mm,
+    strands,
+    elongation_tolerance: elongationTolerance || 7,
+    notes: sanitiseInput(notes),
+    photos: photos || [],
+    result: "COMPLIANT",
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("post_tensioning_records")
+      .insert(record);
+    if (dbErr) console.error("DB error /post-tensioning-record:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Post-tensioning record saved — within tolerance",
+    tendonId: sanitiseInput(tendonId),
+    concreteStrength_MPa: actualStr,
+    result: "COMPLIANT",
+    applicableStandards: ["AS 1314", "AS 3600", "AS/NZS 4672"],
+    saved,
+  });
+});
+
+// POST /legionella-risk-assessment — Legionella risk per AS 3666 / Health (Legionella) Regulations 2016 (Vic)
+app.post("/legionella-risk-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    propertyId,
+    propertyName,
+    propertyAddress,
+    assessmentDate,
+    assessor,
+    systemType,           // cooling-tower | hot-water | spa | water-feature | misting | humidifier
+    systemDescription,
+    lastServiceDate,
+    lastMicrobiologicalTest,
+    lastLegionellaResult,  // CFU/L
+    regulatoryLimit_CFU,   // default 1000 CFU/L per AS 3666.2
+    waterTemperatureMin_C,
+    waterTemperatureMax_C,
+    disinfectantType,      // chlorine | bromine | biocide
+    disinfectantLevel_mg_L,
+    targetDisinfectant_mg_L,
+    riskFactors,           // array of strings
+    controlMeasures,       // array of strings
+    maintenancePlanExists,
+    managementPlanRegistered, // required for cooling towers VIC
+    waterSamplingFrequency, // days
+    overallRiskLevel,      // low | medium | high | critical
+    immediateActionsRequired,
+    notes,
+  } = req.body;
+
+  const legionellaLimit = parseFloat(regulatoryLimit_CFU) || 1000;
+  const lastResult = parseFloat(lastLegionellaResult) || 0;
+  const criticalAlerts = [];
+
+  // Legionella count exceedance
+  if (lastResult > legionellaLimit) {
+    criticalAlerts.push(
+      `Legionella count ${lastResult} CFU/L exceeds regulatory limit ${legionellaLimit} CFU/L — immediate disinfection required`
+    );
+  }
+
+  // Temperature danger zone — 25–50°C favours Legionella growth
+  const tempMin = parseFloat(waterTemperatureMin_C) || 0;
+  const tempMax = parseFloat(waterTemperatureMax_C) || 0;
+  if (tempMin >= 20 && tempMax <= 55) {
+    criticalAlerts.push(
+      `Water temperature range ${tempMin}–${tempMax}°C is within Legionella growth zone (20–55°C) — review heating/cooling`
+    );
+  }
+
+  // Disinfectant level check
+  const actualDisinfectant = parseFloat(disinfectantLevel_mg_L) || 0;
+  const targetDisinfectant = parseFloat(targetDisinfectant_mg_L) || 0;
+  if (targetDisinfectant > 0 && actualDisinfectant < targetDisinfectant * 0.5) {
+    criticalAlerts.push(
+      `Disinfectant level ${actualDisinfectant} mg/L is less than 50% of target ${targetDisinfectant} mg/L`
+    );
+  }
+
+  // VIC mandatory management plan for cooling towers
+  if (systemType === "cooling-tower" && managementPlanRegistered === false) {
+    criticalAlerts.push(
+      "Cooling tower management plan not registered — mandatory under Health (Legionella) Regulations 2016 (Vic)"
+    );
+  }
+
+  const hasCritical = criticalAlerts.length > 0;
+
+  const record = {
+    property_id: sanitiseInput(propertyId),
+    property_name: sanitiseInput(propertyName),
+    property_address: sanitiseInput(propertyAddress),
+    assessment_date: assessmentDate,
+    assessor: sanitiseInput(assessor),
+    system_type: sanitiseInput(systemType),
+    system_description: sanitiseInput(systemDescription),
+    last_service_date: lastServiceDate,
+    last_microbiological_test: lastMicrobiologicalTest,
+    last_legionella_result_cfu: lastLegionellaResult,
+    regulatory_limit_cfu: regulatoryLimit_CFU || 1000,
+    water_temperature_min_c: waterTemperatureMin_C,
+    water_temperature_max_c: waterTemperatureMax_C,
+    disinfectant_type: sanitiseInput(disinfectantType),
+    disinfectant_level_mg_l: disinfectantLevel_mg_L,
+    target_disinfectant_mg_l: targetDisinfectant_mg_L,
+    risk_factors: riskFactors || [],
+    control_measures: controlMeasures || [],
+    maintenance_plan_exists: maintenancePlanExists,
+    management_plan_registered: managementPlanRegistered,
+    water_sampling_frequency_days: waterSamplingFrequency,
+    overall_risk_level: sanitiseInput(overallRiskLevel) || "medium",
+    critical_alerts: criticalAlerts,
+    immediate_actions_required: immediateActionsRequired,
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("legionella_risk_assessments")
+      .insert(record);
+    if (dbErr) console.error("DB error /legionella-risk-assessment:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Legionella risk assessment recorded",
+    systemType,
+    overallRiskLevel: sanitiseInput(overallRiskLevel) || "medium",
+    legionellaExceedance: lastResult > legionellaLimit,
+    criticalAlerts,
+    criticalAlertsCount: criticalAlerts.length,
+    requiresImmediateAction: hasCritical,
+    applicableLegislation: [
+      "Health (Legionella) Regulations 2016 (Vic)",
+      "AS 3666.1",
+      "AS 3666.2",
+      "AS/NZS 3666.3",
+      "AIRAH DA19",
+    ],
+    saved,
+  });
+});
+
+// POST /ai-post-tensioning-assessment — AI assesses PT adequacy, stressing sequence, and long-term tendon integrity
+app.post("/ai-post-tensioning-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    tendonType,
+    designLoad_kN,
+    finalLoad_kN,
+    extension1_mm,
+    extension2_mm,
+    designExtension_mm,
+    concreteStrength_MPa,
+    anchorageSlip_mm,
+    frictionCoefficient,
+    wobbleCoefficient,
+    elementType,          // slab | beam | bridge-deck | ground-anchor
+    strandCount,
+    environment,          // internal | external | aggressive | marine
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are a post-tensioning engineer with 20 years experience on Australian PT structures. You are expert in AS 1314, AS 3600, AS 5100, and AS/NZS 4672. Assess post-tensioning stressing records and identify compliance issues and long-term risks.
+
+Assess:
+1. Extension compliance — measured vs theoretical (friction losses, anchorage slip)
+2. Prestress losses — elastic shortening, shrinkage, creep, relaxation
+3. Anchorage zone integrity — bursting and splitting forces
+4. Duct grouting requirements (bonded PT)
+5. Corrosion protection adequacy for environment
+6. Long-term monitoring requirements
+7. AS 3600 cl.9 and cl.18 compliance for slabs and beams
+
+Respond with JSON: { "stressingCompliance": "compliant|marginal|non-compliant", "predictedLongTermLoss_pct": number, "anchorageIntegrity": "adequate|marginal|inadequate", "corrosionRisk": "low|medium|high", "groutingRequired": boolean, "groutingAdequacy": "string", "monitoringRequired": boolean, "maintenanceRecommendations": [], "durabilityConsiderations": [], "designConcerns": [], "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Tendon type: ${tendonType || "unbonded"}
+Element type: ${elementType || "slab"}
+Design load: ${designLoad_kN || "not specified"} kN
+Final load achieved: ${finalLoad_kN || "not specified"} kN
+Design extension: ${designExtension_mm || "not specified"} mm
+Measured extension (end 1): ${extension1_mm || "not specified"} mm
+Measured extension (end 2): ${extension2_mm || "not specified"} mm
+Concrete strength at stressing: ${concreteStrength_MPa || "not specified"} MPa
+Anchorage slip: ${anchorageSlip_mm || "not specified"} mm
+Friction coefficient: ${frictionCoefficient || "not specified"}
+Wobble coefficient: ${wobbleCoefficient || "not specified"}
+Strand count: ${strandCount || "not specified"}
+Environment: ${environment || "internal"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-post-tensioning-assessment error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        stressingCompliance: "marginal",
+        predictedLongTermLoss_pct: 18,
+        anchorageIntegrity: "adequate",
+        corrosionRisk: "medium",
+        groutingRequired: tendonType === "bonded",
+        groutingAdequacy:
+          "Ensure duct is fully filled — voids risk localised corrosion and tendon failure",
+        monitoringRequired: true,
+        maintenanceRecommendations: [
+          "Inspect anchorage end caps annually",
+          "Check for corrosion staining at anchorage zones",
+          "Re-check load at 5-year intervals for unbonded tendons in aggressive environments",
+        ],
+        durabilityConsiderations: [
+          "Unbonded tendons rely on sheathing and grease for corrosion protection",
+          "Marine/aggressive environments require epoxy-coated strand or stainless steel",
+          "Ensure end caps are sealed — moisture ingress causes corrosion",
+        ],
+        designConcerns: [
+          "Verify minimum concrete cover to PT ducts per AS 3600 Table 4.10.3",
+          "Confirm anchorage zone reinforcement for bursting forces per AS 3600 cl.12.5",
+        ],
+        applicableStandards: [
+          "AS 1314",
+          "AS 3600",
+          "AS/NZS 4672.1",
+          "AS 5100.5",
+          "fib Model Code 2010",
+        ],
+        recommendation:
+          "Verify extension compliance calculation accounting for friction and anchorage slip losses. Ensure full duct grouting for bonded PT. Schedule annual anchorage zone inspection.",
+        summary:
+          "PT stressing results require careful comparison to theoretical extensions accounting for all losses. Long-term durability depends on corrosion protection at anchorage zones and, for bonded PT, complete duct grouting.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
