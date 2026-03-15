@@ -22291,6 +22291,146 @@ app.post("/punch-list-close", apiKeyAuth, async (req, res) => {
   return res.json({ jobId: safeJobId, itemId: safeItemId, status: "RESOLVED", resolvedBy: safeResBy, resolution: safeResNote, resolvedAt });
 });
 
+// POST /job-pause  — Pause a job and log the reason
+app.post("/job-pause", apiKeyAuth, async (req, res) => {
+  const { jobId, reason, pausedBy, estimatedResumption } = req.body || {};
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+  if (!reason) return res.status(400).json({ error: "reason required." });
+
+  const VALID_REASONS = ["awaiting-materials", "awaiting-permit", "weather", "client-request", "design-change", "access-issue", "rework-required", "financial-hold", "safety-concern", "other"];
+  const safeJobId  = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeReason = sanitiseInput(String(reason)).toLowerCase().slice(0, 60);
+  const safeBy     = pausedBy ? sanitiseInput(String(pausedBy)).slice(0, 100) : null;
+  const safeResume = estimatedResumption ? sanitiseInput(String(estimatedResumption)).slice(0, 20) : null;
+  const validReason = VALID_REASONS.includes(safeReason) ? safeReason : "other";
+
+  const record = { jobId: safeJobId, status: "PAUSED", reason: validReason, pausedBy: safeBy, estimatedResumption: safeResume, pausedAt: new Date().toISOString() };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("job_status_log").insert({ job_id: safeJobId, status: "PAUSED", reason: validReason, changed_by: safeBy, notes: safeResume ? `Estimated resumption: ${safeResume}` : null, created_at: record.pausedAt });
+      await supabaseAdmin.from("jobs").update({ status: "PAUSED", paused_at: record.pausedAt, pause_reason: validReason }).eq("id", safeJobId);
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.json(record);
+});
+
+// POST /job-resume  — Resume a paused job
+app.post("/job-resume", apiKeyAuth, async (req, res) => {
+  const { jobId, resumedBy, notes } = req.body || {};
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  const safeJobId = sanitiseInput(String(jobId)).slice(0, 80);
+  const safeBy    = resumedBy ? sanitiseInput(String(resumedBy)).slice(0, 100) : null;
+  const safeNotes = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+  const resumedAt = new Date().toISOString();
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("job_status_log").insert({ job_id: safeJobId, status: "IN_PROGRESS", reason: "resumed", changed_by: safeBy, notes: safeNotes, created_at: resumedAt });
+      await supabaseAdmin.from("jobs").update({ status: "IN_PROGRESS", resumed_at: resumedAt }).eq("id", safeJobId);
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.json({ jobId: safeJobId, status: "IN_PROGRESS", resumedBy: safeBy, notes: safeNotes, resumedAt });
+});
+
+// GET /job-status/:jobId  — Get the status history of a job
+app.get("/job-status/:jobId", apiKeyAuth, async (req, res) => {
+  const jobId = sanitiseInput(String(req.params.jobId || "")).slice(0, 80);
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+
+  let history = [];
+  let current = null;
+  if (supabaseAdmin) {
+    try {
+      const { data: log } = await supabaseAdmin.from("job_status_log").select("*").eq("job_id", jobId).order("created_at", { ascending: false }).limit(50);
+      history = log || [];
+      const { data: job } = await supabaseAdmin.from("jobs").select("status, created_at, paused_at, completed_at").eq("id", jobId).single();
+      current = job || null;
+    } catch (_) { /* ignore */ }
+  }
+
+  return res.json({ jobId, currentStatus: current?.status || (history[0]?.status) || "UNKNOWN", current, history, generatedAt: new Date().toISOString() });
+});
+
+// POST /certificate-verify  — Verify a compliance certificate number format
+app.post("/certificate-verify", apiKeyAuth, (req, res) => {
+  const { certNumber, certType, state = "VIC" } = req.body || {};
+  if (!certNumber || !certType) return res.status(400).json({ error: "certNumber and certType required." });
+
+  const safeCert   = sanitiseInput(String(certNumber)).trim().toUpperCase().slice(0, 40);
+  const safeType   = sanitiseInput(String(certType)).toLowerCase().slice(0, 40);
+  const safeState  = sanitiseInput(String(state)).toUpperCase().slice(0, 5);
+
+  // Format validation patterns (Victoria-specific formats)
+  const CERT_PATTERNS = {
+    "plumbing-coc":    /^COC-?\d{6,10}$/i,
+    "gas-certificate": /^GAS-?\d{5,10}$/i,
+    "electrical-coc":  /^(ECOC|EC)-?\d{5,10}$/i,
+    "building-permit": /^BP-?\d{5,10}$/i,
+    "occupancy-permit": /^OP-?\d{5,10}$/i,
+    "licence-number":  /^[A-Z]{1,3}-?\d{5,10}$/i,
+  };
+
+  const pattern  = CERT_PATTERNS[safeType];
+  const formatOk = pattern ? pattern.test(safeCert) : safeCert.length >= 5;
+  const checks   = [
+    { check: "Format validation",          passed: formatOk },
+    { check: "Length check (5-40 chars)",  passed: safeCert.length >= 5 && safeCert.length <= 40 },
+    { check: "No special characters",      passed: /^[A-Z0-9 -]+$/.test(safeCert) },
+    { check: "State jurisdiction matches", passed: safeState === "VIC" || safeState === "NSW" || safeState === "QLD" || safeState === "SA" || safeState === "WA" },
+  ];
+
+  const passed = checks.filter(c => c.passed).length;
+  return res.json({
+    certNumber: safeCert, certType: safeType, state: safeState,
+    valid: formatOk && passed === checks.length,
+    formatOk,
+    checks,
+    note: !pattern ? "Custom format — manual verification recommended" : null,
+    verifiedAt: new Date().toISOString(),
+  });
+});
+
+// POST /labour-allocation  — Log labour allocation for a job
+app.post("/labour-allocation", apiKeyAuth, async (req, res) => {
+  const { jobId, allocations = [] } = req.body || {};
+  if (!jobId) return res.status(400).json({ error: "jobId required." });
+  if (!Array.isArray(allocations) || allocations.length === 0) return res.status(400).json({ error: "allocations array required." });
+
+  const safeJobId = sanitiseInput(String(jobId)).slice(0, 80);
+  const AWARD_RATES_LABOUR = { plumbing: 65, gas: 70, electrical: 68, drainage: 55, carpentry: 58, hvac: 62, general: 55 };
+
+  const items = allocations.slice(0, 30).map(a => {
+    const trade  = sanitiseInput(String(a.trade || "general")).toLowerCase().slice(0, 40);
+    const rate   = Math.max(0, parseFloat(a.hourlyRate) || AWARD_RATES_LABOUR[trade] || 55);
+    const hours  = Math.max(0, parseFloat(a.hours) || 0);
+    const workers = Math.max(1, parseInt(a.workers) || 1);
+    return {
+      trade,
+      workers,
+      hours,
+      hourlyRate: rate,
+      totalHours: parseFloat((hours * workers).toFixed(2)),
+      labourCost: parseFloat((hours * workers * rate).toFixed(2)),
+      role: a.role ? sanitiseInput(String(a.role)).slice(0, 80) : null,
+    };
+  });
+
+  const totalHours = parseFloat(items.reduce((s, i) => s + i.totalHours, 0).toFixed(2));
+  const totalCost  = parseFloat(items.reduce((s, i) => s + i.labourCost, 0).toFixed(2));
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("labour_allocation").insert({ job_id: safeJobId, allocations: items, total_hours: totalHours, total_cost: totalCost, created_at: new Date().toISOString() });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.json({ jobId: safeJobId, totalHours, totalLabourCost: totalCost, allocations: items, savedAt: new Date().toISOString() });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
