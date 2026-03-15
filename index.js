@@ -789,9 +789,9 @@ app.get("/health", async (_req, res) => {
   }
 
   // OpenAI connectivity — list models (fast, unauthenticated-safe ping)
-  if (openai) {
+  if (client) {
     try {
-      await openai.models.list({ limit: 1 });
+      await client.models.list({ limit: 1 });
       checks.openai = { status: "ok" };
     } catch (e) {
       // 401 = key misconfigured, but API is reachable
@@ -6942,6 +6942,302 @@ app.post("/geofence-check", (req, res) => {
       ? "These coordinates are outside Victoria. Elemetric is designed for Victorian trade compliance only."
       : null,
     checkedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /photo-count-check ───────────────────────────────────────────────────
+// Validates that a job submission has sufficient photos before sending to /review.
+// Returns detailed breakdown by required vs provided, with per-item gap analysis.
+app.post("/photo-count-check", (req, res) => {
+  const { jobType, photoLabels = [], photoCount } = req.body || {};
+  const SUPPORTED = ["plumbing", "gas", "electrical", "drainage", "carpentry", "hvac"];
+
+  if (!jobType || !SUPPORTED.includes(jobType.toLowerCase())) {
+    return res.status(400).json({ error: `jobType required. Use one of: ${SUPPORTED.join(", ")}` });
+  }
+
+  const REQUIRED_COUNTS = { plumbing: 8, gas: 8, electrical: 8, drainage: 6, carpentry: 6, hvac: 6 };
+  const required = REQUIRED_COUNTS[jobType.toLowerCase()] || 6;
+  const provided = photoCount !== undefined ? Number(photoCount) : photoLabels.length;
+
+  const checklist = (CHECKLISTS[jobType.toLowerCase()] || []).map(item => {
+    const covered = photoLabels.some(label =>
+      String(label).toLowerCase().includes(item.item.toLowerCase().substring(0, 15))
+    );
+    return {
+      item:        item.item,
+      required:    item.required,
+      covered,
+      regulatoryRef: item.regulatoryRef || null,
+    };
+  });
+
+  const coveredCount   = checklist.filter(c => c.covered).length;
+  const uncoveredRequired = checklist.filter(c => c.required && !c.covered);
+  const sufficient     = provided >= required;
+  const checklistCoverage = checklist.length > 0
+    ? Math.round((coveredCount / checklist.length) * 100)
+    : null;
+
+  return res.json({
+    jobType,
+    requiredPhotos:  required,
+    providedPhotos:  provided,
+    sufficient,
+    shortfall:       Math.max(0, required - provided),
+    checklistCoverage: checklistCoverage !== null ? `${checklistCoverage}%` : null,
+    coveredItems:    coveredCount,
+    totalItems:      checklist.length,
+    uncoveredRequiredItems: uncoveredRequired.map(c => c.item),
+    checklist,
+    recommendation: sufficient
+      ? uncoveredRequired.length > 0
+        ? `Photo count is sufficient but ${uncoveredRequired.length} required checklist item(s) appear uncovered.`
+        : "Photo count is sufficient and checklist coverage looks good."
+      : `Add at least ${required - provided} more photo(s) before submitting to /review.`,
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+// ── POST /compare-jobs ────────────────────────────────────────────────────────
+// Side-by-side comparison of two job analyses. Useful for reviewing progress
+// between inspections or comparing two tradespeople on the same job type.
+app.post("/compare-jobs", (req, res) => {
+  const { jobA, jobB, label } = req.body || {};
+
+  if (!jobA || !jobB) {
+    return res.status(400).json({ error: "jobA and jobB objects are required." });
+  }
+
+  const extract = (job, name) => ({
+    label:          job.label || name,
+    jobType:        job.jobType || job.job_type || null,
+    confidence:     typeof job.confidence === "number" ? job.confidence : null,
+    complianceScore:typeof job.complianceScore === "number" ? job.complianceScore : null,
+    missingCount:   Array.isArray(job.itemsMissing) ? job.itemsMissing.length : (typeof job.missingCount === "number" ? job.missingCount : null),
+    detectedCount:  Array.isArray(job.itemsDetected) ? job.itemsDetected.length : null,
+    photoCount:     typeof job.photoCount === "number" ? job.photoCount : null,
+    riskRating:     job.riskRating || job.risk_rating || null,
+    gpsRecorded:    job.gpsRecorded ?? job.gps_recorded ?? null,
+    signatureObtained: job.signatureObtained ?? job.signature_obtained ?? null,
+    createdAt:      job.createdAt || job.created_at || null,
+  });
+
+  const a = extract(jobA, "Job A");
+  const b = extract(jobB, "Job B");
+
+  const compareNum = (aVal, bVal, higherIsBetter = true) => {
+    if (aVal === null || bVal === null) return "insufficient data";
+    const diff = aVal - bVal;
+    if (Math.abs(diff) < 1) return "equal";
+    return higherIsBetter
+      ? diff > 0 ? `${a.label} higher by ${Math.abs(diff).toFixed(1)}` : `${b.label} higher by ${Math.abs(diff).toFixed(1)}`
+      : diff < 0 ? `${a.label} better by ${Math.abs(diff).toFixed(1)}` : `${b.label} better by ${Math.abs(diff).toFixed(1)}`;
+  };
+
+  const winner = (a.complianceScore !== null && b.complianceScore !== null)
+    ? a.complianceScore > b.complianceScore ? a.label
+    : b.complianceScore > a.complianceScore ? b.label
+    : "tie"
+    : null;
+
+  return res.json({
+    comparisonLabel: label || `${a.label} vs ${b.label}`,
+    jobA: a,
+    jobB: b,
+    comparisons: {
+      complianceScore:  compareNum(a.complianceScore, b.complianceScore),
+      confidence:       compareNum(a.confidence, b.confidence),
+      missingItems:     compareNum(a.missingCount, b.missingCount, false),
+    },
+    winner,
+    summary: winner && winner !== "tie"
+      ? `${winner} has higher compliance.`
+      : winner === "tie" ? "Both jobs have equal compliance scores." : "Insufficient data to determine winner.",
+    comparedAt: new Date().toISOString(),
+  });
+});
+
+// ── GET /award-rates ──────────────────────────────────────────────────────────
+// Returns current Victorian Award rates for all supported trade types.
+// Data sourced from the Building and Construction General On-site Award 2020.
+app.get("/award-rates", (_req, res) => {
+  const AWARD_DESCRIPTIONS = {
+    plumbing:   "Plumbing & Fire Sprinklers Award 2020 — Tradesperson Grade 4",
+    gas:        "Plumbing & Fire Sprinklers Award 2020 — Gas Fitting specialist loading",
+    electrical: "Electrical, Electronic and Communications Contracting Award 2020 — Grade 4",
+    drainage:   "Plumbing & Fire Sprinklers Award 2020 — Drainage Tradesperson",
+    carpentry:  "Building and Construction General On-site Award 2020 — Carpenter Grade 4",
+    hvac:       "Plumbing & Fire Sprinklers Award 2020 — HVAC&R specialist loading",
+  };
+
+  const rates = Object.entries(AWARD_RATES).map(([trade, data]) => ({
+    trade,
+    baseHourlyRate:      data.rate,
+    currency:            "AUD",
+    jurisdiction:        "Victoria, Australia",
+    awardDescription:    AWARD_DESCRIPTIONS[trade] || data.description || null,
+    casualLoading:       "25% on top of base rate",
+    overtimeRateWeekday: `${Math.round(data.rate * 1.5 * 10) / 10} (time and a half)`,
+    overtimeRateWeekend: `${Math.round(data.rate * 2.0 * 10) / 10} (double time)`,
+    publicHolidayRate:   `${Math.round(data.rate * 2.5 * 10) / 10} (double time + 50%)`,
+    note: "These rates are indicative only. Verify current rates via the Fair Work Commission.",
+  }));
+
+  return res.json({
+    effectiveDate: "2024-07-01",
+    jurisdiction:  "Victoria, Australia",
+    source:        "Fair Work Commission — Modern Awards",
+    rates,
+    retrievedAt:   new Date().toISOString(),
+  });
+});
+
+// ── POST /ai-feedback ─────────────────────────────────────────────────────────
+// Stores user feedback on an AI analysis result in Supabase. Used to improve
+// prompt quality over time by flagging false positives / false negatives.
+app.post("/ai-feedback", async (req, res) => {
+  const {
+    analysisId,
+    userId,
+    feedbackType,
+    feedbackNote,
+    actualOutcome,
+    rating,
+  } = req.body || {};
+
+  const VALID_FEEDBACK_TYPES = ["false_positive", "false_negative", "inaccurate_items", "correct", "unclear_output", "other"];
+
+  if (!analysisId || !feedbackType) {
+    return res.status(400).json({ error: "analysisId and feedbackType are required." });
+  }
+  if (!VALID_FEEDBACK_TYPES.includes(feedbackType)) {
+    return res.status(400).json({ error: `feedbackType must be one of: ${VALID_FEEDBACK_TYPES.join(", ")}` });
+  }
+
+  const feedbackRecord = {
+    analysis_id:    analysisId,
+    user_id:        userId     || null,
+    feedback_type:  feedbackType,
+    feedback_note:  feedbackNote  ? sanitiseInput(String(feedbackNote)).substring(0, 500) : null,
+    actual_outcome: actualOutcome ? sanitiseInput(String(actualOutcome)).substring(0, 200) : null,
+    rating:         typeof rating === "number" ? Math.min(5, Math.max(1, Math.round(rating))) : null,
+    submitted_at:   new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("ai_feedback").insert(feedbackRecord);
+      if (error) {
+        console.error("ai-feedback insert error:", error);
+        // Fail gracefully — don't error the user just because logging failed
+      }
+    } catch (err) {
+      console.error("ai-feedback unexpected error:", err);
+    }
+  }
+
+  // Track in usageStats for admin visibility
+  usageStats.requests++;
+
+  return res.json({
+    received:     true,
+    analysisId,
+    feedbackType,
+    message:      "Thank you for your feedback. It helps improve Elemetric AI accuracy.",
+    submittedAt:  feedbackRecord.submitted_at,
+  });
+});
+
+// ── POST /job-score-card ──────────────────────────────────────────────────────
+// Generates a printable A4-style score card for a job from its analysis data.
+// Returns structured JSON with all sections a tradesperson needs for their records.
+app.post("/job-score-card", (req, res) => {
+  const {
+    jobType,
+    traderName,
+    licenceNumber,
+    siteAddress,
+    jobDate,
+    itemsDetected = [],
+    itemsMissing  = [],
+    itemsUnclear  = [],
+    complianceScore,
+    confidence,
+    riskRating,
+    gpsRecorded,
+    signatureObtained,
+    analysisId,
+  } = req.body || {};
+
+  if (!jobType) {
+    return res.status(400).json({ error: "jobType is required." });
+  }
+
+  const GRADE_MAP = { A: ">= 90", B: ">= 80", C: ">= 70", D: ">= 60", F: "< 60" };
+  const getGrade = (score) => {
+    if (score >= 90) return "A";
+    if (score >= 80) return "B";
+    if (score >= 70) return "C";
+    if (score >= 60) return "D";
+    return "F";
+  };
+
+  const score = typeof complianceScore === "number" ? complianceScore : null;
+  const grade = score !== null ? getGrade(score) : null;
+
+  const liabilityPeriod = LIABILITY_PERIODS[jobType?.toLowerCase()] || null;
+  const tradeLabel = {
+    plumbing: "Plumbing", gas: "Gas Fitting", electrical: "Electrical",
+    drainage: "Drainage", carpentry: "Carpentry / Building", hvac: "HVAC / Refrigeration",
+  }[jobType?.toLowerCase()] || jobType;
+
+  const actionRequired = itemsMissing.filter(item => {
+    const lower = item.toLowerCase();
+    return lower.includes("certificate") || lower.includes("certificate") ||
+           lower.includes("rcd") || lower.includes("ptr") || lower.includes("gas compliance") ||
+           lower.includes("backflow") || lower.includes("earth") || lower.includes("permit");
+  });
+
+  return res.json({
+    documentType:      "Job Score Card",
+    platform:          "Elemetric AI Compliance Platform",
+    jurisdiction:      "Victoria, Australia",
+    generatedAt:       new Date().toISOString(),
+
+    jobDetails: {
+      analysisId:      analysisId  || null,
+      tradeType:       tradeLabel,
+      jobDate:         jobDate      || null,
+      siteAddress:     siteAddress  || null,
+      traderName:      traderName   || null,
+      licenceNumber:   licenceNumber || null,
+    },
+
+    complianceResult: {
+      score:           score,
+      grade:           grade,
+      gradeDescription: grade ? `Grade ${grade} — ${GRADE_MAP[grade]} points` : null,
+      confidence:      confidence || null,
+      riskRating:      riskRating || null,
+      passOrFail:      score !== null ? (score >= 70 ? "PASS" : "FAIL") : null,
+    },
+
+    evidence: {
+      itemsDetected:   itemsDetected,
+      itemsMissing:    itemsMissing,
+      itemsUnclear:    itemsUnclear,
+      gpsRecorded:     gpsRecorded     ?? null,
+      signatureObtained: signatureObtained ?? null,
+    },
+
+    actionsRequired: actionRequired.length > 0
+      ? actionRequired.map(item => ({ item, priority: "critical", note: "Resolve before issuing compliance certificate." }))
+      : [],
+
+    liabilityNote: liabilityPeriod
+      ? `Under the ${liabilityPeriod.statute}, defects liability applies for ${liabilityPeriod.defects} years from completion.`
+      : null,
   });
 });
 
