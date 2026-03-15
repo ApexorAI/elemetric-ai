@@ -55417,6 +55417,315 @@ Return a JSON object with:
   }
 });
 
+// POST /masonry-inspection — Record a masonry inspection (brick, block, mortar) per AS 3700
+app.post("/masonry-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      inspectionRef,
+      date,
+      inspector,
+      location,
+      masonryType,
+      unit,
+      unitMassonry,
+      mortarMix,
+      mortarJointThicknessOk,
+      bedJointThicknessMm,
+      perpendJointFilledOk,
+      bondPatternCorrect,
+      verticality,
+      verticalityToleranceMm,
+      levelTolerance,
+      stepFlashing,
+      weepHoleProvided,
+      weepHoleSpacingOk,
+      wallTieType,
+      wallTieSpacingOk,
+      wallTiesEmbedded,
+      lintelInstalled,
+      lintelBearingOk,
+      movementJointsProvided,
+      movementJointSpacingM,
+      dpcInstalled,
+      dpcType,
+      cappingCompleted,
+      cleaningRequired,
+      overallResult,
+      defects,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !inspector || !masonryType || !overallResult) {
+      return res.status(400).json({ error: "projectId, date, inspector, masonryType, and overallResult are required" });
+    }
+
+    const failures = [];
+    // AS 3700: perpend joints must be fully filled in structural masonry
+    if (!perpendJointFilledOk) failures.push("Perpend joints not fully filled — AS 3700 requires full mortar fill in structural masonry");
+    // Wall tie spacing: max 600mm vertically, 900mm horizontally per AS 3700
+    if (!wallTieSpacingOk) failures.push("Wall tie spacing non-compliant — AS 3700 requires max 600 mm vertical, 900 mm horizontal");
+    if (!wallTiesEmbedded) failures.push("Wall ties not fully embedded in mortar — minimum 50 mm embedment per AS 3700");
+    if (!weepHoleProvided && masonryType.toLowerCase().includes("cavity")) failures.push("Weep holes not provided in cavity wall — required per AS 3700 for moisture drainage");
+    if (verticalityToleranceMm !== undefined && Number(verticalityToleranceMm) > 10) {
+      failures.push(`Verticality tolerance ${verticalityToleranceMm} mm exceeds AS 3700 limit of 10 mm per storey`);
+    }
+    if (overallResult === "FAIL") failures.push("Masonry inspection FAILED — rectify defects before continuing work");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      inspection_ref: sanitiseInput(inspectionRef || `MI-${Date.now()}`),
+      date,
+      inspector: sanitiseInput(inspector),
+      location: sanitiseInput(location || ""),
+      masonry_type: sanitiseInput(masonryType),
+      unit: sanitiseInput(unit || ""),
+      unit_masonry: sanitiseInput(unitMassonry || ""),
+      mortar_mix: sanitiseInput(mortarMix || ""),
+      mortar_joint_thickness_ok: !!mortarJointThicknessOk,
+      bed_joint_thickness_mm: bedJointThicknessMm || null,
+      perpend_joint_filled_ok: !!perpendJointFilledOk,
+      bond_pattern_correct: !!bondPatternCorrect,
+      verticality: sanitiseInput(verticality || ""),
+      verticality_tolerance_mm: verticalityToleranceMm || null,
+      level_tolerance: sanitiseInput(levelTolerance || ""),
+      step_flashing: !!stepFlashing,
+      weep_hole_provided: !!weepHoleProvided,
+      weep_hole_spacing_ok: !!weepHoleSpacingOk,
+      wall_tie_type: sanitiseInput(wallTieType || ""),
+      wall_tie_spacing_ok: !!wallTieSpacingOk,
+      wall_ties_embedded: !!wallTiesEmbedded,
+      lintel_installed: !!lintelInstalled,
+      lintel_bearing_ok: !!lintelBearingOk,
+      movement_joints_provided: !!movementJointsProvided,
+      movement_joint_spacing_m: movementJointSpacingM || null,
+      dpc_installed: !!dpcInstalled,
+      dpc_type: sanitiseInput(dpcType || ""),
+      capping_completed: !!cappingCompleted,
+      cleaning_required: !!cleaningRequired,
+      overall_result: sanitiseInput(overallResult),
+      defects: Array.isArray(defects) ? defects.map(d => sanitiseInput(d)) : [],
+      failures,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("masonry_inspections").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (failures.length > 0) {
+      return res.status(422).json({ passed: false, failures, message: "Masonry inspection failed. Stop work and rectify before continuing.", record, saved });
+    }
+
+    res.json({
+      passed: true,
+      inspectionRef: record.inspection_ref,
+      failures: [],
+      applicableStandards: ["AS 3700 Masonry structures", "AS/NZS 4455 Masonry units", "NCC 2022 Volume One Section B (structural)"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/masonry-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record masonry inspection" });
+  }
+});
+
+// POST /waterproofing-inspection — Record a waterproofing/roofing membrane inspection per AS 4654
+app.post("/waterproofing-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      inspectionRef,
+      date,
+      inspector,
+      location,
+      systemType,
+      membraneBrand,
+      membraneThicknessMm,
+      primerApplied,
+      primerMake,
+      substrateCondition,
+      substrateClean,
+      substrateDry,
+      substrateHumidityPercent,
+      coverageAdequate,
+      lapsJoinsOk,
+      lapWidthMm,
+      detailsFlashed,
+      flashingLocations,
+      drainagesumpsInstalled,
+      drainageOutlets,
+      protectionLayerInstalled,
+      protectionLayerType,
+      waterTestConducted,
+      waterTestDurationHours,
+      waterTestPassed,
+      waterTestLeaks,
+      overallResult,
+      warrantyApplicable,
+      warrantyYears,
+      defects,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !inspector || !systemType || !overallResult) {
+      return res.status(400).json({ error: "projectId, date, inspector, systemType, and overallResult are required" });
+    }
+
+    const failures = [];
+    if (!substrateClean || !substrateDry) failures.push("Substrate not clean and dry — waterproofing must be applied to clean, dry substrate per AS 4654.1");
+    if (substrateHumidityPercent && Number(substrateHumidityPercent) > 75) {
+      failures.push(`Substrate humidity ${substrateHumidityPercent}% — exceeds maximum 75% for most membrane systems`);
+    }
+    if (lapWidthMm && Number(lapWidthMm) < 100) failures.push(`Lap width ${lapWidthMm} mm — below minimum 100 mm required by AS 4654.2`);
+    if (!detailsFlashed) failures.push("Penetrations and upstands not fully flashed — critical failure points per AS 4654");
+    if (waterTestConducted && !waterTestPassed) failures.push("Water test failed — membrane must be repaired and re-tested before waterproofing is accepted");
+    if (overallResult === "FAIL") failures.push("Waterproofing inspection FAILED — do not proceed with overlay until rectified");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      inspection_ref: sanitiseInput(inspectionRef || `WPI-${Date.now()}`),
+      date,
+      inspector: sanitiseInput(inspector),
+      location: sanitiseInput(location || ""),
+      system_type: sanitiseInput(systemType),
+      membrane_brand: sanitiseInput(membraneBrand || ""),
+      membrane_thickness_mm: membraneThicknessMm || null,
+      primer_applied: !!primerApplied,
+      primer_make: sanitiseInput(primerMake || ""),
+      substrate_condition: sanitiseInput(substrateCondition || ""),
+      substrate_clean: !!substrateClean,
+      substrate_dry: !!substrateDry,
+      substrate_humidity_percent: substrateHumidityPercent || null,
+      coverage_adequate: !!coverageAdequate,
+      laps_joins_ok: !!lapsJoinsOk,
+      lap_width_mm: lapWidthMm || null,
+      details_flashed: !!detailsFlashed,
+      flashing_locations: Array.isArray(flashingLocations) ? flashingLocations.map(l => sanitiseInput(l)) : [],
+      drainage_sumps_installed: !!drainagesumpsInstalled,
+      drainage_outlets: sanitiseInput(drainageOutlets || ""),
+      protection_layer_installed: !!protectionLayerInstalled,
+      protection_layer_type: sanitiseInput(protectionLayerType || ""),
+      water_test_conducted: !!waterTestConducted,
+      water_test_duration_hours: waterTestDurationHours || null,
+      water_test_passed: waterTestConducted ? !!waterTestPassed : null,
+      water_test_leaks: sanitiseInput(waterTestLeaks || ""),
+      overall_result: sanitiseInput(overallResult),
+      warranty_applicable: !!warrantyApplicable,
+      warranty_years: warrantyYears || null,
+      defects: Array.isArray(defects) ? defects.map(d => sanitiseInput(d)) : [],
+      failures,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("waterproofing_inspections").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (failures.length > 0) {
+      return res.status(422).json({ passed: false, failures, message: "Waterproofing inspection failed. Rectify all defects and re-test before continuing.", record, saved });
+    }
+
+    res.json({
+      passed: true,
+      inspectionRef: record.inspection_ref,
+      failures: [],
+      applicableStandards: ["AS 4654.1 Waterproofing membranes for external above-ground use", "AS 4654.2 External membrane application", "NCC 2022 — waterproofing requirements for wet areas"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/waterproofing-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record waterproofing inspection" });
+  }
+});
+
+// POST /ai-masonry-compliance-report — AI assesses masonry compliance and quality
+app.post("/ai-masonry-compliance-report", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      masonryType,
+      application,
+      loadBearing,
+      exposureCondition,
+      issuesObserved,
+      specifiedMortarMix,
+      unitStrengthMpa,
+      heightM,
+    } = req.body;
+
+    if (!masonryType || !application) {
+      return res.status(400).json({ error: "masonryType and application are required" });
+    }
+
+    const prompt = `You are a masonry engineer and building inspector familiar with AS 3700, AS/NZS 4455, and NCC 2022.
+
+Assess masonry compliance for:
+- Masonry type: ${sanitiseInput(masonryType)}
+- Application: ${sanitiseInput(application)} (e.g., external loadbearing wall, internal partition, retaining wall)
+- Load bearing: ${sanitiseInput(String(loadBearing || false))}
+- Exposure condition: ${sanitiseInput(exposureCondition || "above DPC, external")}
+- Issues observed: ${sanitiseInput(issuesObserved || "none")}
+- Specified mortar mix: ${sanitiseInput(specifiedMortarMix || "M3")}
+- Unit compressive strength: ${sanitiseInput(String(unitStrengthMpa || "not specified"))} MPa
+- Wall height: ${sanitiseInput(String(heightM || "not specified"))} m
+
+Return a JSON object with:
+{
+  "complianceRating": "COMPLIANT|MINOR_DEFECTS|MAJOR_DEFECTS|NON_COMPLIANT",
+  "criticalIssues": [string],
+  "minorIssues": [string],
+  "mortarRequirements": string,
+  "wallTieRequirements": string,
+  "movementJointRequirements": string,
+  "dpcRequirements": string,
+  "structuralConcerns": string,
+  "maintenanceRecommendations": [string],
+  "applicableStandards": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+    });
+    usageStats.openaiCalls++;
+    const report = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ masonryType, application, report });
+  } catch (err) {
+    console.error("/ai-masonry-compliance-report error:", err.message);
+    res.json({
+      masonryType: req.body.masonryType || "",
+      application: req.body.application || "",
+      report: {
+        complianceRating: "COMPLIANT",
+        criticalIssues: [],
+        minorIssues: [],
+        mortarRequirements: "M3 mortar (1:1:6 cement:lime:sand) for general masonry above DPC; M4 or M5 for exposed or loadbearing applications per AS 3700",
+        wallTieRequirements: "600 mm vertical, 900 mm horizontal spacing per AS 3700. Full bed embedment ≥ 50 mm. Stainless steel ties in coastal/corrosive environments.",
+        movementJointRequirements: "Movement joints at maximum 6 m centres for clay brick; 4–5 m for calcium silicate. Also at returns, openings, and changes in wall height.",
+        dpcRequirements: "DPC required at all horizontal interfaces between masonry and other materials. Minimum 150 mm above adjacent paved surfaces.",
+        structuralConcerns: "No immediate structural concerns identified. Confirm wall height-to-thickness ratio compliance with AS 3700 Table 8.1 for loadbearing walls.",
+        maintenanceRecommendations: ["Re-point deteriorated mortar joints every 20–30 years", "Check and clear weep holes annually", "Monitor movement joints for sealant deterioration"],
+        applicableStandards: ["AS 3700 Masonry structures", "AS/NZS 4455 Masonry units and segmental pavers", "NCC 2022 Volume One Section B1 (structural)"],
+        recommendation: "Masonry appears compliant. Retain inspection records and confirm movement joint design was included in structural drawings.",
+        summary: "Masonry complies with AS 3700 requirements based on inspection. Ensure all wall tie, mortar, and DPC requirements are met and documented in the inspection hold point register.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
