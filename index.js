@@ -23116,6 +23116,173 @@ app.get("/job-notes/:jobId", apiKeyAuth, async (req, res) => {
   return res.json({ jobId, totalNotes: notes.length, byType, notes, generatedAt: new Date().toISOString() });
 });
 
+// POST /asset-register  — Log a piece of plant/equipment to an asset register
+app.post("/asset-register", apiKeyAuth, async (req, res) => {
+  const { contractorId, assetName, assetType, serialNumber, purchaseDate, purchasePrice, currentValue, nextServiceDate, status, notes } = req.body || {};
+  if (!contractorId || !assetName) return res.status(400).json({ error: "contractorId and assetName required." });
+
+  const VALID_ASSET_TYPES   = ["vehicle", "power-tool", "hand-tool", "testing-equipment", "lifting-equipment", "scaffolding", "compressor", "generator", "computer", "other"];
+  const VALID_ASSET_STATUSES = ["active", "in-repair", "retired", "stolen", "lost"];
+  const safeCId     = sanitiseInput(String(contractorId)).slice(0, 80);
+  const safeName    = sanitiseInput(String(assetName)).slice(0, 100);
+  const safeType    = VALID_ASSET_TYPES.includes(String(assetType || "").toLowerCase().replace(/ /g, "-")) ? String(assetType).toLowerCase().replace(/ /g, "-") : "other";
+  const safeSerial  = serialNumber ? sanitiseInput(String(serialNumber)).slice(0, 80) : null;
+  const safeStatus  = VALID_ASSET_STATUSES.includes(String(status || "").toLowerCase()) ? String(status).toLowerCase() : "active";
+  const safeNotes   = notes ? sanitiseInput(String(notes)).slice(0, 300) : null;
+
+  const asset = {
+    assetId:        `AST-${safeCId.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`,
+    contractorId:   safeCId, assetName: safeName, assetType: safeType,
+    serialNumber:   safeSerial,
+    purchaseDate:   purchaseDate ? sanitiseInput(String(purchaseDate)).slice(0, 20) : null,
+    purchasePrice:  purchasePrice ? Math.max(0, parseFloat(purchasePrice) || 0) : null,
+    currentValue:   currentValue ? Math.max(0, parseFloat(currentValue) || 0) : null,
+    nextServiceDate: nextServiceDate ? sanitiseInput(String(nextServiceDate)).slice(0, 20) : null,
+    status:         safeStatus, notes: safeNotes,
+    createdAt:      new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("asset_register").insert({
+        asset_id: asset.assetId, contractor_id: asset.contractorId, asset_name: asset.assetName,
+        asset_type: asset.assetType, serial_number: asset.serialNumber, purchase_date: asset.purchaseDate,
+        purchase_price: asset.purchasePrice, current_value: asset.currentValue,
+        next_service_date: asset.nextServiceDate, status: asset.status, notes: asset.notes,
+        created_at: asset.createdAt,
+      });
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.status(201).json({ ...asset, saved: !!supabaseAdmin });
+});
+
+// GET /asset-register/:contractorId  — Get all assets for a contractor
+app.get("/asset-register/:contractorId", apiKeyAuth, async (req, res) => {
+  const contractorId = sanitiseInput(String(req.params.contractorId || "")).slice(0, 80);
+  const assetType    = req.query.type ? sanitiseInput(String(req.query.type)).toLowerCase() : null;
+  if (!contractorId) return res.status(400).json({ error: "contractorId required." });
+
+  let assets = [];
+  if (supabaseAdmin) {
+    try {
+      let q = supabaseAdmin.from("asset_register").select("*").eq("contractor_id", contractorId).order("asset_name", { ascending: true }).limit(200);
+      if (assetType) q = q.eq("asset_type", assetType);
+      const { data } = await q;
+      assets = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  const now = new Date().toISOString().split("T")[0];
+  const serviceDue   = assets.filter(a => a.next_service_date && a.next_service_date <= now).length;
+  const totalValue   = parseFloat(assets.reduce((s, a) => s + (a.current_value || 0), 0).toFixed(2));
+
+  return res.json({ contractorId, totalAssets: assets.length, serviceDue, estimatedTotalValue: totalValue, filter: assetType || "all", assets, generatedAt: new Date().toISOString() });
+});
+
+// POST /ai-cost-estimate  — AI estimates job costs from a scope description
+app.post("/ai-cost-estimate", apiKeyAuth, async (req, res) => {
+  const { jobType, scopeDescription, propertyType, state = "VIC", squareMetres } = req.body || {};
+  if (!jobType || !scopeDescription) return res.status(400).json({ error: "jobType and scopeDescription required." });
+
+  const safeType  = sanitiseInput(String(jobType)).slice(0, 40);
+  const safeScope = sanitiseInput(String(scopeDescription)).slice(0, 2000);
+  const safeProp  = propertyType ? sanitiseInput(String(propertyType)).slice(0, 60) : null;
+  const safeState = sanitiseInput(String(state)).toUpperCase().slice(0, 5);
+  const safeSqm   = squareMetres ? Math.max(0, parseFloat(squareMetres) || 0) : null;
+
+  const prompt = `You are a ${safeType} trade estimator in ${safeState}, Australia.
+
+Estimate the cost for the following scope of works:
+${safeScope}
+${safeProp ? `\nProperty type: ${safeProp}` : ""}
+${safeSqm ? `\nSize: approximately ${safeSqm} m²` : ""}
+
+Respond with JSON:
+{
+  "labourCost": { "low": number, "mid": number, "high": number },
+  "materialsCost": { "low": number, "mid": number, "high": number },
+  "totalCost": { "low": number, "mid": number, "high": number },
+  "daysDuration": { "min": number, "max": number },
+  "assumptions": ["assumption1", ...],
+  "exclusions": ["exclusion1", ...],
+  "confidence": "LOW|MEDIUM|HIGH"
+}`;
+
+  try {
+    const aiRes = await callOpenAIWithRetry([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, max_tokens: 600 });
+    const parsed = JSON.parse(aiRes.choices[0].message.content);
+    usageStats.openaiCalls++;
+    return res.json({
+      jobType: safeType, state: safeState,
+      labourCost:    parsed.labourCost    || { low: 0, mid: 0, high: 0 },
+      materialsCost: parsed.materialsCost || { low: 0, mid: 0, high: 0 },
+      totalCost:     parsed.totalCost     || { low: 0, mid: 0, high: 0 },
+      daysDuration:  parsed.daysDuration  || { min: 1, max: 2 },
+      assumptions:   Array.isArray(parsed.assumptions) ? parsed.assumptions : [],
+      exclusions:    Array.isArray(parsed.exclusions) ? parsed.exclusions : [],
+      confidence:    ["LOW", "MEDIUM", "HIGH"].includes(parsed.confidence) ? parsed.confidence : "MEDIUM",
+      disclaimer: "Estimate only. Obtain formal quotes before committing to any project.",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (_) {
+    return res.json({
+      jobType: safeType, state: safeState,
+      labourCost: null, materialsCost: null, totalCost: null, daysDuration: null,
+      assumptions: [], exclusions: [], confidence: "LOW",
+      disclaimer: "Cost estimation temporarily unavailable. Please obtain formal trade quotes.",
+      generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
+// POST /emergency-contact  — Store emergency contacts for a site or job
+app.post("/emergency-contact", apiKeyAuth, async (req, res) => {
+  const { siteId, jobId, contacts = [] } = req.body || {};
+  if (!siteId && !jobId) return res.status(400).json({ error: "siteId or jobId required." });
+  if (!Array.isArray(contacts) || contacts.length === 0) return res.status(400).json({ error: "contacts array required." });
+
+  const VALID_ROLES = ["site-supervisor", "safety-officer", "project-manager", "client", "subcontractor", "emergency-services", "first-aider", "other"];
+  const safeSiteId = siteId ? sanitiseInput(String(siteId)).slice(0, 80) : null;
+  const safeJobId  = jobId ? sanitiseInput(String(jobId)).slice(0, 80) : null;
+
+  const stored = contacts.slice(0, 20).map(c => ({
+    name:    sanitiseInput(String(c.name || "")).slice(0, 100),
+    role:    VALID_ROLES.includes(String(c.role || "").toLowerCase().replace(/ /g, "-")) ? String(c.role).toLowerCase().replace(/ /g, "-") : "other",
+    phone:   c.phone ? sanitiseInput(String(c.phone)).replace(/[^0-9+ ()-]/g, "").slice(0, 20) : null,
+    email:   c.email && isValidEmail(c.email) ? c.email.toLowerCase() : null,
+    isPrimary: c.isPrimary === true,
+    notes:   c.notes ? sanitiseInput(String(c.notes)).slice(0, 100) : null,
+  }));
+
+  if (supabaseAdmin) {
+    try {
+      await supabaseAdmin.from("emergency_contacts").upsert(
+        stored.map(c => ({ site_id: safeSiteId, job_id: safeJobId, ...c, updated_at: new Date().toISOString() })),
+        { onConflict: "site_id,job_id,name" }
+      );
+    } catch (_) { /* non-critical */ }
+  }
+
+  return res.json({ siteId: safeSiteId, jobId: safeJobId, contactsStored: stored.length, contacts: stored, savedAt: new Date().toISOString() });
+});
+
+// GET /emergency-contact/:siteId  — Get emergency contacts for a site
+app.get("/emergency-contact/:siteId", apiKeyAuth, async (req, res) => {
+  const siteId = sanitiseInput(String(req.params.siteId || "")).slice(0, 80);
+  if (!siteId) return res.status(400).json({ error: "siteId required." });
+
+  let contacts = [];
+  if (supabaseAdmin) {
+    try {
+      const { data } = await supabaseAdmin.from("emergency_contacts").select("*").eq("site_id", siteId).order("is_primary", { ascending: false }).limit(20);
+      contacts = data || [];
+    } catch (_) { /* ignore */ }
+  }
+
+  return res.json({ siteId, count: contacts.length, contacts, generatedAt: new Date().toISOString() });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
