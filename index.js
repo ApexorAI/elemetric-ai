@@ -55726,6 +55726,317 @@ Return a JSON object with:
   }
 });
 
+// POST /fire-system-commissioning — Record a fire safety system commissioning inspection
+app.post("/fire-system-commissioning", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      commissioningRef,
+      date,
+      contractor,
+      technician,
+      technicianLicenceNumber,
+      buildingAddress,
+      buildingClass,
+      systemType,
+      systemScope,
+      designStandard,
+      asBuiltDrawingsRef,
+      coverageAreaM2,
+      sprinklerHeadCount,
+      detectorCount,
+      exitLightCount,
+      smokeDetectorsOk,
+      heatDetectorsOk,
+      sprinklersOk,
+      fipOperational,
+      fipAddressable,
+      emergencyLightingOk,
+      exitSignageOk,
+      alarmSoundersOk,
+      suppressionSystemOk,
+      firePumpOk,
+      firePumpFlowTestLps,
+      firePumpPressureKpa,
+      maintenanceSwitchesOk,
+      zoneValvesOk,
+      annunciatorOk,
+      bmsIntegrated,
+      faultsList,
+      overallResult,
+      completionCertificateIssued,
+      completionCertificateRef,
+      nextServiceDate,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !contractor || !systemType || !overallResult) {
+      return res.status(400).json({ error: "projectId, date, contractor, systemType, and overallResult are required" });
+    }
+
+    const failures = [];
+    if (!fipOperational) failures.push("Fire Indicator Panel (FIP) not operational — system must not be handed over until FIP is fully functional");
+    if (!emergencyLightingOk) failures.push("Emergency lighting non-compliant — AS 2293 requires emergency lighting at all exits and along escape routes");
+    if (!exitSignageOk) failures.push("Exit signage non-compliant — illuminated exit signs required per NCC 2022 and AS 2293");
+    if (!alarmSoundersOk) failures.push("Alarm sounders not functioning — occupant evacuation system must be operational per BCA");
+    if (systemType.toLowerCase().includes("sprinkler") && !sprinklersOk) failures.push("Sprinkler system not operational — building must not be occupied until system is commissioned");
+    if (Array.isArray(faultsList) && faultsList.length > 0) failures.push(`${faultsList.length} active fault(s) on system: ${faultsList.slice(0, 3).map(f => sanitiseInput(f)).join(", ")}${faultsList.length > 3 ? "..." : ""}`);
+    if (overallResult === "FAIL") failures.push("Fire safety system commissioning FAILED — do not occupy building until system is fully commissioned");
+
+    if (failures.length > 0) console.warn(`[FIRE SYSTEM] ${systemType} at ${projectId} — ${failures.join("; ")}`);
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      commissioning_ref: sanitiseInput(commissioningRef || `FSC-${Date.now()}`),
+      date,
+      contractor: sanitiseInput(contractor),
+      technician: sanitiseInput(technician || ""),
+      technician_licence_number: sanitiseInput(technicianLicenceNumber || ""),
+      building_address: sanitiseInput(buildingAddress || ""),
+      building_class: sanitiseInput(buildingClass || ""),
+      system_type: sanitiseInput(systemType),
+      system_scope: sanitiseInput(systemScope || ""),
+      design_standard: sanitiseInput(designStandard || ""),
+      as_built_drawings_ref: sanitiseInput(asBuiltDrawingsRef || ""),
+      coverage_area_m2: coverageAreaM2 || null,
+      sprinkler_head_count: sprinklerHeadCount || null,
+      detector_count: detectorCount || null,
+      exit_light_count: exitLightCount || null,
+      smoke_detectors_ok: !!smokeDetectorsOk,
+      heat_detectors_ok: !!heatDetectorsOk,
+      sprinklers_ok: !!sprinklersOk,
+      fip_operational: !!fipOperational,
+      fip_addressable: !!fipAddressable,
+      emergency_lighting_ok: !!emergencyLightingOk,
+      exit_signage_ok: !!exitSignageOk,
+      alarm_sounders_ok: !!alarmSoundersOk,
+      suppression_system_ok: !!suppressionSystemOk,
+      fire_pump_ok: firePumpOk !== undefined ? !!firePumpOk : null,
+      fire_pump_flow_test_lps: firePumpFlowTestLps || null,
+      fire_pump_pressure_kpa: firePumpPressureKpa || null,
+      maintenance_switches_ok: !!maintenanceSwitchesOk,
+      zone_valves_ok: !!zoneValvesOk,
+      annunciator_ok: !!annunciatorOk,
+      bms_integrated: !!bmsIntegrated,
+      faults_list: Array.isArray(faultsList) ? faultsList.map(f => sanitiseInput(f)) : [],
+      overall_result: sanitiseInput(overallResult),
+      failures,
+      completion_certificate_issued: !!completionCertificateIssued,
+      completion_certificate_ref: sanitiseInput(completionCertificateRef || ""),
+      next_service_date: nextServiceDate || null,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("fire_system_commissioning").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (failures.length > 0) {
+      return res.status(422).json({ commissioned: false, failures, message: "Fire system commissioning failed. Building must not be occupied until system is fully commissioned.", record, saved });
+    }
+
+    res.json({
+      commissioned: true,
+      commissioningRef: record.commissioning_ref,
+      failures: [],
+      annualServiceRequired: true,
+      applicableStandards: ["AS 1851 Maintenance of fire protection systems", "AS 1670.1 Fire detection, warning, control and intercom systems", "AS 2118.1 Automatic fire sprinkler systems", "NCC 2022 Section E (services and equipment)"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/fire-system-commissioning error:", err.message);
+    res.status(500).json({ error: "Failed to record fire system commissioning" });
+  }
+});
+
+// POST /paint-inspection — Record a paint and coatings inspection per AS/NZS 1580 and AS/NZS 2312
+app.post("/paint-inspection", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId,
+      inspectionRef,
+      date,
+      inspector,
+      location,
+      substrateType,
+      substrateCondition,
+      coatingSystem,
+      paintBrand,
+      paintProduct,
+      colourRef,
+      surfacePreparation,
+      surfacePreparationStandard,
+      ambientTempC,
+      relativeHumidityPercent,
+      dewPointC,
+      substrateTemp,
+      dftSpecMicrons,
+      dftReadings,
+      dftAvgMicrons,
+      adhesionTestResult,
+      adhesionMpa,
+      glossLevel,
+      holidayTestConducted,
+      holidayTestResult,
+      overallResult,
+      defects,
+      notes,
+    } = req.body;
+
+    if (!projectId || !date || !inspector || !coatingSystem || !overallResult) {
+      return res.status(400).json({ error: "projectId, date, inspector, coatingSystem, and overallResult are required" });
+    }
+
+    const failures = [];
+    // DFT tolerance: typically ±10% of specified DFT per AS/NZS 4506
+    if (dftSpecMicrons && dftAvgMicrons && Number(dftAvgMicrons) < Number(dftSpecMicrons) * 0.85) {
+      failures.push(`Average DFT ${dftAvgMicrons} µm is more than 15% below specified ${dftSpecMicrons} µm — inadequate film build, re-coat required`);
+    }
+    if (relativeHumidityPercent && Number(relativeHumidityPercent) > 85) {
+      failures.push(`Relative humidity ${relativeHumidityPercent}% — painting must not proceed above 85% RH (most coatings) or within 3°C of dew point`);
+    }
+    if (dewPointC && substrateTemp && Number(substrateTemp) <= Number(dewPointC) + 3) {
+      failures.push(`Substrate temperature ${substrateTemp}°C is within 3°C of dew point ${dewPointC}°C — condensation risk, do not apply coating`);
+    }
+    if (adhesionTestResult && adhesionTestResult.toUpperCase() === "FAIL") failures.push("Adhesion test failed — coating not bonded to substrate, remove and re-apply after proper surface preparation");
+    if (holidayTestConducted && holidayTestResult === "FAIL") failures.push("Holiday test failed — pinholes/voids in coating, repair before acceptance");
+
+    const record = {
+      project_id: sanitiseInput(projectId),
+      inspection_ref: sanitiseInput(inspectionRef || `PI-${Date.now()}`),
+      date,
+      inspector: sanitiseInput(inspector),
+      location: sanitiseInput(location || ""),
+      substrate_type: sanitiseInput(substrateType || ""),
+      substrate_condition: sanitiseInput(substrateCondition || ""),
+      coating_system: sanitiseInput(coatingSystem),
+      paint_brand: sanitiseInput(paintBrand || ""),
+      paint_product: sanitiseInput(paintProduct || ""),
+      colour_ref: sanitiseInput(colourRef || ""),
+      surface_preparation: sanitiseInput(surfacePreparation || ""),
+      surface_preparation_standard: sanitiseInput(surfacePreparationStandard || ""),
+      ambient_temp_c: ambientTempC || null,
+      relative_humidity_percent: relativeHumidityPercent || null,
+      dew_point_c: dewPointC || null,
+      substrate_temp: substrateTemp || null,
+      dft_spec_microns: dftSpecMicrons || null,
+      dft_readings: Array.isArray(dftReadings) ? dftReadings.map(Number) : [],
+      dft_avg_microns: dftAvgMicrons || null,
+      adhesion_test_result: sanitiseInput(adhesionTestResult || ""),
+      adhesion_mpa: adhesionMpa || null,
+      gloss_level: sanitiseInput(glossLevel || ""),
+      holiday_test_conducted: !!holidayTestConducted,
+      holiday_test_result: sanitiseInput(holidayTestResult || ""),
+      overall_result: sanitiseInput(overallResult),
+      defects: Array.isArray(defects) ? defects.map(d => sanitiseInput(d)) : [],
+      failures,
+      notes: sanitiseInput(notes || ""),
+      created_at: new Date().toISOString(),
+    };
+
+    let saved = false;
+    if (supabaseAdmin) {
+      const { error } = await supabaseAdmin.from("paint_inspections").insert(record);
+      if (!error) saved = true;
+    }
+
+    if (failures.length > 0) {
+      return res.status(422).json({ passed: false, failures, message: "Paint inspection failed. Rectify deficiencies before accepting coatings.", record, saved });
+    }
+
+    res.json({
+      passed: true,
+      inspectionRef: record.inspection_ref,
+      failures: [],
+      applicableStandards: ["AS/NZS 1580 Paints and related materials test methods", "AS/NZS 2312 Guide to protection of structural steel against atmospheric corrosion", "AS 1627 Metal finishing — preparation and pretreatment of surfaces"],
+      record,
+      saved,
+    });
+  } catch (err) {
+    console.error("/paint-inspection error:", err.message);
+    res.status(500).json({ error: "Failed to record paint inspection" });
+  }
+});
+
+// POST /ai-fire-safety-compliance — AI assesses fire safety system compliance for a building
+app.post("/ai-fire-safety-compliance", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      buildingClass,
+      buildingHeight,
+      grossFloorAreaM2,
+      occupancyType,
+      existingSystems,
+      observedIssues,
+      lastMaintenanceDate,
+    } = req.body;
+
+    if (!buildingClass || !occupancyType) {
+      return res.status(400).json({ error: "buildingClass and occupancyType are required" });
+    }
+
+    const prompt = `You are a fire safety engineer with expertise in the National Construction Code 2022 (NCC), AS 1670, AS 2118, and Victorian fire safety legislation.
+
+Assess fire safety system compliance for:
+- Building class: ${sanitiseInput(buildingClass)}
+- Building height: ${sanitiseInput(String(buildingHeight || "not specified"))} m
+- Gross floor area: ${sanitiseInput(String(grossFloorAreaM2 || "not specified"))} m²
+- Occupancy type: ${sanitiseInput(occupancyType)}
+- Existing systems: ${sanitiseInput(existingSystems || "not specified")}
+- Observed issues: ${sanitiseInput(observedIssues || "none")}
+- Last maintenance date: ${sanitiseInput(lastMaintenanceDate || "unknown")}
+
+Return a JSON object with:
+{
+  "complianceRating": "COMPLIANT|MINOR_ISSUES|MAJOR_ISSUES|NON_COMPLIANT",
+  "mandatorySystemsRequired": [string],
+  "criticalIssues": [string],
+  "maintenanceIssues": [string],
+  "annualMaintenanceRequirements": [string],
+  "occupancyPermitRisk": boolean,
+  "evacuationPlanRequired": boolean,
+  "fireEngineeringRequired": boolean,
+  "applicableStandards": [string],
+  "recommendation": string,
+  "summary": string
+}`;
+
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 800,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+
+    res.json({ buildingClass, occupancyType, assessment });
+  } catch (err) {
+    console.error("/ai-fire-safety-compliance error:", err.message);
+    res.json({
+      buildingClass: req.body.buildingClass || "",
+      occupancyType: req.body.occupancyType || "",
+      assessment: {
+        complianceRating: "MINOR_ISSUES",
+        mandatorySystemsRequired: ["Smoke detection (AS 1670.1)", "Emergency lighting (AS 2293.1)", "Exit signage (AS 2293.1)", "Portable fire extinguishers (AS 2444)"],
+        criticalIssues: [],
+        maintenanceIssues: ["Annual fire system maintenance required per AS 1851", "FIP and detector testing required every 6 months per AS 1670.1"],
+        annualMaintenanceRequirements: ["Annual sprinkler system maintenance per AS 1851 Table 1.1", "6-monthly emergency lighting discharge test per AS 2293.2", "Annual extinguisher service per AS 1851 Part 8", "Annual fire door inspection per AS 1905.1"],
+        occupancyPermitRisk: false,
+        evacuationPlanRequired: true,
+        fireEngineeringRequired: false,
+        applicableStandards: ["NCC 2022 Section E — services and equipment", "AS 1851 Maintenance of fire protection systems", "AS 1670.1 Fire detection and alarm systems", "AS 2118.1 Automatic fire sprinkler systems"],
+        recommendation: "Ensure all mandatory fire safety systems are commissioned and documented before occupation. Establish an annual maintenance schedule and register with Building Council of Australia (BCA) compliance.",
+        summary: "Fire safety compliance requires correctly commissioned systems, documented maintenance schedules, and a current emergency management plan. Engage a licensed fire protection contractor for all commissioning and maintenance.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
