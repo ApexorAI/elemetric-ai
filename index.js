@@ -65195,6 +65195,425 @@ Notes: ${notes || "none"}`,
   }
 });
 
+// POST /hot-work-permit — Hot work permit for welding/grinding/cutting per AS 1674.1 / fire safety requirements
+app.post("/hot-work-permit", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    projectName,
+    permitNumber,
+    issueDate,
+    startDateTime,
+    endDateTime,
+    issuedBy,
+    workersAuthorised,    // array of { name, company }
+    hotWorkType,          // welding | cutting | grinding | soldering | torch | brazing | other
+    workLocation,
+    floorLevel,
+    buildingOccupied,
+    sprinklerSystem,
+    sprinklerImpaired,    // true | false
+    combustiblesCleared,  // 10 m radius per AS 1674.1
+    clearanceRadius_m,    // should be >= 10 m
+    fireExtinguisherPresent,
+    fireExtinguisherType, // DCP | CO2 | water | foam
+    fireExtinguisherInspected,
+    fireWatch_required,
+    fireWatchName,
+    fireWatchDuration_minutes, // post-hot-work fire watch — min 60 min AS 1674.1
+    permitsToWorkObtained,     // hot-work + confined-space if applicable
+    gasDetectionRequired,
+    gasDetectionResult,
+    ventilationAdequate,
+    hotWorkSurface,       // concrete | steel | timber | near-combustibles
+    heatShieldInstalled,
+    drainsCovered,        // prevent sparks entering drains
+    fireAlarmIsolated,    // true | false (AS 1851 — must document)
+    fireAlarmIsolationAuthorised,
+    permitExtensions,     // array of { extensionTime, authorisedBy }
+    permitClosed,         // true when work complete and fire watch done
+    photos,
+    notes,
+  } = req.body;
+
+  const concerns = [];
+
+  // Clearance radius
+  if (!combustiblesCleared) {
+    concerns.push("Combustible materials not cleared to 10 m radius per AS 1674.1");
+  }
+  const radius = parseFloat(clearanceRadius_m) || 0;
+  if (radius > 0 && radius < 10) {
+    concerns.push(`Clearance radius ${radius} m is less than required 10 m per AS 1674.1`);
+  }
+
+  // Fire watch duration
+  const watchDuration = parseInt(fireWatchDuration_minutes, 10) || 0;
+  if (fireWatch_required && watchDuration < 60) {
+    concerns.push(`Fire watch ${watchDuration} min is less than required 60 min post-hot-work per AS 1674.1`);
+  }
+
+  // Sprinkler impaired without authorisation
+  if (sprinklerImpaired === true || sprinklerImpaired === "true") {
+    concerns.push("Sprinkler system impaired during hot work — fire brigade notification and impairment authority required");
+  }
+
+  // Fire alarm isolated without authorisation
+  if ((fireAlarmIsolated === true || fireAlarmIsolated === "true") && !fireAlarmIsolationAuthorised) {
+    concerns.push("Fire alarm isolated without documented authorisation — AS 1851 compliance required");
+  }
+
+  // No fire extinguisher
+  if (!fireExtinguisherPresent) {
+    concerns.push("No fire extinguisher at hot work location");
+  }
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    permit_number: sanitiseInput(permitNumber),
+    issue_date: issueDate,
+    start_date_time: startDateTime,
+    end_date_time: endDateTime,
+    issued_by: sanitiseInput(issuedBy),
+    workers_authorised: workersAuthorised || [],
+    hot_work_type: sanitiseInput(hotWorkType),
+    work_location: sanitiseInput(workLocation),
+    floor_level: floorLevel,
+    building_occupied: buildingOccupied,
+    sprinkler_system: sprinklerSystem,
+    sprinkler_impaired: sprinklerImpaired,
+    combustibles_cleared: combustiblesCleared,
+    clearance_radius_m: clearanceRadius_m,
+    fire_extinguisher_present: fireExtinguisherPresent,
+    fire_extinguisher_type: sanitiseInput(fireExtinguisherType),
+    fire_extinguisher_inspected: fireExtinguisherInspected,
+    fire_watch_required: fireWatch_required,
+    fire_watch_name: sanitiseInput(fireWatchName),
+    fire_watch_duration_minutes: fireWatchDuration_minutes,
+    permits_to_work_obtained: permitsToWorkObtained,
+    gas_detection_required: gasDetectionRequired,
+    gas_detection_result: sanitiseInput(gasDetectionResult),
+    ventilation_adequate: ventilationAdequate,
+    hot_work_surface: sanitiseInput(hotWorkSurface),
+    heat_shield_installed: heatShieldInstalled,
+    drains_covered: drainsCovered,
+    fire_alarm_isolated: fireAlarmIsolated,
+    fire_alarm_isolation_authorised: fireAlarmIsolationAuthorised,
+    permit_extensions: permitExtensions || [],
+    permit_closed: permitClosed,
+    concerns,
+    issued: true,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("hot_work_permits")
+      .insert(record);
+    if (dbErr) console.error("DB error /hot-work-permit:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  res.json({
+    message: "Hot work permit issued",
+    permitNumber: sanitiseInput(permitNumber),
+    hotWorkType: sanitiseInput(hotWorkType),
+    concerns,
+    concernsCount: concerns.length,
+    fireWatchRequired: fireWatch_required,
+    fireWatchDuration_minutes: watchDuration,
+    applicableStandards: [
+      "AS 1674.1",
+      "AS 1851",
+      "AS 1265",
+      "NCC 2022 Section E",
+      "OHS Regulations 2017 (Vic)",
+    ],
+    saved,
+  });
+});
+
+// POST /swimming-pool-barrier-inspection — Pool/spa barrier inspection per Building Regs 2018 (Vic) / AS 1926
+app.post("/swimming-pool-barrier-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId,
+    propertyAddress,
+    ownerName,
+    inspectionDate,
+    inspector,
+    inspectorRegistration,
+    poolType,             // in-ground | above-ground | portable | spa | wading
+    poolInstallationYear,
+    barrierType,          // fence | wall | building-wall | combination
+    barrierHeight_mm,     // min 1200 mm per AS 1926.1
+    barrierHeightCompliant,
+    gateSelfClosing,
+    gateSelfLatching,
+    gateOpeningOutward,   // must open away from pool
+    latchHeight_mm,       // min 1500 mm from bottom or on pool side at 1200 mm
+    nonClimbZone_mm,      // 900 mm non-climbable zone each side of gate
+    climbingHazardsWithin900mm, // true | false
+    barrierGapsCompliant,  // gaps <=100 mm horizontal, <=100 mm vertical
+    maxGap_mm,
+    returnGap_mm,         // gap between gate and fence post <=10 mm
+    poolSideDirectAccess, // true | false — direct door access from building to pool
+    doorAlarmPresent,
+    doorAlarmWorking,
+    barrierDamaged,
+    barrierDamagedDescription,
+    overallResult,        // PASS | FAIL | FURTHER-INVESTIGATION
+    photos,
+    notes,
+  } = req.body;
+
+  const failures = [];
+
+  // Height check — 1200 mm minimum per AS 1926.1
+  const height = parseFloat(barrierHeight_mm) || 0;
+  if (height > 0 && height < 1200) {
+    failures.push(`Barrier height ${height} mm is below minimum 1200 mm per AS 1926.1`);
+  }
+  if (barrierHeightCompliant === false || barrierHeightCompliant === "false") {
+    failures.push("Barrier height non-compliant");
+  }
+
+  // Gate requirements
+  if (!gateSelfClosing) failures.push("Gate is not self-closing — required per AS 1926.1");
+  if (!gateSelfLatching) failures.push("Gate is not self-latching — required per AS 1926.1");
+  if (gateOpeningOutward === false || gateOpeningOutward === "false") {
+    failures.push("Gate does not open away from pool — required per AS 1926.1");
+  }
+
+  // Latch height
+  const latch = parseFloat(latchHeight_mm) || 0;
+  if (latch > 0 && latch < 1500) {
+    failures.push(`Gate latch height ${latch} mm is below 1500 mm minimum per AS 1926.1`);
+  }
+
+  // Climbable objects within 900 mm
+  if (climbingHazardsWithin900mm === true || climbingHazardsWithin900mm === "true") {
+    failures.push("Climbable objects within 900 mm of barrier — child access risk");
+  }
+
+  // Gaps
+  const maxGapMm = parseFloat(maxGap_mm) || 0;
+  if (maxGapMm > 100) failures.push(`Barrier gap ${maxGapMm} mm exceeds maximum 100 mm per AS 1926.1`);
+
+  const returnGapMm = parseFloat(returnGap_mm) || 0;
+  if (returnGapMm > 10) failures.push(`Return gap at gate post ${returnGapMm} mm exceeds maximum 10 mm`);
+
+  // Direct access without alarm
+  if (poolSideDirectAccess && !doorAlarmPresent) {
+    failures.push("Direct access door to pool has no alarm — required per Building Regulations 2018 (Vic)");
+  }
+  if (poolSideDirectAccess && doorAlarmPresent && !doorAlarmWorking) {
+    failures.push("Door alarm present but not working");
+  }
+
+  // Physical damage
+  if (barrierDamaged === true || barrierDamaged === "true") {
+    failures.push(`Barrier physically damaged: ${sanitiseInput(barrierDamagedDescription) || "see notes"}`);
+  }
+
+  const passed = failures.length === 0;
+  const result = passed ? "PASS" : "FAIL";
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    property_address: sanitiseInput(propertyAddress),
+    owner_name: sanitiseInput(ownerName),
+    inspection_date: inspectionDate,
+    inspector: sanitiseInput(inspector),
+    inspector_registration: sanitiseInput(inspectorRegistration),
+    pool_type: sanitiseInput(poolType),
+    pool_installation_year: poolInstallationYear,
+    barrier_type: sanitiseInput(barrierType),
+    barrier_height_mm: barrierHeight_mm,
+    barrier_height_compliant: barrierHeightCompliant,
+    gate_self_closing: gateSelfClosing,
+    gate_self_latching: gateSelfLatching,
+    gate_opening_outward: gateOpeningOutward,
+    latch_height_mm: latchHeight_mm,
+    non_climb_zone_mm: nonClimbZone_mm,
+    climbing_hazards_within_900mm: climbingHazardsWithin900mm,
+    barrier_gaps_compliant: barrierGapsCompliant,
+    max_gap_mm: maxGap_mm,
+    return_gap_mm: returnGap_mm,
+    pool_side_direct_access: poolSideDirectAccess,
+    door_alarm_present: doorAlarmPresent,
+    door_alarm_working: doorAlarmWorking,
+    barrier_damaged: barrierDamaged,
+    failures,
+    overall_result: result,
+    photos: photos || [],
+    notes: sanitiseInput(notes),
+    created_at: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    const { error: dbErr } = await supabaseAdmin
+      .from("swimming_pool_barrier_inspections")
+      .insert(record);
+    if (dbErr) console.error("DB error /swimming-pool-barrier-inspection:", dbErr.message);
+    else saved = true;
+  }
+
+  usageStats.requests++;
+
+  if (!passed) {
+    return res.status(422).json({
+      error: "Pool barrier inspection FAILED — child drowning prevention non-compliance",
+      failures,
+      overallResult: result,
+      immediateActions: [
+        "Rectify all failures immediately — drowning is the leading cause of death in children under 5",
+        "Do not use pool until barrier is compliant",
+        "Re-inspection required within 60 days per Building Regulations 2018 (Vic)",
+        "Non-compliance is a reportable offence — council may issue penalty",
+      ],
+      applicableStandards: [
+        "AS 1926.1",
+        "AS 1926.2",
+        "Building Regulations 2018 (Vic)",
+        "Building Act 1993 (Vic)",
+      ],
+      saved,
+    });
+  }
+
+  res.json({
+    message: "Pool barrier inspection PASSED",
+    overallResult: result,
+    failuresCount: 0,
+    applicableStandards: ["AS 1926.1", "AS 1926.2", "Building Regulations 2018 (Vic)"],
+    saved,
+  });
+});
+
+// POST /ai-fire-risk-hot-work — AI assesses hot work fire risks, precautions, and required controls
+app.post("/ai-fire-risk-hot-work", apiKeyAuth, async (req, res) => {
+  const {
+    hotWorkType,
+    workLocation,
+    buildingOccupied,
+    combustiblesNearby,
+    sprinklerSystem,
+    sprinklerImpaired,
+    floorConstruction,    // concrete | timber | steel-deck | composite
+    nearbyHazards,        // fuel store | gas line | chemical store | void | cavity
+    existingControls,
+    fireWatchPlan,
+    photos,
+    notes,
+  } = req.body;
+
+  const imageInputs = Array.isArray(photos) && photos.length > 0
+    ? photos.slice(0, 4).map((url) => ({
+        type: "image_url",
+        image_url: { url, detail: "low" },
+      }))
+    : [];
+
+  const systemPrompt = `You are a fire safety engineer and hot work specialist with 20 years experience on Australian construction and industrial sites. Assess hot work fire risks and required precautions per AS 1674.1, AS 1851, AS 1265, and NCC 2022.
+
+Assess:
+1. Ignition risk from sparks, spatter, radiant heat, and conduction
+2. Hidden fire risks — voids, cavities, insulation, timber framing, roof space
+3. Smouldering materials — minimum 60 minute post-work fire watch requirement
+4. Sprinkler system impairment and fire brigade notification requirements
+5. Gas detection requirements for confined or enclosed spaces
+6. Fire watcher duties and qualifications
+7. Permit scope and duration appropriateness
+
+Respond with JSON: { "fireRisk": "low|medium|high|critical", "ignitionRiskFactors": [], "hiddenFireRisks": [], "gasDetectionRequired": boolean, "minimumFireWatchMinutes": number, "confinedSpaceConsideration": boolean, "sprinklerImpairmentProcedure": "string", "requiredPrecautions": [], "extinguisherType": "string", "evacuationConsideration": "string", "recommendedPermitDuration": "string", "applicableStandards": [], "recommendation": "string", "summary": "string" }`;
+
+  const userContent = [
+    {
+      type: "text",
+      text: `Hot work type: ${hotWorkType || "welding"}
+Work location: ${workLocation || "not specified"}
+Building occupied: ${buildingOccupied || "no"}
+Combustibles nearby: ${combustiblesNearby || "none identified"}
+Sprinkler system: ${sprinklerSystem || "not known"}
+Sprinkler impaired: ${sprinklerImpaired || "no"}
+Floor construction: ${floorConstruction || "not specified"}
+Nearby hazards: ${Array.isArray(nearbyHazards) ? nearbyHazards.join(", ") : (nearbyHazards || "none")}
+Existing controls: ${existingControls || "none"}
+Fire watch plan: ${fireWatchPlan || "not specified"}
+Notes: ${notes || "none"}`,
+    },
+    ...imageInputs,
+  ];
+
+  try {
+    const aiResponse = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+    });
+    usageStats.openaiCalls++;
+    const parsed = JSON.parse(aiResponse.choices[0].message.content);
+    res.json({ source: "ai", assessment: parsed });
+  } catch (err) {
+    console.error("/ai-fire-risk-hot-work error:", err.message);
+    res.json({
+      source: "fallback",
+      assessment: {
+        fireRisk: "medium",
+        ignitionRiskFactors: [
+          "Sparks and spatter up to 10 m from welding point",
+          "Radiant heat igniting nearby timber, insulation, or paper",
+          "Conducted heat through steel members igniting hidden combustibles",
+        ],
+        hiddenFireRisks: [
+          "Smouldering in wall/floor cavities may not be visible for hours",
+          "Roof space combustibles if hot work performed near structural penetrations",
+          "Insulation batts — very susceptible to smouldering ignition",
+        ],
+        gasDetectionRequired: false,
+        minimumFireWatchMinutes: 60,
+        confinedSpaceConsideration: false,
+        sprinklerImpairmentProcedure:
+          "Notify fire brigade and building owner. Issue impairment notice per AS 1851. Restore system immediately after hot work.",
+        requiredPrecautions: [
+          "Clear all combustibles to minimum 10 m radius",
+          "Wet down timber and combustible surfaces adjacent to work area",
+          "Cover drains, openings, and floor gaps to prevent spark entry",
+          "Install fire-rated blankets/screens to protect adjacent surfaces",
+          "Assign dedicated fire watcher with clear view of work and surrounds",
+          "Maintain fire extinguisher at point of work — DCP minimum",
+          "Post-work fire watch of minimum 60 minutes",
+        ],
+        extinguisherType: "DCP (dry chemical powder) 4.5 kg minimum for welding/grinding",
+        evacuationConsideration:
+          "Notify building occupants if work is in occupied building. Establish emergency evacuation plan.",
+        recommendedPermitDuration: "Maximum 8-hour shift — renew daily",
+        applicableStandards: [
+          "AS 1674.1",
+          "AS 1851",
+          "AS 1265",
+          "NCC 2022 Section E",
+          "OHS Regulations 2017 (Vic)",
+        ],
+        recommendation:
+          "Issue hot work permit with 60-minute fire watch requirement. Clear combustibles to 10 m. Assign fire watcher. Inspect work area after 30 minutes and 60 minutes post-completion.",
+        summary:
+          "Hot work presents medium fire risk manageable with proper permit controls, combustible clearance, and dedicated fire watching. The 60-minute post-work fire watch is the most critical control as smouldering fires often develop after workers leave.",
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
