@@ -40589,6 +40589,233 @@ app.get("/contractor-dashboard/:contractorId", apiKeyAuth, async (req, res) => {
   });
 });
 
+// POST /project-risk-register — Add a risk to the project risk register
+app.post("/project-risk-register", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, riskTitle, riskDescription, riskCategory,
+    likelihood = 3, consequence = 3,
+    controlMeasures = [], residualLikelihood, residualConsequence,
+    owner, reviewDate, status = "OPEN", raisedBy,
+  } = req.body;
+  if (!projectId || !riskTitle || !riskDescription) {
+    return res.status(400).json({ error: "projectId, riskTitle, and riskDescription are required." });
+  }
+  const L = Math.min(Math.max(Number(likelihood), 1), 5);
+  const C = Math.min(Math.max(Number(consequence), 1), 5);
+  const inherentRiskScore = L * C;
+  const RL = residualLikelihood ? Math.min(Math.max(Number(residualLikelihood), 1), 5) : L;
+  const RC = residualConsequence ? Math.min(Math.max(Number(residualConsequence), 1), 5) : C;
+  const residualRiskScore = RL * RC;
+  const getRating = (score) => score >= 15 ? "EXTREME" : score >= 10 ? "HIGH" : score >= 5 ? "MEDIUM" : "LOW";
+  const riskRef = `RISK-${Date.now().toString(36).toUpperCase()}`;
+  const record = {
+    risk_ref: riskRef,
+    project_id: projectId,
+    risk_title: sanitiseInput(riskTitle),
+    risk_description: sanitiseInput(riskDescription),
+    risk_category: sanitiseInput(riskCategory || ""),
+    likelihood: L,
+    consequence: C,
+    inherent_risk_score: inherentRiskScore,
+    inherent_risk_rating: getRating(inherentRiskScore),
+    control_measures: Array.isArray(controlMeasures) ? controlMeasures.map(m => sanitiseInput(m)) : [],
+    residual_likelihood: RL,
+    residual_consequence: RC,
+    residual_risk_score: residualRiskScore,
+    residual_risk_rating: getRating(residualRiskScore),
+    owner: sanitiseInput(owner || ""),
+    review_date: reviewDate || null,
+    status,
+    raised_by: sanitiseInput(raisedBy || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("project_risk_register").insert(record);
+    if (error) console.error("project-risk-register DB error:", error.message);
+  }
+  res.json({
+    riskRef, riskTitle, inherentRiskScore, inherentRiskRating: record.inherent_risk_rating,
+    residualRiskScore, residualRiskRating: record.residual_risk_rating,
+    saved: !!supabaseAdmin,
+  });
+});
+
+// GET /project-risk-register/:projectId — Get risk register for a project
+app.get("/project-risk-register/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { rating, status } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("project_risk_register").select("*").eq("project_id", projectId).order("inherent_risk_score", { ascending: false });
+  if (rating) query = query.eq("inherent_risk_rating", rating);
+  if (status) query = query.eq("status", status);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  const summary = { extreme: 0, high: 0, medium: 0, low: 0 };
+  data.forEach(r => { const k = r.residual_risk_rating?.toLowerCase(); if (k && summary[k] !== undefined) summary[k]++; });
+  res.json({ projectId, total: data.length, residualRiskSummary: summary, risks: data });
+});
+
+// POST /issue-register — Log a project issue
+app.post("/issue-register", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, issueTitle, issueDescription, issueType = "GENERAL",
+    priority = "MEDIUM", raisedBy, assignedTo, dueDate,
+    affectedActivities = [], proposedResolution, status = "OPEN",
+    linkedRiskRef, notes,
+  } = req.body;
+  if (!projectId || !issueTitle || !issueDescription) {
+    return res.status(400).json({ error: "projectId, issueTitle, and issueDescription are required." });
+  }
+  const validPriorities = ["CRITICAL", "HIGH", "MEDIUM", "LOW"];
+  const validStatuses = ["OPEN", "IN_PROGRESS", "RESOLVED", "CLOSED", "DEFERRED", "ESCALATED"];
+  const validTypes = ["TECHNICAL", "COMMERCIAL", "PROGRAMME", "SAFETY", "QUALITY", "STAKEHOLDER", "DESIGN", "GENERAL"];
+  if (!validPriorities.includes(priority)) return res.status(400).json({ error: `priority must be one of: ${validPriorities.join(", ")}` });
+  if (!validStatuses.includes(status)) return res.status(400).json({ error: `status must be one of: ${validStatuses.join(", ")}` });
+  if (!validTypes.includes(issueType)) return res.status(400).json({ error: `issueType must be one of: ${validTypes.join(", ")}` });
+  const issueRef = `ISS-${Date.now().toString(36).toUpperCase()}`;
+  const daysUntilDue = dueDate ? Math.ceil((new Date(dueDate) - new Date()) / (1000 * 60 * 60 * 24)) : null;
+  const isOverdue = daysUntilDue !== null && daysUntilDue < 0 && !["RESOLVED", "CLOSED"].includes(status);
+  const record = {
+    issue_ref: issueRef,
+    project_id: projectId,
+    issue_title: sanitiseInput(issueTitle),
+    issue_description: sanitiseInput(issueDescription),
+    issue_type: issueType,
+    priority,
+    raised_by: sanitiseInput(raisedBy || ""),
+    assigned_to: sanitiseInput(assignedTo || ""),
+    due_date: dueDate || null,
+    days_until_due: daysUntilDue,
+    is_overdue: isOverdue,
+    affected_activities: Array.isArray(affectedActivities) ? affectedActivities.map(a => sanitiseInput(a)) : [],
+    proposed_resolution: sanitiseInput(proposedResolution || ""),
+    status,
+    linked_risk_ref: sanitiseInput(linkedRiskRef || ""),
+    notes: sanitiseInput(notes || ""),
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("issue_register").insert(record);
+    if (error) console.error("issue-register DB error:", error.message);
+  }
+  res.json({ issueRef, issueType, priority, status, daysUntilDue, isOverdue, saved: !!supabaseAdmin });
+});
+
+// GET /issue-register/:projectId — List issues for a project
+app.get("/issue-register/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { status, priority, issueType } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("issue_register").select("*").eq("project_id", projectId).order("created_at", { ascending: false });
+  if (status) query = query.eq("status", status);
+  if (priority) query = query.eq("priority", priority);
+  if (issueType) query = query.eq("issue_type", issueType);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({
+    projectId, total: data.length,
+    open: data.filter(i => i.status === "OPEN").length,
+    overdue: data.filter(i => i.is_overdue).length,
+    critical: data.filter(i => i.priority === "CRITICAL").length,
+    issues: data,
+  });
+});
+
+// POST /ai-project-status-report — AI generates a project status report
+app.post("/ai-project-status-report", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, reportPeriod, reportDate,
+    percentageComplete, scheduledComplete, actualComplete,
+    budgetAud, spentToDateAud, forecastFinalCostAud,
+    openIssues = 0, openRisks = 0, openVariations = 0,
+    keyAchievements = [], keyActivitiesNextPeriod = [],
+    lookAheadWeeks = 4, programmeStatus = "ON_TRACK",
+    budgetStatus = "ON_BUDGET", safetyStatus = "GREEN",
+    qualityStatus = "GREEN", stakeholderStatus = "GREEN",
+  } = req.body;
+  if (!projectName || !reportPeriod) {
+    return res.status(400).json({ error: "projectName and reportPeriod are required." });
+  }
+  const sanitisedProject = sanitiseInput(projectName);
+  const sanitisedPeriod = sanitiseInput(reportPeriod);
+  const scheduleVariance = (percentageComplete !== undefined && scheduledComplete !== undefined)
+    ? +(Number(percentageComplete) - Number(scheduledComplete)).toFixed(1)
+    : null;
+  const costVariancePct = (budgetAud && spentToDateAud && percentageComplete)
+    ? +((Number(spentToDateAud) / Number(budgetAud) - Number(percentageComplete) / 100) * 100).toFixed(1)
+    : null;
+  const systemPrompt = `You are an experienced Australian construction project manager. Write clear, concise project status reports.`;
+  const userPrompt = `Write a project status report for period: ${sanitisedPeriod}
+Project: ${sanitisedProject}
+Date: ${sanitiseInput(reportDate || new Date().toISOString().split("T")[0])}
+Physical completion: ${percentageComplete || "TBD"}%
+Schedule status: ${programmeStatus} (planned: ${scheduledComplete || "N/A"}%, actual: ${actualComplete || "N/A"}%)
+Budget: $${budgetAud || "TBD"} | Spent: $${spentToDateAud || "TBD"} | Forecast: $${forecastFinalCostAud || "TBD"}
+Open issues: ${openIssues} | Risks: ${openRisks} | Variations: ${openVariations}
+Key achievements: ${keyAchievements.map(a => sanitiseInput(a)).join("; ") || "None listed"}
+Next period activities: ${keyActivitiesNextPeriod.map(a => sanitiseInput(a)).join("; ") || "None listed"}
+Status indicators — Programme: ${programmeStatus} | Budget: ${budgetStatus} | Safety: ${safetyStatus} | Quality: ${qualityStatus}
+
+Return JSON with:
+{
+  "executiveSummary": "...",
+  "overallStatus": "GREEN|AMBER|RED",
+  "programmeNarrative": "...",
+  "costNarrative": "...",
+  "safetyNarrative": "...",
+  "qualityNarrative": "...",
+  "stakeholderNarrative": "...",
+  "keyAchievements": ["...", "..."],
+  "issuesAndRisks": "...",
+  "lookAhead": ["...", "..."],
+  "actionsRequired": [{"action": "...", "owner": "...", "by": "..."}],
+  "closingStatement": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 2000,
+    });
+    usageStats.openaiCalls++;
+    const report = JSON.parse(aiRes.choices[0].message.content);
+    const reportRef = `PSR-${Date.now().toString(36).toUpperCase()}`;
+    res.json({
+      reportRef, projectId, projectName: sanitisedProject, reportPeriod: sanitisedPeriod,
+      metrics: { percentageComplete, scheduleVariance, costVariancePct, programmeStatus, budgetStatus },
+      report,
+    });
+  } catch (err) {
+    console.error("ai-project-status-report error:", err.message);
+    const reportRef = `PSR-FALLBACK`;
+    const overallStatus = [programmeStatus, budgetStatus, safetyStatus, qualityStatus].some(s => s === "RED" || s === "BEHIND") ? "RED"
+      : [programmeStatus, budgetStatus, safetyStatus, qualityStatus].some(s => s === "AMBER" || s === "AT_RISK") ? "AMBER"
+      : "GREEN";
+    res.json({
+      reportRef, projectId, projectName: sanitisedProject, reportPeriod: sanitisedPeriod,
+      metrics: { percentageComplete, scheduleVariance, costVariancePct, programmeStatus, budgetStatus },
+      report: {
+        executiveSummary: `${sanitisedProject} — Status report for ${sanitisedPeriod}. Overall status: ${overallStatus}.`,
+        overallStatus,
+        programmeNarrative: `Project is ${programmeStatus.replace(/_/g, " ").toLowerCase()}.`,
+        costNarrative: `Budget status: ${budgetStatus.replace(/_/g, " ").toLowerCase()}.`,
+        safetyNarrative: `Safety status: ${safetyStatus}. No lost time injuries recorded this period.`,
+        qualityNarrative: `Quality status: ${qualityStatus}.`,
+        stakeholderNarrative: `Stakeholder status: ${stakeholderStatus}.`,
+        keyAchievements: keyAchievements.length ? keyAchievements : ["No achievements listed"],
+        issuesAndRisks: `${openIssues} open issues, ${openRisks} open risks, ${openVariations} pending variations.`,
+        lookAhead: keyActivitiesNextPeriod.length ? keyActivitiesNextPeriod : ["Activities to be confirmed"],
+        actionsRequired: [],
+        closingStatement: `Report prepared for ${sanitisedPeriod}.`,
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
