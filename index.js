@@ -76560,6 +76560,330 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 273 ─────────────────────────────────────────────────────────────────
+
+// POST /incident-report — Record workplace incident, near miss, or dangerous occurrence
+app.post("/incident-report", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, incidentDate, incidentTime, reportedBy,
+      incidentType, description, location, injuredPersonName,
+      injuryType, bodyPartAffected, treatmentGiven, treatmentFacility,
+      lostTimeDays, medicalTreatmentRequired,
+      immediateRootCause, contributingFactors,
+      witnessNames, propertydamage, propertyDamageValue,
+      notifiableIncident, worksafeNotified, worksafeRef,
+      correctiveActions, correctiveDueDate, investigationRequired,
+      investigationCompletedDate, notes
+    } = req.body;
+
+    if (!projectId || !incidentDate || !reportedBy || !incidentType || !description) {
+      return res.status(400).json({ error: "projectId, incidentDate, reportedBy, incidentType, description are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeReportedBy = sanitiseInput(String(reportedBy));
+    const safeDescription = sanitiseInput(String(description));
+    const safeLocation = location ? sanitiseInput(String(location)) : null;
+
+    const witnesses = Array.isArray(witnessNames) ? witnessNames : [];
+    const contributing = Array.isArray(contributingFactors) ? contributingFactors : [];
+    const corrections = Array.isArray(correctiveActions) ? correctiveActions : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const incType = String(incidentType).toUpperCase();
+    const lostDays = parseInt(lostTimeDays) || 0;
+
+    // OHS Act 2004 (Vic) s.37-38 — Notifiable incidents (fatality, serious injury, dangerous incident)
+    // OHS Regulations 2017 (Vic) — specific notification requirements
+    const isNotifiable = notifiableIncident === true || notifiableIncident === "true" ||
+      incType === "FATALITY" || incType === "SERIOUS_INJURY" || incType === "DANGEROUS_OCCURRENCE" ||
+      lostDays >= 1 || (injuryType && /fracture|amputation|crush|electric|drowning|burn|asphyxiation|explosion/i.test(String(injuryType)));
+
+    if (isNotifiable) {
+      if (!(worksafeNotified === true || worksafeNotified === "true")) {
+        criticalIssues.push("Notifiable incident — WorkSafe Victoria must be notified IMMEDIATELY by phone: 13 23 60 (OHS Act 2004 Vic s.37). Scene must be preserved.");
+      } else if (!worksafeRef) {
+        warnings.push("WorkSafe notified but reference number not recorded — obtain and document reference number.");
+      }
+    }
+
+    if (incType === "FATALITY") {
+      criticalIssues.push("FATALITY — contact WorkSafe Vic 13 23 60 immediately. Preserve scene. Do not disturb until WorkSafe investigation complete. OHS Act 2004 Vic s.37.");
+    }
+
+    if (!investigationRequired && isNotifiable) {
+      warnings.push("Notifiable incident requires formal investigation — ensure root cause analysis is completed within 28 days.");
+    }
+
+    if (corrections.length === 0 && incType !== "NEAR_MISS") {
+      warnings.push("No corrective actions assigned — required for all incidents to prevent recurrence.");
+    }
+
+    if (!correctiveDueDate && corrections.length > 0) {
+      warnings.push("Corrective action due date not set — assign deadlines to all corrective actions.");
+    }
+
+    if (lostDays > 0 && !(medicalTreatmentRequired === true || medicalTreatmentRequired === "true")) {
+      warnings.push("Lost time injury recorded but medical treatment not confirmed — update if medical treatment was required.");
+    }
+
+    // LTIFR impact
+    let incidentClassification;
+    if (incType === "FATALITY") {
+      incidentClassification = "FATALITY";
+    } else if (lostDays > 0) {
+      incidentClassification = "LTI";
+    } else if (medicalTreatmentRequired === true || medicalTreatmentRequired === "true") {
+      incidentClassification = "MTI";
+    } else if (incType === "NEAR_MISS") {
+      incidentClassification = "NEAR_MISS";
+    } else {
+      incidentClassification = "FIRST_AID";
+    }
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("incident_reports")
+        .insert({
+          project_id: safeProject,
+          incident_date: incidentDate,
+          incident_time: incidentTime || null,
+          reported_by: safeReportedBy,
+          incident_type: incType,
+          description: safeDescription,
+          location: safeLocation,
+          injured_person_name: injuredPersonName ? sanitiseInput(String(injuredPersonName)) : null,
+          injury_type: injuryType ? sanitiseInput(String(injuryType)) : null,
+          body_part_affected: bodyPartAffected ? sanitiseInput(String(bodyPartAffected)) : null,
+          treatment_given: treatmentGiven ? sanitiseInput(String(treatmentGiven)) : null,
+          treatment_facility: treatmentFacility ? sanitiseInput(String(treatmentFacility)) : null,
+          lost_time_days: lostDays || null,
+          medical_treatment_required: medicalTreatmentRequired || false,
+          immediate_root_cause: immediateRootCause ? sanitiseInput(String(immediateRootCause)) : null,
+          contributing_factors: contributing,
+          witness_names: witnesses,
+          property_damage: propertydamage || false,
+          property_damage_value: propertyDamageValue || null,
+          notifiable_incident: isNotifiable,
+          worksafe_notified: worksafeNotified || false,
+          worksafe_ref: worksafeRef ? sanitiseInput(String(worksafeRef)) : null,
+          corrective_actions: corrections,
+          corrective_due_date: correctiveDueDate || null,
+          investigation_required: investigationRequired || isNotifiable,
+          incident_classification: incidentClassification,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        incidentClassification,
+        isNotifiable,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Notifiable incident — immediate WorkSafe Victoria notification required.",
+        standards: ["OHS Act 2004 (Vic) s.37-38", "OHS Regulations 2017 (Vic)"],
+      });
+    }
+
+    res.json({
+      incidentClassification,
+      isNotifiable,
+      criticalIssues,
+      warnings,
+      savedId,
+      lostTimeDays: lostDays,
+      standards: ["OHS Act 2004 (Vic)", "OHS Regulations 2017 (Vic)"],
+    });
+  } catch (err) {
+    console.error("POST /incident-report error:", err.message);
+    res.status(500).json({ error: "Failed to record incident report." });
+  }
+});
+
+// POST /toolbox-talk-record — Record toolbox talk / safety briefing attendance
+app.post("/toolbox-talk-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, talkDate, conductedBy, topic,
+      content, duration, attendees, attendeeCount,
+      questionsRaised, actionsFromTalk, followUpRequired, notes
+    } = req.body;
+
+    if (!projectId || !talkDate || !conductedBy || !topic) {
+      return res.status(400).json({ error: "projectId, talkDate, conductedBy, topic are required." });
+    }
+
+    const safeProject = sanitiseInput(String(projectId));
+    const safeConductedBy = sanitiseInput(String(conductedBy));
+    const safeTopic = sanitiseInput(String(topic));
+    const safeContent = content ? sanitiseInput(String(content)) : null;
+
+    const attendeeList = Array.isArray(attendees) ? attendees : [];
+    const questions = Array.isArray(questionsRaised) ? questionsRaised : [];
+    const actions = Array.isArray(actionsFromTalk) ? actionsFromTalk : [];
+    const warnings = [];
+
+    const attendCount = attendeeCount || attendeeList.length || 0;
+    if (attendCount === 0) {
+      warnings.push("No attendees recorded — toolbox talk attendance record is incomplete.");
+    }
+
+    if (followUpRequired === true || followUpRequired === "true") {
+      if (actions.length === 0) {
+        warnings.push("Follow-up flagged but no actions recorded — document required follow-up actions.");
+      }
+    }
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("toolbox_talk_records")
+        .insert({
+          project_id: safeProject,
+          talk_date: talkDate,
+          conducted_by: safeConductedBy,
+          topic: safeTopic,
+          content: safeContent,
+          duration_minutes: duration || null,
+          attendees: attendeeList,
+          attendee_count: attendCount,
+          questions_raised: questions,
+          actions_from_talk: actions,
+          follow_up_required: followUpRequired || false,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    res.json({
+      savedId,
+      warnings,
+      topic: safeTopic,
+      attendeeCount: attendCount,
+      actionsCount: actions.length,
+      standards: ["OHS Act 2004 (Vic)", "AS/NZS ISO 45001:2018"],
+    });
+  } catch (err) {
+    console.error("POST /toolbox-talk-record error:", err.message);
+    res.status(500).json({ error: "Failed to record toolbox talk." });
+  }
+});
+
+// POST /ai-incident-investigation — AI assists root cause analysis and preventive measures for incidents
+app.post("/ai-incident-investigation", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      incidentType, description, injuryType, immediateRootCause,
+      contributingFactors, workActivity, hazardsPresent,
+      controlsInPlace, controlsAdequate, workerExperience,
+      supervisoryPresence, siteContext
+    } = req.body;
+
+    if (!incidentType || !description) {
+      return res.status(400).json({ error: "incidentType and description are required." });
+    }
+
+    const safeIncType = sanitiseInput(String(incidentType));
+    const safeDesc = sanitiseInput(String(description));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const contributing = Array.isArray(contributingFactors) ? contributingFactors.map(f => sanitiseInput(String(f))) : [];
+    const hazards = Array.isArray(hazardsPresent) ? hazardsPresent.map(h => sanitiseInput(String(h))) : [];
+    const controls = Array.isArray(controlsInPlace) ? controlsInPlace.map(c => sanitiseInput(String(c))) : [];
+
+    const prompt = `You are a workplace safety investigator conducting root cause analysis for a Victorian construction incident.
+
+Incident type: ${safeIncType}
+Description: ${safeDesc}
+Injury type: ${injuryType || "Not stated"}
+Immediate root cause identified: ${immediateRootCause || "Not stated"}
+Contributing factors: ${contributing.join("; ") || "None identified"}
+Work activity at time: ${workActivity || "Not stated"}
+Hazards present: ${hazards.join(", ") || "Not identified"}
+Controls in place: ${controls.join(", ") || "None recorded"}
+Controls adequate: ${controlsAdequate ? "Yes" : "No/Unknown"}
+Worker experience level: ${workerExperience || "Unknown"}
+Supervisory presence: ${supervisoryPresence ? "Yes" : "No"}
+Location: ${safeSite}
+
+Conduct a 5-Why and Bow-Tie analysis. Assess under:
+- OHS Act 2004 (Vic) s.21 (duty of care)
+- OHS Regulations 2017 (Vic)
+- AS/NZS ISO 45001:2018
+- Hierarchy of controls
+
+Identify:
+1. Root causes (systemic, not just immediate)
+2. Systemic failures (management systems, culture, supervision)
+3. Whether existing controls were inadequate or absent
+4. Corrective actions at each level of hierarchy of controls
+5. Preventive measures to avoid recurrence
+
+Respond ONLY in JSON:
+{
+  "rootCauses": ["string"],
+  "systemicFailures": ["string"],
+  "controlsAdequacyAssessment": "string",
+  "correctiveActions": [{"category": "ELIMINATION|SUBSTITUTION|ENGINEERING|ADMINISTRATIVE|PPE", "action": "string", "priority": "IMMEDIATE|SHORT_TERM|LONG_TERM"}],
+  "preventiveMeasures": ["string"],
+  "managementSystemGaps": ["string"],
+  "recurrenceLikelihood": "LOW|MODERATE|HIGH",
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 900,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        rootCauses: ["AI analysis unavailable — conduct manual 5-Why investigation"],
+        systemicFailures: ["Unable to assess without AI"],
+        controlsAdequacyAssessment: "Manual review required — compare controls against hierarchy of controls and OHS Regulations 2017 (Vic).",
+        correctiveActions: [
+          { category: "ADMINISTRATIVE", action: "Review and update SWMS/JSA for affected activity", priority: "IMMEDIATE" },
+          { category: "ADMINISTRATIVE", action: "Conduct site-wide toolbox talk on contributing factors", priority: "SHORT_TERM" },
+        ],
+        preventiveMeasures: ["Strengthen supervisory oversight", "Review training and competency for affected work"],
+        managementSystemGaps: ["Investigation required to identify SMS gaps"],
+        recurrenceLikelihood: "MODERATE",
+        applicableStandards: ["OHS Act 2004 (Vic) s.21", "OHS Regulations 2017 (Vic)", "AS/NZS ISO 45001:2018"],
+        summary: "AI incident investigation unavailable. Conduct manual root cause investigation with WHS professional.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      incidentType: safeIncType,
+      standards: ["OHS Act 2004 (Vic)", "OHS Regulations 2017 (Vic)", "AS/NZS ISO 45001:2018"],
+    });
+  } catch (err) {
+    console.error("POST /ai-incident-investigation error:", err.message);
+    res.status(500).json({ error: "Failed to run incident investigation." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
