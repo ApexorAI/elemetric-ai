@@ -48333,6 +48333,281 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /builder-warranty-insurance — Log a Domestic Building Insurance (DBI) record (Vic)
+app.post("/builder-warranty-insurance", apiKeyAuth, async (req, res) => {
+  const {
+    contractorId, contractorName, registrationNumber,
+    propertyAddress, ownerName, contractValue,
+    policyNumber, insurer, insuranceStartDate, insuranceEndDate,
+    worksDescription, permitNumber, actualCompletionDate,
+    notes,
+  } = req.body;
+
+  if (!contractorId || !contractorName || !propertyAddress || !policyNumber) {
+    return res.status(400).json({ error: "contractorId, contractorName, propertyAddress, and policyNumber are required." });
+  }
+
+  const sanitisedContractor = sanitiseInput(contractorName, 150);
+  const sanitisedAddress = sanitiseInput(propertyAddress, 300);
+
+  // Victorian DBI thresholds per Domestic Building Contracts Act 1995
+  const DBI_THRESHOLD = 16000;  // $16,000 — DBI required for residential work above this value
+  const STRUCTURAL_DEFECT_YEARS = 6;
+  const NON_STRUCTURAL_DEFECT_YEARS = 2;
+
+  const contractValueNum = contractValue ? Number(contractValue) : 0;
+  const dbiRequired = contractValueNum > DBI_THRESHOLD;
+
+  // Calculate warranty expiry dates from actual completion
+  let structuralWarrantyExpiry = null;
+  let nonStructuralWarrantyExpiry = null;
+  if (actualCompletionDate) {
+    const completionDate = new Date(actualCompletionDate);
+    const structuralExpiry = new Date(completionDate);
+    structuralExpiry.setFullYear(structuralExpiry.getFullYear() + STRUCTURAL_DEFECT_YEARS);
+    const nonStructuralExpiry = new Date(completionDate);
+    nonStructuralExpiry.setFullYear(nonStructuralExpiry.getFullYear() + NON_STRUCTURAL_DEFECT_YEARS);
+    structuralWarrantyExpiry = structuralExpiry.toISOString().split("T")[0];
+    nonStructuralWarrantyExpiry = nonStructuralExpiry.toISOString().split("T")[0];
+  }
+
+  const warnings = [];
+  if (!dbiRequired && contractValueNum > 0) {
+    warnings.push(`Contract value $${contractValueNum.toLocaleString()} is below DBI threshold ($${DBI_THRESHOLD.toLocaleString()}) — DBI may not be required for this work.`);
+  }
+  if (dbiRequired && !policyNumber) {
+    warnings.push("DBI policy number not provided — insurance must be obtained before commencing work.");
+  }
+
+  const ref = `DBI-${sanitiseInput(String(contractorId), 20)}-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    contractorId: sanitiseInput(String(contractorId), 80),
+    contractorName: sanitisedContractor,
+    registrationNumber: sanitiseInput(registrationNumber || "", 60),
+    property: {
+      address: sanitisedAddress,
+      ownerName: sanitiseInput(ownerName || "", 150),
+    },
+    contract: {
+      value: contractValueNum,
+      worksDescription: sanitiseInput(worksDescription || "", 300),
+      permitNumber: sanitiseInput(permitNumber || "", 60),
+      actualCompletionDate: actualCompletionDate || null,
+    },
+    insurance: {
+      policyNumber: sanitiseInput(policyNumber, 80),
+      insurer: sanitiseInput(insurer || "", 100),
+      startDate: insuranceStartDate || null,
+      endDate: insuranceEndDate || null,
+    },
+    warranty: {
+      structuralDefectYears: STRUCTURAL_DEFECT_YEARS,
+      nonStructuralDefectYears: NON_STRUCTURAL_DEFECT_YEARS,
+      structuralWarrantyExpiry,
+      nonStructuralWarrantyExpiry,
+    },
+    dbiRequired,
+    warnings,
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("builder_warranty_insurance").insert(record);
+      if (error) console.error("DBI insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("DBI DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    dbiRequired,
+    warranty: record.warranty,
+    warnings,
+    message: warnings.length > 0
+      ? warnings[0]
+      : `DBI recorded for ${sanitisedAddress}. Structural warranty expires ${structuralWarrantyExpiry || "on completion + 6 years"}.`,
+    regulatoryNote: "Victorian DBI is mandatory under the Domestic Building Contracts Act 1995 for all residential building work > $16,000 by a registered builder.",
+    saved,
+    record,
+  });
+});
+
+// GET /builder-warranty-insurance/:contractorId — List DBI records for a contractor
+app.get("/builder-warranty-insurance/:contractorId", apiKeyAuth, async (req, res) => {
+  const { contractorId } = req.params;
+  const { expiringInDays } = req.query;
+
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("builder_warranty_insurance")
+      .select("*")
+      .eq("contractorId", sanitiseInput(String(contractorId), 80))
+      .order("createdAt", { ascending: false });
+
+    if (error) throw error;
+
+    let records = data || [];
+
+    // Filter by expiring soon if requested
+    if (expiringInDays) {
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() + Number(expiringInDays));
+      records = records.filter(r => {
+        const exp = r.warranty?.structuralWarrantyExpiry;
+        return exp && new Date(exp) <= cutoff;
+      });
+    }
+
+    const totalContractValue = records.reduce((s, r) => s + (r.contract?.value || 0), 0);
+    const activeWarranties = records.filter(r => {
+      const exp = r.warranty?.structuralWarrantyExpiry;
+      return exp && new Date(exp) > new Date();
+    }).length;
+
+    return res.json({
+      contractorId,
+      total: records.length,
+      activeWarranties,
+      totalContractValue,
+      records,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to retrieve DBI records.", detail: e.message });
+  }
+});
+
+// POST /ai-defect-liability-assessment — AI assesses whether a defect is actionable under DBI/warranty
+app.post("/ai-defect-liability-assessment", apiKeyAuth, async (req, res) => {
+  const {
+    defectDescription, defectLocation, defectType,
+    completionDate, discoveryDate, notificationDate,
+    contractValue, isResidential, contractType,
+    builderStillTradingOrRegistered, insurerName, policyNumber, notes,
+  } = req.body;
+
+  if (!defectDescription || !completionDate || !discoveryDate) {
+    return res.status(400).json({ error: "defectDescription, completionDate, and discoveryDate are required." });
+  }
+
+  const sanitisedDefect = sanitiseInput(defectDescription, 500);
+
+  // Calculate elapsed time
+  const completionDateObj = new Date(completionDate);
+  const discoveryDateObj = new Date(discoveryDate);
+  const elapsedYears = (discoveryDateObj - completionDateObj) / (1000 * 60 * 60 * 24 * 365.25);
+  const elapsedDays = Math.round((discoveryDateObj - completionDateObj) / (1000 * 60 * 60 * 24));
+
+  const prompt = `You are a construction law specialist advising on domestic building defect claims in Victoria, Australia.
+
+Assess the following defect claim:
+- Defect: ${sanitisedDefect}
+- Location: ${sanitiseInput(defectLocation || "", 150)}
+- Defect type: ${sanitiseInput(defectType || "Not specified", 80)}
+- Construction completion date: ${completionDate}
+- Defect discovery date: ${discoveryDate}
+- Notification date: ${sanitiseInput(notificationDate || "Not yet notified", 30)}
+- Elapsed time since completion: ${Math.round(elapsedYears * 10) / 10} years (${elapsedDays} days)
+- Contract value: ${contractValue ? `$${contractValue}` : "Unknown"}
+- Residential: ${isResidential ? "Yes" : "No"}
+- Contract type: ${sanitiseInput(contractType || "Not specified", 60)}
+- Builder still registered/trading: ${builderStillTradingOrRegistered ? "Yes" : "No/Unknown"}
+- Insurer: ${sanitiseInput(insurerName || "Unknown", 100)}
+- Policy number: ${sanitiseInput(policyNumber || "Unknown", 60)}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Reference: Domestic Building Contracts Act 1995 (Vic), Domestic Building Insurance (DBI) — 6-year structural, 2-year non-structural. Building Act 1993 (Vic). VCAT jurisdiction for domestic building disputes.
+
+Respond ONLY with a JSON object:
+{
+  "withinWarrantyPeriod": boolean,
+  "likelyDefectCategory": "STRUCTURAL|NON_STRUCTURAL|AESTHETIC|UNCLEAR",
+  "warrantyYearsApplicable": number,
+  "daysRemainingInWarranty": number,
+  "dbiClaimAvailable": boolean,
+  "dbiClaimStillOpen": boolean,
+  "limitationPeriodExpired": boolean,
+  "recommendedActions": [{"action": string, "timeframe": string}],
+  "vcatPathway": boolean,
+  "vcatTimeLimit": string,
+  "keyStatutoryRights": [string],
+  "caveats": [string],
+  "summary": string (3-4 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      disclaimer: "This is general information only and does not constitute legal advice. Consult a construction lawyer or contact Consumer Affairs Victoria.",
+      elapsedYears: Math.round(elapsedYears * 10) / 10,
+      elapsedDays,
+      withinWarrantyPeriod: parsed.withinWarrantyPeriod ?? (elapsedYears <= 6),
+      likelyDefectCategory: parsed.likelyDefectCategory || "UNCLEAR",
+      warrantyYearsApplicable: parsed.warrantyYearsApplicable || 6,
+      daysRemainingInWarranty: parsed.daysRemainingInWarranty ?? null,
+      dbiClaimAvailable: parsed.dbiClaimAvailable ?? false,
+      dbiClaimStillOpen: parsed.dbiClaimStillOpen ?? false,
+      limitationPeriodExpired: parsed.limitationPeriodExpired ?? false,
+      recommendedActions: parsed.recommendedActions || [],
+      vcatPathway: parsed.vcatPathway ?? true,
+      vcatTimeLimit: parsed.vcatTimeLimit || "",
+      keyStatutoryRights: parsed.keyStatutoryRights || [],
+      caveats: parsed.caveats || [],
+      summary: parsed.summary || "Defect liability assessment complete.",
+    });
+  } catch (e) {
+    console.error("AI defect liability error:", e.message);
+    const withinStructural = elapsedYears <= 6;
+    const withinNonStructural = elapsedYears <= 2;
+    return res.json({
+      success: true,
+      disclaimer: "This is general information only. Consult a construction lawyer or contact Consumer Affairs Victoria (1300 55 81 81).",
+      elapsedYears: Math.round(elapsedYears * 10) / 10,
+      elapsedDays,
+      withinWarrantyPeriod: withinStructural,
+      likelyDefectCategory: "UNCLEAR",
+      warrantyYearsApplicable: 6,
+      daysRemainingInWarranty: withinStructural ? Math.round((6 * 365.25) - elapsedDays) : 0,
+      dbiClaimAvailable: withinStructural && isResidential,
+      dbiClaimStillOpen: withinStructural,
+      limitationPeriodExpired: !withinStructural,
+      recommendedActions: [
+        { action: "Document the defect with photos and written description", timeframe: "Immediately" },
+        { action: "Notify the builder in writing requesting rectification", timeframe: "Within 7 days" },
+        { action: withinStructural ? "If builder fails to rectify, lodge a DBI claim with the insurer" : "Seek legal advice — warranty period may have expired", timeframe: withinStructural ? "Within 30 days of builder's failure" : "Immediately" },
+      ],
+      vcatPathway: true,
+      vcatTimeLimit: "VCAT domestic building dispute: generally within 6 years of completion for structural defects",
+      keyStatutoryRights: [
+        "Domestic Building Contracts Act 1995 s.8 — statutory warranties implied into all domestic building contracts",
+        "DBI provides 6-year structural and 2-year non-structural warranty",
+      ],
+      caveats: ["Time limits are strict — seek legal advice promptly", "DBI claims have specific notification requirements"],
+      summary: `Defect discovered ${Math.round(elapsedYears * 10) / 10} years after completion. ${withinStructural ? "Within the 6-year structural warranty period." : "Outside the 6-year structural warranty period — seek legal advice immediately."} Contact Consumer Affairs Victoria or a construction lawyer to understand your rights.`,
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
