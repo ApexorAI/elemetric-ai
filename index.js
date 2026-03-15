@@ -35902,6 +35902,190 @@ Write a formal apprentice progress report. Return a JSON object with:
   }
 });
 
+// ── Round 137: Bulk operations, data export, import validation ────────────────
+
+// POST /bulk-job-import — Validate and import multiple job records
+app.post("/bulk-job-import", apiKeyAuth, async (req, res) => {
+  const { jobs = [], validateOnly = false } = req.body;
+
+  if (!jobs.length) return res.status(400).json({ error: "jobs array required." });
+  if (jobs.length > 100) return res.status(400).json({ error: "Maximum 100 jobs per bulk import." });
+
+  const validJobTypes = ["plumbing", "gas", "electrical", "drainage", "hvac", "carpentry", "tiling", "roofing", "painting", "general"];
+  const results = [];
+  const errors = [];
+  const valid = [];
+
+  for (let i = 0; i < jobs.length; i++) {
+    const job = jobs[i];
+    const rowNum = i + 1;
+    const rowErrors = [];
+
+    if (!job.jobType) rowErrors.push(`Row ${rowNum}: jobType required`);
+    else if (!validJobTypes.includes(job.jobType.toLowerCase())) rowErrors.push(`Row ${rowNum}: invalid jobType "${job.jobType}"`);
+
+    if (!job.contractorId) rowErrors.push(`Row ${rowNum}: contractorId required`);
+    if (!job.address) rowErrors.push(`Row ${rowNum}: address required`);
+    if (job.email && !isValidEmail(job.email)) rowErrors.push(`Row ${rowNum}: invalid email`);
+
+    if (rowErrors.length > 0) {
+      errors.push(...rowErrors);
+      results.push({ row: rowNum, status: "ERROR", errors: rowErrors });
+    } else {
+      valid.push({
+        job_type: sanitiseInput(job.jobType.toLowerCase()),
+        contractor_id: sanitiseInput(job.contractorId),
+        address: sanitiseInput(job.address),
+        client_name: sanitiseInput(job.clientName || ""),
+        email: sanitiseInput(job.email || ""),
+        phone: sanitiseInput(job.phone || ""),
+        notes: sanitiseInput(job.notes || ""),
+        scheduled_date: job.scheduledDate || null,
+        status: "SCHEDULED",
+        imported_at: new Date().toISOString(),
+      });
+      results.push({ row: rowNum, status: "VALID", jobType: job.jobType });
+    }
+  }
+
+  if (validateOnly || errors.length > 0) {
+    return res.json({
+      total: jobs.length,
+      valid: valid.length,
+      errors: errors.length,
+      results,
+      imported: false,
+      message: errors.length > 0 ? `${errors.length} validation error(s). Fix errors and retry.` : "Validation passed. Submit with validateOnly: false to import.",
+    });
+  }
+
+  if (supabaseAdmin && valid.length > 0) {
+    const { data, error } = await supabaseAdmin.from("jobs").insert(valid).select("id");
+    if (error) return res.status(500).json({ error: "DB error during import.", detail: error.message });
+    return res.json({ total: jobs.length, valid: valid.length, errors: 0, imported: true, importedIds: (data || []).map(d => d.id), results });
+  }
+
+  res.json({ total: jobs.length, valid: valid.length, errors: 0, imported: false, results, saved: false });
+});
+
+// POST /data-export-request — Request a data export for a contractor or project
+app.post("/data-export-request", apiKeyAuth, async (req, res) => {
+  const {
+    exportType, contractorId, projectId, dateFrom, dateTo,
+    format = "JSON", includedTables = [],
+  } = req.body;
+
+  if (!exportType) return res.status(400).json({ error: "exportType required." });
+
+  const validTypes = ["JOBS", "COMPLIANCE", "SAFETY", "FINANCIAL", "DOCUMENTS", "FULL_EXPORT"];
+  const validFormats = ["JSON", "CSV"];
+  const type = (exportType || "JOBS").toUpperCase();
+  const fmt = (format || "JSON").toUpperCase();
+
+  const exportId = `EXP-${Date.now().toString(36).toUpperCase().slice(-8)}`;
+
+  // Map export types to tables
+  const tableMap = {
+    JOBS: ["jobs", "job_costings", "site_access_log"],
+    COMPLIANCE: ["plumbing_certificates", "gas_certificates", "electrical_certificates", "compliance_checks"],
+    SAFETY: ["incident_register", "hazard_log", "jsa_record", "safety_observations"],
+    FINANCIAL: ["invoices", "progress_claims", "payroll_runs", "purchase_orders"],
+    DOCUMENTS: ["drawing_register", "transmittals", "rfi_register"],
+    FULL_EXPORT: ["*"],
+  };
+
+  const tables = includedTables.length > 0 ? includedTables.map(t => sanitiseInput(t)) : (tableMap[type] || []);
+
+  const record = {
+    export_id: exportId,
+    export_type: validTypes.includes(type) ? type : "JOBS",
+    contractor_id: sanitiseInput(contractorId || ""),
+    project_id: sanitiseInput(projectId || ""),
+    date_from: dateFrom || null,
+    date_to: dateTo || null,
+    format: validFormats.includes(fmt) ? fmt : "JSON",
+    included_tables: tables,
+    status: "QUEUED",
+    requested_at: new Date().toISOString(),
+    estimated_completion: new Date(Date.now() + 5 * 60 * 1000).toISOString(), // 5 min estimate
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("data_export_requests")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, requestId: data.id, exportId, status: "QUEUED", tables, ...record });
+  }
+
+  res.json({ success: true, requestId: null, exportId, status: "QUEUED", tables, ...record, saved: false });
+});
+
+// POST /import-validation — Validate a CSV/JSON data import before committing
+app.post("/import-validation", apiKeyAuth, async (req, res) => {
+  const { dataType, records = [], strictMode = false } = req.body;
+
+  if (!dataType || !records.length)
+    return res.status(400).json({ error: "dataType and records required." });
+
+  const validDataTypes = ["contractors", "jobs", "timesheets", "expenses", "materials", "contacts"];
+  const dt = (dataType || "").toLowerCase();
+  if (!validDataTypes.includes(dt)) return res.status(400).json({ error: `dataType must be one of: ${validDataTypes.join(", ")}` });
+
+  // Define required fields per data type
+  const requiredFields = {
+    contractors: ["businessName", "abn", "trade"],
+    jobs: ["jobType", "contractorId", "address"],
+    timesheets: ["contractorId", "date", "hoursWorked"],
+    expenses: ["contractorId", "date", "amount", "description"],
+    materials: ["description", "quantity", "unitCost"],
+    contacts: ["firstName", "lastName"],
+  };
+
+  const required = requiredFields[dt] || [];
+  const validationResults = records.map((record, idx) => {
+    const rowErrors = [];
+    const rowWarnings = [];
+
+    for (const field of required) {
+      if (!record[field] && record[field] !== 0) rowErrors.push(`Missing required field: ${field}`);
+    }
+
+    // Type-specific additional validation
+    if (dt === "jobs" && record.jobType && !["plumbing", "gas", "electrical", "drainage", "hvac", "carpentry", "tiling", "roofing", "painting", "general"].includes(record.jobType.toLowerCase())) {
+      rowErrors.push(`Invalid jobType: "${record.jobType}"`);
+    }
+    if (record.email && !isValidEmail(record.email)) rowErrors.push("Invalid email format");
+    if (record.abn && !/^\d{11}$/.test(record.abn.replace(/\s/g, ""))) rowWarnings.push("ABN may be invalid format (expected 11 digits)");
+    if (dt === "timesheets" && record.hoursWorked > 16) rowWarnings.push("hoursWorked > 16 — unusual value");
+
+    return {
+      row: idx + 1,
+      status: rowErrors.length > 0 ? "ERROR" : rowWarnings.length > 0 ? "WARNING" : "VALID",
+      errors: rowErrors,
+      warnings: rowWarnings,
+    };
+  });
+
+  const errorCount = validationResults.filter(r => r.status === "ERROR").length;
+  const warningCount = validationResults.filter(r => r.status === "WARNING").length;
+  const validCount = validationResults.filter(r => r.status === "VALID").length;
+  const canImport = strictMode ? errorCount === 0 && warningCount === 0 : errorCount === 0;
+
+  res.json({
+    dataType: dt,
+    totalRecords: records.length,
+    validCount, errorCount, warningCount,
+    canImport,
+    strictMode,
+    validationResults,
+    message: canImport ? "Validation passed. Safe to import." : `${errorCount} error(s) must be fixed before importing.`,
+    validatedAt: new Date().toISOString(),
+  });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
