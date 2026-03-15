@@ -3007,6 +3007,164 @@ app.get("/stats", (_req, res) => {
   });
 });
 
+// ── GET /analytics ────────────────────────────────────────────────────────────
+// Protected by API key. Queries Supabase for real-time business metrics:
+// total users, jobs by type, average confidence, missing items frequency,
+// geographic distribution, and daily/weekly/monthly counts.
+
+app.get("/analytics", async (_req, res) => {
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: "Analytics unavailable: database not configured." });
+  }
+
+  try {
+    const now = new Date();
+    const startOfToday   = new Date(now); startOfToday.setHours(0, 0, 0, 0);
+    const startOfWeek    = new Date(now); startOfWeek.setDate(now.getDate() - 7);
+    const startOfMonth   = new Date(now); startOfMonth.setDate(now.getDate() - 30);
+
+    const [
+      usersResult,
+      jobsResult,
+      jobsByTypeResult,
+      recentDayResult,
+      recentWeekResult,
+      recentMonthResult,
+      topMissingResult,
+      geoResult,
+    ] = await Promise.allSettled([
+      // Total user count
+      supabaseAdmin.from("profiles").select("id", { count: "exact", head: true }),
+
+      // All jobs for aggregate stats
+      supabaseAdmin
+        .from("analyses")
+        .select("job_type, confidence, missing_items, created_at, location_state"),
+
+      // Jobs grouped by type (aggregated client-side after fetch)
+      supabaseAdmin
+        .from("analyses")
+        .select("job_type"),
+
+      // Jobs today
+      supabaseAdmin
+        .from("analyses")
+        .select("id", { count: "exact", head: true })
+        .gte("created_at", startOfToday.toISOString()),
+
+      // Jobs last 7 days
+      supabaseAdmin
+        .from("analyses")
+        .select("id", { count: "exact", head: true })
+        .gte("created_at", startOfWeek.toISOString()),
+
+      // Jobs last 30 days
+      supabaseAdmin
+        .from("analyses")
+        .select("id", { count: "exact", head: true })
+        .gte("created_at", startOfMonth.toISOString()),
+
+      // Top missing items (last 30 days)
+      supabaseAdmin
+        .from("analyses")
+        .select("missing_items")
+        .gte("created_at", startOfMonth.toISOString())
+        .not("missing_items", "is", null),
+
+      // Geographic distribution by state
+      supabaseAdmin
+        .from("analyses")
+        .select("location_state")
+        .not("location_state", "is", null),
+    ]);
+
+    // Helper to safely extract data from allSettled results
+    const safeData = (r) => (r.status === "fulfilled" && !r.value.error ? r.value.data : null);
+    const safeCount = (r) => (r.status === "fulfilled" && !r.value.error ? r.value.count : null);
+
+    // Total users
+    const totalUsers = safeCount(usersResult) ?? null;
+
+    // Jobs aggregate stats
+    const allJobs = safeData(jobsResult) || [];
+    const totalJobs = allJobs.length;
+    const avgConfidence = totalJobs > 0
+      ? Math.round(allJobs.reduce((sum, j) => sum + (j.confidence || 0), 0) / totalJobs)
+      : null;
+
+    // Jobs by type
+    const jobTypeRows = safeData(jobsByTypeResult) || [];
+    const jobsByType = jobTypeRows.reduce((acc, row) => {
+      const t = row.job_type || "unknown";
+      acc[t] = (acc[t] || 0) + 1;
+      return acc;
+    }, {});
+
+    // Activity counts
+    const jobsToday   = safeCount(recentDayResult) ?? null;
+    const jobsWeek    = safeCount(recentWeekResult) ?? null;
+    const jobsMonth   = safeCount(recentMonthResult) ?? null;
+
+    // Top missing items (frequency map)
+    const missingRows = safeData(topMissingResult) || [];
+    const missingFreq = {};
+    missingRows.forEach(row => {
+      const items = Array.isArray(row.missing_items)
+        ? row.missing_items
+        : (typeof row.missing_items === "string" ? JSON.parse(row.missing_items) : []);
+      items.forEach(item => {
+        if (item && typeof item === "string") {
+          missingFreq[item] = (missingFreq[item] || 0) + 1;
+        }
+      });
+    });
+    const topMissingItems = Object.entries(missingFreq)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([item, count]) => ({ item, count }));
+
+    // Geographic distribution
+    const geoRows = safeData(geoResult) || [];
+    const geoDistribution = geoRows.reduce((acc, row) => {
+      const state = row.location_state || "unknown";
+      acc[state] = (acc[state] || 0) + 1;
+      return acc;
+    }, {});
+
+    return res.json({
+      generatedAt:    now.toISOString(),
+      users: {
+        total: totalUsers,
+      },
+      jobs: {
+        total:          totalJobs,
+        today:          jobsToday,
+        last7Days:      jobsWeek,
+        last30Days:     jobsMonth,
+        byType:         jobsByType,
+        avgConfidencePct: avgConfidence,
+      },
+      compliance: {
+        topMissingItems,
+      },
+      geography: {
+        byState: geoDistribution,
+      },
+      server: {
+        uptime:         Math.round(process.uptime()),
+        cacheSize:      analysisCache.size,
+        totalRequests:  usageStats.totalRequests,
+        openaiCalls:    usageStats.openaiCalls,
+        replicateCalls: usageStats.replicateCalls,
+        emailsSent:     usageStats.emailsSent,
+      },
+    });
+  } catch (err) {
+    console.error("GET /analytics error:", err);
+    return res.status(500).json({ error: "Analytics query failed. Please try again." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
