@@ -588,6 +588,101 @@ function calculateComplexity(type, photoCount, totalItems, missingCount) {
   return { score, band };
 }
 
+// ── Task 7: Compliance Scoring Algorithm ─────────────────────────────────────
+/**
+ * calculateComplianceScore — multi-dimensional compliance score 0-100.
+ *
+ * Dimensions:
+ *   1. Item coverage    (0-40 pts) — ratio of detected vs total items
+ *   2. Photo evidence   (0-25 pts) — number of quality photos submitted
+ *   3. Regulatory marks (0-20 pts) — regulatory markings confirmed in items
+ *   4. Documentation    (0-15 pts) — GPS, no missing items, completeness
+ *
+ * @param {Object}   p
+ * @param {string}   p.type            - job type (gas, electrical, plumbing…)
+ * @param {string[]} p.itemsDetected   - items that passed
+ * @param {string[]} p.itemsMissing    - items that failed
+ * @param {string[]} p.itemsUnclear   - items that are unclear
+ * @param {number}   p.photoCount      - total photos submitted
+ * @param {boolean}  p.gpsRecorded     - whether GPS was captured (optional)
+ * @param {number}   p.complexityScore - from calculateComplexity()
+ * @returns {{ score, maxScore, grade, passed, breakdown, summary }}
+ */
+function calculateComplianceScore({ type, itemsDetected, itemsMissing, itemsUnclear, photoCount, gpsRecorded, complexityScore }) {
+  const breakdown = {};
+
+  // Dimension 1: Item coverage (0-40 pts)
+  const totalItems = itemsDetected.length + itemsMissing.length + itemsUnclear.length;
+  let coverageScore = 20; // neutral when no items
+  if (totalItems > 0) {
+    const weightedPassed = itemsDetected.length + (itemsUnclear.length * 0.4);
+    coverageScore = Math.round((weightedPassed / totalItems) * 40);
+    // Extra penalty for missing items on high-risk trades
+    if ((type === "gas" || type === "electrical") && itemsMissing.length > 0) {
+      coverageScore = Math.max(0, coverageScore - (itemsMissing.length * 4));
+    }
+  }
+  breakdown.itemCoverage = {
+    score: Math.max(0, Math.min(40, coverageScore)),
+    max: 40,
+    detail: totalItems > 0
+      ? `${itemsDetected.length} passed, ${itemsMissing.length} failed, ${itemsUnclear.length} unclear of ${totalItems} items`
+      : "No items to validate",
+  };
+
+  // Dimension 2: Photo evidence quality (0-25 pts)
+  // Optimal is 10+ photos; each photo contributes until max
+  const photoScore = Math.min(25, Math.round((Math.min(photoCount, 15) / 15) * 25));
+  breakdown.photoEvidence = {
+    score: photoScore,
+    max: 25,
+    detail: `${photoCount} photo${photoCount !== 1 ? "s" : ""} submitted (optimal: 10+)`,
+  };
+
+  // Dimension 3: Regulatory compliance markers (0-20 pts)
+  // Keywords that indicate regulatory markings were verified
+  const regKeywords = ["compliance", "label", "certification", "certified", "AS ", "AGA",
+                       "RCD", "PTR", "marking", "rated", "test cert", "test result"];
+  const regDetected = itemsDetected.filter(i => regKeywords.some(k => i.toLowerCase().includes(k.toLowerCase())));
+  const regMissing  = itemsMissing.filter(i  => regKeywords.some(k => i.toLowerCase().includes(k.toLowerCase())));
+  let regScore = 20;
+  regScore -= regMissing.length  * 6;
+  regScore  = Math.min(20, regScore + regDetected.length * 2);
+  breakdown.regulatoryCompliance = {
+    score: Math.max(0, Math.min(20, regScore)),
+    max: 20,
+    detail: `${regDetected.length} regulatory item${regDetected.length !== 1 ? "s" : ""} confirmed` +
+            (regMissing.length > 0 ? `, ${regMissing.length} missing` : ""),
+  };
+
+  // Dimension 4: Documentation completeness (0-15 pts)
+  const docPenalties = [];
+  let docScore = 15;
+  if (!gpsRecorded)           { docScore -= 5; docPenalties.push("no GPS (-5)"); }
+  if (itemsMissing.length > 2){ docScore -= Math.min(4, itemsMissing.length - 2); docPenalties.push(`${itemsMissing.length} missing items`); }
+  if (itemsUnclear.length > 3){ docScore -= 2; docPenalties.push("multiple unclear items (-2)"); }
+  if (photoCount < 3)          { docScore -= 3; docPenalties.push("too few photos (-3)"); }
+  breakdown.documentationCompleteness = {
+    score: Math.max(0, docScore),
+    max: 15,
+    detail: docPenalties.length > 0 ? docPenalties.join("; ") : "Documentation complete",
+  };
+
+  const totalScore = Object.values(breakdown).reduce((sum, d) => sum + d.score, 0);
+  const grade = totalScore >= 90 ? "A+" : totalScore >= 80 ? "A" :
+                totalScore >= 70 ? "B"  : totalScore >= 60 ? "C" :
+                totalScore >= 50 ? "D"  : "F";
+
+  return {
+    score:    totalScore,
+    maxScore: 100,
+    grade,
+    passed:   totalScore >= 70,
+    breakdown,
+    summary:  `Compliance score ${totalScore}/100 (Grade ${grade}). ${breakdown.itemCoverage.detail}.`,
+  };
+}
+
 app.post("/review", reviewLimiter, async (req, res) => {
 let resolveDedup, rejectDedup, cacheKey;
 try {
@@ -1309,12 +1404,23 @@ const { score: complexityScore, band: complexityBand } = calculateComplexity(
 const complexityBonus = complexityBand === "complex" ? 10 : complexityBand === "moderate" ? 5 : 0;
 const adjustedConfidence = Math.min(100, overallConfidence + complexityBonus);
 
+const complianceScore = calculateComplianceScore({
+  type,
+  itemsDetected,
+  itemsMissing,
+  itemsUnclear,
+  photoCount: images.length,
+  gpsRecorded: !!(req.body?.gpsRecorded),
+  complexityScore,
+});
+
 const finalResult = {
   relevant,
   overall_confidence: overallConfidence,
   adjusted_confidence: adjustedConfidence,
   complexity_score: complexityScore,
   complexity_band: complexityBand,
+  compliance_score: complianceScore,
   items_detected: itemsDetected,
   items_missing: itemsMissing,
   items_unclear: itemsUnclear,
