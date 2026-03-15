@@ -30243,6 +30243,165 @@ app.post("/waste-tracking", apiKeyAuth, async (req, res) => {
   res.json({ success: true, wasteLogId: null, diversionRate, totalKg, recycledKg, landfillKg, ...record, saved: false });
 });
 
+// ── Round 107: BIM coordination, clash detection log, model federate ──────────
+
+// POST /bim-model-register — Register a BIM model file in the project model register
+app.post("/bim-model-register", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, modelName, discipline, authoringTool,
+    fileFormat, revision, coordinateSystem, levelOfDetail,
+    modelAuthor, issuedDate, fileUrl, description,
+  } = req.body;
+
+  if (!projectId || !modelName || !discipline)
+    return res.status(400).json({ error: "projectId, modelName, discipline required." });
+
+  const validDisciplines = ["ARCHITECTURAL", "STRUCTURAL", "CIVIL", "MECHANICAL", "ELECTRICAL", "PLUMBING", "FIRE", "HYDRAULIC", "SITE", "FEDERATED"];
+  const validLODs = ["LOD100", "LOD200", "LOD300", "LOD350", "LOD400", "LOD500"];
+  const validFormats = ["RVT", "IFC", "NWD", "NWC", "DWG", "SKP", "STEP", "OTHER"];
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    model_name: sanitiseInput(modelName),
+    discipline: validDisciplines.includes((discipline || "").toUpperCase()) ? discipline.toUpperCase() : "ARCHITECTURAL",
+    authoring_tool: sanitiseInput(authoringTool || ""),
+    file_format: validFormats.includes((fileFormat || "").toUpperCase()) ? fileFormat.toUpperCase() : "IFC",
+    revision: sanitiseInput(revision || "1.0"),
+    coordinate_system: sanitiseInput(coordinateSystem || ""),
+    level_of_detail: validLODs.includes((levelOfDetail || "").toUpperCase()) ? levelOfDetail.toUpperCase() : "LOD300",
+    model_author: sanitiseInput(modelAuthor || ""),
+    issued_date: issuedDate || new Date().toISOString().split("T")[0],
+    file_url: fileUrl && isSafeUrl(fileUrl) ? fileUrl : null,
+    description: sanitiseInput(description || ""),
+    status: "CURRENT",
+    registered_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("bim_model_register")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, modelId: data.id, ...record });
+  }
+
+  res.json({ success: true, modelId: null, ...record, saved: false });
+});
+
+// POST /clash-detection — Log clash detection results from a BIM coordination session
+app.post("/clash-detection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, sessionDate, conductedBy, modelsReviewed = [],
+    clashes = [],
+  } = req.body;
+
+  if (!projectId || !clashes.length)
+    return res.status(400).json({ error: "projectId and clashes required." });
+
+  const validTypes = ["HARD", "SOFT", "WORKFLOW"];
+  const validStatuses = ["NEW", "ACTIVE", "REVIEWED", "RESOLVED", "APPROVED_BY_DESIGN"];
+
+  const processedClashes = clashes.map((c, idx) => ({
+    clashId: c.clashId || `CLH-${String(idx + 1).padStart(4, "0")}`,
+    type: validTypes.includes((c.type || "").toUpperCase()) ? c.type.toUpperCase() : "HARD",
+    discipline1: sanitiseInput(c.discipline1 || ""),
+    discipline2: sanitiseInput(c.discipline2 || ""),
+    location: sanitiseInput(c.location || ""),
+    level: sanitiseInput(c.level || ""),
+    description: sanitiseInput(c.description || ""),
+    assignedTo: sanitiseInput(c.assignedTo || ""),
+    priority: ["LOW", "MEDIUM", "HIGH", "CRITICAL"].includes((c.priority || "").toUpperCase()) ? c.priority.toUpperCase() : "MEDIUM",
+    status: validStatuses.includes((c.status || "").toUpperCase()) ? c.status.toUpperCase() : "NEW",
+    resolution: sanitiseInput(c.resolution || ""),
+  }));
+
+  const hardClashes = processedClashes.filter(c => c.type === "HARD").length;
+  const softClashes = processedClashes.filter(c => c.type === "SOFT").length;
+  const resolvedClashes = processedClashes.filter(c => c.status === "RESOLVED" || c.status === "APPROVED_BY_DESIGN").length;
+  const criticalClashes = processedClashes.filter(c => c.priority === "CRITICAL").length;
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    session_date: sessionDate || new Date().toISOString().split("T")[0],
+    conducted_by: sanitiseInput(conductedBy || ""),
+    models_reviewed: Array.isArray(modelsReviewed) ? modelsReviewed.map(m => sanitiseInput(m)) : [],
+    clashes: processedClashes,
+    total_clashes: processedClashes.length,
+    hard_clashes: hardClashes,
+    soft_clashes: softClashes,
+    resolved_clashes: resolvedClashes,
+    outstanding_clashes: processedClashes.length - resolvedClashes,
+    critical_clashes: criticalClashes,
+    resolution_rate: processedClashes.length > 0 ? Math.round((resolvedClashes / processedClashes.length) * 100) : 0,
+    logged_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("clash_detection_sessions")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, sessionId: data.id, ...record });
+  }
+
+  res.json({ success: true, sessionId: null, ...record, saved: false });
+});
+
+// POST /bim-execution-plan — Store a BIM Execution Plan (BEP) outline
+app.post("/bim-execution-plan", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, bimManager, clientBimRequirements,
+    targetLod, coordinationSoftware, collaborationPlatform,
+    modellingResponsibilities = [], deliverables = [],
+    coordinationMeetingFrequency = "fortnightly",
+    namingConvention, state = "VIC",
+  } = req.body;
+
+  if (!projectId || !projectName) return res.status(400).json({ error: "projectId and projectName required." });
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    project_name: sanitiseInput(projectName),
+    bim_manager: sanitiseInput(bimManager || ""),
+    client_bim_requirements: sanitiseInput(clientBimRequirements || ""),
+    target_lod: sanitiseInput(targetLod || "LOD300"),
+    coordination_software: sanitiseInput(coordinationSoftware || "Navisworks"),
+    collaboration_platform: sanitiseInput(collaborationPlatform || ""),
+    modelling_responsibilities: modellingResponsibilities.map(r => ({
+      discipline: sanitiseInput(r.discipline || ""),
+      responsible_party: sanitiseInput(r.responsibleParty || ""),
+      software: sanitiseInput(r.software || ""),
+      lod: sanitiseInput(r.lod || "LOD300"),
+    })),
+    deliverables: deliverables.map(d => ({
+      deliverable: sanitiseInput(d.deliverable || ""),
+      format: sanitiseInput(d.format || "IFC"),
+      dueDate: d.dueDate || null,
+    })),
+    coordination_meeting_frequency: sanitiseInput(coordinationMeetingFrequency),
+    naming_convention: sanitiseInput(namingConvention || ""),
+    state: sanitiseInput(state),
+    status: "ACTIVE",
+    created_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("bim_execution_plans")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, bepId: data.id, ...record });
+  }
+
+  res.json({ success: true, bepId: null, ...record, saved: false });
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
