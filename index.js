@@ -50066,6 +50066,370 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /overhead-power-line-risk — Log an OPL risk assessment and buffer zone for a site
+app.post("/overhead-power-line-risk", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectAddress, assessmentDate, assessedBy,
+    lineOwner, lineVoltageKv, lineHeightM, lineDistanceFromWorksM,
+    lineType, lineOrientation,
+    plantsAndEquipment, maxPlantHeightM,
+    worksType, worksDescription,
+    oplContactWithNetworkObtained, electricityProviderRef,
+    safeworkingDistanceM, exclusionZoneM,
+    controlsImplemented, craneOrElevatedWork, craneMaxRadiusM,
+    safeWorkMethodStatementRef, notes,
+  } = req.body;
+
+  if (!projectId || !assessmentDate || !assessedBy || !lineVoltageKv) {
+    return res.status(400).json({ error: "projectId, assessmentDate, assessedBy, and lineVoltageKv are required." });
+  }
+
+  const voltage = Number(lineVoltageKv);
+
+  // Safe approach distances per AS/NZS 4836 and WorkSafe Victoria
+  // Approach limit depends on voltage
+  let safeworkingDistance;
+  let exclusionZone;
+  if (voltage <= 1) {
+    safeworkingDistance = 0.5;   // m — Low voltage
+    exclusionZone = 1.0;
+  } else if (voltage <= 11) {
+    safeworkingDistance = 1.5;
+    exclusionZone = 3.0;
+  } else if (voltage <= 33) {
+    safeworkingDistance = 3.0;
+    exclusionZone = 6.0;
+  } else if (voltage <= 66) {
+    safeworkingDistance = 3.0;
+    exclusionZone = 6.0;
+  } else if (voltage <= 132) {
+    safeworkingDistance = 6.0;
+    exclusionZone = 8.0;
+  } else {
+    safeworkingDistance = 8.0;
+    exclusionZone = 10.0;
+  }
+
+  // Override if user provided values
+  const resolvedSafeWorkingDistance = safeworkingDistanceM || safeworkingDistance;
+  const resolvedExclusionZone = exclusionZoneM || exclusionZone;
+
+  const failures = [];
+  const criticalFailures = [];
+
+  const lineDistance = Number(lineDistanceFromWorksM || 0);
+  if (lineDistance > 0 && lineDistance < resolvedExclusionZone) {
+    criticalFailures.push(`Works are ${lineDistance}m from OPL — within ${resolvedExclusionZone}m exclusion zone. ALL WORKS MUST CEASE until line owner assessment and controls are in place.`);
+  } else if (lineDistance > 0 && lineDistance < resolvedSafeWorkingDistance * 2) {
+    failures.push(`Works within ${resolvedSafeWorkingDistance * 2}m of OPL — safe working distance controls required.`);
+  }
+
+  if (craneOrElevatedWork) {
+    const craneRadius = Number(craneMaxRadiusM || 0);
+    if (craneRadius > 0 && (lineDistance - craneRadius) < resolvedExclusionZone) {
+      criticalFailures.push(`Crane radius ${craneRadius}m could bring plant within exclusion zone — contact line owner before any crane operations near OPL.`);
+    }
+  }
+
+  if (!oplContactWithNetworkObtained && lineDistance < resolvedSafeWorkingDistance * 3) {
+    failures.push("Contact with network owner (AusNet/Powercor/United Energy) required before works proceed near OPL.");
+  }
+
+  const maxEquipmentHeight = Number(maxPlantHeightM || 0);
+  const lineHeight = Number(lineHeightM || 0);
+  if (lineHeight > 0 && maxEquipmentHeight > 0 && lineHeight - maxEquipmentHeight < resolvedSafeWorkingDistance) {
+    criticalFailures.push(`Plant height ${maxEquipmentHeight}m with line at ${lineHeight}m leaves only ${lineHeight - maxEquipmentHeight}m clearance — less than ${resolvedSafeWorkingDistance}m safe working distance.`);
+  }
+
+  const riskLevel = criticalFailures.length > 0 ? "CRITICAL" : failures.length > 0 ? "HIGH" : "MEDIUM";
+
+  const ref = `OPL-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectAddress: sanitiseInput(projectAddress || "", 300),
+    assessmentDate,
+    assessedBy: sanitiseInput(assessedBy, 120),
+    line: {
+      owner: sanitiseInput(lineOwner || "", 100),
+      voltageKv: voltage,
+      heightM: lineHeightM || null,
+      distanceFromWorksM: lineDistance || null,
+      type: sanitiseInput(lineType || "", 60),
+      orientation: sanitiseInput(lineOrientation || "", 60),
+    },
+    equipment: {
+      types: (plantsAndEquipment || []).map(e => sanitiseInput(String(e), 80)).slice(0, 10),
+      maxHeightM: maxEquipmentHeight || null,
+      craneOrElevatedWork: !!craneOrElevatedWork,
+      craneMaxRadiusM: craneMaxRadiusM || null,
+    },
+    distances: {
+      safeworkingDistanceM: resolvedSafeWorkingDistance,
+      exclusionZoneM: resolvedExclusionZone,
+    },
+    controls: (controlsImplemented || []).map(c => sanitiseInput(String(c), 150)).slice(0, 10),
+    networkContact: {
+      obtained: !!oplContactWithNetworkObtained,
+      providerRef: sanitiseInput(electricityProviderRef || "", 80),
+    },
+    safeWorkMethodStatementRef: sanitiseInput(safeWorkMethodStatementRef || "", 60),
+    riskLevel,
+    criticalFailures,
+    failures,
+    worksDescription: sanitiseInput(worksDescription || "", 300),
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("overhead_power_line_risks").insert(record);
+      if (error) console.error("OPL risk insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("OPL risk DB error:", e.message);
+    }
+  }
+
+  if (criticalFailures.length > 0) {
+    console.warn(`[SAFETY CRITICAL] OPL risk at ${sanitiseInput(projectAddress || "", 80)}: ${criticalFailures[0]}`);
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    riskLevel,
+    safeworkingDistanceM: resolvedSafeWorkingDistance,
+    exclusionZoneM: resolvedExclusionZone,
+    criticalFailures,
+    failures,
+    message: criticalFailures.length > 0
+      ? `CRITICAL: ${criticalFailures[0]}`
+      : failures.length > 0
+        ? `HIGH risk OPL proximity — implement controls. Safe working distance: ${resolvedSafeWorkingDistance}m.`
+        : `OPL risk assessed. Maintain ${resolvedSafeWorkingDistance}m safe working distance from ${voltage}kV line.`,
+    emergencyContact: "If contact with an OPL occurs — do not approach. Call 000. Keep others clear. If trapped in vehicle, stay inside and call for help.",
+    saved,
+    record,
+  });
+});
+
+// POST /underground-services-clearance — Log a Dial Before You Dig / underground services clearance
+app.post("/underground-services-clearance", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectAddress, excavationDate, submittedBy,
+    dbydReferenceNumber, dbydSubmissionDate,
+    excavationDepthM, excavationLengthM, excavationWidthM, excavationArea,
+    servicesIdentified, servicesPlans, potholingRequired, potholingCompleted,
+    supervisorNotified, swmsRef, notes,
+  } = req.body;
+
+  if (!projectId || !projectAddress || !excavationDate) {
+    return res.status(400).json({ error: "projectId, projectAddress, and excavationDate are required." });
+  }
+
+  const sanitisedAddress = sanitiseInput(projectAddress, 300);
+
+  const validServiceTypes = ["ELECTRICAL", "GAS", "WATER", "SEWER", "TELECOMMUNICATIONS", "FIBRE_OPTIC", "STORMWATER", "UNKNOWN"];
+  const processedServices = Array.isArray(servicesIdentified)
+    ? servicesIdentified.slice(0, 20).map(s => ({
+        type: validServiceTypes.includes((s.type || s || "").toUpperCase().replace(/ /g, "_")) ? (s.type || s).toUpperCase().replace(/ /g, "_") : "UNKNOWN",
+        depth: s.depth || null,
+        owner: sanitiseInput(String(s.owner || ""), 80),
+        marked: s.marked ?? null,
+        potholed: s.potholed ?? null,
+      }))
+    : [];
+
+  const hasHighRiskServices = processedServices.some(s => ["ELECTRICAL", "GAS"].includes(s.type));
+  const missingPotholing = hasHighRiskServices && potholingRequired && !potholingCompleted;
+
+  const warnings = [];
+  if (!dbydReferenceNumber) warnings.push("No DBYD reference number — submit enquiry at 1100.com.au or call 1100 before any excavation.");
+  if (hasHighRiskServices && !potholingRequired) warnings.push("Electrical or gas services identified — potholing to confirm exact depth is strongly recommended.");
+  if (missingPotholing) warnings.push("Potholing required but not yet completed — do not excavate near high-risk services until potholing confirms service depths.");
+  if (!swmsRef) warnings.push("No SWMS referenced — an Excavation SWMS is required for all excavations > 1.5m deep.");
+
+  const safeToProceed = !missingPotholing && (dbydReferenceNumber || !hasHighRiskServices);
+
+  const ref = `DBYD-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectAddress: sanitisedAddress,
+    excavationDate,
+    submittedBy: sanitiseInput(submittedBy || "", 120),
+    dbyd: {
+      referenceNumber: sanitiseInput(dbydReferenceNumber || "", 60),
+      submissionDate: dbydSubmissionDate || null,
+    },
+    excavation: {
+      depthM: excavationDepthM || null,
+      lengthM: excavationLengthM || null,
+      widthM: excavationWidthM || null,
+      area: sanitiseInput(excavationArea || "", 100),
+    },
+    servicesIdentified: processedServices,
+    potholing: {
+      required: !!potholingRequired,
+      completed: !!potholingCompleted,
+    },
+    supervisorNotified: !!supervisorNotified,
+    swmsRef: sanitiseInput(swmsRef || "", 60),
+    hasHighRiskServices,
+    warnings,
+    safeToProceed,
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("underground_services_clearances").insert(record);
+      if (error) console.error("DBYD clearance insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("DBYD clearance DB error:", e.message);
+    }
+  }
+
+  return res.status(safeToProceed ? 201 : 422).json({
+    success: safeToProceed,
+    ref,
+    safeToProceed,
+    hasHighRiskServices,
+    warnings,
+    message: !safeToProceed
+      ? `Do NOT excavate — ${warnings[0] || "unresolved high-risk services or incomplete clearance."}`
+      : warnings.length > 0
+        ? `Clearance recorded with warnings — review before excavating.`
+        : `Underground services clearance complete — ${processedServices.length} service(s) identified.`,
+    reminder: "Call 1100 (Dial Before You Dig) before ANY excavation work. Identify, locate, and protect all underground services.",
+    saved,
+    record,
+  });
+});
+
+// POST /ai-excavation-risk — AI assesses excavation risk for a given site and scope
+app.post("/ai-excavation-risk", apiKeyAuth, async (req, res) => {
+  const {
+    location, excavationDepthM, excavationLengthM,
+    soilType, groundwaterPresent, adjacentStructures,
+    servicesNearby, nearOPL, nearGasPipeline,
+    trafficLoadAbove, weather, season, notes,
+  } = req.body;
+
+  if (!location || !excavationDepthM) {
+    return res.status(400).json({ error: "location and excavationDepthM are required." });
+  }
+
+  const sanitisedLocation = sanitiseInput(location, 200);
+  const depth = Number(excavationDepthM);
+  const sanitisedAdjacent = Array.isArray(adjacentStructures)
+    ? adjacentStructures.map(s => sanitiseInput(String(s), 100)).slice(0, 5)
+    : [];
+
+  const prompt = `You are a geotechnical and construction safety engineer assessing excavation risk in Victoria, Australia.
+
+Assess the risk for the following excavation:
+- Location: ${sanitisedLocation}
+- Depth: ${depth}m
+- Length: ${excavationLengthM ? `${excavationLengthM}m` : "Unknown"}
+- Soil type: ${sanitiseInput(soilType || "Unknown", 60)}
+- Groundwater present: ${groundwaterPresent ? "Yes" : "No"}
+- Adjacent structures: ${sanitisedAdjacent.join(", ") || "None"}
+- Underground services nearby: ${servicesNearby ? "Yes — DBYD required" : "None identified"}
+- Near overhead power lines: ${nearOPL ? "Yes" : "No"}
+- Near gas pipeline: ${nearGasPipeline ? "Yes" : "No"}
+- Traffic load above: ${sanitiseInput(trafficLoadAbove || "None", 60)}
+- Weather: ${sanitiseInput(weather || "Fine", 40)}
+- Season: ${sanitiseInput(season || "Not specified", 20)}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Reference: WHS Regulations 2017 (excavation provisions), AS 4678, Excavation Code of Practice (Safe Work Australia), AS 3798.
+
+Respond ONLY with a JSON object:
+{
+  "riskLevel": "LOW|MEDIUM|HIGH|CRITICAL",
+  "excavationClass": "SIMPLE|COMPLEX|HIGH_RISK",
+  "batteredOrSupportRequired": boolean,
+  "engineeringDesignRequired": boolean,
+  "batteredSlopeMaxAngle": number,
+  "trenchSheetingRequired": boolean,
+  "registeredNotification": boolean,
+  "controlMeasures": [string],
+  "groundwaterControls": [string],
+  "emergencyProcedures": [string],
+  "dbydRequired": boolean,
+  "inspectionFrequency": string,
+  "regulatoryRequirements": [string],
+  "summary": string (2-3 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      location: sanitisedLocation,
+      excavationDepthM: depth,
+      riskLevel: parsed.riskLevel || "MEDIUM",
+      excavationClass: parsed.excavationClass || "COMPLEX",
+      batteredOrSupportRequired: parsed.batteredOrSupportRequired ?? depth > 1.5,
+      engineeringDesignRequired: parsed.engineeringDesignRequired ?? depth > 3,
+      batteredSlopeMaxAngle: parsed.batteredSlopeMaxAngle || null,
+      trenchSheetingRequired: parsed.trenchSheetingRequired ?? depth > 1.5,
+      registeredNotification: parsed.registeredNotification ?? depth > 5,
+      controlMeasures: parsed.controlMeasures || [],
+      groundwaterControls: parsed.groundwaterControls || [],
+      emergencyProcedures: parsed.emergencyProcedures || [],
+      dbydRequired: parsed.dbydRequired ?? true,
+      inspectionFrequency: parsed.inspectionFrequency || "Daily and after adverse weather",
+      regulatoryRequirements: parsed.regulatoryRequirements || [],
+      summary: parsed.summary || "Excavation risk assessment complete.",
+    });
+  } catch (e) {
+    console.error("AI excavation risk error:", e.message);
+    return res.json({
+      success: true,
+      location: sanitisedLocation,
+      excavationDepthM: depth,
+      riskLevel: depth > 3 ? "HIGH" : depth > 1.5 ? "MEDIUM" : "LOW",
+      excavationClass: depth > 3 ? "HIGH_RISK" : depth > 1.5 ? "COMPLEX" : "SIMPLE",
+      batteredOrSupportRequired: depth > 1.5,
+      engineeringDesignRequired: depth > 3,
+      batteredSlopeMaxAngle: 45,
+      trenchSheetingRequired: depth > 1.5 && (soilType || "").toLowerCase().includes("sand") || depth > 2.5,
+      registeredNotification: depth > 5,
+      controlMeasures: ["Install battered sides or trench shoring for excavations > 1.5m depth", "Conduct pre-excavation DBYD search", "Implement exclusion zones for personnel", "Provide safe access/egress every 6m maximum"],
+      groundwaterControls: groundwaterPresent ? ["Install dewatering pump before excavating", "Monitor groundwater levels daily", "Do not allow workers to enter waterlogged excavation"] : [],
+      emergencyProcedures: ["Rescue plan for excavation collapse — do NOT enter to rescue without structural shore/prop", "Emergency contacts posted at worksite", "Medical rescue equipment on site"],
+      dbydRequired: true,
+      inspectionFrequency: "Before workers enter each day, after adverse weather, and after any detected movement",
+      regulatoryRequirements: [
+        depth > 1.5 ? "WHS Regulations 2017 reg.306 — excavation over 1.5m requires shoring/battering or engineer's assessment" : "WHS Regulations 2017 — basic excavation safety applies",
+        depth > 5 ? "Register excavation over 5m as notifiable construction work (WorkSafe Victoria)" : "",
+        "DBYD enquiry mandatory before excavation: dial 1100",
+      ].filter(Boolean),
+      summary: `${depth}m deep excavation assessed as ${depth > 3 ? "HIGH" : depth > 1.5 ? "MEDIUM" : "LOW"} risk. ${depth > 1.5 ? "Shoring or engineered battering required." : "Standard excavation safety controls apply."}`,
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
