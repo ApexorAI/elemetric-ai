@@ -37141,6 +37141,140 @@ Return JSON with:
   }
 });
 
+// POST /weather-delay-log — Log a weather-related delay event
+app.post("/weather-delay-log", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, delayDate, weatherEvent, affectedActivities = [],
+    hoursLost, workersAffected, equipmentStoodDown = [],
+    bom_reference, photoEvidence = false, supervisorNotes,
+    eoTClaimRaised = false,
+  } = req.body;
+  if (!projectId || !delayDate || !weatherEvent) {
+    return res.status(400).json({ error: "projectId, delayDate, and weatherEvent are required." });
+  }
+  const validEvents = ["RAIN", "HIGH_WIND", "EXTREME_HEAT", "STORM", "FLOOD", "LIGHTNING", "FOG", "FROST", "OTHER"];
+  if (!validEvents.includes(weatherEvent)) {
+    return res.status(400).json({ error: `weatherEvent must be one of: ${validEvents.join(", ")}` });
+  }
+  const delayRef = `WDL-${Date.now().toString(36).toUpperCase()}`;
+  const costImpact = (Number(hoursLost) || 0) * (Number(workersAffected) || 0);
+  const record = {
+    delay_ref: delayRef,
+    project_id: projectId,
+    delay_date: delayDate,
+    weather_event: weatherEvent,
+    affected_activities: Array.isArray(affectedActivities) ? affectedActivities.map(a => sanitiseInput(a)) : [],
+    hours_lost: Number(hoursLost) || 0,
+    workers_affected: Number(workersAffected) || 0,
+    equipment_stood_down: Array.isArray(equipmentStoodDown) ? equipmentStoodDown.map(e => sanitiseInput(e)) : [],
+    bom_reference: sanitiseInput(bom_reference || ""),
+    photo_evidence: Boolean(photoEvidence),
+    supervisor_notes: sanitiseInput(supervisorNotes || ""),
+    eot_claim_raised: Boolean(eoTClaimRaised),
+    person_hours_lost: costImpact,
+    created_at: new Date().toISOString(),
+  };
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from("weather_delays").insert(record);
+    if (error) console.error("weather-delay-log DB error:", error.message);
+  }
+  res.json({
+    delayRef, projectId, weatherEvent, delayDate,
+    hoursLost: Number(hoursLost) || 0,
+    workersAffected: Number(workersAffected) || 0,
+    personHoursLost: costImpact,
+    eoTClaimRaised, saved: !!supabaseAdmin,
+  });
+});
+
+// GET /weather-delay-log/:projectId — Summarise weather delays for EOT support
+app.get("/weather-delay-log/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { from, to } = req.query;
+  if (!supabaseAdmin) return res.status(503).json({ error: "Database not configured." });
+  let query = supabaseAdmin.from("weather_delays").select("*").eq("project_id", projectId).order("delay_date", { ascending: false });
+  if (from) query = query.gte("delay_date", from);
+  if (to) query = query.lte("delay_date", to);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  const totalHoursLost = data.reduce((s, d) => s + (d.hours_lost || 0), 0);
+  const totalPersonHours = data.reduce((s, d) => s + (d.person_hours_lost || 0), 0);
+  const eventBreakdown = {};
+  data.forEach(d => { eventBreakdown[d.weather_event] = (eventBreakdown[d.weather_event] || 0) + 1; });
+  res.json({
+    projectId, delayCount: data.length, totalHoursLost, totalPersonHours,
+    eoTClaimsRaised: data.filter(d => d.eot_claim_raised).length,
+    eventBreakdown, delays: data,
+  });
+});
+
+// POST /ai-weather-delay — AI estimates delay impact and EOT entitlement
+app.post("/ai-weather-delay", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, weatherEvent, affectedActivities = [], hoursLost,
+    criticalPathImpact = false, contractType = "AS4000",
+    bomDataAvailable = false, previousDelayDays = 0,
+  } = req.body;
+  if (!weatherEvent || !hoursLost) {
+    return res.status(400).json({ error: "weatherEvent and hoursLost are required." });
+  }
+  const sanitisedEvent = sanitiseInput(weatherEvent);
+  const systemPrompt = `You are an Australian construction contract specialist with expertise in extension of time (EOT) claims.`;
+  const userPrompt = `Assess EOT entitlement for a weather delay under an Australian construction contract:
+Contract type: ${sanitiseInput(contractType)}
+Weather event: ${sanitisedEvent}
+Hours lost: ${hoursLost}
+Critical path impacted: ${criticalPathImpact}
+Affected activities: ${affectedActivities.map(a => sanitiseInput(a)).join("; ")}
+BOM data available: ${bomDataAvailable}
+Prior approved delays (days): ${previousDelayDays}
+
+Return JSON with:
+{
+  "eoTEntitlement": "LIKELY|POSSIBLE|UNLIKELY",
+  "estimatedDaysEntitled": 0.5,
+  "concurrentDelayRisk": false,
+  "notificationRequirements": "...",
+  "evidenceRequired": ["...", "..."],
+  "contractualBasis": "...",
+  "floatConsiderations": "...",
+  "costRecoveryLikelihood": "LIKELY|POSSIBLE|UNLIKELY",
+  "recommendedActions": ["...", "..."],
+  "draftNoticeText": "..."
+}`;
+  try {
+    const aiRes = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 1500,
+    });
+    usageStats.openaiCalls++;
+    const assessment = JSON.parse(aiRes.choices[0].message.content);
+    res.json({ projectId, weatherEvent: sanitisedEvent, hoursLost, criticalPathImpact, contractType, assessment });
+  } catch (err) {
+    console.error("ai-weather-delay error:", err.message);
+    res.json({
+      projectId, weatherEvent: sanitisedEvent, hoursLost, criticalPathImpact, contractType,
+      assessment: {
+        eoTEntitlement: "POSSIBLE",
+        estimatedDaysEntitled: Math.ceil(Number(hoursLost) / 8),
+        concurrentDelayRisk: false,
+        notificationRequirements: "Notify the superintendent promptly under the contract conditions.",
+        evidenceRequired: ["Bureau of Meteorology records", "Site diary entries", "Photographs with timestamps", "Daily logs"],
+        contractualBasis: `Review EOT clause under ${sanitiseInput(contractType)}`,
+        floatConsiderations: "Check whether the delay falls on the critical path.",
+        costRecoveryLikelihood: "POSSIBLE",
+        recommendedActions: ["Submit written notice to superintendent", "Compile BOM weather data", "Document affected activities"],
+        draftNoticeText: `We write to notify you of a weather delay event on ${new Date().toLocaleDateString("en-AU")} affecting our works.`,
+      },
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
