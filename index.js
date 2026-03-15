@@ -78660,6 +78660,392 @@ Respond ONLY in JSON:
   }
 });
 
+// ── Round 279 ─────────────────────────────────────────────────────────────────
+
+// POST /retaining-structure-design-check — Record retaining wall or earth retention design verification
+app.post("/retaining-structure-design-check", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, location, checkDate, checkedBy,
+      structureType, retainedHeightM, surchargeKpa,
+      soilType, groundwaterPresent, groundwaterDepthM,
+      engineerOfRecord, designStandard,
+      slidingFOS, overturningFOS, bearingFOS, circularFailureFOS,
+      specifiedMinSlidingFOS, specifiedMinOverturningFOS,
+      drainageProvided, drainageType, weepHolesSpacingMm,
+      reinforcementChecked, concreteCoverMm, specifiedCoverMm,
+      inspectedByStructuralEngineer, constructionCertIssued, notes
+    } = req.body;
+
+    if (!location || !checkDate || !checkedBy || !structureType) {
+      return res.status(400).json({ error: "location, checkDate, checkedBy, structureType are required." });
+    }
+
+    const safeLocation = sanitiseInput(String(location));
+    const safeCheckedBy = sanitiseInput(String(checkedBy));
+    const safeStructType = sanitiseInput(String(structureType));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+
+    const criticalIssues = [];
+    const warnings = [];
+
+    const slidingFs = parseFloat(slidingFOS) || null;
+    const overturningFs = parseFloat(overturningFOS) || null;
+    const bearingFs = parseFloat(bearingFOS) || null;
+    const circularFs = parseFloat(circularFailureFOS) || null;
+
+    const minSliding = parseFloat(specifiedMinSlidingFOS) || 1.5;
+    const minOverturning = parseFloat(specifiedMinOverturningFOS) || 1.5;
+
+    // AS 4678 — Earth-retaining structures, AS 2159 — Pile design, AS 1726 — Geotech
+    if (slidingFs !== null && slidingFs < minSliding) {
+      criticalIssues.push(`Sliding FOS ${slidingFs} below minimum ${minSliding} — retaining structure inadequate for design surcharge. Re-analyse (AS 4678).`);
+    } else if (slidingFs !== null && slidingFs < minSliding * 1.1) {
+      warnings.push(`Sliding FOS ${slidingFs} close to minimum ${minSliding} — verify analysis assumptions.`);
+    }
+
+    if (overturningFs !== null && overturningFs < minOverturning) {
+      criticalIssues.push(`Overturning FOS ${overturningFs} below minimum ${minOverturning} — structure will overturn under design loads. Redesign required.`);
+    }
+
+    if (bearingFs !== null && bearingFs < 2.0) {
+      criticalIssues.push(`Bearing FOS ${bearingFs} below minimum 2.0 — foundation failure risk. Increase footing size or deep foundation required.`);
+    }
+
+    if (circularFs !== null && circularFs < 1.5) {
+      criticalIssues.push(`Circular/slope failure FOS ${circularFs} below minimum 1.5 — global slope stability inadequate.`);
+    }
+
+    // Drainage — critical for retaining structures
+    if (!drainageProvided) {
+      criticalIssues.push("Drainage not provided behind retaining wall — hydrostatic pressure build-up will reduce FOS below design values (AS 4678 cl.4.5).");
+    }
+
+    const weepSpacing = parseFloat(weepHolesSpacingMm) || null;
+    if (drainageProvided && weepSpacing !== null && weepSpacing > 2000) {
+      warnings.push(`Weep hole spacing ${weepSpacing}mm — standard maximum is 2000mm for retaining walls. Increase frequency.`);
+    }
+
+    // Cover
+    const concrCover = parseFloat(concreteCoverMm) || null;
+    const specCover = parseFloat(specifiedCoverMm) || null;
+    if (concrCover !== null && specCover !== null && concrCover < specCover) {
+      criticalIssues.push(`Concrete cover ${concrCover}mm below specified ${specCover}mm — reinforcement durability compromised.`);
+    }
+
+    const retainedH = parseFloat(retainedHeightM) || null;
+    if (retainedH !== null && retainedH > 1.5 && !inspectedByStructuralEngineer) {
+      criticalIssues.push("Retaining structure > 1.5m not confirmed inspected by structural engineer — required for public safety (Building Regulations 2018 Vic).");
+    }
+
+    if (retainedH !== null && retainedH > 1.0 && !constructionCertIssued) {
+      warnings.push("Construction certificate not confirmed issued for retaining structure > 1.0m — verify building permit requirements.");
+    }
+
+    const checkStatus = criticalIssues.length > 0 ? "FAIL" : warnings.length > 0 ? "CONDITIONAL_PASS" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("retaining_structure_design_checks")
+        .insert({
+          project_id: safeProject,
+          location: safeLocation,
+          check_date: checkDate,
+          checked_by: safeCheckedBy,
+          structure_type: safeStructType,
+          retained_height_m: retainedH,
+          surcharge_kpa: surchargeKpa || null,
+          soil_type: soilType ? sanitiseInput(String(soilType)) : null,
+          groundwater_present: groundwaterPresent || false,
+          groundwater_depth_m: groundwaterDepthM || null,
+          engineer_of_record: engineerOfRecord ? sanitiseInput(String(engineerOfRecord)) : null,
+          sliding_fos: slidingFs,
+          overturning_fos: overturningFs,
+          bearing_fos: bearingFs,
+          circular_failure_fos: circularFs,
+          drainage_provided: drainageProvided || false,
+          drainage_type: drainageType ? sanitiseInput(String(drainageType)) : null,
+          weep_holes_spacing_mm: weepSpacing,
+          concrete_cover_mm: concrCover,
+          specified_cover_mm: specCover,
+          inspected_by_structural_engineer: inspectedByStructuralEngineer || false,
+          construction_cert_issued: constructionCertIssued || false,
+          check_status: checkStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        checkStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Retaining structure design fails — do not construct until redesigned by structural engineer.",
+        standards: ["AS 4678", "AS 1726", "Building Regulations 2018 (Vic)"],
+      });
+    }
+
+    res.json({
+      checkStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      retainedHeightM: retainedH,
+      slidingFOS: slidingFs,
+      overturningFOS: overturningFs,
+      standards: ["AS 4678", "AS 1726"],
+    });
+  } catch (err) {
+    console.error("POST /retaining-structure-design-check error:", err.message);
+    res.status(500).json({ error: "Failed to record retaining structure design check." });
+  }
+});
+
+// POST /structural-inspection-record — Record formal structural inspection by engineer
+app.post("/structural-inspection-record", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      projectId, inspectionDate, inspectedBy, licenceNumber,
+      buildingAddress, buildingClass, inspectionType,
+      structuralElements, foundationCondition, slabCondition,
+      columnBeamCondition, roofStructureCondition, bracingCondition,
+      cracksPresent, crackWidthMm, crackPattern,
+      deflectionPresent, deflectionMm, allowableDeflectionMm,
+      spallationPresent, exposedReinforcementPresent,
+      carbonationDepthMm, chloridePresent,
+      overallConditionRating, remainingLifeYears,
+      closureRecommended, remedialWorks, urgency,
+      certificateIssued, certRef, notes
+    } = req.body;
+
+    if (!inspectionDate || !inspectedBy || !buildingAddress) {
+      return res.status(400).json({ error: "inspectionDate, inspectedBy, buildingAddress are required." });
+    }
+
+    const safeInspector = sanitiseInput(String(inspectedBy));
+    const safeAddress = sanitiseInput(String(buildingAddress));
+    const safeProject = projectId ? sanitiseInput(String(projectId)) : null;
+
+    const elements = Array.isArray(structuralElements) ? structuralElements : [];
+    const remedial = Array.isArray(remedialWorks) ? remedialWorks : [];
+    const criticalIssues = [];
+    const warnings = [];
+
+    const crackMm = parseFloat(crackWidthMm) || null;
+    const deflMm = parseFloat(deflectionMm) || null;
+    const allowDeflMm = parseFloat(allowableDeflectionMm) || null;
+    const condRating = String(overallConditionRating || "").toUpperCase();
+
+    // AS 3600 — Concrete structures, AS 4100 — Steel structures, AS 3700 — Masonry
+    if (condRating === "CRITICAL" || condRating === "POOR") {
+      criticalIssues.push(`Overall structural condition rated ${overallConditionRating} — immediate engineering assessment and repair required.`);
+    }
+
+    if (closureRecommended === true || closureRecommended === "true") {
+      criticalIssues.push("Structural engineer recommends CLOSURE — building must not be occupied until structural works are completed.");
+    }
+
+    if (crackMm !== null) {
+      if (crackMm > 5) {
+        criticalIssues.push(`Crack width ${crackMm}mm — significant structural cracking. Immediately assess for load capacity.`);
+      } else if (crackMm > 0.3) {
+        warnings.push(`Crack width ${crackMm}mm — exceeds durability limit 0.3mm. Carbonation and reinforcement corrosion risk (AS 3600).`);
+      }
+    }
+
+    if (deflMm !== null && allowDeflMm !== null && deflMm > allowDeflMm) {
+      criticalIssues.push(`Deflection ${deflMm}mm exceeds allowable ${allowDeflMm}mm — structural performance not meeting design requirements.`);
+    }
+
+    if (exposedReinforcementPresent === true || exposedReinforcementPresent === "true") {
+      criticalIssues.push("Exposed reinforcement detected — section loss and structural capacity reduction. Urgent repair required.");
+    }
+
+    if (spallationPresent === true || spallationPresent === "true") {
+      warnings.push("Concrete spallation — falling material hazard. Restrict access below and schedule repair.");
+    }
+
+    const urgencyLevel = String(urgency || "").toUpperCase();
+    if (urgencyLevel === "IMMEDIATE") {
+      criticalIssues.push("Inspector classified urgency as IMMEDIATE — restrict use until structural remediation complete.");
+    }
+
+    if (!certificateIssued) {
+      warnings.push("Structural inspection certificate not issued — required for building regulatory compliance.");
+    }
+
+    const inspectionStatus = criticalIssues.length > 0 ? "FAIL" : warnings.length > 0 ? "DEFECTS_NOTED" : "PASS";
+
+    let savedId = null;
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin
+        .from("structural_inspection_records")
+        .insert({
+          project_id: safeProject,
+          inspection_date: inspectionDate,
+          inspected_by: safeInspector,
+          licence_number: licenceNumber ? sanitiseInput(String(licenceNumber)) : null,
+          building_address: safeAddress,
+          building_class: buildingClass || null,
+          inspection_type: inspectionType ? sanitiseInput(String(inspectionType)) : null,
+          structural_elements: elements,
+          overall_condition_rating: condRating || null,
+          crack_width_mm: crackMm,
+          crack_pattern: crackPattern ? sanitiseInput(String(crackPattern)) : null,
+          deflection_mm: deflMm,
+          spallation_present: spallationPresent || false,
+          exposed_reinforcement_present: exposedReinforcementPresent || false,
+          closure_recommended: closureRecommended || false,
+          remedial_works: remedial,
+          urgency: urgencyLevel || null,
+          remaining_life_years: remainingLifeYears || null,
+          certificate_issued: certificateIssued || false,
+          cert_ref: certRef ? sanitiseInput(String(certRef)) : null,
+          inspection_status: inspectionStatus,
+          critical_issues: criticalIssues,
+          warnings,
+          notes: notes ? sanitiseInput(String(notes)) : null,
+          created_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+      if (!error && data) savedId = data.id;
+    }
+
+    if (criticalIssues.length > 0) {
+      return res.status(422).json({
+        inspectionStatus,
+        criticalIssues,
+        warnings,
+        savedId,
+        message: "Structural defects requiring immediate action — restrict access.",
+        standards: ["AS 3600", "AS 4100", "AS 4349.1", "Building Act 1993 (Vic)"],
+      });
+    }
+
+    res.json({
+      inspectionStatus,
+      criticalIssues,
+      warnings,
+      savedId,
+      overallConditionRating: condRating || null,
+      remainingLifeYears: remainingLifeYears || null,
+      standards: ["AS 3600", "AS 4100", "AS 4349.1"],
+    });
+  } catch (err) {
+    console.error("POST /structural-inspection-record error:", err.message);
+    res.status(500).json({ error: "Failed to record structural inspection." });
+  }
+});
+
+// POST /ai-structural-condition-assessment — AI assesses structural condition and remediation urgency
+app.post("/ai-structural-condition-assessment", apiKeyAuth, async (req, res) => {
+  try {
+    const {
+      structureType, ageYears, constructionMaterial, exposureClass,
+      cracksObserved, deflection, spallation, corrosion,
+      loadChanges, foundationMovement, prevRepairs,
+      occupancyType, criticality, siteContext
+    } = req.body;
+
+    if (!structureType) {
+      return res.status(400).json({ error: "structureType is required." });
+    }
+
+    const safeStructType = sanitiseInput(String(structureType));
+    const safeSite = siteContext ? sanitiseInput(String(siteContext)) : "Victoria, Australia";
+    const prevRepairList = Array.isArray(prevRepairs) ? prevRepairs.map(r => sanitiseInput(String(r))) : [];
+
+    const prompt = `You are a structural engineering consultant assessing structural condition and recommending remediation priority for a Victorian building or infrastructure asset.
+
+Structure type: ${safeStructType}
+Age: ${ageYears ? ageYears + " years" : "Unknown"}
+Construction material: ${constructionMaterial || "Unknown"}
+Exposure class: ${exposureClass || "Not stated"}
+Cracks observed: ${cracksObserved || "None noted"}
+Deflection: ${deflection || "None noted"}
+Spallation: ${spallation ? "Present" : "Absent"}
+Corrosion indicators: ${corrosion || "None"}
+Load changes since construction: ${loadChanges || "None"}
+Foundation movement: ${foundationMovement || "None"}
+Previous repairs: ${prevRepairList.join("; ") || "None"}
+Occupancy type: ${occupancyType || "Unknown"}
+Criticality: ${criticality || "Unknown"}
+Location: ${safeSite}
+
+Assess structural condition under:
+- AS 3600 (concrete structures)
+- AS 4100 (steel structures)
+- AS 3700 (masonry)
+- AS 4349.1 (inspection of buildings — residential)
+- AS 4349.3 (inspection — timber)
+
+Provide:
+1. Overall structural condition grade (A-F scale)
+2. Failure risk
+3. Root causes of observed distress
+4. Remediation urgency
+5. Recommended investigation methods
+6. Estimated remaining service life without intervention
+
+Respond ONLY in JSON:
+{
+  "conditionGrade": "A|B|C|D|E|F",
+  "failureRisk": "NEGLIGIBLE|LOW|MODERATE|HIGH|IMMINENT",
+  "rootCauses": ["string"],
+  "remediationUrgency": "IMMEDIATE|SHORT_TERM|MEDIUM_TERM|LONG_TERM|MONITOR",
+  "investigationRecommendations": ["string"],
+  "remediationRecommendations": ["string"],
+  "estimatedServiceLifeWithoutIntervention": "string",
+  "closeureRequired": true|false,
+  "applicableStandards": ["string"],
+  "summary": "string"
+}`;
+
+    let aiResult;
+    try {
+      const response = await callOpenAIWithRetry({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+      });
+      usageStats.openaiCalls++;
+      aiResult = JSON.parse(response.choices[0].message.content);
+    } catch {
+      aiResult = {
+        conditionGrade: null,
+        failureRisk: "MODERATE",
+        rootCauses: ["AI analysis unavailable — engage structural engineer"],
+        remediationUrgency: "SHORT_TERM",
+        investigationRecommendations: ["Visual inspection by structural engineer", "Non-destructive testing (NDT)"],
+        remediationRecommendations: ["Engage structural engineer for condition assessment"],
+        estimatedServiceLifeWithoutIntervention: "Unknown — structural engineer assessment required.",
+        closeureRequired: false,
+        applicableStandards: ["AS 3600", "AS 4100", "AS 4349.1"],
+        summary: "AI structural assessment unavailable. Engage registered structural engineer.",
+      };
+    }
+
+    res.json({
+      ...aiResult,
+      structureType: safeStructType,
+      standards: ["AS 3600", "AS 4100", "AS 4349.1", "AS 3700"],
+    });
+  } catch (err) {
+    console.error("POST /ai-structural-condition-assessment error:", err.message);
+    res.status(500).json({ error: "Failed to assess structural condition." });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
