@@ -31320,6 +31320,202 @@ app.get("/legal-notices/:projectId", apiKeyAuth, async (req, res) => {
   res.status(503).json({ error: "Database not configured." });
 });
 
+// ── Round 113: Communication log, stakeholder register, AI meeting summary ────
+
+// POST /communication-log — Record a formal project communication
+app.post("/communication-log", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, communicationType, from, to,
+    subject, summary, actionRequired = false,
+    actionDueDate, actionAssignedTo,
+    medium = "EMAIL", priority = "NORMAL",
+    fileUrl,
+  } = req.body;
+
+  if (!projectId || !subject || !summary)
+    return res.status(400).json({ error: "projectId, subject, summary required." });
+
+  const validTypes = ["EMAIL", "LETTER", "MEETING_MINUTES", "PHONE_CALL", "SITE_INSTRUCTION", "NOTICE", "REPORT", "OTHER"];
+  const validMediums = ["EMAIL", "LETTER", "PHONE", "IN_PERSON", "VIDEO_CALL", "FAX", "OTHER"];
+  const validPriorities = ["LOW", "NORMAL", "HIGH", "URGENT"];
+
+  const comRef = `COMM-${Date.now().toString(36).toUpperCase().slice(-8)}`;
+
+  const record = {
+    comm_ref: comRef,
+    project_id: sanitiseInput(projectId),
+    communication_type: validTypes.includes((communicationType || "").toUpperCase()) ? communicationType.toUpperCase() : "OTHER",
+    from: sanitiseInput(from || ""),
+    to: sanitiseInput(to || ""),
+    subject: sanitiseInput(subject),
+    summary: sanitiseInput(summary),
+    action_required: Boolean(actionRequired),
+    action_due_date: actionRequired ? (actionDueDate || null) : null,
+    action_assigned_to: actionRequired ? sanitiseInput(actionAssignedTo || "") : "",
+    medium: validMediums.includes((medium || "").toUpperCase()) ? medium.toUpperCase() : "EMAIL",
+    priority: validPriorities.includes((priority || "").toUpperCase()) ? priority.toUpperCase() : "NORMAL",
+    file_url: fileUrl && isSafeUrl(fileUrl) ? fileUrl : null,
+    status: actionRequired ? "ACTION_REQUIRED" : "LOGGED",
+    logged_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("communication_log")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, commId: data.id, commRef: comRef, ...record });
+  }
+
+  res.json({ success: true, commId: null, commRef: comRef, ...record, saved: false });
+});
+
+// POST /stakeholder-register — Register a project stakeholder
+app.post("/stakeholder-register", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, name, organisation, role, stakeholderType,
+    influence, interest, email, phone,
+    engagementStrategy, engagementFrequency,
+    notes,
+  } = req.body;
+
+  if (!projectId || !name || !role)
+    return res.status(400).json({ error: "projectId, name, role required." });
+
+  const validTypes = ["CLIENT", "CONTRACTOR", "CONSULTANT", "AUTHORITY", "COMMUNITY", "MEDIA", "INVESTOR", "EMPLOYEE", "SUPPLIER", "OTHER"];
+  const validLevels = ["LOW", "MEDIUM", "HIGH"];
+  const type = (stakeholderType || "OTHER").toUpperCase();
+  const inf = (influence || "MEDIUM").toUpperCase();
+  const int = (interest || "MEDIUM").toUpperCase();
+
+  // Engagement quadrant
+  const quadrant = inf === "HIGH" && int === "HIGH" ? "MANAGE_CLOSELY"
+    : inf === "HIGH" && int !== "HIGH" ? "KEEP_SATISFIED"
+    : inf !== "HIGH" && int === "HIGH" ? "KEEP_INFORMED"
+    : "MONITOR";
+
+  const record = {
+    project_id: sanitiseInput(projectId),
+    name: sanitiseInput(name),
+    organisation: sanitiseInput(organisation || ""),
+    role: sanitiseInput(role),
+    stakeholder_type: validTypes.includes(type) ? type : "OTHER",
+    influence: validLevels.includes(inf) ? inf : "MEDIUM",
+    interest: validLevels.includes(int) ? int : "MEDIUM",
+    engagement_quadrant: quadrant,
+    email: sanitiseInput(email || ""),
+    phone: sanitiseInput(phone || ""),
+    engagement_strategy: sanitiseInput(engagementStrategy || ""),
+    engagement_frequency: sanitiseInput(engagementFrequency || ""),
+    notes: sanitiseInput(notes || ""),
+    status: "ACTIVE",
+    registered_at: new Date().toISOString(),
+  };
+
+  if (supabaseAdmin) {
+    const { data, error } = await supabaseAdmin
+      .from("stakeholder_register")
+      .insert(record)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "DB error.", detail: error.message });
+    return res.json({ success: true, stakeholderId: data.id, engagementQuadrant: quadrant, ...record });
+  }
+
+  res.json({ success: true, stakeholderId: null, engagementQuadrant: quadrant, ...record, saved: false });
+});
+
+// GET /stakeholders/:projectId — List stakeholders for a project
+app.get("/stakeholders/:projectId", apiKeyAuth, async (req, res) => {
+  const { projectId } = req.params;
+  const { quadrant, type } = req.query;
+
+  if (supabaseAdmin) {
+    let query = supabaseAdmin
+      .from("stakeholder_register")
+      .select("*")
+      .eq("project_id", projectId)
+      .eq("status", "ACTIVE")
+      .order("influence", { ascending: false });
+
+    if (quadrant) query = query.eq("engagement_quadrant", quadrant.toUpperCase());
+    if (type) query = query.eq("stakeholder_type", type.toUpperCase());
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: "DB error." });
+
+    const byQuadrant = {
+      MANAGE_CLOSELY: (data || []).filter(s => s.engagement_quadrant === "MANAGE_CLOSELY").length,
+      KEEP_SATISFIED: (data || []).filter(s => s.engagement_quadrant === "KEEP_SATISFIED").length,
+      KEEP_INFORMED: (data || []).filter(s => s.engagement_quadrant === "KEEP_INFORMED").length,
+      MONITOR: (data || []).filter(s => s.engagement_quadrant === "MONITOR").length,
+    };
+
+    return res.json({ projectId, stakeholders: data || [], count: (data || []).length, byQuadrant });
+  }
+
+  res.status(503).json({ error: "Database not configured." });
+});
+
+// POST /ai-meeting-summary — AI generates a structured summary and action items from raw meeting notes
+app.post("/ai-meeting-summary", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, meetingType, meetingDate, attendees = [],
+    rawNotes, chairperson,
+  } = req.body;
+
+  if (!rawNotes) return res.status(400).json({ error: "rawNotes required." });
+
+  const sanitisedNotes = sanitiseInput(rawNotes);
+  const attendeeList = attendees.map(a => sanitiseInput(a)).join(", ");
+
+  const prompt = `You are an experienced construction project manager. Parse the following raw meeting notes and produce a structured formal meeting summary.
+
+Meeting type: ${sanitiseInput(meetingType || "Site Meeting")}
+Date: ${sanitiseInput(meetingDate || "Not specified")}
+Chairperson: ${sanitiseInput(chairperson || "Not specified")}
+Attendees: ${attendeeList || "Not specified"}
+
+RAW MEETING NOTES:
+${sanitisedNotes}
+
+Return a JSON object with:
+- "title": formal meeting title
+- "keyDiscussionPoints": array of { "topic": string, "discussion": string, "outcome": string }
+- "actionItems": array of { "action": string, "assignedTo": string, "dueDate": string|null, "priority": "LOW"|"MEDIUM"|"HIGH" }
+- "decisions": array of formal decisions made
+- "issues": array of issues raised that require follow-up
+- "nextMeetingDate": if mentioned in notes, otherwise null
+- "executiveSummary": 2-3 sentence summary of the meeting
+- "meetingRating": "PRODUCTIVE"|"AVERAGE"|"UNPRODUCTIVE" based on outcomes`;
+
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 1800,
+    });
+    usageStats.openaiCalls++;
+    const result = JSON.parse(completion.choices[0].message.content);
+    return res.json({ ...result, projectId, meetingType, meetingDate, attendees, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    return res.json({
+      title: `${meetingType || "Site"} Meeting — ${meetingDate || "Unknown Date"}`,
+      keyDiscussionPoints: [],
+      actionItems: [],
+      decisions: [],
+      issues: [],
+      nextMeetingDate: null,
+      executiveSummary: "Automated meeting summary temporarily unavailable. Manual summary required.",
+      meetingRating: "AVERAGE",
+      projectId, meetingType, meetingDate, attendees, generatedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
