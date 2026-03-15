@@ -46210,6 +46210,326 @@ Respond ONLY with a JSON object:
   }
 });
 
+// POST /earthworks-compaction-record — Log a field compaction test result (AS 1289 series)
+app.post("/earthworks-compaction-record", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, testDate, testLocation, chainage,
+    layer, fillMaterial, fillSource,
+    testMethod, dryDensityKgM3, moistureContentPercent,
+    proctorDryDensityKgM3, optimumMoistureMContentPercent,
+    relativeDensityPercent, specifiedCompactionPercent,
+    dcpBlowsPer100mm, cbr, soilClassification,
+    testedBy, labRef, notes,
+  } = req.body;
+
+  if (!projectId || !testDate || !testMethod || dryDensityKgM3 === undefined) {
+    return res.status(400).json({ error: "projectId, testDate, testMethod, and dryDensityKgM3 are required." });
+  }
+
+  const dryDensity = Number(dryDensityKgM3);
+  const proctorDensity = proctorDryDensityKgM3 ? Number(proctorDryDensityKgM3) : null;
+
+  // Calculate relative density if Proctor reference provided
+  const calculatedRelDensity = proctorDensity && proctorDensity > 0
+    ? Math.round((dryDensity / proctorDensity) * 10000) / 100
+    : (relativeDensityPercent ? Number(relativeDensityPercent) : null);
+
+  // Default specification: 95% Standard Proctor for residential fill (AS 3798)
+  const specCompaction = specifiedCompactionPercent || 95;
+  const passFailStatus = calculatedRelDensity !== null
+    ? (calculatedRelDensity >= specCompaction ? "PASS" : "FAIL")
+    : "UNASSESSED";
+
+  const validMethods = ["SAND_REPLACEMENT", "NUCLEAR_DENSOMETER", "DRIVE_CYLINDER", "DCP", "DYNAMIC_CONE_PENETROMETER"];
+  const resolvedMethod = validMethods.find(m => m.includes((testMethod || "").toUpperCase().replace(/[- ]/g, "_"))) || sanitiseInput(testMethod, 60);
+
+  const remarks = [];
+  if (passFailStatus === "FAIL") {
+    remarks.push(`Compaction FAILED — ${calculatedRelDensity}% < ${specCompaction}% specified. Rework layer and re-test.`);
+  }
+  if (moistureContentPercent !== undefined && optimumMoistureMContentPercent !== undefined) {
+    const moistureDev = Math.abs(Number(moistureContentPercent) - Number(optimumMoistureMContentPercent));
+    if (moistureDev > 3) {
+      remarks.push(`Moisture content ${moistureContentPercent}% is ${moistureDev.toFixed(1)}% from OMC — adjust before compaction.`);
+    }
+  }
+
+  const ref = `COMP-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectName: sanitiseInput(projectName || "", 200),
+    testDate,
+    testLocation: sanitiseInput(testLocation || "", 200),
+    chainage: sanitiseInput(chainage || "", 40),
+    layer: sanitiseInput(layer || "", 60),
+    fillMaterial: sanitiseInput(fillMaterial || "", 100),
+    fillSource: sanitiseInput(fillSource || "", 150),
+    testMethod: resolvedMethod,
+    results: {
+      dryDensityKgM3: dryDensity,
+      moistureContentPercent: moistureContentPercent !== undefined ? Number(moistureContentPercent) : null,
+      proctorDryDensityKgM3: proctorDensity,
+      optimumMoistureContentPercent: optimumMoistureMContentPercent || null,
+      relativeDensityPercent: calculatedRelDensity,
+      specifiedCompactionPercent: specCompaction,
+      dcpBlowsPer100mm: dcpBlowsPer100mm || null,
+      cbr: cbr || null,
+    },
+    soilClassification: sanitiseInput(soilClassification || "", 40),
+    passFailStatus,
+    remarks,
+    testedBy: sanitiseInput(testedBy || "", 120),
+    labRef: sanitiseInput(labRef || "", 60),
+    notes: sanitiseInput(notes || "", 400),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("earthworks_compaction_records").insert(record);
+      if (error) console.error("Compaction record insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Compaction record DB error:", e.message);
+    }
+  }
+
+  return res.status(201).json({
+    success: true,
+    ref,
+    relativeDensityPercent: calculatedRelDensity,
+    specifiedCompactionPercent: specCompaction,
+    passFailStatus,
+    remarks,
+    message: passFailStatus === "PASS"
+      ? `Compaction PASSED — ${calculatedRelDensity}% ≥ ${specCompaction}% specified.`
+      : passFailStatus === "FAIL"
+        ? `Compaction FAILED — ${calculatedRelDensity}% < ${specCompaction}% required. Rework required.`
+        : "Compaction recorded — relative density not calculated (no Proctor reference provided).",
+    saved,
+    record,
+  });
+});
+
+// POST /formwork-pre-pour-inspection — Pre-pour formwork inspection before concrete placement
+app.post("/formwork-pre-pour-inspection", apiKeyAuth, async (req, res) => {
+  const {
+    projectId, projectName, elementRef, elementType,
+    inspectionDate, inspectedBy, supervisorName,
+    concreteGrade, designStrength, pourVolume,
+    // Formwork checks
+    formworkSecure, adequatePropsAndShores, leaksSealed,
+    releaseAgentApplied, dimensionsVerified, levelAndPlumb,
+    constructionJointsPrepared, cleanedOut, noDebris,
+    // Reinforcement checks
+    reinforcementInstalled, barSizes, spacing,
+    coverAchieved, specifiedCoverMm, measuredCoverMm,
+    splicesCompliant, stirrupsAndTiesCorrect, lapLengthsCorrect,
+    // Embedments
+    embedmentsInstalled, conduitInstalled, holdDownsInstalled,
+    // Pre-pour notification
+    engineerNotified, bcaNotified, concretePlantOrdered,
+    pourStartTime, weather,
+    nonCompliances, notes,
+  } = req.body;
+
+  if (!projectId || !elementRef || !inspectionDate || !inspectedBy) {
+    return res.status(400).json({ error: "projectId, elementRef, inspectionDate, and inspectedBy are required." });
+  }
+
+  const sanitisedElement = sanitiseInput(elementRef, 100);
+  const sanitisedInspector = sanitiseInput(inspectedBy, 120);
+
+  // Auto-generate failures list
+  const failures = [];
+  if (formworkSecure === false) failures.push("Formwork not adequately secured.");
+  if (adequatePropsAndShores === false) failures.push("Inadequate propping/shoring — do not pour until rectified.");
+  if (leaksSealed === false) failures.push("Formwork has unsealed gaps/leaks — seal before pour.");
+  if (releaseAgentApplied === false) failures.push("Release agent not applied.");
+  if (dimensionsVerified === false) failures.push("Dimensions not verified against drawings.");
+  if (levelAndPlumb === false) failures.push("Formwork not level and plumb.");
+  if (cleanedOut === false || noDebris === false) failures.push("Formwork not cleaned out — remove debris and construction waste.");
+  if (reinforcementInstalled === false) failures.push("Reinforcement not fully installed.");
+  if (coverAchieved === false) failures.push("Specified concrete cover not achieved.");
+  if (specifiedCoverMm && measuredCoverMm && Number(measuredCoverMm) < Number(specifiedCoverMm)) {
+    failures.push(`Cover ${measuredCoverMm}mm < specified ${specifiedCoverMm}mm — adjust spacers.`);
+  }
+  if (stirrupsAndTiesCorrect === false) failures.push("Stirrups/ties incorrect — rectify before pour.");
+  if (lapLengthsCorrect === false) failures.push("Bar lap lengths insufficient — verify against AS 3600.");
+
+  // Add any additional non-compliances
+  const additionalNC = (nonCompliances || []).map(n => sanitiseInput(String(n), 200)).slice(0, 10);
+  const allFailures = [...failures, ...additionalNC];
+
+  // Hold point — cannot pour with failures
+  const approvedToPour = allFailures.length === 0;
+
+  const ref = `FWPPI-${Date.now().toString(36).toUpperCase()}`;
+
+  const record = {
+    ref,
+    projectId: sanitiseInput(String(projectId), 80),
+    projectName: sanitiseInput(projectName || "", 200),
+    elementRef: sanitisedElement,
+    elementType: sanitiseInput(elementType || "", 80),
+    inspectionDate,
+    inspectedBy: sanitisedInspector,
+    supervisorName: sanitiseInput(supervisorName || "", 120),
+    concreteSpec: {
+      grade: sanitiseInput(concreteGrade || "", 20),
+      designStrength: designStrength || null,
+      pourVolumeM3: pourVolume || null,
+    },
+    formworkChecks: { formworkSecure, adequatePropsAndShores, leaksSealed, releaseAgentApplied, dimensionsVerified, levelAndPlumb, constructionJointsPrepared, cleanedOut, noDebris },
+    reinforcementChecks: { reinforcementInstalled, barSizes: sanitiseInput(barSizes || "", 100), spacing: sanitiseInput(spacing || "", 60), coverAchieved, specifiedCoverMm, measuredCoverMm, splicesCompliant, stirrupsAndTiesCorrect, lapLengthsCorrect },
+    embedments: { embedmentsInstalled, conduitInstalled, holdDownsInstalled },
+    notification: { engineerNotified: !!engineerNotified, bcaNotified: !!bcaNotified, concretePlantOrdered: !!concretePlantOrdered },
+    pourSchedule: { startTime: pourStartTime || null, weather: sanitiseInput(weather || "", 60) },
+    failures: allFailures,
+    approvedToPour,
+    notes: sanitiseInput(notes || "", 500),
+    createdAt: new Date().toISOString(),
+  };
+
+  let saved = false;
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.from("formwork_pre_pour_inspections").insert(record);
+      if (error) console.error("Pre-pour inspection insert error:", error.message);
+      else saved = true;
+    } catch (e) {
+      console.error("Pre-pour inspection DB error:", e.message);
+    }
+  }
+
+  // Hold point: if not approved to pour, return 422 with a message
+  const statusCode = approvedToPour ? 201 : 422;
+
+  return res.status(statusCode).json({
+    success: approvedToPour,
+    ref,
+    approvedToPour,
+    failureCount: allFailures.length,
+    failures: allFailures,
+    message: approvedToPour
+      ? `Pre-pour inspection PASSED for ${sanitisedElement} — APPROVED to pour.`
+      : `Pre-pour inspection HOLD POINT — ${allFailures.length} issue(s) must be rectified before pouring ${sanitisedElement}.`,
+    saved,
+    record,
+  });
+});
+
+// POST /ai-geotechnical-interpretation — AI interprets geotechnical data and recommends footing type
+app.post("/ai-geotechnical-interpretation", apiKeyAuth, async (req, res) => {
+  const {
+    location, soilDescription, classificationsites,
+    depthToRockM, groundwaterDepthM, dcpResults,
+    bearingCapacityKpa, reactivitySite, soilClass,
+    slopeDegrees, treesPresent, treeSpecies, treeDistanceM,
+    proposedStructure, structureLoadKN, notes,
+  } = req.body;
+
+  if (!location || !soilDescription) {
+    return res.status(400).json({ error: "location and soilDescription are required." });
+  }
+
+  const sanitisedLocation = sanitiseInput(location, 200);
+  const sanitisedDesc = sanitiseInput(soilDescription, 500);
+
+  const prompt = `You are a geotechnical engineer interpreting site investigation data for residential construction in Victoria, Australia.
+
+SITE DATA:
+- Location: ${sanitisedLocation}
+- Soil description: ${sanitisedDesc}
+- Soil class (AS 2870): ${sanitiseInput(soilClass || "Unknown", 20)}
+- Site reactivity: ${sanitiseInput(reactivitySite || "Unknown", 40)}
+- Depth to rock: ${depthToRockM !== undefined ? `${depthToRockM}m` : "Unknown"}
+- Groundwater depth: ${groundwaterDepthM !== undefined ? `${groundwaterDepthM}m` : "Unknown"}
+- DCP results: ${sanitiseInput(dcpResults || "Not provided", 200)}
+- Bearing capacity: ${bearingCapacityKpa ? `${bearingCapacityKpa} kPa` : "Not determined"}
+- Slope: ${slopeDegrees !== undefined ? `${slopeDegrees}°` : "Level"}
+- Trees present: ${treesPresent ? "Yes" : "No"}
+${treesPresent ? `- Tree species: ${sanitiseInput(treeSpecies || "Unknown", 100)}, distance ${treeDistanceM || "Unknown"}m` : ""}
+- Proposed structure: ${sanitiseInput(proposedStructure || "Residential dwelling", 100)}
+- Structure load: ${structureLoadKN ? `${structureLoadKN} kN` : "Not specified"}
+${notes ? `- Notes: ${sanitiseInput(notes, 200)}` : ""}
+
+Reference: AS 2870 (Residential slabs and footings), AS 3798 (Guidelines on earthworks for commercial and residential developments), NCC 2022.
+
+Respond ONLY with a JSON object:
+{
+  "soilClassification": string (AS 2870 class: A/S/M/H1/H2/E/P),
+  "recommendedFootingType": string,
+  "minimumFootingDepthMm": number,
+  "minimumBeamDepthMm": number,
+  "minimumSlabThicknessMm": number,
+  "bearingCapacityAssessment": string,
+  "groundwaterConsiderations": string,
+  "treeInfluenceZone": string,
+  "slopeConsiderations": string,
+  "riskFlags": [string],
+  "furtherInvestigationRequired": boolean,
+  "furtherInvestigationItems": [string],
+  "designAssumptions": [string],
+  "summary": string (2-3 sentences)
+}`;
+
+  usageStats.openaiCalls++;
+  try {
+    const completion = await callOpenAIWithRetry({
+      model: "gpt-4.1-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 900,
+      temperature: 0.2,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content);
+
+    return res.json({
+      success: true,
+      soilClassification: parsed.soilClassification || soilClass || "Unknown",
+      recommendedFootingType: parsed.recommendedFootingType || "",
+      minimumFootingDepthMm: parsed.minimumFootingDepthMm ?? null,
+      minimumBeamDepthMm: parsed.minimumBeamDepthMm ?? null,
+      minimumSlabThicknessMm: parsed.minimumSlabThicknessMm ?? null,
+      bearingCapacityAssessment: parsed.bearingCapacityAssessment || "",
+      groundwaterConsiderations: parsed.groundwaterConsiderations || "",
+      treeInfluenceZone: parsed.treeInfluenceZone || "",
+      slopeConsiderations: parsed.slopeConsiderations || "",
+      riskFlags: parsed.riskFlags || [],
+      furtherInvestigationRequired: parsed.furtherInvestigationRequired ?? false,
+      furtherInvestigationItems: parsed.furtherInvestigationItems || [],
+      designAssumptions: parsed.designAssumptions || [],
+      summary: parsed.summary || "Geotechnical interpretation complete.",
+      disclaimer: "This is an AI-generated interpretation only. A registered geotechnical engineer must review site data and certify the footing design.",
+    });
+  } catch (e) {
+    console.error("AI geotech interpretation error:", e.message);
+    return res.json({
+      success: true,
+      soilClassification: soilClass || "Unknown — further investigation required",
+      recommendedFootingType: "Engineer to determine based on full site investigation",
+      minimumFootingDepthMm: null,
+      minimumBeamDepthMm: null,
+      minimumSlabThicknessMm: null,
+      bearingCapacityAssessment: "Bearing capacity not determined — conduct plate bearing test or use lab CBR.",
+      groundwaterConsiderations: "Confirm groundwater levels during wet season before finalising footing design.",
+      treeInfluenceZone: treesPresent ? "Assess tree root influence zone per AS 2870 Appendix D." : "Not applicable.",
+      slopeConsiderations: slopeDegrees > 5 ? "Slope > 5° — engineer to assess slope stability and any cut/fill requirements." : "Level site — standard footing design applicable.",
+      riskFlags: ["Manual interpretation required — engage geotechnical engineer"],
+      furtherInvestigationRequired: true,
+      furtherInvestigationItems: ["Soil classification test (particle size, Atterberg limits)", "Standard Proctor compaction test", "CBR testing"],
+      designAssumptions: [],
+      summary: "Automated geotechnical interpretation unavailable. Engage a registered geotechnical engineer to review site investigation data and provide footing recommendations.",
+      disclaimer: "This is an AI-generated interpretation only. A registered geotechnical engineer must review site data and certify the footing design.",
+    });
+  }
+});
+
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found." });
