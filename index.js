@@ -634,8 +634,8 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
     // Step 3: Run Stable Diffusion inpainting via Replicate
     // Only the masked (white) region is edited; everything else is preserved exactly.
     const prompt =
-      `A ${modelNumber} mounted high on the wall only, nothing else added, no furniture, no objects below, ` +
-      `clean installation, photorealistic, natural lighting, ${roomDescription}, high quality photograph`;
+      `A ${modelNumber} air conditioning unit mounted on the wall, professional installation photo, ` +
+      `photorealistic, 8k quality, same room lighting, natural shadows, seamlessly blended, ${roomDescription}`;
 
     console.log("[visualise] Step 3 - Calling Replicate with prompt:", prompt, "| image size:", correctedWallImage.length);
 
@@ -648,10 +648,10 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
             image:            `data:${correctedMime};base64,${correctedWallImage}`,
             mask:             `data:image/png;base64,${maskBase64}`,
             prompt,
-            negative_prompt:  "blurry, low quality, distorted, unrealistic, cartoon, sketch, watermark, text",
+            negative_prompt:  "ceiling, roof, floor, distorted, blurry, cartoon, painting, unrealistic, floating",
             strength:         0.95,
-            guidance_scale:   7.5,
-            num_inference_steps: 30,
+            guidance_scale:   9,
+            num_inference_steps: 50,
             num_outputs:      1,
           },
         }
