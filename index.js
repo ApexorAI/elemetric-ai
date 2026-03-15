@@ -7,6 +7,7 @@ const Replicate = require("replicate");
 const rateLimit = require("express-rate-limit");
 const Stripe = require("stripe");
 const { createClient } = require("@supabase/supabase-js");
+const sharp = require("sharp");
 
 const app = express();
 
@@ -676,6 +677,143 @@ app.post("/visualise", visualiserLimiter, async (req, res) => {
     return res.status(500).json({
       error: "Visualisation failed",
       details: error.message || "Unknown server error",
+    });
+  }
+});
+
+// ── Weatherproof photo stamping ────────────────────────────────────────────────
+// Burns GPS coordinates + server timestamp as a tamper-evident overlay onto the
+// image itself before the file is saved on-device.
+
+app.post("/stamp-photo", async (req, res) => {
+  try {
+    const { image, mime, gps, capturedAt } = req.body || {};
+
+    if (!image || typeof image !== "string") {
+      return res.status(400).json({ error: "Missing image data." });
+    }
+
+    const inputBuffer = Buffer.from(image, "base64");
+    const meta = await sharp(inputBuffer).metadata();
+    const w = meta.width || 1200;
+    const h = meta.height || 900;
+
+    const gpsText = gps && typeof gps.lat === "number" && typeof gps.lng === "number"
+      ? `GPS ${gps.lat.toFixed(6)}, ${gps.lng.toFixed(6)}`
+      : "GPS unavailable";
+
+    const melbNow = new Date(capturedAt || Date.now()).toLocaleString("en-AU", {
+      timeZone: "Australia/Melbourne",
+      day: "2-digit", month: "2-digit", year: "numeric",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+      hour12: true,
+    });
+
+    const barH = 76;
+    // Escape XML special chars in text
+    const escXml = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+    const svgOverlay = `<svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="${h - barH}" width="${w}" height="${barH}" fill="rgba(0,0,0,0.72)"/>
+  <text x="14" y="${h - barH + 22}" fill="#f97316" font-size="19" font-family="monospace" font-weight="bold">ELEMETRIC VERIFIED</text>
+  <text x="14" y="${h - barH + 46}" fill="white" font-size="17" font-family="monospace">${escXml(gpsText)}</text>
+  <text x="14" y="${h - barH + 68}" fill="rgba(255,255,255,0.85)" font-size="15" font-family="monospace">${escXml(melbNow)}</text>
+</svg>`;
+
+    const stampedBuffer = await sharp(inputBuffer)
+      .composite([{ input: Buffer.from(svgOverlay), blend: "over" }])
+      .jpeg({ quality: 88 })
+      .toBuffer();
+
+    return res.json({
+      image: stampedBuffer.toString("base64"),
+      mime: "image/jpeg",
+    });
+  } catch (error) {
+    console.error("Stamp photo error:", error);
+    return res.status(500).json({
+      error: "Photo stamping failed",
+      details: error.message || "Unknown error",
+    });
+  }
+});
+
+// ── Property Compliance Passport ───────────────────────────────────────────────
+// Public lookup: returns full job history for an address, compliance trend,
+// and overall score. Uses service-role key to read across all users.
+
+app.get("/property-passport", async (req, res) => {
+  try {
+    const address = typeof req.query.address === "string" ? req.query.address.trim() : "";
+
+    if (address.length < 3) {
+      return res.status(400).json({ error: "Provide at least 3 characters of an address." });
+    }
+
+    if (!supabaseAdmin) {
+      return res.status(503).json({ error: "Passport service not configured on server." });
+    }
+
+    const { data: jobs, error } = await supabaseAdmin
+      .from("jobs")
+      .select("id, job_type, job_name, job_addr, confidence, relevant, detected, missing, created_at, installer_name, status")
+      .ilike("job_addr", `%${address}%`)
+      .order("created_at", { ascending: false })
+      .limit(100);
+
+    if (error) {
+      console.error("Property passport DB error:", error);
+      return res.status(500).json({ error: "Database query failed." });
+    }
+
+    const jobList = jobs || [];
+
+    // Compliance trend — average confidence per calendar month
+    const monthMap = {};
+    for (const job of jobList) {
+      const month = (job.created_at || "").slice(0, 7); // "YYYY-MM"
+      if (!month) continue;
+      if (!monthMap[month]) monthMap[month] = { sum: 0, count: 0 };
+      monthMap[month].sum += job.confidence ?? 0;
+      monthMap[month].count++;
+    }
+
+    const trend = Object.entries(monthMap)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([month, { sum, count }]) => ({
+        month,
+        avgConfidence: Math.round(sum / count),
+        jobCount: count,
+      }));
+
+    const overallCompliance = jobList.length > 0
+      ? Math.round(jobList.reduce((s, j) => s + (j.confidence ?? 0), 0) / jobList.length)
+      : null;
+
+    return res.json({
+      address,
+      jobCount: jobList.length,
+      overallCompliance,
+      trend,
+      jobs: jobList.map((j) => ({
+        id: j.id,
+        jobType: j.job_type,
+        jobName: j.job_name,
+        jobAddr: j.job_addr,
+        confidence: j.confidence,
+        relevant: j.relevant,
+        detected: j.detected,
+        missing: j.missing,
+        createdAt: j.created_at,
+        installerName: j.installer_name,
+        status: j.status,
+      })),
+    });
+  } catch (error) {
+    console.error("Property passport error:", error);
+    return res.status(500).json({
+      error: "Property passport failed",
+      details: error.message || "Unknown error",
     });
   }
 });
