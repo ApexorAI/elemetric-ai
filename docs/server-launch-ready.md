@@ -1,8 +1,9 @@
 # Elemetric Server — Launch Readiness Report
-**Generated:** 2026-03-17
-**Server version:** index.js (single-file Express.js, ~107 000 lines)
+**Generated:** 2026-03-17 (updated 2026-03-17 post-mobile-testing)
+**Server version:** index.js (single-file Express.js, ~108 000 lines)
 **Runtime:** Node.js on Railway
 **Model:** GPT-4.1-mini Vision (OpenAI)
+**PDF library:** pdfkit (server-side PDF generation)
 
 ---
 
@@ -60,6 +61,8 @@ The startup report in `app.listen()` checks all critical variables and logs `✗
 | POST | `/before-after` | Active | Global | API key |
 | POST | `/auto-classify` | Active | Global | API key |
 | POST | `/bulk-review` | Active | Global | API key |
+
+> **Mobile fix (2026-03-17):** `/review` now filters out `photoType="360"` and `photoType="wide_shot"` photos before analysis. Use `/process-360` for 360-degree content. Signature is not required for `/review` — only relevant at PDF export stage.
 
 ### Property Passport
 | Method | Path | Status | Notes |
@@ -150,6 +153,20 @@ The startup report in `app.listen()` checks all critical variables and logs `✗
 | POST | `/near-miss-log` | Active |
 | GET | `/near-miss-log` | Active |
 
+### PDF Generation
+| Method | Path | Status | Notes |
+|--------|------|--------|-------|
+| POST | `/export-report` | Active | Returns `{ pdf_base64, filename, size_kb }` + `Content-Type: application/pdf` |
+| GET | `/pdf/:jobId` | Active | API key required — regenerates PDF for any past job |
+
+> **Mobile fix (2026-03-17):** `/export-report` now generates a real server-side PDF using pdfkit. Returns base64-encoded PDF with filename. Includes 1 KB size validation. `/pdf/:jobId` is a new endpoint for retrieving any past job's PDF by ID without local storage.
+
+### Employer Account Management
+| Method | Path | Status | Notes |
+|--------|------|--------|-------|
+| POST | `/employer/upgrade` | Active | API key required — upgrades user to employer, creates team, sends welcome email |
+| GET | `/employer/onboarding-status` | Active | API key required — powers employer onboarding checklist |
+
 ### Monitoring
 | Method | Path | Status | Notes |
 |--------|------|--------|-------|
@@ -159,7 +176,6 @@ The startup report in `app.listen()` checks all critical variables and logs `✗
 | GET | `/performance` | Active | API key required |
 | GET | `/timestamp` | Active | — |
 | GET | `/` | Active | Heartbeat |
-| POST | `/export-report` | Active | — |
 
 ---
 
@@ -312,4 +328,22 @@ Counters reset at midnight Sydney time each day. Check `GET /health` for service
 
 ---
 
-*This document was generated on 2026-03-17 as part of the pre-launch server audit.*
+---
+
+## 12. Changes — Mobile Testing Round (2026-03-17)
+
+The following fixes were applied after initial mobile testing:
+
+| # | Task | Change |
+|---|------|--------|
+| 1 | 360/wide_shot filter | `/review` now silently skips `photoType="360"` and `photoType="wide_shot"` photos. Use `/process-360` for 360 content. |
+| 2 | PDF export fixed | `/export-report` generates a real server-side PDF using pdfkit. Returns `pdf_base64` + `Content-Type: application/pdf`. 1 KB size validation added. |
+| 3 | Weather optional | `/weather-impact` no longer errors when `weatherCondition` is absent. Returns neutral zero-impact response. |
+| 4 | Employer upgrade | New `POST /employer/upgrade` — updates role, creates team, sends welcome email. |
+| 5 | Employer onboarding | New `GET /employer/onboarding-status` — powers the employer onboarding checklist. |
+| 6 | Signature boundary | Documented explicitly: `/review` never requires signature. Signature is client-enforced before calling `/export-report`. |
+| 7 | PDF retrieval | New `GET /pdf/:jobId` — regenerates and returns PDF for any past job by ID. |
+
+**New dependency:** `pdfkit` added to `package.json`.
+
+*This document was last updated 2026-03-17 (post-mobile-testing round).*
