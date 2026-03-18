@@ -1,8 +1,8 @@
 # Elemetric Server — Launch Readiness Report
-**Generated:** 2026-03-17 (updated 2026-03-17 post-mobile-testing)
-**Server version:** index.js (single-file Express.js, ~108 000 lines)
+**Generated:** 2026-03-17 (updated 2026-03-18 post-session-3)
+**Server version:** index.js (single-file Express.js, ~110 000 lines)
 **Runtime:** Node.js on Railway
-**Model:** GPT-4.1-mini Vision (OpenAI)
+**AI Models:** GPT-4.1-mini Vision (compliance analysis), GPT-4o-mini (prescreening), Claude Haiku 4.5 (compliance chatbot)
 **PDF library:** pdfkit (server-side PDF generation)
 
 ---
@@ -43,6 +43,7 @@ All required variables must be set in Railway before launch.
 | `NODE_ENV` | Optional | Environment mode | Defaults to `development` |
 | `PORT` | Optional | Server port | Defaults to `8080` |
 | `SUPABASE_WEBHOOK_SECRET` | Optional | Webhook auth | Signup webhooks accepted without verification |
+| `ANTHROPIC_API_KEY` | Important | Claude Haiku chatbot | `/chat` returns 503 |
 
 The startup report in `app.listen()` checks all critical variables and logs `✗ MISSING` warnings for any that are absent.
 
@@ -69,6 +70,16 @@ The startup report in `app.listen()` checks all critical variables and logs `✗
 |--------|------|--------|-------|
 | POST | `/property-passport` | Active | 24-hour cache per property |
 | POST | `/property-passport/claim` | Active | Sends email to owner |
+
+### Trial Period
+| Method | Path | Status | Notes |
+|--------|------|--------|-------|
+| POST | `/check-trial` | Active | Returns trial_active, trial_days_remaining, trial_expired for a userId |
+
+### Compliance Chatbot
+| Method | Path | Status | Rate Limit |
+|--------|------|--------|------------|
+| POST | `/chat` | Active | 20/day (free), 100/day (paid or trial) |
 
 ### Email / Notifications
 | Method | Path | Status |
@@ -191,6 +202,8 @@ The startup report in `app.listen()` checks all critical variables and logs `✗
 | User daily (free) | 24 hours | 50 per user | All AI endpoints |
 | User daily (paid) | 24 hours | 200 per user | All AI endpoints |
 | Employer | — | Unlimited | All AI endpoints |
+| Chat (free) | 24 hours | 20 per user | `/chat` |
+| Chat (paid/trial) | 24 hours | 100 per user | `/chat` |
 
 ---
 
@@ -347,3 +360,21 @@ The following fixes were applied after initial mobile testing:
 **New dependency:** `pdfkit` added to `package.json`.
 
 *This document was last updated 2026-03-17 (post-mobile-testing round).*
+
+---
+
+## 13. Changes — Session 3 (2026-03-18)
+
+| # | Task | Change |
+|---|------|--------|
+| 1 | Referral code endpoint | New `GET /referral/generate-code` — idempotent, 60s cache, always returns a code |
+| 2 | 14-day trial backend | `trial_started_at` column added to profiles (see `supabase/migrations/trial.sql`). New `POST /check-trial`. `/review` resolves user tier (free/trial/paid/employer) before rate limiting. Trial users get paid-tier limits (200/day). |
+| 3 | Compliance chatbot | New `POST /chat` using Claude Haiku 4.5 (`claude-haiku-4-5-20251001`). Rate-limited: 20/day free, 100/day paid or active trial. Accepts `message` + `history[]` for multi-turn. |
+| 4 | Employer web portal | 5 endpoints: `GET /employer/portal/:teamId`, `/employer/team/:teamId/jobs`, `/employer/team/:teamId/members`, `POST /employer/invite/web`, `GET /employer/report/:teamId` |
+| 5 | AI speed optimization | prescreenPhotos() now uses `gpt-4o-mini` (faster/cheaper). Full analysis retains `gpt-4.1-mini`. Concurrency stays at 5. |
+| 6–8 | Trade compliance prompts | Electrical (7 subtypes × 20 PASS/FAIL), Carpentry (7 subtypes), HVAC (5 subtypes) — all with detailed example calibration sets |
+| 9 | Performance monitoring | `performanceStats` object tracks per-endpoint timing, error rates, job-type AI costs. `/launch-metrics` updated to surface these. |
+
+**New dependencies:** `@anthropic-ai/sdk` added to `package.json`.
+
+*This document was last updated 2026-03-18 (post-session-3).*
