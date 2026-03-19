@@ -1,5 +1,5 @@
 # Elemetric Server — Launch Readiness Report
-**Generated:** 2026-03-17 (updated 2026-03-18 post-session-3)
+**Generated:** 2026-03-17 (updated 2026-03-19 post-session-4)
 **Server version:** index.js (single-file Express.js, ~110 000 lines)
 **Runtime:** Node.js on Railway
 **AI Models:** GPT-4.1-mini Vision (compliance analysis), GPT-4o-mini (prescreening), Claude Haiku 4.5 (compliance chatbot)
@@ -38,7 +38,7 @@ All required variables must be set in Railway before launch.
 | `RESEND_API_KEY` | **Critical** | Transactional email | All email endpoints disabled |
 | `ELEMETRIC_API_KEY` | **Critical** | API authentication | All endpoints accessible without key |
 | `REPLICATE_API_TOKEN` | Important | Stable Diffusion inpainting | `/visualise` returns 503 |
-| `ALLOWED_ORIGINS` | Important | CORS whitelist | CORS open (dev) or blocked (prod) |
+| `ALLOWED_ORIGINS` | Optional | Additional CORS origins (comma-separated) | Hardcoded defaults cover elemetric.com.au and Railway URL |
 | `EMAIL_FROM` | Optional | Sender address | Defaults to `Elemetric <noreply@elemetric.app>` |
 | `NODE_ENV` | Optional | Environment mode | Defaults to `development` |
 | `PORT` | Optional | Server port | Defaults to `8080` |
@@ -75,6 +75,8 @@ The startup report in `app.listen()` checks all critical variables and logs `✗
 | Method | Path | Status | Notes |
 |--------|------|--------|-------|
 | POST | `/check-trial` | Active | Returns trial_active, trial_days_remaining, trial_expired for a userId |
+| POST | `/trial/start` | Active | Explicitly starts 14-day trial (idempotent — safe to call multiple times) |
+| GET | `/trial/status?userId=` | Active | Returns full trial status; same fields as /check-trial |
 
 ### Compliance Chatbot
 | Method | Path | Status | Rate Limit |
@@ -214,7 +216,7 @@ The startup report in `app.listen()` checks all critical variables and logs `✗
 - **API key auth** — `x-elemetric-key` header validated on all non-public endpoints
 - **Input sanitisation** — null bytes + ASCII control chars stripped from all body/query params
 - **Auth header hardening** — rejects malformed Authorization headers
-- **CORS** — configurable via `ALLOWED_ORIGINS` env var
+- **CORS** — hardcoded production origins (elemetric.com.au, www.elemetric.com.au, app.elemetric.com.au, Railway URL) always allowed; additional origins via `ALLOWED_ORIGINS` env var; mobile apps (no Origin header) always pass through
 - **HTML escaping** — all user content in emails passed through `escHtml()`
 - **Stripe webhook signature** — verified with `STRIPE_WEBHOOK_SECRET`
 - **Timing-safe comparison** — Supabase webhook secret verified with `crypto.timingSafeEqual`
@@ -304,7 +306,7 @@ Counters reset at midnight Sydney time each day. Check `GET /health` for service
 - [ ] Run `GET /health` and confirm all services return `ok`
 - [ ] Test `POST /review` end-to-end with a real photo
 - [ ] Confirm Stripe webhook events are arriving
-- [ ] Verify `ALLOWED_ORIGINS` includes the production app URL
+- [ ] Verify CORS works for production domains (hardcoded: elemetric.com.au + Railway URL)
 
 ### Day 1
 - [ ] Monitor `GET /launch-metrics` every hour
