@@ -1,6 +1,7 @@
 # Elemetric Server — Launch Readiness Report
-**Generated:** 2026-03-17 (updated 2026-03-19 post-session-4)
-**Server version:** index.js (single-file Express.js, ~110 000 lines)
+**Generated:** 2026-03-17 (updated 2026-03-20 post-session-5)
+**Server version:** index.js (single-file Express.js, ~112 000 lines)
+**npm audit:** 0 vulnerabilities (verified 2026-03-20)
 **Runtime:** Node.js on Railway
 **AI Models:** GPT-4.1-mini Vision (compliance analysis), GPT-4o-mini (prescreening), Claude Haiku 4.5 (compliance chatbot)
 **PDF library:** pdfkit (server-side PDF generation)
@@ -82,6 +83,7 @@ The startup report in `app.listen()` checks all critical variables and logs `✗
 | Method | Path | Status | Rate Limit |
 |--------|------|--------|------------|
 | POST | `/chat` | Active | 20/day (free), 100/day (paid or trial) |
+| POST | `/compliance-summary` | Active | Uses Claude Haiku — no separate rate limit |
 
 ### Email / Notifications
 | Method | Path | Status |
@@ -379,4 +381,19 @@ The following fixes were applied after initial mobile testing:
 
 **New dependencies:** `@anthropic-ai/sdk` added to `package.json`.
 
-*This document was last updated 2026-03-18 (post-session-3).*
+## 14. Changes — Session 5 (2026-03-20)
+
+| # | Task | Change |
+|---|------|--------|
+| 1 | /review logging | Added STEP 1.5 Supabase connection log, plan/tier log, rate-limit pass confirmation. Full AI raw response logged in non-production mode. |
+| 2 | BPC regulatory references | Plumbing prompt now cites specific versioned standards: AS/NZS 3500.1/3500.2/3500.3/3500.4:2025 + AS/NZS 5601.1:2022. VICTORIAN_REGULATIONS updated with clause references. PROMPT_REGISTRY version bumped to 1.2.0. |
+| 3 | AI response quality | PROMPT_OPTIMISATION_HEADER now requires: specific AS/NZS clause numbers, exact measurements in failure descriptions, plain English with jargon explained, specific photo instructions in recommended_actions. |
+| 4 | POST /compliance-summary | New endpoint — uses Claude Haiku to generate a plain-English job summary for property owners/building surveyors. Powers "Share with Client" feature. Returns `{ summary, outcome, confidence, risk_rating }`. |
+| 5 | Rate limits | Updated: free=10/day, individual=50/day, employer=unlimited. Reset now uses Sydney midnight (AEST/AEDT). Improved 429 message tells user exactly when limit resets and how to upgrade. |
+| 6 | /webhook/job-completed | Added `launchMetrics.jobsCompleted++` and `jobsCompletedWeek++` to the webhook (previously missing). |
+| 7 | /verify-certificate HTML | Full redesign: ELEMETRIC header, large coloured VERIFIED/NOT VERIFIED/REVOKED badges, compliance score, risk rating colour-coded, suburb, date, licence last 4. Not-found and revoked pages also redesigned. |
+| 8 | /chat system prompt | Expanded with: BPC/VBA/ESV roles, Victorian licence categories, 7-year liability context, VBA inspector visit checklist, common compliance failures by trade type, specific standard clause references. |
+| 9 | /launch-metrics | Now returns: weekly counters (signups/analyses/PDFs/jobs this week), avg_confidence_today, most_popular_trade_today, error_rate_pct. New tracking added to review endpoint for confidence + trade type. |
+| 10 | Final hardening | npm audit = 0 vulnerabilities. node --check = syntax clean. Docs updated. |
+
+*This document was last updated 2026-03-20 (post-session-5).*
