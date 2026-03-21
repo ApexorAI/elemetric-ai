@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(node:*)"
+      "Bash(node:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(grep -v \"//.*cors\\\\|//.*CORS\")",
+      "Bash(chmod +x /c/Users/cayde/Projects/elemetric/server/.git/hooks/pre-commit)"
     ]
   }
 }
